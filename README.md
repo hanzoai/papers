@@ -238,32 +238,22 @@ Jin represents Hanzo's multimodal AI framework with vision-language-audio-3D cap
 
 ---
 
-### 6. Zen AI Model Family
+### 6. Zen AI Model Family (Base Frontier Models)
 
-**Directory**: [`zen/`](https://github.com/hanzoai/papers/tree/main/zen)
+**Repository**: https://github.com/zenlm/papers  
+**Co-developed by**: Hanzo AI Inc (Techstars '24) & Zoo Labs Foundation (501c3)
 
-Zen AI is a comprehensive family of ultra-efficient language models co-developed by Hanzo AI and Zoo Labs Foundation. All models are based on Qwen3 architectures with innovative optimizations.
+Zen AI is a comprehensive family of ultra-efficient language models serving as the **base underlying frontier models** for both Hanzo AI and Zoo Labs ecosystems. All models are based on Qwen3 architectures with innovative optimizations.
 
-- **Main Whitepaper**: `zen/ZEN_WHITEPAPER_2025.md` (v1.0.1)
-  - Technical overview of the complete Zen ecosystem
-  - 600M to 480B parameter models
+- **Main Whitepaper**: [ZEN_WHITEPAPER_2025.md](https://github.com/zenlm/papers/blob/main/ZEN_WHITEPAPER_2025.md) (v1.0.1)
+  - Complete Zen ecosystem: 600M to 480B parameters
   - 95% reduction in energy consumption
-  - Partnership: Hanzo AI (Techstars '17) & Zoo Labs Foundation (501c3)
+  - Recursive AI Self-Improvement System (RAIS)
+  - Partnership: Hanzo AI (Techstars '24) & Zoo Labs Foundation
 
-- **Core Model Papers**:
-  - `zen-nano_whitepaper.tex`: Edge computing (600M params)
-  - `zen-eco_whitepaper.tex`: Balanced performance
-  - `zen-coder_whitepaper.tex`: Code generation specialist
-  - `zen-omni_whitepaper.tex`: Multimodal understanding
-  - `zen-next_whitepaper.tex`: Ultra-sparse inference (MoE)
-  - `zen-guard_whitepaper.tex`: Safety and alignment
-
-- **Specialized Models**:
-  - `zen-artist_whitepaper.tex`: Creative generation
-  - `zen-designer-instruct_whitepaper.tex`: Design instruction
-  - `zen-designer-thinking_whitepaper.tex`: Design reasoning
-  - `zen-scribe_whitepaper.tex`: Writing and documentation
-  - Additional models: agent, 3d, video, world, foley, musician, director
-
-- **Family Overview**: `zen/zen_family_overview.tex`
+- **Model Documentation**: Visit https://github.com/zenlm/papers for:
+  - Core Models: Nano, Eco, Coder, Omni, Next, Guard
+  - Specialized Models: Artist, Designer, Scribe, Director, and more
+  - Architecture papers and technical specifications
+  - Deployment guides and optimization strategies
 

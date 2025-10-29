@@ -248,7 +248,7 @@ Zen AI is a comprehensive family of ultra-efficient language models co-developed
   - Technical overview of the complete Zen ecosystem
   - 600M to 480B parameter models
   - 95% reduction in energy consumption
-  - Partnership: Hanzo AI (Techstars '24) & Zoo Labs Foundation (501c3)
+  - Partnership: Hanzo AI (Techstars '17) & Zoo Labs Foundation (501c3)
 
 - **Core Model Papers**:
   - `zen-nano_whitepaper.tex`: Edge computing (600M params)

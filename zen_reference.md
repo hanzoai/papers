@@ -2,7 +2,7 @@
 
 **Repository**: https://github.com/zenlm/papers  
 **Organization**: ZenLM  
-**Co-developed by**: Hanzo AI Inc (Techstars '24) & Zoo Labs Foundation (501c3)
+**Co-developed by**: Hanzo AI Inc (Techstars '17) & Zoo Labs Foundation (501c3)
 
 Zen AI is a comprehensive family of ultra-efficient language models that serve as the **base underlying frontier models** for both Hanzo AI and Zoo Labs projects. All models are based on Qwen3 architectures with innovative optimizations.
 

@@ -199,7 +199,7 @@ If you use Hanzo Network in your research, please cite:
 ### ZenLM (Co-developed Models)
 - **Zen Models**: https://github.com/zenlm/papers
 - **Base Frontier Models**: Shared foundation for both Hanzo and Zoo ecosystems
-- **Partnership**: Hanzo AI Inc (Techstars '24) & Zoo Labs Foundation (501c3)
+- **Partnership**: Hanzo AI Inc (Techstars '17) & Zoo Labs Foundation (501c3)
 
 ## License
 
@@ -254,7 +254,7 @@ Jin represents Hanzo's multimodal AI framework with vision-language-audio-3D cap
 ### 6. Zen AI Model Family (Base Frontier Models)
 
 **Repository**: https://github.com/zenlm/papers  
-**Co-developed by**: Hanzo AI Inc (Techstars '24) & Zoo Labs Foundation (501c3)
+**Co-developed by**: Hanzo AI Inc (Techstars '17) & Zoo Labs Foundation (501c3)
 
 Zen AI is a comprehensive family of ultra-efficient language models serving as the **base underlying frontier models** for both Hanzo AI and Zoo Labs ecosystems. All models are based on Qwen3 architectures with innovative optimizations.
 
@@ -262,7 +262,7 @@ Zen AI is a comprehensive family of ultra-efficient language models serving as t
   - Complete Zen ecosystem: 600M to 480B parameters
   - 95% reduction in energy consumption
   - Recursive AI Self-Improvement System (RAIS)
-  - Partnership: Hanzo AI (Techstars '24) & Zoo Labs Foundation
+  - Partnership: Hanzo AI (Techstars '17) & Zoo Labs Foundation
 
 - **Model Documentation**: Visit https://github.com/zenlm/papers for:
   - Core Models: Nano, Eco, Coder, Omni, Next, Guard

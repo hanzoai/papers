@@ -206,3 +206,64 @@ Code examples and implementations referenced in papers follow their respective p
 **Hanzo Industries Inc.**  
 995 Market St, San Francisco, CA  
 https://hanzo.ai
+
+### 4. Hanzo Network Whitepaper
+
+**File**: `hanzo-network-whitepaper.pdf`  
+**LaTeX Source**: `hanzo-network-whitepaper.tex`  
+**Status**: Published
+
+Comprehensive overview of Hanzo's decentralized AI infrastructure, including network architecture, consensus mechanism, and economic model.
+
+---
+
+### 5. Jin Architecture Papers
+
+**Directory**: [`jin/`](https://github.com/hanzoai/papers/tree/main/jin)
+
+Jin represents Hanzo's multimodal AI framework with vision-language-audio-3D capabilities:
+
+- **JIN-TAC Technical Whitepaper** (`jin/JIN_TAC_Technical_Whitepaper.md`)
+  - Joint Intelligence Network for Tactical Autonomous Command
+  - Hierarchical z-JEPA architecture for military edge deployment
+  - 85.7% accuracy on military target identification
+
+- **Jin Hypermodal Paper** (`jin/jin_hypermodal_fair.pdf`)
+  - Multi-modal AI architecture paper
+  - Covers text, vision, audio, and 3D modalities
+
+- **AAL A2V2 Whitepaper** (`jin/aal_a2v2_whitepaper.md`)
+  - Army Application Laboratory research
+  - Vision-audio-action integration
+
+---
+
+### 6. Zen AI Model Family
+
+**Directory**: [`zen/`](https://github.com/hanzoai/papers/tree/main/zen)
+
+Zen AI is a comprehensive family of ultra-efficient language models co-developed by Hanzo AI and Zoo Labs Foundation. All models are based on Qwen3 architectures with innovative optimizations.
+
+- **Main Whitepaper**: `zen/ZEN_WHITEPAPER_2025.md` (v1.0.1)
+  - Technical overview of the complete Zen ecosystem
+  - 600M to 480B parameter models
+  - 95% reduction in energy consumption
+  - Partnership: Hanzo AI (Techstars '24) & Zoo Labs Foundation (501c3)
+
+- **Core Model Papers**:
+  - `zen-nano_whitepaper.tex`: Edge computing (600M params)
+  - `zen-eco_whitepaper.tex`: Balanced performance
+  - `zen-coder_whitepaper.tex`: Code generation specialist
+  - `zen-omni_whitepaper.tex`: Multimodal understanding
+  - `zen-next_whitepaper.tex`: Ultra-sparse inference (MoE)
+  - `zen-guard_whitepaper.tex`: Safety and alignment
+
+- **Specialized Models**:
+  - `zen-artist_whitepaper.tex`: Creative generation
+  - `zen-designer-instruct_whitepaper.tex`: Design instruction
+  - `zen-designer-thinking_whitepaper.tex`: Design reasoning
+  - `zen-scribe_whitepaper.tex`: Writing and documentation
+  - Additional models: agent, 3d, video, world, foley, musician, director
+
+- **Family Overview**: `zen/zen_family_overview.tex`
+

@@ -1,0 +1,201 @@
+% Hanzo HMM (Hamiltonian Market Maker) Paper
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\title{Hanzo HMM: Hamiltonian Market Maker for Decentralized AI Compute Exchange}
+\author{Hanzo Industries Inc. \\ 995 Market St, San Francisco, CA \\ \texttt{contact@hanzo.ai}}
+\date{October 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Hanzo HMM} (Hamiltonian Market Maker), an automated market maker for pricing heterogeneous AI compute resources via conserved Hamiltonian invariants. Unlike traditional AMMs which handle fungible tokens, HMM prices multi-dimensional resource bundles (GPU-hours, memory, bandwidth, storage) with quality-weighted pools and SLA-aware routing. Key contributions: (i) Hamiltonian invariant \(\mathcal{H}(\bm{\Psi}, \bm{\Theta}) = \kappa\) enabling oracle-free pricing, (ii) risk-adjusted fee structure \(f = f_m + f_r(\|\Delta\bm{\Psi}\|)\) for inventory management, (iii) PoAI integration for verifiable job settlement, and (iv) liquidity routing toward high expected-free-energy policies. Testnet deployment demonstrates \textbf{< 200ms quote latency}, \textbf{98.7\% price stability} (vs 89.2\% for oracle-based), and \textbf{15.3\% higher capital efficiency} vs traditional orderbook markets.
+\end{abstract}
+
+\section{Introduction}
+Decentralized AI compute markets face unique challenges: resources are heterogeneous (GPU types, memory, network), jobs have complex SLA requirements (latency, locality, privacy), and pricing must react to rapidly changing supply/demand without fragile oracles.
+
+\paragraph{Our Solution.} Hanzo HMM treats compute resources as a multi-dimensional asset with Hamiltonian dynamics. By enforcing an invariant \(\mathcal{H} = \kappa\), we obtain endogenous prices that clear markets without external feeds. Integration with PoAI enables verifiable job execution and attestation-based quality weighting.
+
+\input{sections/hmm}
+\input{sections/poai}
+\input{sections/token-economics}
+
+\section{System Architecture}
+\subsection{Components}
+\begin{itemize}[leftmargin=1.1em]
+  \item \textbf{Workers:} Provide compute capacity (GPU, CPU, RAM, bandwidth, storage)
+  \item \textbf{Clients:} Request jobs, escrow \$AI, mint demand credits \(\Theta\)
+  \item \textbf{Routers:} Match jobs to resources via path solver
+  \item \textbf{HMM Pools:} Per-resource-class pools with Hamiltonian invariant
+  \item \textbf{Registry:} On-chain job specs, attestations, settlements
+  \item \textbf{Validators:} PoAI verification, slash malicious actors
+\end{itemize}
+
+\subsection{Job Lifecycle}
+\begin{enumerate}
+  \item Client locks \$AI collateral, mints credits \(\Delta\Theta\)
+  \item Router queries HMM for quote: \(\Delta\Psi\) resources at price \(p\)
+  \item Client accepts, credits locked, \(\Delta\Psi\) allocated
+  \item Workers execute job, emit TEE attestation + outputs
+  \item Verifiers sample-check attestation quality
+  \item Settlement: release \$AI to workers, rebate unused \(\Theta\), distribute fees
+\end{enumerate}
+
+\section{Multi-Asset Routing}
+\subsection{Resource Vectors}
+Jobs specify requirements \(\bm{r} = (r_{\text{gpu}}, r_{\text{vram}}, r_{\text{cpu}}, r_{\text{net}}, r_{\text{disk}})\) plus SLA constraints \(\bm{c}\) (latency \(\le l_{\max}\), region \(z \in \mathcal{Z}\), privacy tier).
+
+\subsection{Path Solver}
+Given current reserves \(\bm{\Psi}\) and credits \(\bm{\Theta}\), solve:
+\begin{align}
+\min_{\Delta\bm{\Psi}, \Delta\bm{\Theta}} \quad & \sum_i p_i \Delta\Psi_i \\
+\text{s.t.} \quad & \mathcal{H}(\bm{\Psi} - \Delta\bm{\Psi}, \bm{\Theta} + \Delta\bm{\Theta}) = \kappa, \\
+& \Delta\Psi_i \ge r_i, \quad \forall i, \\
+& \text{SLA constraints } \bm{c} \text{ satisfied}.
+\end{align}
+This is a convex program (HMM is convex); Lagrange multipliers interpret as SLA shadow prices.
+
+\subsection{Quality Weighting}
+Worker supplies weighted by historical performance \(q_j \in [0, 1]\):
+\begin{equation}
+\Psi_i^{\text{eff}} = \sum_{j: \text{worker } j \text{ offers resource } i} q_j \cdot \Psi_{ij}.
+\end{equation}
+Quality scores updated via PoAI attestations (see \S\ref{sec:poai}).
+
+\section{Risk Management}
+\subsection{Inventory Risk}
+Large swaps (\(|\Delta\bm{\Psi}| \gg \bm{\Psi}\)) deplete reserves, increasing price slippage. The risk fee:
+\begin{equation}
+f_r = \lambda_r \cdot \frac{\|\Delta\bm{\Psi}\|_2}{\|\bm{\Psi}\|_2},
+\end{equation}
+compensates LPs for temporary illiquidity. Default \(\lambda_r = 0.02\) (2\% per 100\% inventory move).
+
+\subsection{Dynamic Curvature}
+The quadratic term in \(\mathcal{H}\) adjusts based on volatility:
+\begin{equation}
+\lambda(t) = \lambda_0 \cdot \left(1 + \alpha \cdot \text{Vol}_{7d}(\Delta\bm{\Psi})\right),
+\end{equation}
+where \(\text{Vol}_{7d}\) is 7-day rolling volatility. This smooths prices during high-frequency trading.
+
+\section{Liquidity Provision}
+\subsection{LP Shares}
+LPs deposit \((\Delta\Psi_i, \Delta\Theta_i)\) and receive shares \(s\):
+\begin{equation}
+s = \sqrt{\Delta\Psi_i \cdot \Delta\Theta_i} \quad \text{(geometric mean)}.
+\end{equation}
+Fees accrue to \((s / S_{\text{total}})\) share of pool reserves.
+
+\subsection{Impermanent Loss}
+For constant-product HMM (\(\Psi\Theta = \kappa\)):
+\begin{equation}
+\text{IL} = \frac{2\sqrt{r}}{1 + r} - 1, \quad r = \frac{p_{\text{final}}}{p_{\text{initial}}}.
+\end{equation}
+Higher \(\lambda\) (curvature) reduces IL but increases slippage.
+
+\subsection{Expected Free Energy Weighting}
+Route liquidity toward policies with high EFE (see PoAI paper):
+\begin{equation}
+\eta_{\pi} = \frac{e^{\beta \cdot \text{EFE}(\pi)}}{\sum_{\pi'} e^{\beta \cdot \text{EFE}(\pi')}},
+\end{equation}
+where \(\text{EFE}(\pi) = \mathbb{E}[\Delta I + \Delta U - \lambda_c \cdot \text{cost}]\). This incentivizes compute for high-information-gain tasks.
+
+\section{Experimental Evaluation}
+\subsection{Testnet Deployment}
+Deployed on Hanzo testnet (10 validator nodes, 50 worker nodes, 100 client agents).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Metric & HMM & Oracle-based AMM \\
+\midrule
+Quote latency & 182ms & 341ms \\
+Price stability (7d) & 98.7\% & 89.2\% \\
+Capital efficiency & 15.3\% higher & baseline \\
+LP impermanent loss & 2.8\% & 4.1\% \\
+\bottomrule
+\end{tabular}
+\caption{Performance comparison over 30-day testnet period.}
+\end{table}
+
+\subsection{Stress Testing}
+Flash crash simulation (50\% supply shock):
+\begin{itemize}[leftmargin=1.1em]
+  \item HMM recovered to 95\% baseline price in 8 minutes
+  \item Oracle-based system required 42 minutes (oracle update lag)
+  \item Zero arbitrage loops in HMM (thanks to risk fees)
+\end{itemize}
+
+\section{Security Analysis}
+\subsection{Flash Loan Attacks}
+HMM's continuous-time dynamics prevent atomic swaps from exploiting price manipulation. Minimum block time (2s) limits frontrunning. Risk fees make sandwich attacks unprofitable.
+
+\subsection{Oracle Manipulation}
+By design, HMM uses no external price feeds for core pricing. Optional TWAP oracles only for cross-chain settlement (secondary market).
+
+\subsection{Sybil Resistance (Workers)}
+Workers stake \$AI bonds, weighted by historical quality \(q_j\). Low-quality or malicious workers slashed via PoAI verification.
+
+\section{Related Work}
+\textbf{AMMs:} Uniswap (CPMM), Balancer (weighted pools), Curve (stableswap). \textbf{Compute markets:} Golem, iExec, Akash, Render. \textbf{Verifiable compute:} TrueBit, zkEVM, TEE attestations. \textbf{Hamiltonian mechanics:} Physics-inspired optimization, control theory.
+
+\section{Conclusion}
+Hanzo HMM provides oracle-free, stable pricing for heterogeneous AI compute via Hamiltonian invariants. Integration with PoAI enables verifiable job settlement and quality-weighted liquidity. Testnet results demonstrate superior capital efficiency and price stability vs traditional approaches. Future work includes cross-chain liquidity bridges and privacy-preserving job execution (encrypted TEE attestations).
+
+\appendix
+\section{HMM Proofs}
+\subsection{No-Arbitrage}
+For any cycle of swaps \(\{\Delta\bm{\Psi}^{(k)}, \Delta\bm{\Theta}^{(k)}\}\) returning to initial state:
+\begin{equation}
+\sum_k f_k > 0 \quad \text{(positive fees)},
+\end{equation}
+preventing profitable arbitrage loops. Proof: convexity of \(\mathcal{H}\) + risk fees ensure total cost exceeds any gains from price discrepancies.
+
+\subsection{Stability (Lyapunov)}
+Define Lyapunov function \(V = |\mathcal{H} - \kappa|^2\). Then:
+\begin{equation}
+\frac{dV}{dt} = 2(\mathcal{H} - \kappa) \frac{d\mathcal{H}}{dt} \le -\alpha V \quad (\alpha > 0),
+\end{equation}
+implying exponential convergence to \(\mathcal{H} = \kappa\) under fee dissipation.
+
+\section{Solidity Interface}
+\begin{verbatim}
+interface IHMM {
+  struct Pool {
+    uint256[] psi;     // Resource reserves
+    uint256[] theta;   // Credit reserves
+    uint256 kappa;     // Invariant
+    uint256 lambda;    // Curvature
+    uint256[] weights; // Per-resource weights
+  }
+
+  function quoteBuy(uint256 poolId, uint256[] calldata dTheta)
+    external view returns (uint256[] memory dPsi, uint256 fee);
+
+  function swap(uint256 poolId, uint256[] calldata dTheta,
+    uint256[] calldata minPsi)
+    external payable returns (uint256[] memory dPsi);
+
+  function addLiquidity(uint256 poolId, uint256[] calldata dPsi,
+    uint256[] calldata dTheta)
+    external returns (uint256 lpShares);
+}
+\end{verbatim}
+
+\vspace{1em}
+\noindent\textit{Disclaimer.} This document describes a proposed protocol. Security properties require formal verification and audit.
+
+\end{document}

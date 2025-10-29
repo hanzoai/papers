@@ -183,10 +183,23 @@ If you use Hanzo Network in your research, please cite:
 
 ## Related Projects
 
+### Hanzo AI Projects
 - **Hanzo Node**: https://github.com/hanzoai/hanzo (Rust blockchain implementation)
 - **Agent SDK**: https://github.com/hanzoai/agent (Python multi-agent framework)
 - **MCP Tools**: https://github.com/hanzoai/mcp (Model Context Protocol)
 - **Jin**: Multimodal LLM architecture (text/vision/audio/3D)
+
+### Zoo Labs Foundation (Partner Organization)
+- **Zoo Papers**: https://github.com/zooai/papers
+- **Zoo ZIPs**: Zoo Improvement Proposals for decentralized learning protocols
+- **DSO (ZIP-001)**: Decentralized Semantic Optimization - Byzantine-robust prior aggregation
+  - *Built on Hanzo's ASO (HIP-002) and HMM (HIP-004)*
+  - *Years of co-development between Hanzo AI Inc and Zoo Labs Foundation (501c3)*
+
+### ZenLM (Co-developed Models)
+- **Zen Models**: https://github.com/zenlm/papers
+- **Base Frontier Models**: Shared foundation for both Hanzo and Zoo ecosystems
+- **Partnership**: Hanzo AI Inc (Techstars '24) & Zoo Labs Foundation (501c3)
 
 ## License
 

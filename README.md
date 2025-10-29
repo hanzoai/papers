@@ -132,9 +132,9 @@ The Lux-Hanzo-Zoo-Zen ecosystem has published **58 comprehensive research papers
 ### Cross-Layer Innovations
 
 **Validator Economics**:
-- Lux validators: **1M LUX stake** (high security, L0 foundation)
-- Hanzo validators: **1 AI token** (self-mined on any device, then participate in HMM compute market)
-- Zoo validators: **1,000 ZOO stake** (democratic participation, accessible)
+- Lux validators: **1M LUX stake** (PoS + Genesis, high security, L0 foundation)
+- Hanzo validators: **1 AI token** (PoW compute, self-mined on any device, participate in HMM market)
+- Zoo validators: **1,000 ZOO stake** (PoAI - weighted by LLM experience sharing and semantic contributions)
 
 **Research Integration**:
 - Lux A-Chain provides TEE attestation for Hanzo compute verification

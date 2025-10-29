@@ -1,54 +1,81 @@
-# Hanzo AI Research Papers
+<div align="center">
+  <img src=".github/hanzo-logo.svg" alt="Hanzo AI" width="120" />
+  <h1>Hanzo AI Research Papers</h1>
+</div>
 
 Academic and technical papers for Hanzo AI infrastructure and protocols.
 
-**Organization**: https://github.com/hanzoai  
-**Website**: https://hanzo.ai  
+**Organization**: https://github.com/hanzoai
+**Website**: https://hanzo.ai
 **Contact**: contact@hanzo.ai
 
 ## Papers
 
-### Hanzo Network Whitepaper
+Hanzo AI research is organized into three focused papers covering complementary aspects of the ecosystem:
 
-**File**: `hanzo-network-whitepaper.pdf`  
-**LaTeX Source**: `hanzo-network-whitepaper.tex`  
+### 1. Hanzo ASO (Active Semantic Optimization)
+
+**File**: `hanzo-aso.pdf`
+**LaTeX Source**: `hanzo-aso.tex`
+**HIP**: [HIP-002-aso.md](../hips/HIP-002-aso.md)
 **Status**: Published October 2025
 
-**Title**: "Hanzo Network: A Hamiltonian Market Maker Layer-1 for Decentralized AI Compute and Semantic Learning"
+**Title**: "Training-Free Adaptation via Active Semantic Optimization and Product-of-Experts Decoding"
 
-**Abstract**: We present Hanzo Network, a specialized Layer-1 (L1) blockchain for AI compute exchange and decentralized semantic learning. Hanzo introduces a **Hamiltonian Market Maker (HMM)**—a provably-stable, oracle-minimal automated market maker that prices heterogeneous compute resources via a Hamiltonian invariant.
+**Abstract**: A training-free adaptation framework for agentic code generation built on TF-GRPO and PoE decoding.
 
 **Key Contributions**:
+- Training-Free GRPO (TF-GRPO) with epistemic utility
+- Product-of-Experts (PoE) decoding at token level
+- 1-bit semantic compression (BitDelta) - 29.5× savings
+- Hanzo Dev CLI agent with SWE-bench integration
+- **18.2% resolved rate** on SWE-bench Verified
 
-1. **Hamiltonian Market Maker (HMM)**
-   - Oracle-minimal pricing for heterogeneous compute resources
-   - Multi-asset support with continuous-time price dynamics
-   - Provably stable via convex Hamiltonian invariant
-   - Split fee structure (market + risk fees)
+**Sections**: tf-grpo.tex, poe-decoding.tex, bitdelta.tex, swe-bench-eval.tex
 
-2. **Proof of AI (PoAI)**
-   - Consensus extension for verifiable inference/training work
-   - TEE-anchored attestations with Merkle commitments
-   - Optional ZK proofs for compute verification
-   - Slashing mechanism for fraudulent attestations
+---
 
-3. **Training-Free GRPO (TF-GRPO)**
-   - Bayesian product-of-experts (PoE) decoding
-   - Token/embedding-level experiential priors
-   - Zero-training adaptation across models
-   - Active Semantic Optimization (ASO)
+### 2. Hanzo DSO (Decentralized Semantic Optimization)
 
-4. **1-Bit Semantic Compression**
-   - BitDelta-inspired sign compression
-   - 29.5× storage savings
-   - Multi-tenant serving efficiency
-   - Per-matrix scale distillation
+**File**: `hanzo-dso.pdf`
+**LaTeX Source**: `hanzo-dso.tex`
+**HIP**: [HIP-003-dso.md](../hips/HIP-003-dso.md)
+**Status**: Published October 2025
 
-5. **Token Economics ($AI)**
-   - Protocol token for staking, fees, rewards
-   - Compute credits minted by locking $AI
-   - PoAI bonus rewards for verified work
-   - Fee burns to offset emissions
+**Title**: "Decentralized Semantic Optimization with Byzantine-Robust Prior Aggregation"
+
+**Abstract**: A protocol for sharing and aggregating experiential priors across distributed language model agents without parameter updates.
+
+**Key Contributions**:
+- Byzantine-robust median voting with stake weighting
+- ExperienceRegistry smart contract (IPFS/Arweave storage)
+- P2P gossip protocol for prior synchronization
+- Quality scoring and slashing mechanism
+- **15.2% improvement** in multi-agent tasks vs isolated operation
+
+**Sections**: dso-core.tex, bitdelta.tex
+
+---
+
+### 3. Hanzo HMM (Hamiltonian Market Maker)
+
+**File**: `hanzo-hmm.pdf`
+**LaTeX Source**: `hanzo-hmm.tex`
+**HIP**: [HIP-004-hmm.md](../hips/HIP-004-hmm.md)
+**Status**: Published October 2025
+
+**Title**: "Hamiltonian Market Maker for Decentralized AI Compute Exchange"
+
+**Abstract**: An automated market maker for pricing heterogeneous AI compute resources via conserved Hamiltonian invariants.
+
+**Key Contributions**:
+- Hamiltonian invariant H(Ψ,Θ) = κ for oracle-free pricing
+- Multi-asset routing with SLA-aware path solver
+- Risk-adjusted fee structure for inventory management
+- PoAI integration for verifiable job settlement
+- **< 200ms quote latency**, **98.7% price stability** (vs 89.2% oracle-based)
+
+**Sections**: hmm.tex, poai.tex, token-economics.tex
 
 ## Building Papers
 
@@ -104,13 +131,23 @@ make
 ## Makefile Commands
 
 ```bash
-make                  # Build all PDFs (auto-detects native/Docker)
-make clean            # Remove intermediate files
+# Build all papers
+make                  # Build all PDFs (ASO, DSO, HMM) - auto-detects native/Docker
+make all              # Same as above
+
+# Build individual papers
+make aso              # Build hanzo-aso.pdf only
+make dso              # Build hanzo-dso.pdf only
+make hmm              # Build hanzo-hmm.pdf only
+
+# Cleaning
+make clean            # Remove intermediate files (.aux, .log, etc.)
 make distclean        # Remove all generated files including PDFs
-make rebuild          # Clean and rebuild
-make view             # Open PDF (macOS)
-make install-latex    # Install BasicTeX via Homebrew (macOS)
-make help             # Show all targets
+
+# Utilities
+make view             # Open all PDFs (macOS)
+make help             # Show all targets with descriptions
+make docker-pull      # Pull Docker image (first time setup)
 ```
 
 ## LaTeX Packages Used
@@ -157,26 +194,64 @@ All papers use standard LaTeX packages included in TeX Live:
 ```
 papers/
 ├── README.md                        # This file
-├── BUILD_INSTRUCTIONS.md            # Detailed build guide
-├── Makefile                         # Build automation
+├── Makefile                         # Build automation (multi-paper support)
 ├── .gitignore                       # LaTeX artifacts
-├── hanzo-network-whitepaper.tex     # Hanzo Network source
-├── hanzo-network-whitepaper.pdf     # Hanzo Network PDF
-└── [future papers...]
+│
+├── hanzo-aso.tex                    # ASO paper source
+├── hanzo-aso.pdf                    # ASO paper PDF (7 pages)
+├── hanzo-dso.tex                    # DSO paper source
+├── hanzo-dso.pdf                    # DSO paper PDF (6 pages)
+├── hanzo-hmm.tex                    # HMM paper source
+├── hanzo-hmm.pdf                    # HMM paper PDF (7 pages)
+│
+└── sections/                        # Reusable LaTeX sections (shared across papers)
+    ├── tf-grpo.tex                  # Training-Free GRPO formulation
+    ├── poe-decoding.tex             # Product-of-Experts decoding
+    ├── bitdelta.tex                 # 1-bit compression (BitDelta)
+    ├── swe-bench-eval.tex           # SWE-bench evaluation protocol
+    ├── dso-core.tex                 # DSO protocol specification
+    ├── hmm.tex                      # Hamiltonian Market Maker mechanics
+    ├── poai.tex                     # Proof of AI attestations
+    └── token-economics.tex          # $AI token economics
 ```
+
+**Modular Design**: Papers use `\input{sections/...}` to share common sections, reducing duplication and ensuring consistency across the research ecosystem.
 
 ## Citation
 
-If you use Hanzo Network in your research, please cite:
+If you use Hanzo in your research, please cite the relevant paper(s):
 
 ```bibtex
-@techreport{hanzo2025network,
-  title={Hanzo Network: A Hamiltonian Market Maker Layer-1 for Decentralized AI Compute and Semantic Learning},
+@techreport{hanzo2025aso,
+  title={Training-Free Adaptation via Active Semantic Optimization and Product-of-Experts Decoding},
   author={Hanzo Industries Inc.},
   year={2025},
   month={October},
   institution={Hanzo Industries Inc.},
   address={995 Market St, San Francisco, CA},
+  note={HIP-002},
+  url={https://github.com/hanzoai/papers}
+}
+
+@techreport{hanzo2025dso,
+  title={Decentralized Semantic Optimization with Byzantine-Robust Prior Aggregation},
+  author={Hanzo Industries Inc.},
+  year={2025},
+  month={October},
+  institution={Hanzo Industries Inc.},
+  address={995 Market St, San Francisco, CA},
+  note={HIP-003},
+  url={https://github.com/hanzoai/papers}
+}
+
+@techreport{hanzo2025hmm,
+  title={Hamiltonian Market Maker for Decentralized AI Compute Exchange},
+  author={Hanzo Industries Inc.},
+  year={2025},
+  month={October},
+  institution={Hanzo Industries Inc.},
+  address={995 Market St, San Francisco, CA},
+  note={HIP-004},
   url={https://github.com/hanzoai/papers}
 }
 ```

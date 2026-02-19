@@ -1,104 +1,62 @@
-# Makefile for building Hanzo Network whitepaper PDF
+# Makefile for Hanzo Papers
+# Automatically compiles all LaTeX papers to PDF
 
-# Variables
-LATEX = pdflatex
-BIBTEX = bibtex
-MAIN = hanzo-network-whitepaper
-TEX_FILES = $(wildcard *.tex)
-PDF = $(MAIN).pdf
+# Find all .tex files in current directory (excludes sections/, zen/ subdirs)
+TEX_FILES := $(wildcard *.tex)
+PDF_FILES := $(patsubst %.tex,pdfs/%.pdf,$(TEX_FILES))
 
-# LaTeX build flags
-LATEX_FLAGS = -interaction=nonstopmode -halt-on-error
-
-# Docker image for LaTeX compilation (if native tools not available)
-DOCKER_IMAGE = texlive/texlive:latest
-DOCKER_RUN = docker run --rm -v "$(PWD):/workdir" -w /workdir $(DOCKER_IMAGE)
-
-# Check if pdflatex is available
-LATEX_AVAILABLE := $(shell command -v pdflatex 2> /dev/null)
-
-# Default target
+# Default target: compile all papers
 .PHONY: all
-all: $(PDF)
+all: $(PDF_FILES)
+	@echo "All papers compiled successfully"
+	@echo ""
+	@echo "Generated PDFs:"
+	@ls -lh pdfs/
 
-# Build PDF (requires 2-3 passes for references)
-$(PDF): $(TEX_FILES)
-ifdef LATEX_AVAILABLE
-	@echo "Building $(MAIN).pdf using native LaTeX..."
-	$(LATEX) $(LATEX_FLAGS) $(MAIN).tex
-	$(LATEX) $(LATEX_FLAGS) $(MAIN).tex
-else
-	@echo "Building $(MAIN).pdf using Docker (native LaTeX not found)..."
-	$(DOCKER_RUN) pdflatex $(LATEX_FLAGS) $(MAIN).tex
-	$(DOCKER_RUN) pdflatex $(LATEX_FLAGS) $(MAIN).tex
-endif
-	@echo "PDF built successfully: $(PDF)"
+# Create pdfs directory
+pdfs:
+	@mkdir -p pdfs
 
-# Build with bibliography (if we add references later)
-.PHONY: full
-full: $(TEX_FILES)
-ifdef LATEX_AVAILABLE
-	@echo "Building $(MAIN).pdf with bibliography using native LaTeX..."
-	$(LATEX) $(LATEX_FLAGS) $(MAIN).tex
-	$(BIBTEX) $(MAIN)
-	$(LATEX) $(LATEX_FLAGS) $(MAIN).tex
-	$(LATEX) $(LATEX_FLAGS) $(MAIN).tex
-else
-	@echo "Building $(MAIN).pdf with bibliography using Docker..."
-	$(DOCKER_RUN) pdflatex $(LATEX_FLAGS) $(MAIN).tex
-	$(DOCKER_RUN) bibtex $(MAIN)
-	$(DOCKER_RUN) pdflatex $(LATEX_FLAGS) $(MAIN).tex
-	$(DOCKER_RUN) pdflatex $(LATEX_FLAGS) $(MAIN).tex
-endif
-	@echo "PDF built successfully: $(PDF)"
+# Compile a single .tex file to PDF
+pdfs/%.pdf: %.tex | pdfs
+	@echo "Compiling $<..."
+	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
+	@cd pdfs && bibtex $(*F) 2>/dev/null || true
+	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
+	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
+	@if [ -f pdfs/$(*F).pdf ]; then \
+		echo "  Successfully compiled $(*F).pdf"; \
+	else \
+		echo "  Failed to compile $(*F).pdf"; \
+	fi
 
-# Clean intermediate files
+# Clean auxiliary files
 .PHONY: clean
 clean:
-	@echo "Cleaning intermediate files..."
-	rm -f *.aux *.log *.out *.toc *.bbl *.blg *.synctex.gz *.fls *.fdb_latexmk
-	@echo "Clean complete."
+	@echo "Cleaning auxiliary files..."
+	@rm -f pdfs/*.aux pdfs/*.log pdfs/*.bbl pdfs/*.blg pdfs/*.out pdfs/*.toc pdfs/*.lof pdfs/*.lot
+	@rm -f *.aux *.log *.bbl *.blg *.out *.toc *.lof *.lot
+	@echo "Cleaned"
 
-# Clean everything including PDF
-.PHONY: distclean
-distclean: clean
-	@echo "Removing PDF..."
-	rm -f $(PDF)
-	@echo "Distclean complete."
+# Clean everything including PDFs
+.PHONY: clean-all
+clean-all: clean
+	@echo "Removing all PDFs..."
+	@rm -f pdfs/*.pdf
+	@echo "All files cleaned"
 
-# Quick rebuild
-.PHONY: rebuild
-rebuild: clean all
-
-# View PDF (macOS)
-.PHONY: view
-view: $(PDF)
-	@echo "Opening $(PDF)..."
-	open $(PDF)
-
-# Install LaTeX via Homebrew (macOS)
-.PHONY: install-latex
-install-latex:
-	@echo "Installing BasicTeX via Homebrew..."
-	@echo "This requires Homebrew and may take several minutes."
-	brew install --cask basictex
-	@echo "Updating PATH for current session..."
-	@echo "Add /Library/TeX/texbin to your PATH in ~/.zshrc or ~/.bashrc"
-	@echo "Then run: tlmgr update --self && tlmgr install collection-latexextra"
-
-# Help
+# Help target
 .PHONY: help
 help:
-	@echo "Hanzo Network Whitepaper Build System"
+	@echo "Hanzo Papers Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all (default)  - Build PDF with 2 LaTeX passes (auto-detects native/Docker)"
-	@echo "  full           - Build PDF with bibliography (3 passes + bibtex)"
-	@echo "  clean          - Remove intermediate files (.aux, .log, etc.)"
-	@echo "  distclean      - Remove all generated files including PDF"
-	@echo "  rebuild        - Clean and rebuild"
-	@echo "  view           - Open PDF in default viewer (macOS)"
-	@echo "  install-latex  - Install BasicTeX via Homebrew (macOS only)"
-	@echo "  help           - Show this help message"
+	@echo "  make all              - Compile all papers (default)"
+	@echo "  make clean            - Remove auxiliary files"
+	@echo "  make clean-all        - Remove all files including PDFs"
+	@echo "  make pdfs/<name>.pdf  - Compile a specific paper"
 	@echo ""
-	@echo "Note: If pdflatex is not found, Docker will be used automatically."
+	@echo "Papers found: $(words $(TEX_FILES))"
+	@echo ""
+	@echo "Docker usage:"
+	@echo "  docker run --rm -v \"\$$PWD:/workdir\" -w /workdir texlive/texlive:latest make all"

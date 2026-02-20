@@ -1,62 +1,85 @@
 # Makefile for Hanzo Papers
-# Automatically compiles all LaTeX papers to PDF
+# Compiles all standalone .tex papers (with \documentclass) to PDF.
+# Excludes sections/*.tex (included fragments, no \documentclass).
+#
+# Usage:
+#   make all                            # Build all 42 papers
+#   make pdfs/hanzo-aso.pdf             # Build one root paper
+#   make pdfs/zen/zen-coder_whitepaper.pdf  # Build one zen paper
+#   make clean                          # Remove aux files
+#   make clean-all                      # Remove aux + PDFs
+#
+# Docker (no local TeX install needed):
+#   docker run --rm -v "$$PWD:/workdir" -w /workdir texlive/texlive:latest make all
 
-# Find all .tex files in current directory (excludes sections/, zen/ subdirs)
-TEX_FILES := $(wildcard *.tex)
-PDF_FILES := $(patsubst %.tex,pdfs/%.pdf,$(TEX_FILES))
+# Discover standalone .tex files (root + zen/, exclude sections/)
+ROOT_TEX := $(wildcard *.tex)
+ZEN_TEX  := $(wildcard zen/*.tex)
+ALL_TEX  := $(ROOT_TEX) $(ZEN_TEX)
 
-# Default target: compile all papers
+# Map to output PDFs under pdfs/
+ALL_PDFS := $(patsubst %.tex,pdfs/%.pdf,$(ALL_TEX))
+
+# Default: build everything
 .PHONY: all
-all: $(PDF_FILES)
-	@echo "All papers compiled successfully"
+all: $(ALL_PDFS)
 	@echo ""
-	@echo "Generated PDFs:"
-	@ls -lh pdfs/
+	@echo "=== Build complete ==="
+	@echo "Papers compiled: $(words $(ALL_PDFS))"
+	@echo ""
+	@find pdfs -name '*.pdf' | sort
 
-# Create pdfs directory
-pdfs:
-	@mkdir -p pdfs
-
-# Compile a single .tex file to PDF
-pdfs/%.pdf: %.tex | pdfs
-	@echo "Compiling $<..."
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@cd pdfs && bibtex $(*F) 2>/dev/null || true
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@pdflatex -interaction=nonstopmode -output-directory=pdfs $< > /dev/null || true
-	@if [ -f pdfs/$(*F).pdf ]; then \
-		echo "  Successfully compiled $(*F).pdf"; \
+# Rule for root-level papers: pdfs/foo.pdf from foo.tex
+pdfs/%.pdf: %.tex
+	@mkdir -p $(dir $@)
+	@echo "Compiling $< ..."
+	@pdflatex -interaction=nonstopmode -output-directory=$(dir $@) $< > /dev/null 2>&1 || true
+	@cd $(dir $@) && bibtex $(basename $(notdir $@)) > /dev/null 2>&1 || true
+	@pdflatex -interaction=nonstopmode -output-directory=$(dir $@) $< > /dev/null 2>&1 || true
+	@if [ -f "$@" ]; then \
+		echo "  OK  $@"; \
 	else \
-		echo "  Failed to compile $(*F).pdf"; \
+		echo "  FAIL $@"; \
 	fi
 
-# Clean auxiliary files
+# Clean auxiliary files (keep PDFs)
 .PHONY: clean
 clean:
 	@echo "Cleaning auxiliary files..."
-	@rm -f pdfs/*.aux pdfs/*.log pdfs/*.bbl pdfs/*.blg pdfs/*.out pdfs/*.toc pdfs/*.lof pdfs/*.lot
-	@rm -f *.aux *.log *.bbl *.blg *.out *.toc *.lof *.lot
-	@echo "Cleaned"
+	@find pdfs -type f ! -name '*.pdf' -delete 2>/dev/null || true
+	@find . -maxdepth 1 -name '*.aux' -o -name '*.log' -o -name '*.out' \
+		-o -name '*.toc' -o -name '*.bbl' -o -name '*.blg' \
+		-o -name '*.lof' -o -name '*.lot' | xargs rm -f 2>/dev/null || true
+	@echo "Done"
 
-# Clean everything including PDFs
+# Clean everything
 .PHONY: clean-all
-clean-all: clean
-	@echo "Removing all PDFs..."
-	@rm -f pdfs/*.pdf
-	@echo "All files cleaned"
+clean-all:
+	@echo "Removing all generated files..."
+	@rm -rf pdfs
+	@echo "Done"
 
-# Help target
+# List papers
+.PHONY: list
+list:
+	@echo "Root papers ($(words $(ROOT_TEX))):"
+	@for f in $(ROOT_TEX); do echo "  $$f"; done
+	@echo ""
+	@echo "Zen papers ($(words $(ZEN_TEX))):"
+	@for f in $(ZEN_TEX); do echo "  $$f"; done
+	@echo ""
+	@echo "Total: $(words $(ALL_TEX)) papers"
+
 .PHONY: help
 help:
 	@echo "Hanzo Papers Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make all              - Compile all papers (default)"
-	@echo "  make clean            - Remove auxiliary files"
-	@echo "  make clean-all        - Remove all files including PDFs"
-	@echo "  make pdfs/<name>.pdf  - Compile a specific paper"
+	@echo "  make all                  - Compile all $(words $(ALL_TEX)) papers"
+	@echo "  make pdfs/<name>.pdf      - Compile a specific paper"
+	@echo "  make list                 - List all discovered papers"
+	@echo "  make clean                - Remove auxiliary files"
+	@echo "  make clean-all            - Remove all generated files"
 	@echo ""
-	@echo "Papers found: $(words $(TEX_FILES))"
-	@echo ""
-	@echo "Docker usage:"
+	@echo "Docker:"
 	@echo "  docker run --rm -v \"\$$PWD:/workdir\" -w /workdir texlive/texlive:latest make all"

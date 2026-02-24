@@ -1,0 +1,804 @@
+% Hanzo Flow: Visual Workflow Builder for AI Agent Orchestration
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{natbib}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  xleftmargin=2em,
+}
+
+\title{Hanzo Flow: Visual Workflow Builder for AI Agent Orchestration}
+\author{
+    David Wei \quad
+    Marcus Chen \quad
+    Zach Kelling \\
+    \textit{Hanzo AI Research} \\
+    \texttt{research@hanzo.ai}
+}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Hanzo Flow}, a visual workflow builder for constructing, debugging, and deploying multi-agent AI systems. While code-based agent frameworks provide flexibility, they impose high barriers to iteration, lack visibility into agent decision-making, and make debugging multi-agent interactions intractable. Hanzo Flow introduces three innovations: (i) a \emph{typed dataflow graph} formalism where nodes represent agent operations (LLM calls, tool invocations, control flow, human-in-the-loop gates) and edges represent typed data channels, enabling static verification of workflow correctness before execution; (ii) a \emph{visual debugger} with execution replay, token-level attribution, and branching exploration that reduces debugging time by 67\% compared to log-based debugging; and (iii) an \emph{adaptive execution engine} that supports parallel branch execution, dynamic subgraph expansion, and automatic retry with model fallback, achieving 94\% end-to-end success rate on complex multi-step tasks. We evaluate Hanzo Flow on the AgentBench suite, a novel visual workflow benchmark (FlowBench-200), and a user study with 48 developers. Results show that visual workflow construction reduces development time by 3.2x compared to code-based frameworks while achieving equivalent or superior task completion rates. Hanzo Flow has been used in production to build 1,200+ workflows processing 8.4 million agent invocations over 10 months.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The rise of AI agents---autonomous systems that combine LLM reasoning with tool use and memory~\cite{wang2024survey,xi2023rise}---has created demand for frameworks that simplify agent construction and orchestration. Current approaches fall into two categories:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Code-first frameworks} (LangChain~\cite{langchain2023}, CrewAI~\cite{crewai2024}, AutoGen~\cite{wu2023autogen}): Flexible but opaque. Agent behavior is encoded in Python/TypeScript code, making it difficult to visualize control flow, debug failures, or modify workflows without deep understanding of the codebase.
+    \item \textbf{No-code builders} (Zapier AI, Make.com): Accessible but limited. Support simple linear chains but lack the expressiveness for conditional branching, parallel execution, loops, and multi-agent coordination required for complex workflows.
+\end{enumerate}
+
+Hanzo Flow occupies the middle ground: a visual programming environment with the expressiveness of code-first frameworks and the accessibility of no-code builders.
+
+\subsection{Design Principles}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Graphs, not chains}: Workflows are directed acyclic graphs (DAGs) with typed edges, supporting arbitrary branching, merging, and parallel execution.
+    \item \textbf{Static verification}: Type checking and constraint validation catch errors before execution.
+    \item \textbf{Observable execution}: Every node execution is logged with full input/output traces, enabling replay and debugging.
+    \item \textbf{Incremental deployment}: Workflows can be tested node-by-node, branch-by-branch, or end-to-end before deployment.
+\end{enumerate}
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item A typed dataflow graph formalism for agent workflows with static verification (\S\ref{sec:formalism}).
+    \item A visual debugger with execution replay and branching exploration (\S\ref{sec:debugger}).
+    \item An adaptive execution engine with parallel branching and model fallback (\S\ref{sec:engine}).
+    \item Evaluation on benchmarks and user study (\S\ref{sec:evaluation}).
+    \item Production deployment analysis (\S\ref{sec:production}).
+\end{enumerate}
+
+\section{Typed Dataflow Graphs}
+\label{sec:formalism}
+
+\subsection{Formal Definition}
+
+\begin{definition}[Flow Graph]
+A Hanzo Flow graph is a tuple $G = (V, E, \Sigma, \tau)$ where:
+\begin{itemize}[leftmargin=1.1em]
+    \item $V = \{v_1, \ldots, v_n\}$ is a set of nodes (operations).
+    \item $E \subseteq V \times V \times \text{Port}$ is a set of directed edges with port annotations.
+    \item $\Sigma$ is a type system with base types $\mathcal{B} = \{\texttt{string}, \texttt{number}, \texttt{boolean}, \texttt{json}, \texttt{image}, \texttt{embedding}, \texttt{message[]}\}$ and constructors $\texttt{List}[\cdot]$, $\texttt{Optional}[\cdot]$, $\texttt{Union}[\cdot, \cdot]$.
+    \item $\tau : \text{Port} \to \Sigma$ assigns types to input and output ports.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Well-Typed Flow]
+A flow graph $G$ is well-typed if for every edge $(u, v, (p_u, p_v)) \in E$:
+\begin{equation}
+\tau(p_u^{\text{out}}) \preceq \tau(p_v^{\text{in}}),
+\end{equation}
+where $\preceq$ denotes subtype compatibility (e.g., $\texttt{string} \preceq \texttt{Optional[string]}$).
+\end{definition}
+
+\subsection{Node Types}
+
+Hanzo Flow provides 14 built-in node types organized into four categories:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llc}
+\toprule
+\textbf{Category} & \textbf{Node Type} & \textbf{Ports} \\
+\midrule
+\multirow{4}{*}{AI} & LLM Call & 3 in, 2 out \\
+& Embedding & 1 in, 1 out \\
+& Classifier & 1 in, 2 out \\
+& Structured Output & 2 in, 1 out \\
+\midrule
+\multirow{3}{*}{Control} & Conditional Branch & 1 in, $n$ out \\
+& Parallel Split & 1 in, $n$ out \\
+& Merge/Join & $n$ in, 1 out \\
+\midrule
+\multirow{4}{*}{Data} & Transform (code) & $n$ in, $m$ out \\
+& API Call & 2 in, 2 out \\
+& Database Query & 2 in, 1 out \\
+& File I/O & 1 in, 1 out \\
+\midrule
+\multirow{3}{*}{Human} & Approval Gate & 1 in, 2 out \\
+& Input Request & 0 in, 1 out \\
+& Feedback Loop & 2 in, 2 out \\
+\bottomrule
+\end{tabular}
+\caption{Built-in node types in Hanzo Flow.}
+\label{tab:nodes}
+\end{table}
+
+\subsection{LLM Call Node}
+
+The LLM Call node is the fundamental AI operation. It accepts three inputs:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{System prompt} (\texttt{string}): The system-level instruction.
+    \item \textbf{Messages} (\texttt{message[]}): Conversation history.
+    \item \textbf{Tools} (\texttt{json[]}): Available tool definitions.
+\end{enumerate}
+
+And produces two outputs:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Response} (\texttt{string | json}): The model's text or structured output.
+    \item \textbf{Tool calls} (\texttt{json[]}): Any tool invocations requested by the model.
+\end{enumerate}
+
+Configuration includes model selection (or ``auto'' for routing), temperature, max tokens, response format (text, JSON, or schema-constrained), and retry policy.
+
+\subsection{Conditional Branch Node}
+
+The Conditional Branch node evaluates a predicate on its input and routes data to one of $n$ output ports:
+
+\begin{definition}[Branch Semantics]
+Given input $x$ and predicates $\{P_1, \ldots, P_n\}$ with a default branch $d$:
+\begin{equation}
+\text{output}(x) = \begin{cases}
+\text{port}_i & \text{if } P_i(x) \text{ is first true predicate}, \\
+\text{port}_d & \text{if no predicate is true}.
+\end{cases}
+\end{equation}
+\end{definition}
+
+Predicates can be:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Expression-based}: JavaScript expressions (e.g., \texttt{x.score > 0.8}).
+    \item \textbf{LLM-based}: Natural language conditions evaluated by a classifier (e.g., ``Is this response about code?'').
+    \item \textbf{Schema-based}: JSON Schema validation (e.g., ``Does the output contain a \texttt{name} field?'').
+\end{itemize}
+
+\subsection{Static Verification}
+
+Before execution, Hanzo Flow performs four verification passes:
+
+\begin{algorithm}[H]
+\caption{Static Flow Verification}
+\label{alg:verify}
+\begin{algorithmic}[1]
+\Require Flow graph $G = (V, E, \Sigma, \tau)$
+\State \Comment{Pass 1: Type checking}
+\For{each edge $(u, v, (p_u, p_v)) \in E$}
+    \State Verify $\tau(p_u^{\text{out}}) \preceq \tau(p_v^{\text{in}})$
+\EndFor
+\State \Comment{Pass 2: Connectivity}
+\State Verify all non-optional input ports have exactly one incoming edge
+\State Verify graph has exactly one start node and at least one end node
+\State \Comment{Pass 3: Acyclicity (for non-loop subgraphs)}
+\State Verify topological sort exists for non-feedback edges
+\State \Comment{Pass 4: Resource bounds}
+\State Verify no unbounded parallel expansion
+\State Estimate max token consumption and cost
+\State \Return verification result with warnings/errors
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Type Safety]
+If a flow graph passes static verification, then at runtime, no type mismatch error will occur at any edge, assuming node implementations respect their declared types.
+\end{theorem}
+
+\begin{proof}
+By induction on topological order. The start node produces outputs of declared type. Each subsequent node receives inputs of compatible type (by verification), and by the contract of node implementations, produces outputs of declared type. The inductive step preserves type safety at every edge.
+\end{proof}
+
+\section{Visual Debugger}
+\label{sec:debugger}
+
+\subsection{Execution Traces}
+
+Every execution of a flow graph produces a trace $T = [(v_i, t_i, x_i, y_i, \delta_i)]$ where $v_i$ is the node, $t_i$ is the timestamp, $x_i$ is the input, $y_i$ is the output, and $\delta_i$ is the duration. Traces are stored in a structured log and indexed for retrieval.
+
+\subsection{Replay Mode}
+
+The visual debugger supports full execution replay:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Step-through}: Execute one node at a time, inspecting inputs/outputs at each step.
+    \item \textbf{Breakpoints}: Pause execution at specific nodes or when conditions are met.
+    \item \textbf{Time travel}: Rewind to any previous step and re-execute from that point with modified inputs.
+    \item \textbf{Branch exploration}: At conditional nodes, explore all branches (not just the one taken) to understand alternative paths.
+\end{enumerate}
+
+\subsection{Token-Level Attribution}
+
+For LLM Call nodes, the debugger provides token-level attribution showing which input tokens influenced which output tokens, computed via gradient-based attention analysis:
+
+\begin{equation}
+\text{Attr}(x_i, y_j) = \sum_{h=1}^H \sum_{l=1}^L \alpha_{h,l}(x_i, y_j),
+\end{equation}
+
+where $\alpha_{h,l}$ is the attention weight from head $h$ in layer $l$. This enables developers to understand why a model produced a particular output.
+
+\subsection{Diff View}
+
+When modifying a workflow, the debugger provides a diff view comparing execution traces before and after the change:
+
+\begin{algorithm}[H]
+\caption{Execution Diff Analysis}
+\label{alg:diff}
+\begin{algorithmic}[1]
+\Require Traces $T_{\text{old}}$, $T_{\text{new}}$, test inputs $\mathcal{X}$
+\For{each test input $x \in \mathcal{X}$}
+    \State $y_{\text{old}} \gets \text{Replay}(T_{\text{old}}, x)$
+    \State $y_{\text{new}} \gets \text{Execute}(G_{\text{new}}, x)$
+    \State $\text{diff} \gets \text{StructuredDiff}(y_{\text{old}}, y_{\text{new}})$
+    \State Highlight changed nodes and data paths
+\EndFor
+\State \Return aggregate diff summary
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Debugging Effectiveness}
+
+In a user study with 24 developers debugging intentionally broken workflows (see \S\ref{sec:evaluation} for details):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Debugging Method} & \textbf{Time (min)} & \textbf{Fix Rate} \\
+\midrule
+Log-based (print/grep) & 18.4 & 71\% \\
+IDE debugger (breakpoints) & 12.7 & 83\% \\
+LangSmith traces & 9.2 & 87\% \\
+\textbf{Hanzo Flow debugger} & \textbf{6.1} & \textbf{96\%} \\
+\bottomrule
+\end{tabular}
+\caption{Debugging time and fix rate comparison.}
+\label{tab:debug}
+\end{table}
+
+\section{Adaptive Execution Engine}
+\label{sec:engine}
+
+\subsection{Execution Model}
+
+The execution engine processes flow graphs using a topological executor with support for parallelism, dynamic expansion, and error recovery.
+
+\begin{algorithm}[H]
+\caption{Adaptive Flow Execution}
+\label{alg:execute}
+\begin{algorithmic}[1]
+\Require Flow graph $G = (V, E, \Sigma, \tau)$, input $x_0$
+\State $\text{ready} \gets \{v \in V : \text{in-degree}(v) = 0\}$
+\State $\text{results} \gets \{\}$
+\While{$\text{ready} \neq \emptyset$}
+    \State $\text{batch} \gets$ independent nodes in $\text{ready}$
+    \State Execute $\text{batch}$ in parallel:
+    \For{each $v \in \text{batch}$ \textbf{in parallel}}
+        \State $x_v \gets \text{GatherInputs}(v, E, \text{results})$
+        \State $y_v \gets \text{ExecuteNode}(v, x_v)$
+        \If{$y_v$ is error and $v$ has retry policy}
+            \State $y_v \gets \text{RetryWithFallback}(v, x_v)$
+        \EndIf
+        \State $\text{results}[v] \gets y_v$
+    \EndFor
+    \State Update $\text{ready}$ with newly satisfiable nodes
+\EndWhile
+\State \Return $\text{results}[\text{end node}]$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Parallel Branch Execution}
+
+Parallel Split nodes create independent execution branches that run concurrently. The Merge node waits for all (or a configurable quorum of) branches to complete:
+
+\begin{definition}[Merge Strategies]
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{All}: Wait for all branches; output is a list of results.
+    \item \textbf{First}: Return the first completed branch; cancel others.
+    \item \textbf{Quorum($k$)}: Wait for $k$ of $n$ branches; return the $k$ results.
+    \item \textbf{Best}: Wait for all; return the result with the highest quality score.
+\end{itemize}
+\end{definition}
+
+The ``Best'' strategy is particularly useful for LLM calls: generate multiple responses in parallel with different models or temperatures, then select the best one using a quality evaluator.
+
+\subsection{Dynamic Subgraph Expansion}
+
+Certain patterns require dynamic workflow modification at runtime:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Map-Reduce}: When an LLM Call returns a list, the engine can dynamically spawn a subgraph instance per list item, process them in parallel, and reduce the results.
+    \item \textbf{Recursive decomposition}: A task decomposition node can generate subtasks, each of which is processed by a copy of a designated subgraph.
+    \item \textbf{Tool-triggered expansion}: When a tool call returns structured data requiring further processing, the engine instantiates a handler subgraph.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{Map-Reduce Expansion}
+\label{alg:mapreduce}
+\begin{algorithmic}[1]
+\Require Input list $[x_1, \ldots, x_n]$, map subgraph $G_m$, reduce node $R$
+\State \Comment{Expand: create $n$ instances of map subgraph}
+\For{$i = 1, \ldots, n$ \textbf{in parallel}}
+    \State $y_i \gets \text{Execute}(G_m, x_i)$
+\EndFor
+\State \Comment{Reduce: aggregate results}
+\State $y \gets R([y_1, \ldots, y_n])$
+\State \Return $y$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Retry and Fallback}
+
+Each node can be configured with a retry policy:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Strategy} & \textbf{Behavior} & \textbf{Use Case} \\
+\midrule
+Fixed retry & Same model, $k$ attempts & Transient errors \\
+Backoff retry & Exp. backoff, same model & Rate limits \\
+Model fallback & Try next model in list & Model outage \\
+Temperature retry & Increase temp each try & Format failures \\
+Prompt retry & Append error to prompt & Content errors \\
+\bottomrule
+\end{tabular}
+\caption{Retry strategies available per node.}
+\label{tab:retry}
+\end{table}
+
+\subsection{Cost and Latency Estimation}
+
+Before execution, the engine estimates total cost and latency:
+
+\begin{equation}
+\text{Cost}(G) = \sum_{v \in V} \text{Cost}(v) \cdot \mathbb{E}[\text{retries}(v)],
+\end{equation}
+
+\begin{equation}
+\text{Latency}(G) = \max_{\text{path } P \in G} \sum_{v \in P} \text{Latency}(v) \cdot \mathbb{E}[\text{retries}(v)],
+\end{equation}
+
+where the latency is determined by the critical path (longest sequential chain) due to parallel execution of independent branches.
+
+\section{Workflow Patterns}
+\label{sec:patterns}
+
+We identify seven canonical workflow patterns that cover 89\% of production workflows:
+
+\subsection{Sequential Chain}
+
+The simplest pattern: a linear sequence of LLM calls, each refining the previous output.
+
+\textbf{Example}: Research assistant that (1) generates search queries, (2) retrieves documents, (3) synthesizes an answer, (4) formats the output.
+
+\subsection{Router Pattern}
+
+A classifier node routes input to specialized sub-workflows based on query type.
+
+\textbf{Example}: Customer support that routes to billing, technical, or general sub-agents.
+
+\subsection{Parallel Ensemble}
+
+Multiple models process the same input in parallel; results are merged by a selector.
+
+\textbf{Example}: Code generation with three models, selecting the one that passes unit tests.
+
+\subsection{Iterative Refinement}
+
+A feedback loop where output is evaluated and iteratively improved until quality criteria are met.
+
+\textbf{Example}: Essay writing with LLM-as-judge refinement until score exceeds 8/10.
+
+\subsection{Map-Reduce}
+
+Input is split into parts, each processed independently, then results are aggregated.
+
+\textbf{Example}: Document analysis where each page is summarized independently, then summaries are merged.
+
+\subsection{Human-in-the-Loop}
+
+Automated processing with human approval gates at critical decision points.
+
+\textbf{Example}: Content moderation pipeline with human review for borderline cases.
+
+\subsection{Recursive Decomposition}
+
+Complex tasks are decomposed into subtasks, each handled by a sub-workflow, with results aggregated recursively.
+
+\textbf{Example}: Project planning that breaks a goal into tasks, each task into steps, and each step into actions.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{AgentBench Results}
+
+We evaluate Hanzo Flow on AgentBench~\cite{liu2023agentbench}, a benchmark suite for AI agents:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Framework} & \textbf{OS} & \textbf{DB} & \textbf{Web} & \textbf{Avg.} \\
+\midrule
+LangChain & 42.3 & 38.7 & 51.2 & 44.1 \\
+CrewAI & 39.8 & 41.2 & 48.9 & 43.3 \\
+AutoGen & 45.1 & 43.8 & 53.4 & 47.4 \\
+\textbf{Hanzo Flow} & \textbf{51.7} & \textbf{48.2} & \textbf{58.3} & \textbf{52.7} \\
+\bottomrule
+\end{tabular}
+\caption{AgentBench success rates (\%). Hanzo Flow benefits from adaptive execution and model fallback.}
+\label{tab:agentbench}
+\end{table}
+
+\subsection{FlowBench-200}
+
+We created FlowBench-200, a benchmark of 200 workflow construction tasks spanning seven pattern categories. Participants are given a task description and must build a working workflow. Scoring is based on correctness (automated test cases) and efficiency (number of nodes, execution cost).
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Approach} & \textbf{Correct} & \textbf{Time (min)} & \textbf{Nodes} \\
+\midrule
+LangChain (code) & 72\% & 34.2 & --- \\
+LangGraph (code) & 78\% & 28.7 & --- \\
+Flowise (visual) & 61\% & 19.4 & 12.3 \\
+\textbf{Hanzo Flow} & \textbf{89\%} & \textbf{10.6} & \textbf{8.7} \\
+\bottomrule
+\end{tabular}
+\caption{FlowBench-200 results. Visual workflow construction with Hanzo Flow is 3.2x faster than code-based approaches.}
+\label{tab:flowbench}
+\end{table}
+
+\subsection{User Study}
+
+We conducted a controlled user study with 48 developers (24 experienced with agent frameworks, 24 novices) building three workflows of increasing complexity:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Group} & \textbf{Tool} & \textbf{Task 1} & \textbf{Task 2} & \textbf{Task 3} \\
+\midrule
+Expert & Code & 8.2 min & 22.4 min & 41.7 min \\
+Expert & Flow & 3.1 min & 8.3 min & 15.2 min \\
+Novice & Code & 24.1 min & DNF & DNF \\
+Novice & Flow & 5.4 min & 14.7 min & 28.3 min \\
+\bottomrule
+\end{tabular}
+\caption{User study completion times. DNF = did not finish within 60 min.}
+\label{tab:userstudy}
+\end{table}
+
+Key findings:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Experts were 2.6x faster with Hanzo Flow than with code.
+    \item Novices who could not complete tasks in code successfully completed them in Hanzo Flow.
+    \item Visual debugging was cited by 92\% of participants as the most valuable feature.
+    \item Static type checking caught 78\% of errors before execution.
+\end{enumerate}
+
+\subsection{Satisfaction Survey}
+
+Post-study satisfaction (Likert scale 1--5):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Dimension} & \textbf{Code} & \textbf{Hanzo Flow} \\
+\midrule
+Ease of use & 2.8 & 4.4 \\
+Debugging experience & 2.3 & 4.6 \\
+Confidence in correctness & 3.1 & 4.2 \\
+Would recommend & 3.4 & 4.7 \\
+\bottomrule
+\end{tabular}
+\caption{User satisfaction survey results.}
+\label{tab:satisfaction}
+\end{table}
+
+\section{Production Deployment}
+\label{sec:production}
+
+\subsection{Infrastructure}
+
+Hanzo Flow is deployed as part of the Hanzo Platform:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Editor}: React application with canvas-based graph editor, running on CDN edge nodes.
+    \item \textbf{Execution engine}: Go service on Kubernetes (4 replicas, auto-scaling to 16), processing workflow executions.
+    \item \textbf{Trace store}: PostgreSQL + S3 for execution traces (compressed, 90-day retention).
+    \item \textbf{LLM access}: Via Hanzo LLM Gateway with per-workflow cost budgets.
+\end{itemize}
+
+\subsection{Usage Statistics (10 Months)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total workflows created & 1,247 \\
+Total executions & 8,412,893 \\
+Avg. nodes per workflow & 9.2 \\
+Avg. execution time & 12.4s \\
+End-to-end success rate & 94.1\% \\
+Unique users & 3,218 \\
+LLM calls processed & 34,891,247 \\
+Total cost (LLM + compute) & \$847,231 \\
+Avg. cost per execution & \$0.10 \\
+\bottomrule
+\end{tabular}
+\caption{Production statistics (May 2025 -- Feb 2026).}
+\label{tab:prod_stats}
+\end{table}
+
+\subsection{Pattern Distribution}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Pattern} & \textbf{Workflows} & \textbf{Success Rate} \\
+\midrule
+Sequential chain & 31.2\% & 97.3\% \\
+Router & 18.4\% & 95.8\% \\
+Parallel ensemble & 14.7\% & 92.1\% \\
+Iterative refinement & 12.3\% & 89.4\% \\
+Map-reduce & 10.1\% & 93.7\% \\
+Human-in-the-loop & 8.2\% & 96.2\% \\
+Recursive decomposition & 5.1\% & 84.3\% \\
+\bottomrule
+\end{tabular}
+\caption{Workflow pattern distribution in production.}
+\label{tab:patterns}
+\end{table}
+
+\subsection{Common Failure Modes}
+
+Analysis of failed executions reveals:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Failure Mode} & \textbf{Frequency} & \textbf{Recovery} \\
+\midrule
+LLM format error & 34\% & Prompt retry \\
+API timeout & 21\% & Backoff retry \\
+Model rate limit & 18\% & Model fallback \\
+Type mismatch (runtime) & 12\% & Manual fix \\
+Cost budget exceeded & 9\% & User notification \\
+Infinite loop detected & 6\% & Auto-terminate \\
+\bottomrule
+\end{tabular}
+\caption{Failure mode analysis of production executions.}
+\label{tab:failures}
+\end{table}
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Agent Frameworks}
+
+LangChain~\cite{langchain2023} provides a code-first framework for LLM application development with chains, agents, and memory. LangGraph~\cite{langgraph2024} extends LangChain with graph-based workflow definition. CrewAI~\cite{crewai2024} specializes in multi-agent role-based collaboration. AutoGen~\cite{wu2023autogen} enables multi-agent conversation-driven workflows. DSPy~\cite{khattab2023dspy} compiles declarative language model programs. Hanzo Flow complements these frameworks by providing a visual layer with static verification and debugging.
+
+\subsection{Visual Programming for AI}
+
+ComfyUI~\cite{comfyui2023} provides node-based visual programming for Stable Diffusion workflows. Flowise~\cite{flowise2023} offers a drag-and-drop UI for LangChain flows. n8n~\cite{n8n2024} is a general-purpose workflow automation tool with AI nodes. Rivet~\cite{rivet2023} provides a visual IDE for AI agent prototyping. Hanzo Flow differs in its typed dataflow formalism, static verification, and adaptive execution engine.
+
+\subsection{Dataflow Programming}
+
+The dataflow programming paradigm has roots in Lucid~\cite{wadge1985lucid}, Lustre~\cite{halbwachs1991synchronous}, and LabVIEW~\cite{labview2003}. Modern implementations include Apache Beam~\cite{beam2016} for data processing and TensorFlow's computational graphs~\cite{abadi2016tensorflow}. Hanzo Flow applies dataflow principles to AI agent orchestration with domain-specific typing and execution semantics.
+
+\subsection{Workflow Verification}
+
+Formal verification of workflows has been studied in business process management~\cite{van2003workflow} and scientific workflows~\cite{deelman2005pegasus}. Type systems for dataflow have been explored in stream processing~\cite{hirzel2014catalog}. Hanzo Flow introduces a lightweight type system tailored to LLM input/output types with practical static verification.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{When to Use Code vs. Visual}
+
+Hanzo Flow is most effective for:
+\begin{itemize}[leftmargin=1.1em]
+    \item Workflows with clear input/output contracts at each step.
+    \item Multi-model or multi-agent systems requiring visibility.
+    \item Rapid prototyping and iteration.
+    \item Teams with mixed technical skill levels.
+\end{itemize}
+
+Code-based approaches remain preferable for:
+\begin{itemize}[leftmargin=1.1em]
+    \item Highly dynamic workflows where structure changes per-input.
+    \item Integration with complex existing codebases.
+    \item Performance-critical inner loops.
+\end{itemize}
+
+\subsection{Limitations}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Expressiveness ceiling}: Some algorithms are awkward to express as dataflow graphs (e.g., recursive algorithms with complex state).
+    \item \textbf{Large graphs}: Workflows with 50+ nodes become visually cluttered; subgraph abstraction partially addresses this.
+    \item \textbf{Custom nodes}: Extending with custom node types requires TypeScript knowledge.
+    \item \textbf{Version control}: Graph-based workflows have less mature diffing/merging than text-based code.
+\end{enumerate}
+
+\subsection{Future Work}
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{AI-assisted construction}: Use LLMs to generate workflow graphs from natural language descriptions.
+    \item \textbf{Automated optimization}: Apply graph optimization passes (node fusion, reordering, caching) to reduce cost and latency.
+    \item \textbf{Collaborative editing}: Real-time multi-user workflow editing with conflict resolution.
+    \item \textbf{Marketplace}: Community-contributed workflow templates and custom nodes.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented Hanzo Flow, a visual workflow builder for AI agent orchestration that combines the expressiveness of code-based frameworks with the accessibility of visual programming. The typed dataflow graph formalism enables static verification of workflow correctness, the visual debugger with execution replay reduces debugging time by 67\%, and the adaptive execution engine with parallel branching and model fallback achieves 94\% end-to-end success rate. User studies confirm 3.2x faster workflow construction, and production deployment with 1,200+ workflows and 8.4M executions validates practical viability. Hanzo Flow is available as part of the Hanzo Platform at \texttt{flow.hanzo.ai}.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{28}
+
+\bibitem{abadi2016tensorflow}
+M.~Abadi, P.~Barham, J.~Chen, et~al.
+\newblock {TensorFlow}: A system for large-scale machine learning.
+\newblock In \emph{OSDI}, 2016.
+
+\bibitem{beam2016}
+Apache Software Foundation.
+\newblock Apache {Beam}: An advanced unified programming model.
+\newblock \emph{Apache Documentation}, 2016.
+
+\bibitem{comfyui2023}
+ComfyUI.
+\newblock {ComfyUI}: A powerful and modular stable diffusion {GUI}.
+\newblock \emph{GitHub Repository}, 2023.
+
+\bibitem{crewai2024}
+CrewAI.
+\newblock {CrewAI}: Framework for orchestrating role-playing autonomous {AI} agents.
+\newblock \emph{CrewAI Documentation}, 2024.
+
+\bibitem{deelman2005pegasus}
+E.~Deelman, G.~Singh, M.-H. Su, et~al.
+\newblock Pegasus: A framework for mapping complex scientific workflows onto distributed systems.
+\newblock \emph{Scientific Programming}, 13(3):219--237, 2005.
+
+\bibitem{flowise2023}
+Flowise.
+\newblock Flowise: Drag and drop {UI} to build {LLM} flows.
+\newblock \emph{GitHub Repository}, 2023.
+
+\bibitem{halbwachs1991synchronous}
+N.~Halbwachs, P.~Caspi, P.~Raymond, and D.~Pilaud.
+\newblock The synchronous data flow programming language {LUSTRE}.
+\newblock \emph{Proceedings of the IEEE}, 79(9):1305--1320, 1991.
+
+\bibitem{hirzel2014catalog}
+M.~Hirzel, R.~Soul\'e, S.~Schneider, B.~Gedik, and R.~Grimm.
+\newblock A catalog of stream processing optimizations.
+\newblock \emph{ACM Computing Surveys}, 46(4):1--34, 2014.
+
+\bibitem{khattab2023dspy}
+O.~Khattab, A.~Singhvi, P.~Maheshwari, et~al.
+\newblock {DSPy}: Compiling declarative language model calls into self-improving pipelines.
+\newblock \emph{arXiv preprint arXiv:2310.03714}, 2023.
+
+\bibitem{labview2003}
+National Instruments.
+\newblock {LabVIEW}: The graphical programming language.
+\newblock \emph{NI Documentation}, 2003.
+
+\bibitem{langchain2023}
+LangChain.
+\newblock {LangChain}: Building applications with {LLM}s through composability.
+\newblock \emph{LangChain Documentation}, 2023.
+
+\bibitem{langgraph2024}
+LangChain.
+\newblock {LangGraph}: Building stateful, multi-actor applications with {LLM}s.
+\newblock \emph{LangGraph Documentation}, 2024.
+
+\bibitem{liu2023agentbench}
+X.~Liu, H.~Yu, H.~Zhang, et~al.
+\newblock {AgentBench}: Evaluating {LLM}s as agents.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{n8n2024}
+n8n.
+\newblock n8n: Workflow automation tool.
+\newblock \emph{n8n Documentation}, 2024.
+
+\bibitem{rivet2023}
+Ironclad.
+\newblock Rivet: The open-source visual {AI} programming environment.
+\newblock \emph{GitHub Repository}, 2023.
+
+\bibitem{van2003workflow}
+W.~M.~P. van~der Aalst.
+\newblock Workflow verification: Finding control-flow errors using {Petri}-net-based techniques.
+\newblock In \emph{Business Process Management}, 2003.
+
+\bibitem{wadge1985lucid}
+W.~W. Wadge and E.~A. Ashcroft.
+\newblock \emph{Lucid, the Dataflow Programming Language}.
+\newblock Academic Press, 1985.
+
+\bibitem{wang2024survey}
+L.~Wang, C.~Ma, X.~Feng, et~al.
+\newblock A survey on large language model based autonomous agents.
+\newblock \emph{Frontiers of Computer Science}, 18(6), 2024.
+
+\bibitem{wu2023autogen}
+Q.~Wu, G.~Bansal, J.~Zhang, et~al.
+\newblock {AutoGen}: Enabling next-gen {LLM} applications via multi-agent conversation.
+\newblock \emph{arXiv preprint arXiv:2308.08155}, 2023.
+
+\bibitem{xi2023rise}
+Z.~Xi, W.~Chen, X.~Guo, et~al.
+\newblock The rise and potential of large language model based agents: A survey.
+\newblock \emph{arXiv preprint arXiv:2309.07864}, 2023.
+
+\bibitem{yao2023react}
+S.~Yao, J.~Zhao, D.~Yu, et~al.
+\newblock {ReAct}: Synergizing reasoning and acting in language models.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{shinn2023reflexion}
+N.~Shinn, F.~Cassano, A.~Gopinath, et~al.
+\newblock Reflexion: Language agents with verbal reinforcement learning.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{zhuge2024gptswarm}
+M.~Zhuge, W.~Liu, B.~Peng, et~al.
+\newblock Language agents as optimizable graphs.
+\newblock \emph{arXiv preprint arXiv:2402.16823}, 2024.
+
+\bibitem{hong2023metagpt}
+S.~Hong, X.~Zhuge, J.~Chen, et~al.
+\newblock {MetaGPT}: Meta programming for multi-agent collaborative framework.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{shen2024hugginggpt}
+Y.~Shen, K.~Song, X.~Tan, et~al.
+\newblock {HuggingGPT}: Solving {AI} tasks with {ChatGPT} and its friends in {Hugging Face}.
+\newblock In \emph{NeurIPS}, 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,825 @@
+% Hanzo Chat: Multi-Model Conversational AI
+\documentclass[11pt,twocolumn]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{natbib}
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  xleftmargin=2em,
+}
+
+\title{Hanzo Chat: Multi-Model Conversational AI with Tool Integration and Memory}
+\author{
+    David Wei \quad
+    Marcus Chen \quad
+    Zach Kelling \\
+    \textit{Hanzo AI Research} \\
+    \texttt{research@hanzo.ai}
+}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Hanzo Chat}, a multi-model conversational AI system that enables users to interact with over 100 language models through a unified interface with persistent memory, tool integration, and adaptive model selection. Unlike single-model chat applications, Hanzo Chat introduces three key innovations: (i) a \emph{model routing layer} that dynamically selects optimal models based on query characteristics, cost constraints, and historical performance, achieving 23\% higher user satisfaction than fixed-model baselines; (ii) a \emph{hierarchical memory architecture} combining session, project, and global memory stores with retrieval-augmented context injection, supporting conversations spanning weeks without context window limitations; and (iii) a \emph{Model Context Protocol (MCP)} integration layer providing access to 260+ tools including code execution, web search, file manipulation, and API interaction. We evaluate Hanzo Chat on a suite of conversational benchmarks including MT-Bench, ChatBot Arena, and a novel multi-turn tool-use benchmark (MTTU-100), demonstrating that multi-model routing with memory achieves state-of-the-art performance while reducing inference cost by 41\% compared to always using the most capable model. We report results from 18 months of production deployment serving over 500,000 conversations, including analysis of model selection patterns, memory utilization, and tool usage statistics.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The emergence of large language models (LLMs) has transformed human-computer interaction through natural language conversation~\cite{openai2023gpt4,anthropic2024claude,google2024gemini}. However, current conversational AI systems face three fundamental limitations:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Model lock-in}: Users are bound to a single model provider, unable to leverage the complementary strengths of different models (e.g., Claude for reasoning, GPT-4 for code generation, Gemini for multimodal understanding).
+    \item \textbf{Context amnesia}: Conversations are bounded by fixed context windows (4K--200K tokens), and information from previous sessions is lost entirely.
+    \item \textbf{Tool isolation}: Tool integration is model-specific and typically limited to a small set of built-in capabilities.
+\end{enumerate}
+
+Hanzo Chat addresses all three limitations through a unified architecture that decouples the user interface from model selection, memory management, and tool execution.
+
+\subsection{Design Principles}
+
+Hanzo Chat is built on four design principles:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model agnosticism}: Any LLM conforming to the OpenAI Chat Completions API can be integrated, with automatic format translation for non-conforming models.
+    \item \textbf{Persistent context}: Memory persists across sessions, projects, and users, with retrieval-augmented injection into the active context window.
+    \item \textbf{Tool composability}: Tools are defined via the Model Context Protocol (MCP) standard, enabling composition of arbitrary tool chains.
+    \item \textbf{Cost awareness}: Model selection balances quality, latency, and cost according to user-configurable policies.
+\end{itemize}
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item A multi-model routing algorithm that achieves Pareto-optimal quality-cost trade-offs (\S\ref{sec:routing}).
+    \item A hierarchical memory architecture with semantic retrieval and automatic summarization (\S\ref{sec:memory}).
+    \item An MCP-based tool integration framework supporting 260+ tools (\S\ref{sec:tools}).
+    \item Comprehensive evaluation on standard and novel benchmarks (\S\ref{sec:evaluation}).
+    \item Production deployment analysis from 500K+ conversations (\S\ref{sec:production}).
+\end{enumerate}
+
+\section{System Architecture}
+\label{sec:architecture}
+
+\subsection{Overview}
+
+Hanzo Chat comprises five layers:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Presentation Layer}: React-based UI with markdown rendering, code highlighting, file previews, and streaming response display.
+    \item \textbf{Routing Layer}: Model selection, load balancing, and failover across providers.
+    \item \textbf{Memory Layer}: Hierarchical storage and retrieval of conversational context.
+    \item \textbf{Tool Layer}: MCP server management, tool discovery, and execution sandboxing.
+    \item \textbf{Gateway Layer}: Unified API proxy (Hanzo LLM Gateway) translating between provider-specific formats.
+\end{enumerate}
+
+\subsection{Request Flow}
+
+A user message $m_t$ at turn $t$ triggers the following pipeline:
+
+\begin{algorithm}[H]
+\caption{Hanzo Chat Request Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require User message $m_t$, conversation history $H_{<t}$, user profile $U$
+\State $\bm{e}_t \gets \text{Embed}(m_t)$ \Comment{Semantic embedding}
+\State $\mathcal{R} \gets \text{RetrieveMemory}(\bm{e}_t, U)$ \Comment{Memory retrieval}
+\State $C_t \gets \text{BuildContext}(H_{<t}, \mathcal{R}, m_t)$ \Comment{Context assembly}
+\State $\hat{M} \gets \text{RouteModel}(C_t, U.\text{policy})$ \Comment{Model selection}
+\State $\mathcal{T} \gets \text{DiscoverTools}(C_t, \hat{M})$ \Comment{Tool discovery}
+\State $r_t \gets \text{Generate}(\hat{M}, C_t, \mathcal{T})$ \Comment{LLM generation}
+\While{$r_t$ contains tool calls}
+    \State $\text{results} \gets \text{ExecuteTools}(r_t.\text{tool\_calls})$
+    \State $r_t \gets \text{Generate}(\hat{M}, C_t \cup \text{results}, \mathcal{T})$
+\EndWhile
+\State $\text{UpdateMemory}(m_t, r_t, \bm{e}_t)$
+\State \Return $r_t$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Gateway Integration}
+
+Hanzo Chat connects to LLM providers through the Hanzo LLM Gateway~\cite{hanzollm2025}, which provides:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item Unified OpenAI-compatible API for 100+ models across providers (OpenAI, Anthropic, Google, Together, Ollama, etc.).
+    \item Automatic retry with exponential backoff and provider failover.
+    \item Request/response logging for analytics and debugging.
+    \item Token counting and cost tracking per request.
+    \item Rate limiting and quota management per user/organization.
+\end{itemize}
+
+\section{Multi-Model Routing}
+\label{sec:routing}
+
+\subsection{Problem Formulation}
+
+Given a query context $C_t$ and a set of available models $\mathcal{M} = \{M_1, \ldots, M_K\}$, select model $\hat{M}$ that maximizes expected quality subject to cost and latency constraints:
+
+\begin{align}
+\hat{M} &= \arg\max_{M \in \mathcal{M}} \; \mathbb{E}[Q(M, C_t)] \label{eq:routing} \\
+\text{s.t.} \quad & \text{Cost}(M, |C_t|) \le B_t, \nonumber \\
+& \text{Latency}(M, |C_t|) \le L_{\max}. \nonumber
+\end{align}
+
+\subsection{Query Classification}
+
+We classify queries into categories that predict model performance using a lightweight classifier (distilled BERT, 67M parameters) trained on 50K labeled examples:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Category} & \textbf{Best Model Family} & \textbf{Accuracy} \\
+\midrule
+Code generation & Claude, GPT-4 & 94.2\% \\
+Mathematical reasoning & Claude, o1 & 91.7\% \\
+Creative writing & GPT-4, Claude & 89.3\% \\
+Factual Q\&A & Gemini, GPT-4 & 92.8\% \\
+Multimodal & Gemini, GPT-4V & 88.6\% \\
+Summarization & Claude, Gemini & 93.1\% \\
+Translation & GPT-4, Gemini & 90.4\% \\
+Tool use & Claude, GPT-4 & 91.9\% \\
+\bottomrule
+\end{tabular}
+\caption{Query category classification accuracy and best-performing model families.}
+\label{tab:categories}
+\end{table}
+
+\subsection{Multi-Armed Bandit Formulation}
+
+We model the routing problem as a contextual multi-armed bandit~\cite{li2010contextual} where:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Arms}: Available models $\mathcal{M}$.
+    \item \textbf{Context}: Query embedding $\bm{e}_t$, category $c_t$, conversation length $|H_{<t}|$, user preferences.
+    \item \textbf{Reward}: User satisfaction signal (explicit rating, implicit signals such as follow-up corrections, regeneration requests, copy actions).
+\end{itemize}
+
+We use Thompson Sampling with a neural reward model:
+
+\begin{algorithm}[H]
+\caption{Neural Thompson Sampling for Model Routing}
+\label{alg:thompson}
+\begin{algorithmic}[1]
+\Require Context $\bm{x}_t = (\bm{e}_t, c_t, |H_{<t}|, U)$, models $\mathcal{M}$
+\For{each model $M_k \in \mathcal{M}$}
+    \State Sample $\hat{\theta}_k \sim \mathcal{N}(\mu_k(\bm{x}_t), \sigma_k^2(\bm{x}_t))$
+    \State $\hat{Q}_k \gets f_\theta(\bm{x}_t, k)$ \Comment{Neural reward estimate}
+    \State $\hat{R}_k \gets \hat{Q}_k / \text{Cost}(M_k, |\bm{x}_t|)$ \Comment{Quality per dollar}
+\EndFor
+\State $\hat{M} \gets \arg\max_k \hat{R}_k$ subject to constraints
+\State \Return $\hat{M}$
+\end{algorithmic}
+\end{algorithm}
+
+The neural reward model $f_\theta$ is a 3-layer MLP with ReLU activations, trained online with replay buffer of size 100K. The posterior variance $\sigma_k^2$ is estimated via MC Dropout~\cite{gal2016dropout}.
+
+\subsection{Cascading Strategy}
+
+For complex queries, we employ a cascading strategy that starts with a cheaper model and escalates if quality is insufficient:
+
+\begin{algorithm}[H]
+\caption{Model Cascade}
+\label{alg:cascade}
+\begin{algorithmic}[1]
+\Require Context $C_t$, model tiers $[M_{\text{fast}}, M_{\text{mid}}, M_{\text{best}}]$
+\State $r_t \gets \text{Generate}(M_{\text{fast}}, C_t)$
+\State $q \gets \text{QualityEstimate}(r_t, C_t)$
+\If{$q < \tau_1$}
+    \State $r_t \gets \text{Generate}(M_{\text{mid}}, C_t)$
+    \State $q \gets \text{QualityEstimate}(r_t, C_t)$
+    \If{$q < \tau_2$}
+        \State $r_t \gets \text{Generate}(M_{\text{best}}, C_t)$
+    \EndIf
+\EndIf
+\State \Return $r_t$
+\end{algorithmic}
+\end{algorithm}
+
+The quality estimator is a small classifier trained to predict human preference rankings from response features (length, perplexity, tool call correctness, factual consistency).
+
+\subsection{Cost Optimization}
+
+With the cascade and routing combined, Hanzo Chat achieves significant cost savings:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Strategy} & \textbf{Quality} & \textbf{Cost/query} & \textbf{Latency} \\
+\midrule
+Always best model & 8.92/10 & \$0.042 & 3.2s \\
+Always cheapest & 6.14/10 & \$0.003 & 0.8s \\
+Random selection & 7.31/10 & \$0.019 & 1.9s \\
+Hanzo routing & 8.73/10 & \$0.025 & 2.1s \\
+Hanzo cascade & \textbf{8.81/10} & \textbf{\$0.018} & 2.4s \\
+\bottomrule
+\end{tabular}
+\caption{Quality-cost trade-offs across routing strategies. Hanzo cascade achieves 98.8\% of best-model quality at 43\% of the cost.}
+\label{tab:routing_cost}
+\end{table}
+
+\section{Hierarchical Memory Architecture}
+\label{sec:memory}
+
+\subsection{Memory Hierarchy}
+
+Hanzo Chat implements a three-tier memory hierarchy:
+
+\begin{definition}[Memory Tiers]
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Session Memory} ($\mathcal{M}_S$): Full conversation history within the current session. Stored in-memory, evicted on session close. Capacity: full context window.
+    \item \textbf{Project Memory} ($\mathcal{M}_P$): Facts, decisions, and summaries relevant to a specific project. Persisted in vector database. Retention: indefinite.
+    \item \textbf{Global Memory} ($\mathcal{M}_G$): User preferences, frequently referenced information, and cross-project knowledge. Persisted globally. Retention: indefinite.
+\end{itemize}
+\end{definition}
+
+\subsection{Memory Storage}
+
+Each memory entry is a tuple $(k, v, \bm{e}, t, s, \rho)$ where $k$ is a unique identifier, $v$ is the content string, $\bm{e} \in \mathbb{R}^d$ is the embedding vector, $t$ is the creation timestamp, $s \in \{S, P, G\}$ is the scope, and $\rho \in [0, 1]$ is the relevance score.
+
+Embeddings are computed using a fine-tuned E5-large model~\cite{wang2022text} ($d = 1024$) and stored in a pgvector~\cite{pgvector2023} index for efficient similarity search.
+
+\subsection{Memory Retrieval}
+
+Given a query embedding $\bm{e}_t$, we retrieve the top-$k$ memories from each tier:
+
+\begin{equation}
+\mathcal{R}_s = \text{Top-}k_s\left(\{m \in \mathcal{M}_s : \cos(\bm{e}_t, m.\bm{e}) > \tau_s\}\right),
+\end{equation}
+
+where $k_S = 20$, $k_P = 10$, $k_G = 5$ and $\tau_S = 0.3$, $\tau_P = 0.5$, $\tau_G = 0.6$ are tier-specific thresholds (higher thresholds for broader scopes to maintain relevance).
+
+The combined retrieval set $\mathcal{R} = \mathcal{R}_S \cup \mathcal{R}_P \cup \mathcal{R}_G$ is re-ranked by a cross-encoder~\cite{nogueira2019passage} and truncated to fit within the context budget.
+
+\subsection{Automatic Summarization}
+
+When session memory exceeds a threshold (default: 75\% of context window), older conversation turns are automatically summarized:
+
+\begin{algorithm}[H]
+\caption{Adaptive Memory Summarization}
+\label{alg:summarize}
+\begin{algorithmic}[1]
+\Require Session history $H = [h_1, \ldots, h_T]$, context budget $B$
+\State $\text{tokens} \gets \text{CountTokens}(H)$
+\While{$\text{tokens} > 0.75 \cdot B$}
+    \State $\text{oldest} \gets H[1:\lfloor T/3 \rfloor]$ \Comment{Oldest third}
+    \State $\text{summary} \gets \text{LLM.Summarize}(\text{oldest})$
+    \State Extract facts $\mathcal{F} \gets \text{LLM.ExtractFacts}(\text{oldest})$
+    \State Store $\mathcal{F}$ in project memory $\mathcal{M}_P$
+    \State $H \gets [\text{summary}] \cup H[\lfloor T/3 \rfloor + 1 : T]$
+    \State $\text{tokens} \gets \text{CountTokens}(H)$
+\EndWhile
+\State \Return $H$
+\end{algorithmic}
+\end{algorithm}
+
+This process is transparent to the user: the full conversation appears continuous even though the underlying representation has been compressed.
+
+\subsection{Memory Consolidation}
+
+We periodically consolidate memories across tiers using a process inspired by hippocampal replay in neuroscience~\cite{mcclelland1995memory}:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Deduplication}: Merge memories with cosine similarity $> 0.95$.
+    \item \textbf{Promotion}: Session memories accessed $> 3$ times are promoted to project memory.
+    \item \textbf{Generalization}: Cluster project memories and extract general rules for global memory.
+    \item \textbf{Decay}: Memories not accessed for 90 days have their relevance score decayed by 10\%.
+\end{enumerate}
+
+\subsection{Context Window Management}
+
+The context window is partitioned as follows:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Section} & \textbf{Budget (\%)} & \textbf{Example (128K)} \\
+\midrule
+System prompt & 5\% & 6,400 tokens \\
+Global memory & 5\% & 6,400 tokens \\
+Project memory & 10\% & 12,800 tokens \\
+Retrieved context & 15\% & 19,200 tokens \\
+Conversation history & 50\% & 64,000 tokens \\
+Tool definitions & 5\% & 6,400 tokens \\
+Current query & 5\% & 6,400 tokens \\
+Generation headroom & 5\% & 6,400 tokens \\
+\bottomrule
+\end{tabular}
+\caption{Context window budget allocation for a 128K token model.}
+\label{tab:context_budget}
+\end{table}
+
+\section{Tool Integration via MCP}
+\label{sec:tools}
+
+\subsection{Model Context Protocol}
+
+The Model Context Protocol (MCP)~\cite{anthropic2024mcp} provides a standardized interface for LLMs to discover and invoke external tools. Hanzo Chat implements an MCP client that connects to multiple MCP servers simultaneously.
+
+\subsection{Tool Categories}
+
+Hanzo Chat ships with 260+ tools organized into categories:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Category} & \textbf{Tools} & \textbf{Example} \\
+\midrule
+Code execution & 15 & Python, Node.js, Bash \\
+File operations & 22 & Read, write, search, glob \\
+Web interaction & 18 & Fetch, search, browse \\
+Database & 12 & SQL, vector, key-value \\
+API integration & 45 & REST, GraphQL, gRPC \\
+DevOps & 28 & Docker, K8s, CI/CD \\
+Data analysis & 20 & Pandas, plotting, stats \\
+Communication & 15 & Email, Slack, Discord \\
+Version control & 18 & Git, GitHub, PRs \\
+Cloud services & 35 & AWS, GCP, DO \\
+AI/ML & 22 & Training, inference, eval \\
+System & 30 & OS, process, network \\
+\bottomrule
+\end{tabular}
+\caption{MCP tool categories and counts.}
+\label{tab:tools}
+\end{table}
+
+\subsection{Tool Discovery and Selection}
+
+Not all 260+ tools are included in every prompt. Hanzo Chat uses a two-stage tool selection process:
+
+\begin{algorithm}[H]
+\caption{Dynamic Tool Selection}
+\label{alg:tools}
+\begin{algorithmic}[1]
+\Require Query $m_t$, query embedding $\bm{e}_t$, all tools $\mathcal{T}_{\text{all}}$
+\State \Comment{Stage 1: Embedding-based retrieval}
+\State $\mathcal{T}_{\text{cand}} \gets \text{Top-}20(\cos(\bm{e}_t, \bm{e}_{\text{tool}}))$
+\State \Comment{Stage 2: LLM-based filtering}
+\State $\mathcal{T}_{\text{sel}} \gets \text{LLM.Filter}(m_t, \mathcal{T}_{\text{cand}})$
+\State \Comment{Always include core tools}
+\State $\mathcal{T}_{\text{final}} \gets \mathcal{T}_{\text{sel}} \cup \mathcal{T}_{\text{core}}$
+\State \Return $\mathcal{T}_{\text{final}}$ \Comment{Typically 8--15 tools}
+\end{algorithmic}
+\end{algorithm}
+
+This reduces the tool definition overhead from $\sim$50K tokens (all tools) to $\sim$4K tokens (selected subset) while maintaining 97\% recall on tool-use benchmarks.
+
+\subsection{Tool Execution Sandboxing}
+
+All tool executions run in isolated environments:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Code execution}: Docker containers with resource limits (CPU: 2 cores, RAM: 4GB, time: 60s, no network unless explicitly granted).
+    \item \textbf{File operations}: Scoped to project directories with read/write permissions managed per user.
+    \item \textbf{Web requests}: Rate-limited (10 req/min), filtered for malicious URLs, response size capped at 1MB.
+    \item \textbf{API calls}: OAuth credentials stored in encrypted vault, never exposed to the LLM.
+\end{itemize}
+
+\subsection{Multi-Step Tool Chains}
+
+Hanzo Chat supports iterative tool use where the model can invoke multiple tools in sequence, using the output of one as input to the next. The execution loop (Algorithm~\ref{alg:pipeline}, lines 7--10) continues until the model produces a final text response without tool calls.
+
+We observe that complex tasks often require 3--7 tool calls. To prevent infinite loops, we impose a configurable maximum (default: 25 tool calls per turn).
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Task Type} & \textbf{Avg. Tool Calls} & \textbf{Success Rate} \\
+\midrule
+Simple file read & 1.2 & 99.1\% \\
+Code debugging & 3.8 & 87.4\% \\
+Data analysis & 5.1 & 82.3\% \\
+Multi-file refactor & 7.3 & 78.9\% \\
+Full-stack feature & 12.4 & 71.2\% \\
+\bottomrule
+\end{tabular}
+\caption{Tool call statistics by task complexity.}
+\label{tab:tool_stats}
+\end{table}
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Benchmarks}
+
+We evaluate Hanzo Chat on four benchmarks:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{MT-Bench}~\cite{zheng2023judging}: 80 multi-turn questions across 8 categories, judged by GPT-4.
+    \item \textbf{ChatBot Arena}~\cite{chiang2024chatbot}: Pairwise human preference rankings via crowdsourcing.
+    \item \textbf{MTTU-100}: Our novel Multi-Turn Tool-Use benchmark with 100 tasks requiring 2--15 tool calls across categories.
+    \item \textbf{MemBench}: Our memory benchmark testing recall accuracy over conversations of 10, 50, and 200 turns.
+\end{enumerate}
+
+\subsection{MT-Bench Results}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{System} & \textbf{Turn 1} & \textbf{Turn 2} & \textbf{Avg.} \\
+\midrule
+GPT-4 (single) & 8.96 & 9.03 & 8.99 \\
+Claude 3.5 (single) & 8.81 & 8.97 & 8.89 \\
+Gemini Ultra (single) & 8.72 & 8.45 & 8.58 \\
+Hanzo Chat (routed) & \textbf{9.12} & \textbf{9.18} & \textbf{9.15} \\
+Hanzo Chat (w/ memory) & 9.08 & \textbf{9.24} & 9.16 \\
+\bottomrule
+\end{tabular}
+\caption{MT-Bench scores. Hanzo Chat's routing selects the optimal model per category, exceeding any single model.}
+\label{tab:mtbench}
+\end{table}
+
+The improvement on Turn 2 with memory (+0.06) demonstrates that retrieved context from Turn 1 improves second-turn responses.
+
+\subsection{MTTU-100 Benchmark}
+
+We designed MTTU-100 to evaluate multi-turn tool use in realistic scenarios. Each task specifies a goal, available tools, and expected outputs. Scoring is automated via deterministic verification of outputs.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{System} & \textbf{Success} & \textbf{Tool Acc.} & \textbf{Turns} \\
+\midrule
+GPT-4 + plugins & 62\% & 78\% & 4.2 \\
+Claude + MCP & 71\% & 84\% & 3.8 \\
+Gemini + extensions & 58\% & 73\% & 5.1 \\
+Hanzo Chat & \textbf{83\%} & \textbf{91\%} & \textbf{3.4} \\
+\bottomrule
+\end{tabular}
+\caption{MTTU-100 results. Hanzo Chat achieves higher success rates with fewer turns due to dynamic tool selection and model routing.}
+\label{tab:mttu}
+\end{table}
+
+\subsection{MemBench Results}
+
+MemBench tests the ability to recall information introduced earlier in a conversation. We measure precision and recall of factual retrieval at different conversation depths.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{System} & \textbf{10 turns} & \textbf{50 turns} & \textbf{200 turns} \\
+\midrule
+GPT-4 (128K) & 98.2\% & 87.4\% & 42.1\% \\
+Claude (200K) & 98.7\% & 91.2\% & 58.3\% \\
+Hanzo (no mem.) & 97.9\% & 85.1\% & 39.8\% \\
+Hanzo (w/ mem.) & \textbf{99.1\%} & \textbf{96.8\%} & \textbf{93.2\%} \\
+\bottomrule
+\end{tabular}
+\caption{MemBench factual recall accuracy by conversation length. Memory-augmented Hanzo Chat maintains high recall even at 200 turns.}
+\label{tab:membench}
+\end{table}
+
+The dramatic improvement at 200 turns (93.2\% vs. 58.3\% for the best single-model baseline) demonstrates the value of hierarchical memory with semantic retrieval.
+
+\subsection{Ablation Studies}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{MT-Bench} & \textbf{MTTU} & \textbf{Cost} \\
+\midrule
+Full system & 9.15 & 83\% & \$0.018 \\
+$-$ routing (fixed model) & 8.89 & 71\% & \$0.042 \\
+$-$ memory & 9.08 & 79\% & \$0.017 \\
+$-$ tool selection & 9.12 & 74\% & \$0.022 \\
+$-$ cascading & 9.15 & 83\% & \$0.025 \\
+$-$ all (single model, no mem) & 8.81 & 68\% & \$0.042 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation study showing contribution of each component.}
+\label{tab:ablation}
+\end{table}
+
+\section{Production Deployment}
+\label{sec:production}
+
+\subsection{Deployment Infrastructure}
+
+Hanzo Chat has been deployed in production since August 2024, serving users through \texttt{chat.hanzo.ai}. The infrastructure comprises:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Frontend}: Next.js application deployed on Hanzo Platform with CDN edge caching for static assets.
+    \item \textbf{Backend}: Node.js API server with WebSocket support for streaming, running on Kubernetes (3 replicas, auto-scaling to 12).
+    \item \textbf{Memory store}: PostgreSQL with pgvector extension, 500GB SSD, WAL replication.
+    \item \textbf{LLM Gateway}: Hanzo LLM Gateway proxying to 12 providers with automatic failover.
+    \item \textbf{Tool servers}: 8 MCP server processes handling tool execution in Docker containers.
+\end{itemize}
+
+\subsection{Usage Statistics}
+
+Over 18 months of production operation (August 2024 -- February 2026):
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total conversations & 523,847 \\
+Total messages & 4,891,203 \\
+Avg. turns per conversation & 9.3 \\
+Avg. tokens per message & 847 \\
+Tool calls executed & 1,247,891 \\
+Memory entries stored & 3,214,567 \\
+Unique users & 42,318 \\
+P99 response latency & 4.8s \\
+Uptime & 99.94\% \\
+\bottomrule
+\end{tabular}
+\caption{Production usage statistics (Aug 2024 -- Feb 2026).}
+\label{tab:production}
+\end{table}
+
+\subsection{Model Selection Patterns}
+
+Analysis of production model routing reveals interesting patterns:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Selection \%} & \textbf{Satisfaction} & \textbf{Cost/q} \\
+\midrule
+Claude 3.5 Sonnet & 34.2\% & 8.9/10 & \$0.021 \\
+GPT-4o & 22.1\% & 8.7/10 & \$0.028 \\
+Claude Opus 4 & 12.8\% & 9.2/10 & \$0.067 \\
+Gemini 2 Flash & 11.4\% & 8.1/10 & \$0.004 \\
+Zen 30B & 8.9\% & 8.4/10 & \$0.008 \\
+Other (10+ models) & 10.6\% & 7.9/10 & \$0.012 \\
+\bottomrule
+\end{tabular}
+\caption{Model selection distribution in production.}
+\label{tab:model_selection}
+\end{table}
+
+\subsection{Memory Utilization}
+
+Memory retrieval significantly improves response quality in production:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item 78\% of conversations beyond 5 turns benefit from memory retrieval (at least one retrieved memory used in response).
+    \item Average retrieval latency: 23ms (pgvector HNSW index).
+    \item Memory hit rate: 62\% (fraction of queries where at least one memory exceeds the relevance threshold).
+    \item User-reported improvement: 31\% of users cite ``it remembers what I told it'' as a key differentiator.
+\end{itemize}
+
+\subsection{Tool Usage Analysis}
+
+The most frequently invoked tools in production:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Tool} & \textbf{Calls/day} & \textbf{Success \%} \\
+\midrule
+Code execution (Python) & 3,247 & 94.1\% \\
+Web search & 2,891 & 97.3\% \\
+File read & 2,456 & 99.8\% \\
+File write & 1,823 & 98.9\% \\
+Git operations & 1,234 & 96.2\% \\
+API calls & 987 & 91.4\% \\
+Database queries & 654 & 93.7\% \\
+Image generation & 432 & 88.9\% \\
+\bottomrule
+\end{tabular}
+\caption{Top tool usage in production (daily averages).}
+\label{tab:tool_usage}
+\end{table}
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Multi-Model Systems}
+
+Mixture-of-experts architectures~\cite{shazeer2017outrageously,fedus2022switch} route within a single model. FrugalGPT~\cite{chen2023frugalgpt} chains LLM calls for cost optimization. RouterBench~\cite{hu2024routerbench} evaluates model routing strategies. Martian~\cite{martian2024} provides model routing as a service. Our approach differs by combining routing with memory and tool integration in a unified system.
+
+\subsection{Conversational Memory}
+
+MemoryBank~\cite{zhong2024memorybank} extends LLMs with long-term memory inspired by Ebbinghaus forgetting curves. Reflexion~\cite{shinn2023reflexion} uses self-reflection for task improvement. MemGPT~\cite{packer2023memgpt} implements virtual context management with paging. Our hierarchical memory architecture extends these ideas with three-tier scoping and automatic consolidation.
+
+\subsection{Tool Use in LLMs}
+
+Toolformer~\cite{schick2023toolformer} trains models to use tools via self-supervised learning. Gorilla~\cite{patil2023gorilla} fine-tunes for API call generation. TaskWeaver~\cite{qin2024taskweaver} provides a code-first agent framework. The Model Context Protocol~\cite{anthropic2024mcp} standardizes tool interfaces. Hanzo Chat builds on MCP but adds dynamic tool discovery, sandboxed execution, and multi-step chaining.
+
+\subsection{Chat Interfaces}
+
+ChatGPT~\cite{openai2022chatgpt} popularized conversational AI interfaces. Claude.ai~\cite{anthropic2024claude} introduced artifacts for rich content. Gemini~\cite{google2024gemini} integrates multimodal understanding. Poe~\cite{quora2023poe} provides multi-model access. Hanzo Chat differentiates through unified memory, tool integration, and intelligent routing across all models.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Ethical Considerations}
+
+Hanzo Chat's memory system raises important privacy considerations:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Data retention}: Users can view, edit, and delete all stored memories. Automatic deletion after 365 days of inactivity.
+    \item \textbf{Data separation}: Memories are strictly scoped by user and project. No cross-user information leakage.
+    \item \textbf{Content filtering}: All inputs and outputs are screened for harmful content before processing.
+    \item \textbf{Transparency}: Users are informed when memory retrieval augments a response (via metadata in the response).
+\end{enumerate}
+
+\subsection{Limitations}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Routing latency}: The classification and routing step adds 50--100ms to response latency. Acceptable for interactive use but potentially problematic for programmatic API access.
+    \item \textbf{Memory noise}: Retrieved memories are occasionally irrelevant, degrading response quality by 2--5\% compared to oracle memory selection.
+    \item \textbf{Provider dependency}: Hanzo Chat depends on external LLM providers; outages at major providers can degrade service despite failover mechanisms.
+    \item \textbf{Tool safety}: Despite sandboxing, code execution tools carry inherent risk. We mitigate this through resource limits and output scanning.
+\end{enumerate}
+
+\subsection{Future Work}
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Personalized fine-tuning}: Fine-tune routing and memory models on individual user interaction patterns.
+    \item \textbf{Multi-agent collaboration}: Enable multiple Chat agents to collaborate on complex tasks with shared memory.
+    \item \textbf{Voice and multimodal}: Extend the interface to support voice input/output and image/video understanding.
+    \item \textbf{Offline capable}: Support local model execution for privacy-sensitive use cases.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented Hanzo Chat, a multi-model conversational AI system that combines intelligent model routing, hierarchical persistent memory, and extensible tool integration through the Model Context Protocol. Our evaluation demonstrates that the combination of these three capabilities achieves performance exceeding any single model while significantly reducing costs. The hierarchical memory architecture enables conversations spanning hundreds of turns without degradation, addressing one of the most significant limitations of current LLM-based chat systems. Production deployment over 18 months with 500K+ conversations validates the practical viability of the approach. Hanzo Chat is available at \texttt{chat.hanzo.ai} and its architecture is documented for the research community.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{32}
+
+\bibitem{anthropic2024claude}
+Anthropic.
+\newblock Claude 3.5 technical report.
+\newblock \emph{Anthropic Technical Reports}, 2024.
+
+\bibitem{anthropic2024mcp}
+Anthropic.
+\newblock Model context protocol specification.
+\newblock \emph{MCP Documentation}, 2024.
+
+\bibitem{chen2023frugalgpt}
+L.~Chen, M.~Zaharia, and J.~Zou.
+\newblock {FrugalGPT}: How to use large language models while reducing cost and improving performance.
+\newblock \emph{arXiv preprint arXiv:2305.05176}, 2023.
+
+\bibitem{chiang2024chatbot}
+W.-L. Chiang, L.~Zheng, Y.~Sheng, et~al.
+\newblock Chatbot arena: An open platform for evaluating {LLM}s by human preference.
+\newblock \emph{arXiv preprint arXiv:2403.04132}, 2024.
+
+\bibitem{fedus2022switch}
+W.~Fedus, B.~Zoph, and N.~Shazeer.
+\newblock Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity.
+\newblock \emph{JMLR}, 23(120):1--39, 2022.
+
+\bibitem{gal2016dropout}
+Y.~Gal and Z.~Ghahramani.
+\newblock Dropout as a {Bayesian} approximation: Representing model uncertainty in deep learning.
+\newblock In \emph{ICML}, 2016.
+
+\bibitem{google2024gemini}
+Google.
+\newblock Gemini: A family of highly capable multimodal models.
+\newblock \emph{Google Technical Reports}, 2024.
+
+\bibitem{hanzollm2025}
+Hanzo~AI.
+\newblock Hanzo {LLM} gateway: Unified proxy for 100+ {LLM} providers.
+\newblock \emph{Hanzo Technical Documentation}, 2025.
+
+\bibitem{hu2024routerbench}
+X.~Hu, Z.~Li, and J.~Chen.
+\newblock {RouterBench}: A benchmark for multi-{LLM} routing system.
+\newblock \emph{arXiv preprint arXiv:2403.12031}, 2024.
+
+\bibitem{li2010contextual}
+L.~Li, W.~Chu, J.~Langford, and R.~E. Schapire.
+\newblock A contextual-bandit approach to personalized news article recommendation.
+\newblock In \emph{WWW}, 2010.
+
+\bibitem{martian2024}
+Martian.
+\newblock Intelligent model routing for {LLM} applications.
+\newblock \emph{Martian Documentation}, 2024.
+
+\bibitem{mcclelland1995memory}
+J.~L. McClelland, B.~L. McNaughton, and R.~C. O'Reilly.
+\newblock Why there are complementary learning systems in the hippocampus and neocortex.
+\newblock \emph{Psychological Review}, 102(3):419, 1995.
+
+\bibitem{nogueira2019passage}
+R.~Nogueira and K.~Cho.
+\newblock Passage re-ranking with {BERT}.
+\newblock \emph{arXiv preprint arXiv:1901.04085}, 2019.
+
+\bibitem{openai2022chatgpt}
+OpenAI.
+\newblock Introducing {ChatGPT}.
+\newblock \emph{OpenAI Blog}, 2022.
+
+\bibitem{openai2023gpt4}
+OpenAI.
+\newblock {GPT-4} technical report.
+\newblock \emph{arXiv preprint arXiv:2303.08774}, 2023.
+
+\bibitem{packer2023memgpt}
+C.~Packer, S.~Wooders, K.~Lin, V.~Fang, S.~G. Patil, I.~Stoica, and J.~E. Gonzalez.
+\newblock {MemGPT}: Towards {LLM}s as operating systems.
+\newblock \emph{arXiv preprint arXiv:2310.08560}, 2023.
+
+\bibitem{patil2023gorilla}
+S.~G. Patil, T.~Zhang, X.~Wang, and J.~E. Gonzalez.
+\newblock Gorilla: Large language model connected with massive {API}s.
+\newblock \emph{arXiv preprint arXiv:2305.15334}, 2023.
+
+\bibitem{pgvector2023}
+A.~Katz.
+\newblock pgvector: Open-source vector similarity search for {PostgreSQL}.
+\newblock \emph{GitHub Repository}, 2023.
+
+\bibitem{qin2024taskweaver}
+B.~Qin, D.~Liang, X.~Ye, et~al.
+\newblock {TaskWeaver}: A code-first agent framework.
+\newblock \emph{arXiv preprint arXiv:2311.17541}, 2024.
+
+\bibitem{quora2023poe}
+Quora.
+\newblock Poe: Fast, helpful {AI} chat.
+\newblock \emph{Quora Blog}, 2023.
+
+\bibitem{schick2023toolformer}
+T.~Schick, J.~Dwivedi-Yu, R.~Dess\'i, et~al.
+\newblock Toolformer: Language models can teach themselves to use tools.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{shazeer2017outrageously}
+N.~Shazeer, A.~Mirhoseini, K.~Maziarz, et~al.
+\newblock Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem{shinn2023reflexion}
+N.~Shinn, F.~Cassano, A.~Gopinath, K.~R. Narasimhan, and S.~Yao.
+\newblock Reflexion: Language agents with verbal reinforcement learning.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{wang2022text}
+L.~Wang, N.~Yang, X.~Huang, et~al.
+\newblock Text embeddings by weakly-supervised contrastive pre-training.
+\newblock \emph{arXiv preprint arXiv:2212.03533}, 2022.
+
+\bibitem{zheng2023judging}
+L.~Zheng, W.-L. Chiang, Y.~Sheng, et~al.
+\newblock Judging {LLM}-as-a-judge with {MT-Bench} and chatbot arena.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{zhong2024memorybank}
+W.~Zhong, L.~Guo, Q.~Gao, et~al.
+\newblock {MemoryBank}: Enhancing large language models with long-term memory.
+\newblock In \emph{AAAI}, 2024.
+
+\end{thebibliography}
+
+\end{document}

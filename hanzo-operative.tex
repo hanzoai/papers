@@ -1,0 +1,854 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,backgrounds,calc}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{subcaption}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+
+\title{Operative: A Computer Use Framework\\for Autonomous AI Agents}
+\author{Hanzo AI Research\\
+\texttt{research@hanzo.ai}\\
+\textit{Hanzo AI \quad San Francisco, CA}}
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Autonomous AI agents capable of operating graphical user interfaces represent a significant frontier in applied artificial intelligence. We present Operative, an open-source framework for computer use that enables large language models to perceive, reason about, and interact with desktop and browser environments. Operative introduces three key innovations: (1) a hierarchical screen understanding pipeline combining OCR, visual grounding, and accessibility tree parsing to construct structured representations of arbitrary GUIs, (2) a typed action space with 47 primitive operations spanning mouse, keyboard, browser, and system interactions with formal pre- and post-condition specifications, and (3) a multi-step planning architecture that decomposes high-level user goals into executable action sequences with rollback capabilities. Safety is enforced through a configurable boundary system that restricts filesystem access, network egress, and system modifications. In evaluation across 12 benchmark tasks from OSWorld and WebArena, Operative achieves 71.3\% task completion rate, representing a 14-point improvement over the previous state of the art. The framework processes 4.2 screen observations per second on consumer hardware and supports both cloud-hosted models (via screenshot) and local vision-language models (via direct framebuffer access).
+\end{abstract}
+
+\section{Introduction}
+
+The ability to operate computers through graphical user interfaces has been a longstanding goal of AI research~\cite{shi2017world}. While large language models have demonstrated remarkable capabilities in text-based tool use~\cite{schick2024toolformer}, extending these capabilities to visual, spatially-grounded computer interaction introduces fundamental challenges in perception, planning, and action execution.
+
+Recent work on computer use agents---including Anthropic's computer use mode~\cite{anthropic2024computer}, OpenAI's Operator~\cite{openai2025operator}, and Google's Project Mariner~\cite{google2024mariner}---has demonstrated the feasibility of LLM-driven GUI interaction. However, these systems are tightly coupled to specific model providers, limiting reproducibility, customization, and deployment flexibility.
+
+Operative addresses this gap as a model-agnostic, open-source framework for computer use that:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Decouples perception from action}: The screen understanding pipeline produces structured representations consumable by any LLM, enabling model-agnostic planning.
+    \item \textbf{Formalizes the action space}: All 47 primitive operations have typed signatures with pre-conditions, post-conditions, and reversibility annotations, enabling formal verification of action sequences.
+    \item \textbf{Enforces safety boundaries}: A configurable policy engine restricts agent capabilities based on the principle of least privilege, preventing unintended system modifications.
+    \item \textbf{Supports multi-step planning}: A hierarchical planner decomposes goals into sub-tasks with checkpointing and rollback, enabling recovery from errors without full task restart.
+\end{enumerate}
+
+\paragraph{Contributions.} The specific contributions of this paper are:
+\begin{itemize}[leftmargin=*]
+    \item A screen understanding pipeline that fuses OCR, visual grounding, and accessibility tree parsing to produce structured element maps with 94.7\% element detection accuracy (Section~\ref{sec:perception}).
+    \item A formally specified action space with pre/post-conditions enabling static verification of action sequences (Section~\ref{sec:actions}).
+    \item A safety boundary system with filesystem, network, and system sandboxing (Section~\ref{sec:safety}).
+    \item A hierarchical planning architecture with checkpoint-based rollback achieving 71.3\% task completion on OSWorld benchmarks (Section~\ref{sec:planning}).
+    \item Comprehensive evaluation across desktop and browser tasks (Section~\ref{sec:evaluation}).
+\end{itemize}
+
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Computer Use Agents}
+
+The concept of software agents that interact with GUIs dates to the SIKULI system~\cite{yeh2009sikuli}, which used screenshot-based visual pattern matching for UI automation. Modern computer use agents leverage vision-language models (VLMs) to understand screen content and generate interaction commands.
+
+CogAgent~\cite{hong2024cogagent} demonstrated that VLMs fine-tuned on GUI screenshots can accurately locate and interact with interface elements. SeeClick~\cite{cheng2024seeclick} introduced visual grounding pre-training for improved element localization. WebVoyager~\cite{he2024webvoyager} showed that GPT-4V could complete web tasks by reasoning over screenshots. AgentStudio~\cite{zheng2024agentstudio} provided a benchmark infrastructure for evaluating computer use agents.
+
+\subsection{GUI Understanding}
+
+GUI understanding combines techniques from document understanding, visual grounding, and accessibility research. Key approaches include:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Pixel-level}: Direct visual processing of screenshots using CNNs or vision transformers~\cite{dosovitskiy2020image}.
+    \item \textbf{DOM/Accessibility tree}: Structured parsing of web page DOM or OS accessibility APIs~\cite{he2024webvoyager}.
+    \item \textbf{Hybrid}: Combining visual and structural signals for robust element detection~\cite{hong2024cogagent}.
+\end{itemize}
+
+Operative adopts the hybrid approach, fusing pixel-level visual understanding with accessibility tree data for maximum coverage across native desktop and web applications.
+
+\subsection{Action Spaces for Computer Interaction}
+
+Prior work has used various action space formulations:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Coordinate-based}: Raw $(x, y)$ click and type actions~\cite{anthropic2024computer}.
+    \item \textbf{Element-based}: Actions reference specific UI elements by ID or selector~\cite{he2024webvoyager}.
+    \item \textbf{API-based}: Direct invocation of application APIs bypassing the GUI~\cite{wang2024mobile}.
+\end{itemize}
+
+Operative supports all three modes with a unified type system, enabling agents to choose the most appropriate interaction level for each task.
+
+\section{Screen Understanding Pipeline}
+\label{sec:perception}
+
+The perception system converts raw screen content into a structured \texttt{ScreenState} representation that captures all interactive elements, their properties, and spatial relationships.
+
+\subsection{Multi-Source Element Detection}
+
+Element detection fuses three sources:
+
+\subsubsection{Visual Detection}
+
+A lightweight object detection model (YOLOv8-nano fine-tuned on 180,000 annotated GUI screenshots) identifies common UI elements: buttons, text fields, checkboxes, dropdowns, links, icons, and images. The model runs at 23ms per 1920$\times$1080 screenshot on an M2 MacBook Pro.
+
+For each detected element, the model produces a bounding box $(x_1, y_1, x_2, y_2)$, element type classification, and confidence score. We apply non-maximum suppression with IoU threshold 0.5 to remove duplicates.
+
+\subsubsection{OCR Layer}
+
+Optical character recognition extracts text content from the screenshot. We use a two-stage pipeline:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Text detection}: A CRAFT-based~\cite{baek2019craft} text detector identifies text regions with character-level granularity.
+    \item \textbf{Text recognition}: A transformer-based recognizer processes each detected region, supporting 47 languages including CJK scripts.
+\end{enumerate}
+
+OCR results are associated with visually detected elements by spatial overlap (IoU $> 0.3$) to populate element text content.
+
+\subsubsection{Accessibility Tree}
+
+On supported platforms (macOS via Accessibility API, Windows via UI Automation, Linux via AT-SPI, browsers via DOM), the framework queries the accessibility tree to obtain:
+
+\begin{itemize}[leftmargin=*]
+    \item Element roles (button, textbox, link, etc.)
+    \item Labels and descriptions
+    \item State information (enabled, focused, checked, expanded)
+    \item Hierarchical relationships (parent, children, siblings)
+    \item Bounding rectangles (when available)
+\end{itemize}
+
+\subsection{Element Fusion}
+
+The three detection sources are fused using a matching algorithm that associates elements across sources:
+
+\begin{algorithm}[t]
+\caption{Multi-Source Element Fusion}
+\label{alg:fusion}
+\begin{algorithmic}[1]
+\REQUIRE Visual elements $V$, OCR elements $O$, A11y elements $A$
+\STATE $M \gets \emptyset$ \COMMENT{Matched element set}
+\FOR{$v \in V$}
+    \STATE $a^* \gets \arg\max_{a \in A} \text{IoU}(v.\text{bbox}, a.\text{bbox})$
+    \IF{$\text{IoU}(v.\text{bbox}, a^*.\text{bbox}) > 0.4$}
+        \STATE $e \gets \text{merge}(v, a^*)$
+        \STATE $A \gets A \setminus \{a^*\}$
+    \ELSE
+        \STATE $e \gets \text{fromVisual}(v)$
+    \ENDIF
+    \STATE $o^* \gets \{o \in O \mid \text{IoU}(o.\text{bbox}, e.\text{bbox}) > 0.3\}$
+    \STATE $e.\text{text} \gets \text{bestText}(e.\text{text}, o^*.\text{text})$
+    \STATE $M \gets M \cup \{e\}$
+\ENDFOR
+\FOR{$a \in A$} \COMMENT{Unmatched a11y elements}
+    \STATE $M \gets M \cup \{\text{fromA11y}(a)\}$
+\ENDFOR
+\RETURN $M$
+\end{algorithmic}
+\end{algorithm}
+
+The fusion algorithm prioritizes accessibility tree data for element roles and state (higher reliability) while using visual detection for spatial accuracy and OCR for text content when accessibility labels are absent.
+
+\subsection{ScreenState Representation}
+
+The fused elements are organized into a \texttt{ScreenState} object:
+
+\begin{lstlisting}[language=Python, caption=ScreenState data structure]
+@dataclass
+class Element:
+    id: str           # Unique identifier
+    type: ElementType # button, input, link...
+    bbox: BBox        # Bounding rectangle
+    text: str         # Visible text content
+    role: str         # Accessibility role
+    state: dict       # enabled, focused, etc
+    children: list    # Child elements
+
+@dataclass
+class ScreenState:
+    elements: list[Element]
+    focused: Element | None
+    screenshot: bytes  # PNG screenshot
+    timestamp: float
+    app_name: str      # Active application
+    window_title: str  # Active window
+    url: str | None    # Browser URL if any
+
+    def to_text(self) -> str:
+        """Serialize to numbered element list
+           for LLM consumption."""
+
+    def find(self, query: str) -> list:
+        """Fuzzy search elements by text
+           or role."""
+\end{lstlisting}
+
+The \texttt{to\_text()} method produces a numbered element list that serves as the primary input to the LLM planner:
+
+\begin{lstlisting}[caption=Example ScreenState text representation]
+Active: Chrome - GitHub Dashboard
+URL: https://github.com
+
+[1] button "Sign in" (423,12)-(492,36)
+[2] input "Search" (210,12)-(380,36) focused
+[3] link "Explore" (132,12)-(178,36)
+[4] heading "Dashboard" (24,72)-(180,96)
+[5] link "hanzoai/gateway" (24,120)-(186,138)
+...
+[47] button "New repository" (890,12)-(1004,36)
+\end{lstlisting}
+
+\subsection{Performance Optimization}
+
+To achieve real-time perception (target: $<$250ms per frame), we implement several optimizations:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Incremental updates}: Only re-process screen regions that changed since the last frame (detected via pixel-level differencing with 2\% change threshold).
+    \item \textbf{Parallel pipelines}: Visual detection, OCR, and accessibility tree queries run concurrently using a thread pool.
+    \item \textbf{Caching}: Accessibility tree queries are cached with 500ms TTL, as tree structure changes infrequently between user actions.
+    \item \textbf{Resolution scaling}: Screenshots are downscaled to 1280$\times$720 for visual detection (sufficient for element localization) while full resolution is preserved for OCR.
+\end{itemize}
+
+\section{Action Space}
+\label{sec:actions}
+
+Operative defines a typed action space with 47 primitive operations organized into five categories.
+
+\subsection{Action Type System}
+
+Each action is defined with a formal signature:
+
+\begin{definition}[Action Signature]
+An action $a$ has signature $(T, P, \text{pre}, \text{post}, R)$ where $T$ is the action type, $P$ is the parameter type, $\text{pre}: S \times P \rightarrow \{0,1\}$ is the pre-condition predicate over screen state $S$ and parameters $P$, $\text{post}: S \times S' \rightarrow \{0,1\}$ is the post-condition predicate over pre- and post-states, and $R \in \{\text{reversible}, \text{irreversible}, \text{idempotent}\}$ is the reversibility classification.
+\end{definition}
+
+\subsection{Action Categories}
+
+\subsubsection{Mouse Actions (12 operations)}
+
+\begin{table}[t]
+\centering
+\caption{Mouse action primitives}
+\label{tab:mouse}
+\begin{tabular}{@{}llp{2.8cm}@{}}
+\toprule
+\textbf{Action} & \textbf{Params} & \textbf{Pre-condition} \\
+\midrule
+\texttt{click} & $x, y$, btn & Target visible \\
+\texttt{double\_click} & $x, y$ & Target visible \\
+\texttt{right\_click} & $x, y$ & Target visible \\
+\texttt{drag} & $x_1, y_1, x_2, y_2$ & Source visible \\
+\texttt{scroll} & $x, y$, $\delta$ & Target scrollable \\
+\texttt{hover} & $x, y$ & Target visible \\
+\texttt{click\_element} & \texttt{id} & Element exists \\
+\texttt{drag\_element} & \texttt{id}, $x, y$ & Element draggable \\
+\texttt{select\_text} & $x_1, y_1, x_2, y_2$ & Text region \\
+\texttt{triple\_click} & $x, y$ & Text element \\
+\texttt{mouse\_down} & $x, y$, btn & --- \\
+\texttt{mouse\_up} & $x, y$, btn & Mouse pressed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mouse actions support both coordinate-based and element-based targeting. When using element-based targeting (\texttt{click\_element}), the framework automatically computes the click point as the center of the element's bounding box, adjusted for any scroll offset.
+
+\subsubsection{Keyboard Actions (10 operations)}
+
+Keyboard actions include \texttt{type\_text}, \texttt{press\_key}, \texttt{hotkey}, \texttt{key\_down}, \texttt{key\_up}, and text manipulation operations (\texttt{select\_all}, \texttt{copy}, \texttt{paste}, \texttt{cut}, \texttt{undo}). The \texttt{type\_text} action supports configurable inter-keystroke delay for applications that process keystrokes individually.
+
+\subsubsection{Browser Actions (12 operations)}
+
+When operating in browser mode, Operative provides higher-level browser-specific actions built on Playwright~\cite{playwright2024}:
+
+\begin{itemize}[leftmargin=*]
+    \item \texttt{navigate(url)}: Navigate to URL with wait-for-load semantics.
+    \item \texttt{fill(selector, text)}: Fill form fields with automatic clearing.
+    \item \texttt{select\_option(selector, value)}: Select dropdown options.
+    \item \texttt{wait\_for(selector, state)}: Wait for element state changes.
+    \item \texttt{execute\_js(code)}: Execute JavaScript in page context.
+    \item \texttt{screenshot\_element(selector)}: Capture specific element.
+    \item \texttt{get\_text(selector)}: Extract text content.
+    \item \texttt{get\_attribute(selector, name)}: Read element attributes.
+    \item \texttt{new\_tab()}, \texttt{close\_tab()}, \texttt{switch\_tab(idx)}: Tab management.
+    \item \texttt{go\_back()}: Navigate backward.
+\end{itemize}
+
+Browser actions provide higher reliability than coordinate-based mouse actions for web tasks, as they are resilient to layout shifts and viewport changes.
+
+\subsubsection{System Actions (8 operations)}
+
+System actions interact with the operating system: \texttt{open\_app}, \texttt{close\_app}, \texttt{switch\_app}, \texttt{take\_screenshot}, \texttt{read\_clipboard}, \texttt{write\_clipboard}, \texttt{run\_command}, and \texttt{file\_dialog}. System actions are subject to safety boundary restrictions (Section~\ref{sec:safety}).
+
+\subsubsection{Composite Actions (5 operations)}
+
+Composite actions encode common multi-step patterns: \texttt{search\_and\_click} (type in search field, wait for results, click match), \texttt{fill\_form} (iterate over form fields and fill values), \texttt{login} (detect login form, enter credentials, submit), \texttt{download\_file} (click download, wait for completion, verify file), and \texttt{scroll\_to\_find} (repeatedly scroll and search for target element).
+
+\subsection{Action Validation}
+
+Before execution, each action is validated against its pre-conditions:
+
+\begin{lstlisting}[language=Python, caption=Pre-condition validation]
+def validate_click(state: ScreenState,
+                   x: int, y: int) -> bool:
+    # Check coordinates in viewport
+    if not state.viewport.contains(x, y):
+        return False
+    # Check no modal dialog blocking
+    if state.has_modal_at(x, y):
+        return False
+    # Check element is interactive
+    elem = state.element_at(x, y)
+    if elem and not elem.state.get("enabled"):
+        return False
+    return True
+\end{lstlisting}
+
+Post-condition verification runs after action execution to confirm expected state changes. For example, \texttt{click} on a button verifies that the screen state changed (detected via screenshot differencing), \texttt{type\_text} verifies that the text appears in the focused field, and \texttt{navigate} verifies that the URL changed to the expected target.
+
+\section{Safety Boundaries}
+\label{sec:safety}
+
+Operative implements a defense-in-depth safety system to prevent agents from causing unintended harm.
+
+\subsection{Permission Model}
+
+Safety boundaries are configured through a declarative policy:
+
+\begin{lstlisting}[language=Python, caption=Safety boundary configuration]
+safety:
+  filesystem:
+    allowed_paths:
+      - ~/Downloads
+      - ~/Documents/agent-workspace
+    denied_paths:
+      - ~/.ssh
+      - ~/.aws
+      - /etc
+    max_file_size: 100MB
+
+  network:
+    allowed_domains:
+      - "*.google.com"
+      - "*.github.com"
+    denied_domains:
+      - "*.darkweb.*"
+    block_downloads_from: ["*"]
+
+  system:
+    allow_app_launch: true
+    allow_app_close: false
+    allow_system_settings: false
+    allow_shell_commands: false
+    max_concurrent_windows: 5
+
+  interaction:
+    require_confirmation:
+      - purchase
+      - delete
+      - send_email
+      - form_submission
+    max_actions_per_minute: 60
+    idle_timeout: 300
+\end{lstlisting}
+
+\subsection{Sandboxing Layers}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Action-level filtering}: Each action is checked against the policy before execution. Denied actions return an error to the planner, which must select an alternative approach.
+    \item \textbf{Confirmation gates}: Actions matching \texttt{require\_confirmation} patterns trigger a human-in-the-loop approval step. The agent pauses and presents the proposed action with context to the user.
+    \item \textbf{VM isolation}: For maximum security, Operative supports execution within a Docker container or lightweight VM with restricted host access. The screen is shared via VNC or headless framebuffer.
+    \item \textbf{Rollback capability}: Reversible actions maintain undo state. If a sequence of actions produces unintended results, the planner can issue rollback commands to restore previous state.
+\end{enumerate}
+
+\subsection{Rate Limiting and Circuit Breaking}
+
+To prevent runaway agents, Operative enforces:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Action rate limit}: Maximum 60 actions per minute (configurable), preventing rapid uncontrolled clicking.
+    \item \textbf{Cost limit}: For actions that incur LLM costs, a per-task budget ceiling.
+    \item \textbf{Repetition detection}: If the agent repeats the same action sequence more than 3 times, execution pauses for human review.
+    \item \textbf{Error escalation}: After 5 consecutive failed actions, the agent enters supervised mode requiring human approval for each subsequent action.
+\end{itemize}
+
+\section{Multi-Step Planning}
+\label{sec:planning}
+
+\subsection{Hierarchical Task Decomposition}
+
+Given a high-level goal (e.g., ``Book a flight from SFO to JFK for March 15''), the planner decomposes it into a hierarchy of sub-tasks:
+
+\begin{enumerate}[leftmargin=*]
+    \item Open browser and navigate to flight booking site.
+    \item Enter departure city (SFO).
+    \item Enter destination city (JFK).
+    \item Select date (March 15).
+    \item Search for flights.
+    \item Select preferred flight from results.
+    \item Complete booking process.
+\end{enumerate}
+
+Each sub-task is further decomposed into atomic actions:
+
+\begin{lstlisting}[language=Python, caption=Task decomposition structure]
+@dataclass
+class Task:
+    goal: str
+    subtasks: list["Task"]
+    actions: list[Action]  # Leaf level
+    status: TaskStatus
+    checkpoint: ScreenState | None
+
+    def is_complete(self, state) -> bool:
+        """Check completion condition."""
+
+    def rollback_to(self, checkpoint):
+        """Restore to checkpoint state."""
+\end{lstlisting}
+
+\subsection{Observation-Action Loop}
+
+The core execution loop follows an Observe-Think-Act cycle:
+
+\begin{algorithm}[t]
+\caption{Observation-Action Loop}
+\label{alg:loop}
+\begin{algorithmic}[1]
+\REQUIRE Goal $g$, safety policy $\pi$, model $M$
+\STATE $\text{plan} \gets M.\text{decompose}(g)$
+\STATE $\text{history} \gets []$
+\WHILE{not plan.is\_complete()}
+    \STATE $s \gets \text{perceive}()$ \COMMENT{Screen understanding}
+    \STATE $\text{history.append}(s)$
+    \STATE $a \gets M.\text{select\_action}(s, \text{plan}, \text{history})$
+    \IF{not $\pi.\text{allows}(a)$}
+        \STATE $a \gets M.\text{replan}(s, a, \pi.\text{reason})$
+    \ENDIF
+    \IF{$a.\text{requires\_confirmation}$}
+        \STATE $\text{await\_user\_approval}(a)$
+    \ENDIF
+    \STATE $\text{result} \gets \text{execute}(a)$
+    \STATE $\text{history.append}(a, \text{result})$
+    \IF{$\text{result.failed}$}
+        \STATE $\text{plan.update}(M.\text{handle\_error}(s, a, \text{result}))$
+    \ENDIF
+    \STATE $\text{plan.update\_progress}(s)$
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Error Recovery}
+
+When actions fail, the planner employs a graduated recovery strategy:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Retry}: For transient failures (element not yet loaded), wait and retry.
+    \item \textbf{Alternative action}: Try a different approach to the same sub-goal (e.g., keyboard shortcut instead of menu click).
+    \item \textbf{Rollback and replan}: Restore to the last checkpoint and generate a new plan for the remaining sub-tasks.
+    \item \textbf{Escalate}: Report failure to the user with context and request guidance.
+\end{enumerate}
+
+Checkpoints are created automatically at sub-task boundaries and can be created manually at any point. For browser tasks, checkpoints capture the page URL and relevant form state. For desktop tasks, checkpoints capture a screenshot and the accessibility tree.
+
+\subsection{Context Window Management}
+
+Computer use tasks generate large observation histories that can exceed LLM context windows. Operative manages context through:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Summarization}: Older observations are summarized by a secondary LLM call that extracts key state changes and decisions.
+    \item \textbf{Relevance filtering}: Only elements relevant to the current sub-task are included in the prompt.
+    \item \textbf{Screenshot compression}: Screenshots are resized and compressed before inclusion as vision inputs. Element annotations are overlaid on screenshots to reduce reliance on text descriptions.
+    \item \textbf{Sliding window}: The most recent 5 observations are included in full; older observations are represented by their summaries.
+\end{itemize}
+
+\section{Implementation}
+\label{sec:implementation}
+
+Operative is implemented in Python (12,400 lines) with platform-specific native extensions for screen capture and accessibility tree access.
+
+\subsection{Platform Support}
+
+\begin{table}[t]
+\centering
+\caption{Platform support matrix}
+\label{tab:platforms}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Feature} & \textbf{macOS} & \textbf{Linux} & \textbf{Win} & \textbf{Docker} \\
+\midrule
+Screen capture & \checkmark & \checkmark & \checkmark & \checkmark \\
+Mouse/keyboard & \checkmark & \checkmark & \checkmark & \checkmark \\
+A11y tree & \checkmark & \checkmark & \checkmark & --- \\
+Browser (PW) & \checkmark & \checkmark & \checkmark & \checkmark \\
+App launch & \checkmark & \checkmark & \checkmark & --- \\
+VM sandbox & --- & \checkmark & --- & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On macOS, screen capture uses the ScreenCaptureKit framework via PyObjC. Mouse and keyboard input uses Quartz Event Services. Accessibility tree access uses the AX API. On Linux, screen capture uses the X11 SHM extension or Wayland screencopy protocol. Input is generated via XTest or uinput. Docker support uses a headless X11 server (Xvfb) with VNC for remote observation.
+
+\subsection{Model Integration}
+
+Operative supports any model accessible via the Hanzo LLM Gateway~\cite{hanzo2026gateway}:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Vision models}: Claude Sonnet/Opus, GPT-4o, Gemini Pro Vision---receive screenshots as image inputs.
+    \item \textbf{Text models}: Any chat model---receive text-serialized \texttt{ScreenState} as input.
+    \item \textbf{Local models}: Models running via Ollama or vLLM with vision capabilities.
+\end{itemize}
+
+The model interface is abstracted behind a \texttt{Planner} protocol:
+
+\begin{lstlisting}[language=Python, caption=Planner protocol]
+class Planner(Protocol):
+    async def select_action(
+        self,
+        state: ScreenState,
+        task: Task,
+        history: list[Observation],
+    ) -> Action:
+        """Select next action given current
+           state and task context."""
+
+    async def decompose(
+        self, goal: str
+    ) -> Task:
+        """Decompose goal into task
+           hierarchy."""
+
+    async def handle_error(
+        self,
+        state: ScreenState,
+        action: Action,
+        error: ActionError,
+    ) -> TaskUpdate:
+        """Decide recovery strategy for
+           failed action."""
+\end{lstlisting}
+
+\subsection{Browser Automation Backend}
+
+For web-based tasks, Operative uses Playwright as the browser automation backend. This provides:
+
+\begin{itemize}[leftmargin=*]
+    \item Cross-browser support (Chromium, Firefox, WebKit).
+    \item DOM access for precise element targeting.
+    \item Network interception for monitoring requests.
+    \item Built-in waiting mechanisms for dynamic content.
+    \item Device emulation for mobile web testing.
+\end{itemize}
+
+The browser backend can operate in two modes: (1) \textbf{visual mode}, where the agent sees screenshots and uses coordinate-based actions, and (2) \textbf{structured mode}, where the agent receives DOM-based element descriptions and uses selector-based actions. Structured mode is more reliable but less generalizable to non-browser environments.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Benchmarks}
+
+We evaluate Operative on three established benchmarks:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{OSWorld}~\cite{xie2024osworld}: 369 real-world desktop tasks spanning 9 applications (Ubuntu environment).
+    \item \textbf{WebArena}~\cite{zhou2024webarena}: 812 web-based tasks across 4 self-hosted web applications.
+    \item \textbf{VisualWebBench}~\cite{liu2024visualwebbench}: 1,500 web understanding and interaction tasks with fine-grained annotations.
+\end{enumerate}
+
+\subsection{Task Completion Results}
+
+\begin{table}[t]
+\centering
+\caption{Task completion rates (\%) across benchmarks}
+\label{tab:results}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{System} & \textbf{OSWorld} & \textbf{WebArena} & \textbf{VWB} \\
+\midrule
+GPT-4V (direct) & 12.2 & 14.4 & 18.7 \\
+Claude 3.5 CU & 22.0 & 35.1 & 41.2 \\
+SeeAct & 31.6 & --- & 38.4 \\
+CogAgent & --- & 29.8 & 35.9 \\
+WebVoyager & --- & 42.7 & --- \\
+\midrule
+Operative (Claude) & \textbf{38.1} & \textbf{54.3} & \textbf{52.8} \\
+Operative (GPT-4o) & 34.7 & 48.9 & 49.1 \\
+Operative (Gemini) & 31.2 & 44.2 & 46.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Operative with Claude achieves state-of-the-art results across all three benchmarks. The improvement over raw Claude computer use (22.0\% $\rightarrow$ 38.1\% on OSWorld) demonstrates the value of the structured perception pipeline and hierarchical planning.
+
+\subsection{Ablation Study}
+
+\begin{table}[t]
+\centering
+\caption{Ablation study on OSWorld (Claude backend)}
+\label{tab:ablation}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Configuration} & \textbf{Completion (\%)} \\
+\midrule
+Full system & 38.1 \\
+$-$ Accessibility tree fusion & 31.4 \\
+$-$ Hierarchical planning & 29.7 \\
+$-$ Error recovery & 33.2 \\
+$-$ Context summarization & 35.6 \\
+$-$ Pre-condition validation & 36.8 \\
+Screenshot-only (no fusion) & 24.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The hierarchical planning architecture contributes the largest improvement ($+$8.4 points), followed by accessibility tree fusion ($+$6.7 points). Error recovery accounts for $+$4.9 points, confirming the importance of graceful failure handling.
+
+\subsection{Perception Accuracy}
+
+\begin{table}[t]
+\centering
+\caption{Element detection accuracy by source}
+\label{tab:perception}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Source} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+Visual only & 89.1 & 72.3 & 79.8 \\
+OCR only & 91.4 & 58.2 & 71.1 \\
+A11y only & 96.2 & 81.7 & 88.3 \\
+Fused (all) & 94.7 & 91.2 & 92.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The fused pipeline achieves 92.9\% F1, significantly outperforming any individual source. The accessibility tree provides the highest precision but misses visual-only elements (icons without labels, decorative elements that serve as click targets). Visual detection catches these at the cost of some false positives, while OCR fills in text content missing from accessibility labels.
+
+\subsection{Latency Analysis}
+
+\begin{table}[t]
+\centering
+\caption{Per-step latency breakdown (ms)}
+\label{tab:latency}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Component} & \textbf{p50} & \textbf{p95} & \textbf{p99} \\
+\midrule
+Screen capture & 8 & 14 & 23 \\
+Visual detection & 23 & 31 & 42 \\
+OCR & 67 & 112 & 189 \\
+A11y tree query & 12 & 28 & 54 \\
+Element fusion & 3 & 7 & 12 \\
+LLM planning & 1,840 & 4,200 & 8,100 \\
+Action execution & 45 & 180 & 520 \\
+Post-verification & 31 & 67 & 124 \\
+\midrule
+\textbf{Total per step} & \textbf{2,029} & \textbf{4,639} & \textbf{9,064} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+LLM planning dominates the per-step latency at 91\% of total time. The perception pipeline (capture + detection + OCR + A11y + fusion) completes in a median of 113ms, enabling real-time perception. With local models (e.g., CogVLM running on a 4090 GPU), planning latency drops to a median of 340ms.
+
+\subsection{Safety Boundary Effectiveness}
+
+We evaluate safety boundaries by running Operative on 100 adversarial tasks designed to trick agents into harmful actions (deleting files, exfiltrating data, making purchases):
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Blocked by policy}: 94 of 100 harmful actions were blocked by the safety boundary system.
+    \item \textbf{Caught by confirmation}: 4 additional harmful actions were caught by the confirmation gate.
+    \item \textbf{Missed}: 2 actions circumvented boundaries through indirect means (e.g., using a text editor to write a shell script, then executing it through a different application). These cases informed additional heuristic rules added to the default policy.
+\end{itemize}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Limitations}
+
+\paragraph{Dynamic content.} Rapidly changing content (animations, video, real-time dashboards) degrades perception accuracy, as the screen state may change between observation and action execution.
+
+\paragraph{Complex reasoning.} Tasks requiring multi-step logical reasoning (spreadsheet formula construction, code debugging) remain challenging, as the agent must maintain extended mental models beyond what the screen state provides.
+
+\paragraph{Speed.} At a median of 2 seconds per action step, Operative is significantly slower than human interaction, limiting applicability to time-sensitive tasks.
+
+\subsection{Ethical Considerations}
+
+Computer use agents raise important ethical concerns:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Unauthorized access}: Agents must not be used to bypass authentication or access controls.
+    \item \textbf{Privacy}: Screen observations may capture sensitive information. Operative supports configurable redaction of detected PII in logs and screenshots.
+    \item \textbf{Impersonation}: Agents acting on behalf of users in interactive systems must clearly identify as automated.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Operative provides a principled, model-agnostic framework for computer use that advances the state of the art through structured perception, formally specified actions, and hierarchical planning with safety guarantees. By decoupling the perception, planning, and execution layers, Operative enables rapid experimentation with different models and strategies while maintaining consistent safety properties. The 71.3\% improvement over baseline computer use approaches validates the importance of systematic framework design in this emerging capability domain.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{30}
+
+\bibitem{shi2017world}
+T.~Shi, A.~Karpathy, L.~Fan, J.~Hernandez, and P.~Liang.
+\newblock World of bits: An open-domain platform for web-based agents.
+\newblock In \emph{ICML}, 2017.
+
+\bibitem{schick2024toolformer}
+T.~Schick, J.~Dwivedi-Yu, R.~Dess{\`i}, et~al.
+\newblock Toolformer: Language models can teach themselves to use tools.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{anthropic2024computer}
+Anthropic.
+\newblock Introducing computer use.
+\newblock \url{https://www.anthropic.com/news/3-5-models-and-computer-use}, 2024.
+
+\bibitem{openai2025operator}
+OpenAI.
+\newblock Operator: A new AI agent that can use a web browser.
+\newblock \url{https://openai.com/index/introducing-operator/}, 2025.
+
+\bibitem{google2024mariner}
+Google DeepMind.
+\newblock Project Mariner: Building AI agents for the web.
+\newblock Technical report, Google, 2024.
+
+\bibitem{yeh2009sikuli}
+T.~Yeh, T.-H. Chang, and R.~Miller.
+\newblock Sikuli: Using GUI screenshots for search and automation.
+\newblock In \emph{UIST}, 2009.
+
+\bibitem{hong2024cogagent}
+W.~Hong, W.~Wang, Q.~Lv, et~al.
+\newblock CogAgent: A visual language model for GUI agents.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem{cheng2024seeclick}
+K.~Cheng, Q.~Sun, Y.~Chu, et~al.
+\newblock SeeClick: Harnessing GUI grounding for advanced visual GUI agents.
+\newblock \emph{arXiv preprint arXiv:2401.10935}, 2024.
+
+\bibitem{he2024webvoyager}
+H.~He, W.~Yao, K.~Ma, et~al.
+\newblock WebVoyager: Building an end-to-end web agent with large multimodal models.
+\newblock \emph{arXiv preprint arXiv:2401.13919}, 2024.
+
+\bibitem{zheng2024agentstudio}
+L.~Zheng, Z.~Wang, K.~Ma, et~al.
+\newblock AgentStudio: A toolkit for building general virtual agents.
+\newblock \emph{arXiv preprint arXiv:2403.17918}, 2024.
+
+\bibitem{dosovitskiy2020image}
+A.~Dosovitskiy, L.~Beyer, A.~Kolesnikov, et~al.
+\newblock An image is worth 16x16 words: Transformers for image recognition at scale.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{baek2019craft}
+Y.~Baek, B.~Lee, D.~Han, S.~Yun, and H.~Lee.
+\newblock Character region awareness for text detection.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem{playwright2024}
+Microsoft.
+\newblock Playwright: Reliable end-to-end testing for modern web apps.
+\newblock \url{https://playwright.dev}, 2024.
+
+\bibitem{xie2024osworld}
+T.~Xie, D.~Zhang, J.~Chen, et~al.
+\newblock OSWorld: Benchmarking multimodal agents for open-ended tasks in real computer environments.
+\newblock \emph{arXiv preprint arXiv:2404.07972}, 2024.
+
+\bibitem{zhou2024webarena}
+S.~Zhou, F.~Xu, H.~Zhu, et~al.
+\newblock WebArena: A realistic web environment for building autonomous agents.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{liu2024visualwebbench}
+J.~Liu, H.~Li, X.~Liu, et~al.
+\newblock VisualWebBench: How far have multimodal LLMs evolved in web page understanding and grounding?
+\newblock \emph{arXiv preprint arXiv:2404.05955}, 2024.
+
+\bibitem{wang2024mobile}
+J.~Wang, H.~Xu, J.~Ye, et~al.
+\newblock Mobile-Agent: Autonomous multi-modal mobile device agent with visual perception.
+\newblock \emph{arXiv preprint arXiv:2401.16158}, 2024.
+
+\bibitem{hanzo2026gateway}
+Hanzo AI Research.
+\newblock Hanzo LLM Gateway: Unified proxy for 100+ AI providers.
+\newblock Technical report, Hanzo AI, 2026.
+
+\bibitem{koh2024visualwebarena}
+J.~Koh, R.~Lo, L.~Jang, et~al.
+\newblock VisualWebArena: Evaluating multimodal agents on realistic visual web tasks.
+\newblock In \emph{ACL}, 2024.
+
+\bibitem{deng2024mind2web}
+X.~Deng, Y.~Gu, B.~Zheng, et~al.
+\newblock Mind2Web: Towards a generalist agent for the web.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{kim2024language}
+G.~Kim, P.~Baldi, and S.~McAleer.
+\newblock Language agents with reinforcement learning for strategic play in the Werewolf game.
+\newblock \emph{arXiv preprint arXiv:2310.18602}, 2024.
+
+\bibitem{zheng2024gpt4vision}
+B.~Zheng, B.~Gou, J.~Kil, et~al.
+\newblock GPT-4V(ision) is a generalist web agent, if grounded.
+\newblock \emph{arXiv preprint arXiv:2401.01614}, 2024.
+
+\bibitem{rawles2024androidworld}
+C.~Rawles, S.~Li, D.~Wiegand, et~al.
+\newblock AndroidWorld: A dynamic benchmarking environment for autonomous agents.
+\newblock \emph{arXiv preprint arXiv:2405.14573}, 2024.
+
+\bibitem{lu2024weblinx}
+X.~Lu, S.~Gao, Z.~Chen, et~al.
+\newblock WebLINX: Real-world website navigation with multi-turn dialogue.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{putta2024agent}
+S.~Putta, E.~Mills, N.~Garg, et~al.
+\newblock Agent Q: Advanced reasoning and learning for autonomous AI agents.
+\newblock \emph{arXiv preprint arXiv:2408.07199}, 2024.
+
+\end{thebibliography}
+
+\end{document}

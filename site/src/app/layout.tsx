@@ -1,26 +1,35 @@
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
-import './globals.css'
-import { getBrandConfig } from '@/config/brands'
+import { Geist, Geist_Mono } from 'next/font/google'
+import { ThemeProvider } from 'next-themes'
+import { siteConfig } from '@/config/papers'
+import './global.css'
 
-const inter = Inter({ subsets: ['latin'] })
+const geist = Geist({
+  subsets: ['latin'],
+  variable: '--font-geist',
+  display: 'swap',
+})
 
-const brandConfig = getBrandConfig()
+const geistMono = Geist_Mono({
+  subsets: ['latin'],
+  variable: '--font-geist-mono',
+  display: 'swap',
+})
 
 export const metadata: Metadata = {
-  title: `${brandConfig.name} Research Papers`,
-  description: brandConfig.description,
+  title: `${siteConfig.name} Research Papers`,
+  description: siteConfig.description,
   openGraph: {
-    title: `${brandConfig.name} Research Papers`,
-    description: brandConfig.description,
-    url: brandConfig.website,
-    siteName: `${brandConfig.name} Papers`,
+    title: `${siteConfig.name} Research Papers`,
+    description: siteConfig.description,
+    url: siteConfig.website,
+    siteName: `${siteConfig.name} Papers`,
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: `${brandConfig.name} Research Papers`,
-    description: brandConfig.description,
+    title: `${siteConfig.name} Research Papers`,
+    description: siteConfig.description,
   },
 }
 
@@ -30,9 +39,27 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
-      <body className={inter.className}>
-        {children}
+    <html
+      lang="en"
+      className={`${geist.variable} ${geistMono.variable}`}
+      suppressHydrationWarning
+    >
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var d=document.documentElement;var s=localStorage.getItem('hanzo-papers-theme');if(s==='dark'||(s!=='light'&&window.matchMedia('(prefers-color-scheme:dark)').matches)){d.classList.add('dark')}else{d.classList.remove('dark')}}catch(e){}})()`,
+          }}
+        />
+      </head>
+      <body className="min-h-svh bg-background font-sans antialiased">
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="dark"
+          storageKey="hanzo-papers-theme"
+          enableSystem
+        >
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   )

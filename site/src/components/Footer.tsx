@@ -1,29 +1,23 @@
-import type { BrandConfig } from '@/config/brands'
+import type { SiteConfig } from '@/config/papers'
 
 interface FooterProps {
-  config: BrandConfig
+  config: SiteConfig
 }
 
 export function Footer({ config }: FooterProps) {
   return (
-    <footer className="border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 mt-20">
-      <div className="container mx-auto px-4 py-8">
+    <footer className="border-t border-border/50 mt-20">
+      <div className="max-w-7xl mx-auto px-6 py-8">
         <div className="flex flex-col md:flex-row items-center justify-between gap-4">
-          <div className="text-center md:text-left">
-            <p className="text-gray-600 dark:text-gray-400">
-              © {new Date().getFullYear()} {config.fullName}
-            </p>
-            <p className="text-sm text-gray-500 dark:text-gray-500 mt-1">
-              Open source research papers
-            </p>
-          </div>
-
-          <div className="flex items-center gap-6">
+          <p className="text-sm text-muted-foreground">
+            &copy; {new Date().getFullYear()} {config.fullName}
+          </p>
+          <div className="flex items-center gap-5 text-sm">
             <a
               href={config.website}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+              className="text-muted-foreground hover:text-foreground transition-colors"
             >
               Website
             </a>
@@ -31,17 +25,9 @@ export function Footer({ config }: FooterProps) {
               href={config.github}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+              className="text-muted-foreground hover:text-foreground transition-colors"
             >
               GitHub
-            </a>
-            <a
-              href="https://github.com/hanzo-apps/papers"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
-            >
-              Template
             </a>
           </div>
         </div>

@@ -1,111 +1,85 @@
-import type { PaperConfig } from '@/config/brands'
+import { FileText, ExternalLink } from 'lucide-react'
+import type { PaperConfig } from '@/config/papers'
 
 interface PaperCardProps {
   paper: PaperConfig
-  brand: string
 }
 
-export function PaperCard({ paper, brand }: PaperCardProps) {
-  const brandColors: Record<string, string> = {
-    hanzo: 'from-orange-500 to-blue-600',
-    zoo: 'from-green-500 to-emerald-600',
-    zen: 'from-purple-500 to-pink-600',
-    lux: 'from-blue-500 to-cyan-600',
-  }
-
-  const gradientClass = brandColors[brand] || 'from-blue-500 to-purple-600'
-
+export function PaperCard({ paper }: PaperCardProps) {
   return (
-    <article className="bg-white dark:bg-gray-800 rounded-xl shadow-lg overflow-hidden hover:shadow-2xl transition-shadow duration-300">
-      {/* Header with gradient */}
-      <div className={`h-2 bg-gradient-to-r ${gradientClass}`} />
-
-      <div className="p-6">
-        {/* Date and Tags */}
+    <article className="group rounded-lg border border-border/60 bg-card hover:border-border transition-colors">
+      <div className="p-5">
         <div className="flex items-center justify-between mb-3">
-          <time className="text-sm text-gray-500 dark:text-gray-400">
+          <time className="text-xs text-muted-foreground font-mono">
             {new Date(paper.date).toLocaleDateString('en-US', {
               year: 'numeric',
-              month: 'long',
-              day: 'numeric',
+              month: 'short',
             })}
           </time>
+          <FileText className="h-4 w-4 text-muted-foreground/50" />
         </div>
 
-        {/* Title */}
-        <h2 className="text-2xl font-bold mb-2 text-gray-900 dark:text-white">
+        <h2 className="text-base font-semibold mb-1 text-foreground group-hover:text-foreground/90">
           {paper.title}
         </h2>
 
-        {/* Subtitle */}
-        <h3 className="text-lg text-gray-600 dark:text-gray-300 mb-4">
+        <h3 className="text-sm text-muted-foreground mb-3">
           {paper.subtitle}
         </h3>
 
-        {/* Authors */}
-        <div className="mb-4">
-          <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-            {paper.authors.join(', ')}
-          </p>
-        </div>
-
-        {/* Abstract */}
-        <p className="text-gray-600 dark:text-gray-400 mb-6 line-clamp-4">
+        <p className="text-sm text-muted-foreground/80 mb-4 line-clamp-3 leading-relaxed">
           {paper.abstract}
         </p>
 
-        {/* Tags */}
-        <div className="flex flex-wrap gap-2 mb-6">
-          {paper.tags.map((tag) => (
+        <div className="flex items-center gap-1.5 mb-4 text-xs text-muted-foreground">
+          {paper.authors.join(' · ')}
+        </div>
+
+        <div className="flex flex-wrap gap-1.5 mb-4">
+          {paper.tags.slice(0, 4).map((tag) => (
             <span
               key={tag}
-              className="px-3 py-1 text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-full"
+              className="px-2 py-0.5 text-[11px] font-mono bg-accent text-accent-foreground rounded"
             >
               {tag}
             </span>
           ))}
         </div>
 
-        {/* Actions */}
-        <div className="flex flex-wrap gap-3">
+        <div className="flex gap-2 pt-3 border-t border-border/40">
           <a
             href={paper.pdfUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className={`flex-1 px-4 py-2 bg-gradient-to-r ${gradientClass} text-white rounded-lg hover:opacity-90 transition-opacity text-center font-medium`}
+            className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-foreground text-background rounded-md hover:bg-foreground/90 transition-colors"
           >
-            Read PDF
+            <FileText className="h-3.5 w-3.5" />
+            PDF
           </a>
           <a
             href={paper.githubUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="px-4 py-2 bg-gray-800 dark:bg-gray-700 text-white rounded-lg hover:bg-gray-900 dark:hover:bg-gray-600 transition-colors"
+            className="px-3 py-1.5 text-sm font-medium border border-border rounded-md text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors"
           >
-            GitHub
+            Source
           </a>
         </div>
 
-        {/* Related Links */}
         {paper.relatedLinks && paper.relatedLinks.length > 0 && (
-          <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-            <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Related Links:
-            </p>
-            <ul className="space-y-1">
-              {paper.relatedLinks.map((link, index) => (
-                <li key={index}>
-                  <a
-                    href={link.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
-                  >
-                    {link.label} →
-                  </a>
-                </li>
-              ))}
-            </ul>
+          <div className="mt-3 pt-3 border-t border-border/30">
+            {paper.relatedLinks.map((link, i) => (
+              <a
+                key={i}
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <ExternalLink className="h-3 w-3" />
+                {link.label}
+              </a>
+            ))}
           </div>
         )}
       </div>

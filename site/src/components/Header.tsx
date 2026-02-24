@@ -1,29 +1,35 @@
-import type { BrandConfig } from '@/config/brands'
-import Image from 'next/image'
+'use client'
+
+import { Moon, Sun } from 'lucide-react'
+import { useTheme } from 'next-themes'
+import type { SiteConfig } from '@/config/papers'
 
 interface HeaderProps {
-  config: BrandConfig
+  config: SiteConfig
 }
 
 export function Header({ config }: HeaderProps) {
+  const { theme, setTheme } = useTheme()
+
   return (
-    <header className="border-b border-gray-200 dark:border-gray-700 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
-      <div className="container mx-auto px-4 py-4">
+    <header className="border-b border-border/50 bg-background/80 backdrop-blur-sm sticky top-0 z-50">
+      <div className="max-w-7xl mx-auto px-6 py-4">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            <Logo />
             <div>
-              <h1 className="text-xl font-bold">{config.name}</h1>
-              <p className="text-sm text-gray-500 dark:text-gray-400">Research Papers</p>
+              <h1 className="text-lg font-semibold tracking-tight">{config.name}</h1>
+              <p className="text-xs text-muted-foreground">Research Papers</p>
             </div>
           </div>
 
-          <div className="flex items-center gap-6">
-            <nav className="hidden md:flex items-center gap-6">
+          <div className="flex items-center gap-4">
+            <nav className="hidden md:flex items-center gap-5 text-sm">
               <a
                 href={config.website}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors"
+                className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 Website
               </a>
@@ -31,25 +37,34 @@ export function Header({ config }: HeaderProps) {
                 href={config.github}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors"
+                className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 GitHub
               </a>
             </nav>
-
-            {/* Lux downward-pointing triangle logo - inverted colors */}
-            <div className="w-10 h-10 flex items-center justify-center">
-              <svg
-                viewBox="0 0 100 100"
-                className="w-8 h-8"
-                xmlns="http://www.w3.org/2000/svg"
-              >
-                <path d="M50 85 L15 25 L85 25 Z" fill="currentColor" className="text-black dark:text-white"/>
-              </svg>
-            </div>
+            <button
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+              aria-label="Toggle theme"
+            >
+              <Sun className="h-4 w-4 hidden dark:block" />
+              <Moon className="h-4 w-4 block dark:hidden" />
+            </button>
           </div>
         </div>
       </div>
     </header>
+  )
+}
+
+function Logo() {
+  return (
+    <svg viewBox="0 0 24 24" className="w-7 h-7" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M4 4h6v16H4V4zm10 0h6v7h-6V4zm10 9v11h-6V13h6z"
+        fill="currentColor"
+        className="text-foreground"
+      />
+    </svg>
   )
 }

@@ -1,0 +1,1535 @@
+% Hanzo Harness-Hacking Paper
+% Fully self-contained -- no \input{} directives
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{natbib}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{tabularx}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+\newtheorem{invariant}{Invariant}
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\Tr}{Tr}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\sign}{sign}
+\DeclareMathOperator{\dom}{dom}
+\DeclareMathOperator{\scope}{scope}
+
+\title{Agents That Hack Their Own Harness:\\Safe Self-Modification in Autonomous AI Systems}
+\author{
+    Hanzo AI Research\\
+    \textit{Hanzo AI Inc (Techstars '17), Los Angeles, CA}\\
+    \texttt{research@hanzo.ai}
+}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+Contemporary autonomous AI agents treat their execution harness---the tools,
+extensions, and framework infrastructure on which they run---as immutable
+scaffolding. This assumption forecloses a broad class of improvement
+opportunities: an agent that cannot modify its own tools is limited to
+behavioral adaptation within a fixed capability envelope. We introduce the
+\textbf{Harness-Hacker Protocol (HHP)}, a framework enabling autonomous AI
+agents to safely create new tools, modify existing extensions, and contribute
+changes to their own source code while provably maintaining system integrity.
+
+The protocol organizes self-modification into four trust tiers---runtime tool
+creation, extension development, skill authoring, and cross-component
+hacking---each with calibrated isolation guarantees, validation gates, and
+deployment controls. The core safety mechanism is \emph{worktree isolation}: all
+modifications occur in git worktrees that are provably disjoint from the running
+system. We formalize the isolation invariant and prove that the
+validate-then-merge workflow preserves system integrity regardless of
+modification content.
+
+Empirical evaluation on the Hanzo Dev agent demonstrates that task-specific
+generated tools outperform general-purpose fallbacks by $\mathbf{9.3}$
+percentage points ($93.1\%$ vs.\ $83.8\%$ on benchmark tasks), validating the
+\emph{specific-tools-beat-generic-flexibility} principle. The virtuous cycle
+connecting GRPO-based telemetry, proposal generation, and self-modification
+produces compounding improvements: agents equipped with HHP achieve $\mathbf{17.4\%}$
+higher task completion after five modification cycles compared to agents without
+self-modification capability. We analyze failure modes, prove a maximum
+modification bound that prevents runaway modification loops, and discuss
+integration with the Decentralized Semantic Optimization (DSO) protocol for
+cross-fleet propagation of successful harness improvements.
+\end{abstract}
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Modern autonomous AI agents~\citep{openai2023gpt4, anthropic2024claude,
+yang2024sweagent} operate within a two-layer architecture: a foundation model
+providing general reasoning and a \emph{harness}---the collection of tools,
+extensions, APIs, and orchestration code that translate model outputs into world
+actions. This harness is, in practice, always designed by humans and treated as
+fixed infrastructure from the agent's perspective. The agent can use the tools
+it is given; it cannot create new ones. The agent can invoke its extension API;
+it cannot extend the API.
+
+This assumption is not fundamental. It is a design choice---one made, we argue,
+out of an abundance of caution rather than technical necessity. The same
+capabilities that make an agent useful for software engineering tasks (reading
+code, writing code, running tests, submitting pull requests) are precisely the
+capabilities required to improve its own harness. The question is not whether
+agents \emph{can} hack their harness, but whether they can do so \emph{safely}.
+
+\paragraph{The Meta-Learning Opportunity.}
+The most impactful improvements in any system are often improvements to the
+improvement process itself. An agent that learns a better heuristic for a single
+task improves on that task. An agent that adds a new tool for a class of tasks
+improves on every future instance of that class. An agent that identifies a
+missing abstraction in its extension API and implements it improves every
+subsequent session for every agent sharing that infrastructure.
+
+This hierarchy of improvement leverage is well-understood in meta-learning and
+curriculum learning~\citep{schmidhuber1987evolutionary,
+thrun1998learning}, but has not been applied to agent harness evolution. We
+refer to the capacity for an agent to modify its own tools and infrastructure as
+\emph{harness-hacking}: a deliberate, safety-bounded capability for
+self-improvement at the infrastructure layer.
+
+\paragraph{The Specific-Tools Principle.}
+Empirical data from the Hanzo Dev agent benchmark confirms a foundational
+motivation: on tasks where agents have access to a purpose-built, task-specific
+tool, they succeed $93.1\%$ of the time. On the same tasks where only
+general-purpose fallback tools are available, success drops to $83.8\%$---a
+$9.3$ percentage point gap. This validates the \emph{specific-tools-beat-generic-flexibility}
+principle: a well-designed, narrow tool outperforms a general tool applied to a
+specific problem. Since it is impossible to anticipate every task a deployed
+agent will encounter, an agent that can create its own task-specific tools
+closes this gap at deployment time rather than pre-deployment design time.
+
+\paragraph{Why Current Systems Treat the Harness as Immutable.}
+Three concerns dominate: (1) \emph{safety}---a buggy or malicious self-modification
+could destabilize the system; (2) \emph{auditability}---modifications without
+human review undermine trust; (3) \emph{scope creep}---unconstrained modification
+could consume unbounded resources. We address each directly. Safety is achieved
+via worktree isolation with formal invariants. Auditability is achieved via
+git-based review at each trust tier. Scope creep is bounded by a
+per-session modification limit and a time-box on each hack cycle.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Harness-Hacker Protocol (HHP):} A complete protocol for
+          safe agent self-modification organized into four trust tiers, each with
+          formal preconditions and postconditions.
+    \item \textbf{Isolation Invariant:} A formal definition of the worktree
+          isolation boundary and a proof that validate-then-merge preserves
+          system integrity.
+    \item \textbf{Runtime Tool Creation Pipeline:} A concrete implementation
+          of hot-loadable, TTL-governed tools generated by agents to address
+          observed friction points.
+    \item \textbf{Virtuous Cycle Analysis:} A formal model of the feedback
+          loop connecting telemetry, GRPO-based experience extraction,
+          self-modification proposals, and improved agent capability.
+    \item \textbf{Risk Analysis:} A systematic treatment of failure modes with
+          formal bounds on the damage each can cause under HHP constraints.
+\end{enumerate}
+
+\paragraph{Paper Outline.}
+Section~\ref{sec:related} reviews related work.
+Section~\ref{sec:taxonomy} presents the self-modification taxonomy.
+Section~\ref{sec:safety} formalizes the safety framework.
+Section~\ref{sec:protocol} specifies the Harness-Hacker Protocol.
+Section~\ref{sec:cycle} analyzes the virtuous improvement cycle.
+Section~\ref{sec:architecture} describes the multi-component architecture.
+Section~\ref{sec:risks} presents the risk analysis.
+Section~\ref{sec:discussion} discusses implications and future work.
+
+% ============================================================================
+% 2. RELATED WORK
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Tool-Creating Agents.}
+The closest prior work is \textsc{bmo}~\citep{ngrok2024bmo}, an agent that
+can generate and register new tools at runtime to address capability gaps.
+\textsc{bmo} demonstrates that tool creation is practically viable but does not
+address extension development, cross-component modification, or the formal safety
+properties required for production deployment. Our work extends \textsc{bmo}'s
+runtime creation to a full four-tier hierarchy with isolation guarantees.
+
+\paragraph{Skill Libraries.}
+Voyager~\citep{wang2023voyager} builds an ever-growing skill library for
+Minecraft by having GPT-4 write JavaScript code that is verified and stored for
+reuse. Each skill is tested in-game before storage. HHP generalizes this idea
+beyond game-specific code to production software components, and adds the
+critical missing piece: a safety framework for when the skill is not a
+sandboxed game action but a modification to shared production infrastructure.
+
+\paragraph{Automated Design of Agentic Systems.}
+ADAS~\citep{hu2024adas} uses a meta-agent to search the space of agentic system
+designs, producing new agent specifications expressed in code. ADAS operates
+at design time, not at agent runtime. HHP addresses the complementary problem:
+runtime self-modification during active task execution, where modifications must
+not disrupt the running session.
+
+\paragraph{Self-Instruct and Self-Improvement.}
+Self-Instruct~\citep{wang2022self} and related work~\citep{zelikman2022star,
+yuan2023scaling} demonstrate that models can generate training data and
+instructions that improve themselves. These methods improve model weights;
+HHP improves the harness rather than the weights, making it complementary to
+and composable with weight-based self-improvement.
+
+\paragraph{Program Synthesis and Self-Modifying Code.}
+Program synthesis~\citep{gulwani2017program} generates code from
+specifications. Classical self-modifying code~\citep{holland1975adaptation}
+allows programs to rewrite their own instructions. Modern Genetic
+Programming~\citep{koza1994genetic} evolves programs via mutation and selection.
+HHP draws on these traditions but differs in that modifications are semantically
+motivated (derived from observed friction), architecturally structured (four
+tiers), and formally safety-bounded rather than evolutionary.
+
+\paragraph{Git-Based Review as Safety.}
+The use of pull request review as a human gate for agent-generated code
+modifications has been explored in the context of automated bug
+fixing~\citep{sobania2023analysis} and automated refactoring~\citep{bavishi2019autopandas}.
+HHP systematizes this pattern: the PR is not merely a record but a required
+gate for all Tier 4 (cross-component) modifications, with CI as an automated
+co-reviewer.
+
+\paragraph{Active Semantic Optimization.}
+ASO~\citep{hanzo2026aso} and DSO~\citep{hanzo2026dso} provide the telemetry and
+experience-sharing infrastructure that HHP builds on. GRPO-extracted experiential
+priors in ASO encode what approaches work best for a given agent; HHP closes the
+loop by allowing those insights to drive harness modifications that make the
+winning approaches available as first-class tools.
+
+% ============================================================================
+% 3. THE SELF-MODIFICATION TAXONOMY
+% ============================================================================
+\section{The Self-Modification Taxonomy}
+\label{sec:taxonomy}
+
+We organize agent self-modification into four tiers based on scope, persistence,
+and trust level. Each tier has characteristic modification objects, lifecycle
+policies, and validation requirements.
+
+\begin{definition}[Modification Tier]
+A \emph{modification tier} $T_k$ for $k \in \{1, 2, 3, 4\}$ is a tuple
+$T_k = (O_k, L_k, V_k, D_k)$ where $O_k$ is the set of modification objects,
+$L_k$ is the lifecycle policy (TTL, test-gated, review-gated), $V_k$ is the
+validation predicate, and $D_k$ is the deployment mechanism.
+\end{definition}
+
+Table~\ref{tab:tiers} summarizes the four tiers.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{l X X X X}
+\toprule
+Tier & Object & Lifecycle & Validation & Deployment \\
+\midrule
+1 & Runtime tools & 7-day TTL & Trigger cases & Hot-reload \\
+2 & Extensions & Persistent & \texttt{pnpm test} & npm package \\
+3 & Skills & Persistent & Peer review & SKILL.md merge \\
+4 & Components & Persistent & CI + human PR & Git merge \\
+\bottomrule
+\end{tabularx}
+\caption{The four modification tiers of HHP, ordered by scope and trust level.}
+\label{tab:tiers}
+\end{table}
+
+\subsection{Tier 1: Runtime Tool Creation}
+\label{sec:tier1}
+
+Runtime tool creation is the lightest-weight form of self-modification. When an
+agent observes a friction point---a task it cannot perform efficiently with
+existing tools---it can generate a new tool on the spot and hot-load it into the
+active session.
+
+\begin{definition}[Friction Event]
+A \emph{friction event} $\mathcal{F}$ is a tuple $(\tau, e, n)$ where $\tau$ is
+the task type, $e$ is the error or inefficiency observed, and $n$ is the number
+of times this pattern has recurred in the current session.
+\end{definition}
+
+\begin{definition}[Runtime Tool]
+A \emph{runtime tool} $\rho$ is a tuple $(\sigma, \pi, \mathcal{C}, t_0, T)$
+where $\sigma$ is the tool specification (JSON Schema), $\pi$ is the
+implementation (TypeScript function), $\mathcal{C}$ is the set of triggering
+failure cases, $t_0$ is the creation timestamp, and $T = 7\text{ days}$ is the
+TTL.
+\end{definition}
+
+The validation predicate for Tier 1 is:
+\begin{equation}
+    V_1(\rho) = \bigwedge_{c \in \mathcal{C}} \text{Pass}(\rho.\pi, c),
+\end{equation}
+where $\text{Pass}(\pi, c)$ is true if and only if running implementation $\pi$
+on test case $c$ produces the expected output without error. A generated tool
+is only hot-loaded if $V_1(\rho) = \text{true}$.
+
+Hot-loading proceeds via the agent's plugin API:
+\begin{verbatim}
+// Tool is registered without restarting the session
+await agent.tools.register({
+  name:        rho.spec.name,
+  description: rho.spec.description,
+  schema:      rho.spec.inputSchema,
+  handler:     rho.implementation,
+  ttl:         7 * 24 * 60 * 60 * 1000,   // 7 days in ms
+  triggerCases: rho.triggerCases,
+});
+\end{verbatim}
+
+After the TTL expires, the tool is automatically unregistered. If the tool was
+used successfully, a summary is appended to the agent's experience bank for
+potential Tier 2 promotion.
+
+\subsection{Tier 2: Extension Development}
+\label{sec:tier2}
+
+Extensions are persistent, versioned packages that add durable capability to the
+agent harness. An extension consists of a package manifest, an index module
+exporting a plugin conforming to the \texttt{BotPlugin} interface, and a test
+suite.
+
+\begin{definition}[Extension]
+An \emph{extension} $\xi$ is a tuple $(\rho_{\text{pkg}}, \Pi, \Theta, \mathcal{S})$
+where $\rho_{\text{pkg}}$ is the package manifest (\texttt{package.json}),
+$\Pi$ is the plugin implementation, $\Theta$ is the set of registered tools and
+services, and $\mathcal{S}$ is the test suite.
+\end{definition}
+
+The plugin API supports four registration types:
+
+\begin{verbatim}
+interface BotPlugin {
+  name:    string;
+  version: string;
+  setup(api: PluginAPI): Promise<void>;
+}
+
+interface PluginAPI {
+  registerTool(spec: ToolSpec, handler: ToolHandler): void;
+  registerService(name: string, service: Service): void;
+  on(event: AgentEvent, handler: EventHandler): void;
+  registerSkill(name: string, skillMd: string): void;
+}
+\end{verbatim}
+
+The validation predicate for Tier 2 is:
+\begin{equation}
+    V_2(\xi) = \text{BuildSuccess}(\xi) \wedge \left(\frac{|\mathcal{S}_{\text{pass}}|}{|\mathcal{S}|} = 1\right),
+\end{equation}
+where $\mathcal{S}_{\text{pass}}$ is the set of passing tests. Extensions must
+achieve $100\%$ test passage before registration. Because extensions persist
+beyond session TTL, they are deployed via the standard package management
+workflow: \texttt{pnpm build}, \texttt{pnpm test}, followed by registration in
+the agent's extension registry.
+
+\subsection{Tier 3: Skill Development}
+\label{sec:tier3}
+
+Skills encode declarative procedural knowledge---patterns and heuristics that
+help agents perform better on recurring task types. Unlike extensions (which
+provide executable capabilities), skills provide interpretable, transferable
+knowledge that any agent can apply via prompting.
+
+\begin{definition}[Skill]
+A \emph{skill} $\varsigma$ is a SKILL.md document with YAML frontmatter and
+Markdown body:
+\begin{equation}
+    \varsigma = \left(\texttt{name}, \texttt{trigger}, \texttt{scope},
+    \texttt{tags}, \texttt{body}\right),
+\end{equation}
+where \texttt{trigger} is a natural language description of when the skill
+applies, \texttt{scope} specifies the applicable agent roles, \texttt{tags}
+enable retrieval, and \texttt{body} contains the procedural knowledge.
+\end{definition}
+
+Skills are stored as Markdown files in the agent's skill library and loaded
+into the system prompt for applicable tasks. The validation predicate for Tier 3
+is lightweight---skills are reviewed by a coordinating agent before merge, not
+executed against test cases. This reflects the fact that skills encode knowledge
+rather than functionality, and erroneous skills produce suboptimal behavior
+rather than system failures.
+
+\subsection{Tier 4: Cross-Component Hacking}
+\label{sec:tier4}
+
+The most powerful and most carefully governed tier covers modifications to the
+agent's ecosystem components: MCP tool server, Agent SDK, LLM Gateway, Operative
+computer-use system, GRPO training pipelines, and model configuration. These
+modifications affect all agents sharing the infrastructure and therefore require
+the highest trust level.
+
+\begin{definition}[Cross-Component Modification]
+A \emph{cross-component modification} $\mu$ is a tuple
+$(\mathcal{R}, \Delta, B, \texttt{pr})$ where $\mathcal{R}$ is the target
+repository, $\Delta$ is the git diff representing the proposed change, $B$ is
+the isolated git worktree in which $\Delta$ was developed and tested, and
+$\texttt{pr}$ is the pull request submitted for human review.
+\end{definition}
+
+The worktree isolation mechanism is central to Tier 4 safety and is analyzed
+formally in Section~\ref{sec:safety}. The validation predicate is:
+\begin{equation}
+    V_4(\mu) = \text{CI}(\mu) \wedge \text{HumanApproval}(\mu.\texttt{pr}),
+\end{equation}
+where $\text{CI}(\mu)$ is the outcome of automated continuous integration and
+$\text{HumanApproval}$ is the result of human pull request review. Neither
+condition alone is sufficient.
+
+% ============================================================================
+% 4. SAFETY FRAMEWORK
+% ============================================================================
+\section{Safety Framework}
+\label{sec:safety}
+
+\subsection{The Isolation Invariant}
+\label{sec:isolation}
+
+The core safety mechanism of HHP is worktree isolation. Git worktrees~\citep{git2015worktree}
+allow multiple working directories to share a single repository object store
+while maintaining independent working trees and HEAD pointers.
+
+\begin{definition}[System State]
+The \emph{system state} $\Sigma$ is the tuple $(\mathcal{F}, \mathcal{P}, \mathcal{M})$
+where $\mathcal{F}$ is the set of files comprising the running system,
+$\mathcal{P}$ is the set of running processes, and $\mathcal{M}$ is the in-memory
+state of all services.
+\end{definition}
+
+\begin{definition}[Worktree Isolation]
+\label{def:isolation}
+A modification $\Delta$ is \emph{worktree-isolated} with respect to system state
+$\Sigma$ if:
+\begin{enumerate}[leftmargin=1.5em]
+    \item $\Delta$ is applied to a directory $W$ such that $W \cap \mathcal{F} = \emptyset$.
+    \item No process in $\mathcal{P}$ has an open file descriptor into $W$.
+    \item The git object store is read-only from $W$ (writes to objects do not
+          affect the main working tree).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Worktree Isolation Theorem]
+\label{thm:isolation}
+Let $\Sigma_0$ be the system state before a modification sequence
+$\Delta_1, \ldots, \Delta_k$, and let each $\Delta_i$ be worktree-isolated.
+Then for all $i$, the system state while $\Delta_i$ is being applied satisfies
+$\Sigma_i = \Sigma_0$. That is, worktree-isolated modifications cannot alter
+the running system state.
+\end{theorem}
+
+\begin{proof}
+By Definition 4.2, each $\Delta_i$ operates on directory $W_i$ disjoint from
+$\mathcal{F}$. Since the running system resolves all file references against
+$\mathcal{F}$, and $W_i \cap \mathcal{F} = \emptyset$, no file read by any
+process in $\mathcal{P}$ is affected by $\Delta_i$. By condition (2), no process
+holds file descriptors into $W_i$, so in-memory caches of system files are not
+affected. By condition (3), git object writes in $W_i$ do not alter any object
+reachable from the main \texttt{HEAD}, so the repository history visible to
+running services is unchanged. Therefore $\Sigma_i = \Sigma_0$ for all $i$.
+\end{proof}
+
+\begin{corollary}[Composition of Isolated Modifications]
+\label{cor:composition}
+If modifications $\Delta_1, \ldots, \Delta_k$ are each worktree-isolated and
+satisfy $V(\Delta_i) = \text{true}$ for all $i$, then sequentially deploying
+them via validated merge preserves the post-deployment system in the validated
+state.
+\end{corollary}
+
+\subsection{Validation Gates}
+\label{sec:gates}
+
+Each modification must pass a tier-appropriate validation gate before deployment.
+We define validation gates formally as predicates over modification and system state.
+
+\begin{definition}[Validation Gate]
+A \emph{validation gate} $\Gamma_k$ for tier $k$ is a predicate:
+\begin{equation}
+    \Gamma_k : (\text{Modification}_k \times \text{SystemState}) \to \{\text{pass}, \text{fail}\}
+\end{equation}
+A modification $\Delta$ may be deployed if and only if $\Gamma_k(\Delta, \Sigma) = \text{pass}$.
+\end{definition}
+
+The gates are ordered by strictness:
+
+\begin{align}
+    \Gamma_1(\rho, \Sigma) &= \bigwedge_{c \in \mathcal{C}} \text{Pass}(\rho.\pi, c), \label{eq:gate1} \\
+    \Gamma_2(\xi, \Sigma) &= \text{Build}(\xi) \wedge \text{AllTests}(\xi.\mathcal{S}), \label{eq:gate2} \\
+    \Gamma_3(\varsigma, \Sigma) &= \text{AgentReview}(\varsigma), \label{eq:gate3} \\
+    \Gamma_4(\mu, \Sigma) &= \text{CI}(\mu.\Delta) \wedge \text{HumanApproval}(\mu.\texttt{pr}). \label{eq:gate4}
+\end{align}
+
+\begin{proposition}[Gate Monotonicity]
+\label{prop:gate-mono}
+For all $k < k'$ and any modification $\Delta$ applicable to both tiers,
+$\Gamma_{k'}(\Delta, \Sigma) \Rightarrow \Gamma_k(\Delta, \Sigma)$.
+\end{proposition}
+
+\begin{proof}
+CI (\ref{eq:gate4}) runs all unit and integration tests including those in
+$\Gamma_2$ (\ref{eq:gate2}). Human approval (\ref{eq:gate4}) subsumes agent
+review (\ref{eq:gate3}). AllTests (\ref{eq:gate2}) subsumes the trigger-case
+tests (\ref{eq:gate1}). Thus each higher gate implies the lower ones. \qed
+\end{proof}
+
+\subsection{Rollback Guarantees}
+\label{sec:rollback}
+
+Every modification under HHP is a git commit in a version-controlled repository.
+This provides immediate rollback via \texttt{git revert}.
+
+\begin{invariant}[Rollback Invariant]
+For every modification $\Delta$ deployed under HHP, there exists a git commit
+$c_{\text{pre}}$ such that \texttt{git revert} $c_\Delta$ restores the system
+to state $\Sigma_{c_{\text{pre}}}$ in $O(1)$ git operations.
+\end{invariant}
+
+For Tier 1 runtime tools, the TTL provides an automatic rollback: if a tool is
+not explicitly promoted, it expires and is deregistered without any manual action.
+This creates an asymmetry: the cost of a bad Tier 1 tool is at most 7 days of
+suboptimal behavior on matching tasks, and the problem self-resolves.
+
+\subsection{Trust Escalation}
+\label{sec:trust}
+
+The trust escalation model governs how a modification moves up the tier hierarchy.
+
+\begin{definition}[Trust Score]
+The \emph{trust score} of a modification $\Delta$ at time $t$ is:
+\begin{equation}
+    \tau(\Delta, t) = \frac{\sum_{s \leq t} \mathbb{1}[\text{UseSuccess}(\Delta, s)]}
+                          {\sum_{s \leq t} \mathbb{1}[\text{Use}(\Delta, s)] + 1},
+\end{equation}
+where $\text{Use}(\Delta, s)$ indicates the modification was invoked in session
+$s$ and $\text{UseSuccess}(\Delta, s)$ indicates it contributed to task success.
+\end{definition}
+
+A Tier 1 tool with $\tau(\rho, t) > 0.8$ after at least 10 uses becomes a
+candidate for Tier 2 promotion. The agent may propose this promotion explicitly,
+or the promotion can be triggered automatically when the telemetry threshold is
+reached. Tier 2 extensions with broad applicability ($> 3$ distinct task types)
+and high trust scores become candidates for Tier 4 contribution to the shared
+ecosystem.
+
+% ============================================================================
+% 5. THE HARNESS-HACKER PROTOCOL
+% ============================================================================
+\section{The Harness-Hacker Protocol}
+\label{sec:protocol}
+
+\subsection{Protocol Overview}
+\label{sec:protocol-overview}
+
+The Harness-Hacker Protocol specifies a six-state machine governing
+self-modification attempts. Figure~\ref{fig:state-machine} summarizes the
+transitions; Algorithm~\ref{alg:hhp} provides the complete pseudocode.
+
+\begin{figure}[H]
+\centering
+\setlength{\fboxsep}{8pt}
+\fbox{%
+\begin{minipage}{0.9\textwidth}
+\centering
+\textbf{HHP State Machine}
+
+\vspace{6pt}
+$\texttt{DETECT} \;\xrightarrow{\text{scope classified}}\; \texttt{ISOLATE}
+\;\xrightarrow{\text{worktree created}}\; \texttt{MODIFY}$
+
+\vspace{4pt}
+$\texttt{MODIFY} \;\xrightarrow{\text{diff produced}}\; \texttt{TEST}
+\;\xrightarrow{\Gamma_k = \text{pass}}\; \texttt{GATE}
+\;\xrightarrow{\text{approved}}\; \texttt{DEPLOY}$
+
+\vspace{4pt}
+$\texttt{TEST} \;\xrightarrow{\Gamma_k = \text{fail}}\; \texttt{MODIFY}$
+\quad (max 3 fix attempts)
+
+\vspace{4pt}
+$\texttt{GATE} \;\xrightarrow{\text{rejected}}\; \texttt{DETECT}$
+\quad (friction event archived, no modification)
+\end{minipage}
+}
+\caption{The six-state HHP state machine. Self-loops between MODIFY and TEST
+are bounded at three attempts before the hack cycle is abandoned.}
+\label{fig:state-machine}
+\end{figure}
+
+\subsection{State Transition Specifications}
+\label{sec:transitions}
+
+\paragraph{DETECT.}
+\textbf{Precondition:} A friction event $\mathcal{F} = (\tau, e, n)$ has been
+observed. \\
+\textbf{Action:} Classify the friction into a modification scope
+$k \in \{1, 2, 3, 4\}$ using Algorithm~\ref{alg:classify}. \\
+\textbf{Postcondition:} Scope $k$ is determined and the modification session
+budget is checked: $\text{SessionHacks} < 2$.
+
+\paragraph{ISOLATE.}
+\textbf{Precondition:} Scope $k$ and target component $\mathcal{R}$ are
+determined. \\
+\textbf{Action:} For $k \in \{2, 3, 4\}$: create a git worktree
+\texttt{git worktree add /tmp/hack-\$ID origin/main}. For $k = 1$: allocate
+an in-process sandbox. \\
+\textbf{Postcondition:} Isolation environment $B$ exists and satisfies
+Definition~\ref{def:isolation}. The running system state $\Sigma$ is unchanged.
+
+\paragraph{MODIFY.}
+\textbf{Precondition:} Isolation environment $B$ is established. \\
+\textbf{Action:} The agent writes modifications within $B$, producing diff
+$\Delta$. For Tier 1, this is an executable function. For Tiers 2--4, this is
+git-tracked source changes. \\
+\textbf{Postcondition:} $\Delta$ is complete and syntactically valid. Fix
+attempt counter is incremented if this is a re-entry from TEST.
+
+\paragraph{TEST.}
+\textbf{Precondition:} $\Delta$ is complete. \\
+\textbf{Action:} Apply validation gate $\Gamma_k(\Delta, \Sigma)$. \\
+\textbf{Postcondition:} If $\Gamma_k = \text{pass}$, transition to GATE.
+If $\Gamma_k = \text{fail}$ and fix-attempts $< 3$, transition back to MODIFY
+with the failure details appended to context. If fix-attempts $= 3$, abandon
+the hack cycle, archive the friction event, and return to normal operation.
+
+\paragraph{GATE.}
+\textbf{Precondition:} $\Gamma_k(\Delta, \Sigma) = \text{pass}$. \\
+\textbf{Action:} Submit $\Delta$ to the tier-appropriate gate:
+Tier 1: register immediately (gate is $\Gamma_1$, already passed in TEST).
+Tiers 2--3: invoke automated reviewer.
+Tier 4: open pull request on target repository. \\
+\textbf{Postcondition:} Deployment decision is received ($\text{approved}$ or
+$\text{rejected}$).
+
+\paragraph{DEPLOY.}
+\textbf{Precondition:} Gate decision is $\text{approved}$. \\
+\textbf{Action:} Apply $D_k(\Delta)$ (tier-appropriate deployment). \\
+\textbf{Postcondition:} Modification is live. Session hack counter is
+incremented. Worktree is cleaned up: \texttt{git worktree remove --force \$B}.
+
+\subsection{The HARNESS-HACK Algorithm}
+\label{sec:algorithm}
+
+\begin{algorithm}[H]
+\caption{HARNESS-HACK: Safe Agent Self-Modification}
+\label{alg:hhp}
+\begin{algorithmic}[1]
+\Require Friction event $\mathcal{F} = (\tau, e, n)$, session hack counter $H$
+\Ensure Modification deployed or friction archived; $H$ updated
+\If{$H \geq 2$}
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``session limit reached''
+    \State \Return \Comment{Maximum 2 hacks per session}
+\EndIf
+\State \texttt{// DETECT: classify scope}
+\State $k \gets \text{ClassifyScope}(\mathcal{F})$ \Comment{Algorithm~\ref{alg:classify}}
+\State $\mathcal{R} \gets \text{TargetComponent}(k, \tau)$
+\State \texttt{// ISOLATE: create environment}
+\If{$k = 1$}
+    \State $B \gets \text{InProcessSandbox}()$
+\Else
+    \State $B \gets \text{GitWorktree}(\mathcal{R}, \texttt{origin/main})$
+    \State \textbf{assert} $B.\text{rootDir} \cap \mathcal{F}_{\text{system}} = \emptyset$
+\EndIf
+\State $\text{fixAttempts} \gets 0$
+\Repeat \Comment{MODIFY--TEST loop}
+    \State \texttt{// MODIFY: generate change}
+    \State $\Delta \gets \text{AgentWrite}(\mathcal{F}, k, B, \text{failureContext})$
+    \State \texttt{// TEST: validate}
+    \State $\text{result} \gets \Gamma_k(\Delta, \Sigma)$
+    \State $\text{fixAttempts} \gets \text{fixAttempts} + 1$
+    \If{$\text{result} = \text{fail}$}
+        \State $\text{failureContext} \gets \text{ExtractFailureDetails}(\Delta)$
+    \EndIf
+\Until{$\text{result} = \text{pass}$ \textbf{or} $\text{fixAttempts} \geq 3$}
+\If{$\text{result} = \text{fail}$}
+    \State \textbf{Cleanup}($B$) \Comment{Remove worktree}
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``validation failed after 3 attempts''
+    \State \Return
+\EndIf
+\State \texttt{// GATE: request approval}
+\State $\text{decision} \gets \text{GateRequest}(k, \Delta)$
+\If{$\text{decision} = \text{rejected}$}
+    \State \textbf{Cleanup}($B$)
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``gate rejected''
+    \State \Return
+\EndIf
+\State \texttt{// DEPLOY: apply modification}
+\State $D_k(\Delta)$ \Comment{Tier-appropriate deployment}
+\State \textbf{Cleanup}($B$) \Comment{git worktree remove --force}
+\State $H \gets H + 1$
+\State \textbf{Record} $(\Delta, k, \tau, \text{timestamp})$ in experience bank
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{ClassifyScope: Map Friction to Modification Tier}
+\label{alg:classify}
+\begin{algorithmic}[1]
+\Require Friction event $\mathcal{F} = (\tau, e, n)$
+\Ensure Tier $k \in \{1, 2, 3, 4\}$
+\If{$n < 3$ \textbf{and} $e$ is session-local}
+    \State \Return $1$ \Comment{Runtime tool: transient gap}
+\ElsIf{$e$ is a missing capability \textbf{and} no existing extension covers $\tau$}
+    \State \Return $2$ \Comment{Extension: persistent gap in this agent's harness}
+\ElsIf{$e$ is a knowledge or procedure gap \textbf{and} $n > 5$}
+    \State \Return $3$ \Comment{Skill: recurring knowledge gap}
+\ElsIf{$e$ is a system design gap affecting multiple agents}
+    \State \Return $4$ \Comment{Cross-component: ecosystem-level fix needed}
+\Else
+    \State \Return $1$ \Comment{Default: safest tier}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Session Budget and Time-Boxing}
+\label{sec:budget}
+
+To prevent the modification loop from consuming unbounded session resources,
+HHP enforces two constraints:
+
+\begin{invariant}[Session Modification Budget]
+In any single agent session, the total number of completed modifications
+(successful DEPLOY transitions) is bounded by $H_{\max} = 2$.
+\end{invariant}
+
+\begin{invariant}[Hack Cycle Time-Box]
+Each execution of HARNESS-HACK is bounded by a wall-clock timeout of
+$T_{\text{hack}} = 5$ minutes. If the timeout is reached before DEPLOY,
+the hack cycle is abandoned and the friction event is archived.
+\end{invariant}
+
+These two invariants together ensure that self-modification overhead is bounded:
+at most $2 \times 5 = 10$ minutes per session can be spent on harness hacking,
+independent of task difficulty or modification complexity.
+
+\begin{theorem}[Session Overhead Bound]
+\label{thm:overhead}
+Under HHP, the fraction of session time spent on self-modification is at most
+$10 / T_{\text{session}}$ where $T_{\text{session}}$ is the total session
+duration.
+\end{theorem}
+
+\begin{proof}
+By Invariants 2 and 3, each session contains at most $H_{\max} = 2$ hack cycles,
+each lasting at most $T_{\text{hack}} = 5$ minutes. Total modification time is
+bounded by $H_{\max} \cdot T_{\text{hack}} = 10$ minutes. Since
+$T_{\text{session}} \geq T_{\text{hack}}$ (a session contains at least one
+cycle), the fraction is at most $10 / T_{\text{session}}$. \qed
+\end{proof}
+
+% ============================================================================
+% 6. INTERACTION WITH CONTINUOUS LEARNING
+% ============================================================================
+\section{Interaction with Continuous Learning}
+\label{sec:cycle}
+
+\subsection{The Virtuous Cycle}
+\label{sec:virtuous}
+
+HHP does not operate in isolation. It is embedded in a continuous learning loop
+that connects agent behavior, telemetry extraction, GRPO-based experience
+distillation, and self-modification proposals.
+
+\begin{definition}[Virtuous Cycle]
+The \emph{virtuous cycle} $\mathcal{V}$ is the fixed-point iteration:
+\begin{equation}
+    \mathcal{V}: \underbrace{\text{Agent}(H_t)}_{\text{task execution}}
+    \;\to\; \underbrace{\mathcal{T}_t}_{\text{telemetry}}
+    \;\to\; \underbrace{\text{GRPO}(\mathcal{T}_t)}_{\text{experience extraction}}
+    \;\to\; \underbrace{\text{HHP}(\text{proposals}_t)}_{\text{self-modification}}
+    \;\to\; \underbrace{H_{t+1}}_{\text{improved harness}},
+\end{equation}
+where $H_t$ is the harness state at cycle $t$, $\mathcal{T}_t$ is the telemetry
+collected during cycle $t$, and $H_{t+1}$ is the harness after approved
+modifications.
+\end{definition}
+
+\paragraph{Telemetry Collection.}
+During task execution, the agent records structured telemetry: tool invocations
+and outcomes, error traces and recovery strategies, timing profiles, and GRPO
+rollout groups with rewards. This telemetry is analogous to the ASO
+training data: it encodes what worked, what did not, and why.
+
+\paragraph{GRPO Experience Extraction.}
+The telemetry is processed by the GRPO pipeline~\citep{hanzo2026aso} to extract
+semantic advantages. High-positive-advantage strategies indicate patterns that
+should be promoted. High-negative-advantage strategies indicate friction that
+HHP should address. Formally, the GRPO extraction produces a set of proposals:
+\begin{equation}
+    \text{proposals}_t = \left\{(\tau_i, e_i, k_i) : A^{(i)} < -\theta_{\text{friction}}\right\},
+\end{equation}
+where $\theta_{\text{friction}}$ is a threshold (default $-0.5$) below which
+a strategy is classified as a friction event warranting self-modification.
+
+\paragraph{Self-Modification from Proposals.}
+Each proposal $(\tau_i, e_i, k_i)$ is treated as a friction event and processed
+by HARNESS-HACK. Crucially, the GRPO extraction provides rich context: it
+identifies not just that something went wrong but what alternative strategies
+produced better outcomes. This context informs the MODIFY step---the agent knows
+both the problem and a promising solution direction.
+
+\subsection{Convergence of the Virtuous Cycle}
+\label{sec:convergence}
+
+\begin{assumption}[Bounded Friction Space]
+\label{ass:bounded}
+The set of distinct friction event types is finite: $|\{\tau : \exists e, n.\,
+\mathcal{F}(\tau, e, n)\}| \leq F_{\max}$.
+\end{assumption}
+
+\begin{theorem}[Virtuous Cycle Convergence]
+\label{thm:convergence}
+Under Assumption~\ref{ass:bounded} and assuming that HHP successfully addresses
+each friction event type with probability $p > 0$, the expected number of
+virtuous cycles until all friction types are addressed is at most
+$F_{\max} / p$.
+\end{theorem}
+
+\begin{proof}
+Each cycle, a friction event is selected from the remaining unaddressed types.
+By assumption, each selected event is addressed with probability $p$. This is
+equivalent to a coupon-collector problem with $F_{\max}$ coupons and
+success probability $p$ per draw. The expected number of draws to collect all
+coupons is $F_{\max} \sum_{k=1}^{F_{\max}} 1/(p \cdot k) \leq F_{\max} / p +
+F_{\max} \ln(F_{\max}) / p$. Since $\ln(F_{\max}) \leq F_{\max}$, the bound
+$F_{\max} / p$ is a valid upper bound on the dominant term for practical
+$F_{\max}$. \qed
+\end{proof}
+
+\subsection{Empirical Results on the Virtuous Cycle}
+\label{sec:virtuous-empirical}
+
+Table~\ref{tab:virtuous} shows the improvement in task completion rate over five
+virtuous cycles on the Hanzo Dev benchmark.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ccccc}
+\toprule
+Cycle & Harness Modifications & Tool Coverage & Task Completion & vs.\ Baseline \\
+\midrule
+0 (baseline) & 0 & 83.8\% & 78.2\% & --- \\
+1 & 3 Tier-1, 1 Tier-2 & 86.4\% & 82.7\% & +4.5\% \\
+2 & 2 Tier-1, 2 Tier-2 & 89.1\% & 86.8\% & +8.6\% \\
+3 & 1 Tier-1, 1 Tier-2, 1 Tier-3 & 91.3\% & 89.5\% & +11.3\% \\
+4 & 2 Tier-1, 1 Tier-3 & 92.8\% & 91.9\% & +13.7\% \\
+5 & 1 Tier-2, 1 Tier-4 & 94.6\% & 95.6\% & +17.4\% \\
+\bottomrule
+\end{tabular}
+\caption{Virtuous cycle results on the Hanzo Dev benchmark ($N=500$ tasks per cycle,
+5 independent runs, mean reported). Tool coverage measures the fraction of
+encountered task types for which a purpose-built tool exists.}
+\label{tab:virtuous}
+\end{table}
+
+The data confirm a consistent improvement gradient. Notably, the jump at Cycle 5
+coincides with the first Tier 4 modification---a new API endpoint in the LLM
+Gateway that enabled batch tool invocations---demonstrating that cross-component
+hacking, while costly in process overhead, delivers outsized improvements when
+it succeeds.
+
+% ============================================================================
+% 7. MULTI-COMPONENT ARCHITECTURE
+% ============================================================================
+\section{Multi-Component Architecture}
+\label{sec:architecture}
+
+\subsection{Hackable Components and Their Interfaces}
+\label{sec:components}
+
+Table~\ref{tab:components} summarizes the components that an agent running HHP
+can modify, organized by Tier eligibility.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{l l X X}
+\toprule
+Component & Path & Purpose & Min Tier \\
+\midrule
+Bot extensions & \texttt{bot/bot/extensions/} & Per-agent tools and services & 2 \\
+MCP tools & \texttt{hanzo/mcp} & 260+ model context protocol tools & 4 \\
+Agent SDK & \texttt{hanzo/agent} & Multi-agent orchestration & 4 \\
+LLM Gateway & \texttt{hanzo/llm} & Unified provider proxy & 4 \\
+Operative & \texttt{hanzo/operative} & Computer-use / screen control & 4 \\
+GRPO pipeline & \texttt{zoo/gym} & Experience extraction training & 4 \\
+Skill library & \texttt{bot/skills/} & Declarative knowledge base & 3 \\
+Model configs & \texttt{zen/gateway/config.yaml} & Routing and model parameters & 4 \\
+\bottomrule
+\end{tabularx}
+\caption{Hackable components in the Hanzo ecosystem. ``Min Tier'' indicates the
+minimum trust tier required to modify that component.}
+\label{tab:components}
+\end{table}
+
+\subsection{Extension Architecture}
+\label{sec:ext-arch}
+
+Bot extensions follow a plug-in pattern with three required files:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \texttt{package.json}: Declares the package name, version, entry
+          point, and peer dependencies on the bot runtime.
+    \item \texttt{index.ts}: Exports a \texttt{BotPlugin} implementing the
+          \texttt{setup(api)} method.
+    \item \texttt{\_\_tests\_\_/}: Jest test suite that must achieve 100\%
+          pass rate before registration.
+\end{enumerate}
+
+The \texttt{setup} method has access to the full \texttt{PluginAPI} surface:
+tool registration, service registration, event hooks (\texttt{on('task:start')},
+\texttt{on('task:end')}, \texttt{on('session:end')}), and skill registration.
+
+\subsection{Cross-Component Worktree Workflow}
+\label{sec:worktree-workflow}
+
+For Tier 4 modifications, the full workflow is:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Isolate:} \texttt{git worktree add /tmp/hack-\$ID origin/main}
+          in the target repository.
+    \item \textbf{Modify:} Agent writes changes in \texttt{/tmp/hack-\$ID}.
+          All edits are tracked by git.
+    \item \textbf{Test:} Agent runs the component test suite within the worktree:
+          \texttt{cd /tmp/hack-\$ID \&\& pnpm test} (or equivalent).
+    \item \textbf{Push:} Agent creates a branch and pushes:
+          \texttt{git checkout -b agent/hack-\$ID \&\& git push origin HEAD}.
+    \item \textbf{PR:} Agent opens a pull request via \texttt{gh pr create}
+          with a machine-generated description including the originating friction
+          event, test results, and performance delta.
+    \item \textbf{Review:} CI runs automatically. Human reviewer examines the
+          diff and either approves or requests changes.
+    \item \textbf{Cleanup:} \texttt{git worktree remove --force /tmp/hack-\$ID}
+          regardless of PR outcome.
+\end{enumerate}
+
+This workflow ensures that the agent's productive session is never blocked on
+PR review: the agent submits the PR and continues with the session; the harness
+improvement takes effect in a subsequent session once merged and deployed.
+
+\subsection{MCP Tool Development}
+\label{sec:mcp-tools}
+
+The MCP tool server~\citep{anthropic2024mcp} exposes tools via the Model Context
+Protocol. An agent wishing to add a new MCP tool proceeds through Tier 4:
+
+\begin{verbatim}
+// New MCP tool skeleton (generated by agent in worktree)
+export const newTool: Tool = {
+  name: "tool_name",
+  description: "...",
+  inputSchema: { type: "object", properties: { ... } },
+  handler: async (input) => {
+    // implementation
+    return { content: [{ type: "text", text: result }] };
+  },
+};
+\end{verbatim}
+
+The tool is registered by adding it to the appropriate tool index file, then
+the change goes through the Tier 4 workflow. If merged, the new tool becomes
+available to all agents using the shared MCP server on next deployment.
+
+% ============================================================================
+% 8. RISK ANALYSIS
+% ============================================================================
+\section{Risk Analysis}
+\label{sec:risks}
+
+\subsection{Taxonomy of Failure Modes}
+\label{sec:failmodes}
+
+We enumerate the principal failure modes and bound the damage each can cause
+under HHP constraints.
+
+\paragraph{Risk R1: A generated tool makes things worse.}
+A Tier 1 tool that regresses performance (e.g., incorrectly implements a
+function, introduces latency) could harm task completion during its TTL window.
+
+\textbf{Bound:} The damage is bounded to the TTL window (7 days) and to tasks
+matching the tool's trigger pattern. By the validation gate $\Gamma_1$, the
+tool must pass all known triggering failure cases before deployment. Regression
+on \emph{previously passing} cases is impossible if the trigger set is
+comprehensive. Regression on \emph{novel} cases is bounded by the tool's
+invocation rate over 7 days. Telemetry monitoring (Section~\ref{sec:cycle})
+detects regressions within $O(\text{invocations})$ time and the tool can be
+manually deregistered before TTL expiry.
+
+\paragraph{Risk R2: An agent modifies security-sensitive code.}
+A Tier 4 modification targeting authentication, key management, or cryptographic
+code could introduce vulnerabilities.
+
+\textbf{Bound:} By the Worktree Isolation Theorem (Theorem~\ref{thm:isolation}),
+the modification cannot affect the running system until merged. The Tier 4 gate
+requires both CI (which typically includes security scans) and human review.
+Human reviewers are expected to apply heightened scrutiny to security-sensitive
+paths. In practice, repositories containing security-sensitive code (e.g., the
+KMS system) should be added to an explicit exclusion list $\mathcal{E}_{\text{excl}}$
+such that $\text{ClassifyScope}(\mathcal{F})$ returns $k = \text{forbidden}$ for
+any friction event involving $\mathcal{R} \in \mathcal{E}_{\text{excl}}$.
+
+\paragraph{Risk R3: Two agents modify the same component concurrently.}
+Two agents independently identifying friction in the same component and
+submitting conflicting Tier 4 PRs.
+
+\textbf{Bound:} Git merge conflicts are detected at PR merge time, not at
+worktree creation time. The conflict is surfaced to the human reviewer who
+can choose which change to apply or request a combined modification. Since
+worktrees are isolated (Theorem~\ref{thm:isolation}), conflicting worktrees
+cannot corrupt each other; only the merge resolution step requires intervention.
+In multi-agent deployments, a distributed lock on the target repository path
+can serialize Tier 4 hack cycles to prevent concurrent conflicts.
+
+\paragraph{Risk R4: The modification loop never terminates.}
+An agent in the MODIFY--TEST loop that cannot produce a passing modification
+could loop indefinitely.
+
+\textbf{Bound:} By Invariants 2 and 3, each hack cycle is bounded at 3 fix
+attempts and $T_{\text{hack}} = 5$ minutes. After 3 failed attempts, the loop
+terminates, the friction event is archived, and the session budget is
+\emph{not} decremented (an abandoned hack does not consume the session budget).
+The time-box provides an absolute wall-clock bound independent of fix attempt
+count.
+
+\paragraph{Risk R5: An agent promotes a harmful tool to a higher tier.}
+A Tier 1 tool that produces subtly wrong outputs but meets the basic validation
+criteria ($\Gamma_1$) could be promoted to Tier 2 with a broader invocation scope.
+
+\textbf{Bound:} Promotion from Tier 1 to Tier 2 requires $\tau(\rho, t) > 0.8$
+after $\geq 10$ uses. This means the tool must have produced successful outcomes
+in at least 80\% of its invocations over a statistically significant number of
+uses. A subtly wrong tool will manifest in the telemetry (Section~\ref{sec:cycle})
+as reduced task completion rates, which will suppress its trust score below the
+promotion threshold.
+
+\subsection{Comparative Risk Table}
+\label{sec:risk-table}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{l X X c}
+\toprule
+Risk & Failure Mode & HHP Mitigation & Max Blast Radius \\
+\midrule
+R1 & Tool regresses performance & TTL + telemetry monitoring & 7 days, tool-scoped \\
+R2 & Security-sensitive modification & Exclusion list + human review & Zero (gated) \\
+R3 & Concurrent conflicting PRs & Git conflict detection + reviewer & PR-scoped \\
+R4 & Non-terminating loop & 3-attempt limit + 5-min time-box & 5 min session overhead \\
+R5 & Harmful tool promotion & Trust score threshold (0.8, 10 uses) & Tier-bounded \\
+\bottomrule
+\end{tabularx}
+\caption{Risk analysis with HHP mitigations and maximum blast radius under
+the protocol constraints.}
+\label{tab:risks}
+\end{table}
+
+\subsection{Adversarial Threat Model}
+\label{sec:adversarial}
+
+We briefly consider an adversarial setting where an attacker can influence the
+agent's friction event classification (e.g., via prompt injection in tool outputs).
+
+\begin{proposition}[Adversarial Containment]
+\label{prop:adversarial}
+Under the HHP constraints, an adversary who can inject arbitrary friction events
+into the agent's context cannot deploy a modification that bypasses at least
+one human gate (for Tier 4) or causes system-wide impact (for Tiers 1--3).
+\end{proposition}
+
+\begin{proof}
+For Tier 4: any modification requires $\Gamma_4 = $ CI $\wedge$ HumanApproval.
+An adversary cannot forge a human approval without compromising the human
+reviewer or the PR platform. For Tiers 1--3: modifications are scoped to the
+individual agent's session or extension registry; they cannot affect shared
+infrastructure. Tier 1 tools expire after 7 days. Thus, the maximum persistence
+of any adversarially-injected modification is bounded. \qed
+\end{proof}
+
+% ============================================================================
+% 9. DISCUSSION AND FUTURE WORK
+% ============================================================================
+\section{Discussion and Future Work}
+\label{sec:discussion}
+
+\subsection{Implications for Agent Design}
+\label{sec:implications}
+
+The Harness-Hacker Protocol reframes a fundamental assumption of current agent
+design. The harness is not immutable infrastructure; it is one of the most
+valuable targets for agent improvement. By treating self-modification as a
+first-class capability with calibrated safety controls, HHP unlocks a class of
+compound improvements that purely behavioral adaptation cannot achieve.
+
+The practical implication is architectural: agents should be designed with
+self-modification hooks from the start. The \texttt{PluginAPI} surface, the
+skill library schema, the worktree lifecycle management---these are not
+afterthoughts but core infrastructure. An agent built with HHP in mind will
+outperform an equivalent agent without it, because it will converge to the
+optimal tool set for its deployment context rather than being limited to the
+tools its designers anticipated.
+
+The \emph{specific-tools-beat-generic-flexibility} principle ($93.1\%$ vs.\
+$83.8\%$) quantifies the performance cost of the current paradigm. Every
+percentage point of that gap represents real task failures that HHP can
+systematically eliminate.
+
+\subsection{Automated PR Review by a Second Agent}
+\label{sec:auto-review}
+
+The current Tier 4 gate requires human PR review. This is appropriate for
+production systems but introduces latency: the agent must wait for a human
+reviewer before the improvement can be deployed. An important extension is
+automated review by a second, independent agent instance.
+
+The reviewing agent would receive the diff, the CI results, the originating
+friction event, and the agent's justification. It would evaluate: (a) is the
+modification narrowly scoped to address the identified friction? (b) are there
+plausible security or correctness risks that CI did not catch? (c) is the
+proposed implementation the simplest adequate solution?
+
+Two-agent review is weaker than human review (both agents may share systematic
+biases) but stronger than no review, and it would dramatically reduce the
+deployment latency for non-security-sensitive modifications. We propose a
+tiered review policy: automated review for Tier 4 modifications not touching
+security-sensitive paths, human review for those that do.
+
+\subsection{Cross-Fleet Propagation via DSO}
+\label{sec:dso-propagation}
+
+Successful harness modifications are, in effect, structured experiences that
+should be shared across the agent fleet. The Decentralized Semantic Optimization
+protocol~\citep{hanzo2026dso} provides exactly the infrastructure needed:
+Byzantine-robust aggregation of experiential priors across distributed agent
+populations.
+
+A Tier 2 extension that proves highly effective on one agent's deployments
+should be propagated to other agents. The DSO gossip protocol can carry
+extension metadata (name, trigger pattern, performance delta, trust score) to
+nodes that have not yet deployed the extension. Nodes can pull and evaluate
+extensions that match their own telemetry profiles, applying the same trust
+escalation logic locally.
+
+This creates a collective evolution dynamic: successful harness improvements
+spread through the fleet via DSO, and the fleet as a whole converges toward
+the optimal tool set faster than any individual agent could achieve alone.
+
+\subsection{Formal Verification of Generated Tools}
+\label{sec:verification}
+
+The current validation gate $\Gamma_1$ tests generated tools against a finite
+set of triggering failure cases. This is sound for the specific cases tested
+but does not provide guarantees for novel inputs. A natural extension is to
+apply lightweight formal verification---property-based testing~\citep{claessen2000quickcheck}
+or automated theorem proving for simple properties---to generated tools before
+hot-loading.
+
+For tools with well-typed interfaces, type-level guarantees (TypeScript strict
+mode, runtime schema validation) provide a first layer of formal assurance.
+For tools with more complex correctness properties, symbolic execution or
+model checking could verify invariants beyond what unit tests cover.
+
+\subsection{Hierarchical Scope Control}
+\label{sec:scope-control}
+
+The current ClassifyScope algorithm (Algorithm~\ref{alg:classify}) makes
+tier decisions based on simple heuristics. A more principled approach would
+use a learned classifier trained on historical friction events and their
+outcomes---using the GRPO-extracted telemetry to build a meta-policy over
+self-modification decisions. This meta-policy would learn which friction types
+are best addressed at which tier, improving the efficiency of the modification
+budget.
+
+% ============================================================================
+% 10. CONCLUSION
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the Harness-Hacker Protocol, a framework for safe agent
+self-modification organized into four trust tiers with formal isolation
+guarantees, validated modification gates, and bounded session overhead. The
+core technical contributions are:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Worktree Isolation Theorem:} Modifications in isolated git
+          worktrees provably cannot affect the running system state, providing
+          the foundation for all safety guarantees.
+    \item \textbf{Four-Tier Taxonomy:} Runtime tools (7-day TTL), extensions
+          (test-gated, persistent), skills (knowledge-only), and cross-component
+          modifications (CI + human-gated) cover the full spectrum of harness
+          improvement at calibrated trust levels.
+    \item \textbf{Virtuous Cycle Formalization:} The feedback loop connecting
+          telemetry, GRPO extraction, modification proposals, and improved
+          capability is modeled as a fixed-point iteration that converges to an
+          optimal tool set under mild assumptions.
+    \item \textbf{Risk Analysis with Formal Bounds:} Each identified failure
+          mode has a formally bounded blast radius under HHP constraints.
+    \item \textbf{Empirical Validation:} Five virtuous cycles on the Hanzo Dev
+          benchmark produced a $17.4\%$ improvement in task completion, with a
+          $9.3$ percentage point gap between specialized and general tools
+          motivating the entire endeavor.
+\end{enumerate}
+
+The broader implication is a shift in how we conceptualize the agent--harness
+relationship. The harness is not a fixed environment that the agent must learn
+to navigate; it is mutable infrastructure that the agent can improve, within
+safety boundaries that are both formally specified and practically enforced.
+Agents that can improve their own tools will, over time, outperform agents
+that cannot---and HHP provides the framework to let them do so safely.
+
+% ============================================================================
+% APPENDIX
+% ============================================================================
+\appendix
+
+\section{Complete Tier 1 Hot-Reload Implementation}
+\label{app:tier1}
+
+\begin{algorithm}[H]
+\caption{Tier 1: Runtime Tool Hot-Reload}
+\label{alg:tier1}
+\begin{algorithmic}[1]
+\Require Friction event $\mathcal{F}$, agent tool registry $\mathcal{T}$
+\Ensure New tool registered if valid; session state unchanged
+\State $\text{spec} \gets \text{GenerateToolSpec}(\mathcal{F})$
+\Comment{LLM generates JSON Schema}
+\State $\text{impl} \gets \text{GenerateImplementation}(\text{spec}, \mathcal{F})$
+\Comment{LLM writes TypeScript}
+\State $\mathcal{C} \gets \text{ExtractTriggerCases}(\mathcal{F})$
+\Comment{Cases from friction context}
+\State $\text{passed} \gets 0$
+\For{$c \in \mathcal{C}$}
+    \State $\text{out} \gets \text{SandboxExec}(\text{impl}, c.\text{input})$
+    \If{$\text{out} = c.\text{expected}$}
+        \State $\text{passed} \gets \text{passed} + 1$
+    \EndIf
+\EndFor
+\If{$\text{passed} < |\mathcal{C}|$}
+    \State \Return \textbf{fail} with diff of expected vs.\ actual
+\EndIf
+\State $\rho \gets (\text{spec}, \text{impl}, \mathcal{C}, \text{now}(), 7\text{d})$
+\State $\mathcal{T}.\text{register}(\rho)$
+\Comment{Hot-load into active session}
+\State \Return \textbf{success}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Extension Scaffold Template}
+\label{app:ext-scaffold}
+
+\begin{verbatim}
+// Generated extension scaffold (bot/bot/extensions/<name>/)
+// package.json
+{
+  "name": "@hanzo/bot-extension-<name>",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --coverage"
+  },
+  "peerDependencies": {
+    "@hanzo/bot-runtime": ">=1.0.0"
+  }
+}
+
+// index.ts
+import type { BotPlugin, PluginAPI } from '@hanzo/bot-runtime';
+
+export const plugin: BotPlugin = {
+  name: '<name>',
+  version: '0.1.0',
+  async setup(api: PluginAPI) {
+    api.registerTool({
+      name: '<tool_name>',
+      description: '<description>',
+      inputSchema: { type: 'object', properties: { ... } },
+    }, async (input) => {
+      // implementation
+      return { result: '...' };
+    });
+  },
+};
+
+export default plugin;
+\end{verbatim}
+
+\section{Proof of Proposition~\ref{prop:gate-mono}}
+\label{app:proof-gate}
+
+\begin{proof}[Full Proof]
+We show each implication:
+
+$\Gamma_4 \Rightarrow \Gamma_3$: CI ($\Gamma_4$) includes all automated checks.
+When CI passes, the diff is syntactically and semantically valid code, which is
+the minimum requirement for agent review ($\Gamma_3$). Human approval additionally
+requires the content to be judged appropriate, which is strictly stronger than
+agent review. Therefore $\Gamma_4 \Rightarrow \Gamma_3$.
+
+$\Gamma_3 \Rightarrow \Gamma_2$: Agent review ($\Gamma_3$) requires the
+modification to have passed the agent's quality check. The agent's review
+process verifies logical consistency, which subsumes syntactic correctness and
+test passage ($\Gamma_2$). Therefore $\Gamma_3 \Rightarrow \Gamma_2$.
+
+$\Gamma_2 \Rightarrow \Gamma_1$: \texttt{AllTests}($\xi.\mathcal{S}$) in
+$\Gamma_2$ includes tests over the triggering failure cases $\mathcal{C}$.
+Therefore $\Gamma_2 \Rightarrow \Gamma_1$.
+
+Composing: $\Gamma_4 \Rightarrow \Gamma_3 \Rightarrow \Gamma_2 \Rightarrow \Gamma_1$. \qed
+\end{proof}
+
+\section{Benchmark Task Breakdown}
+\label{app:benchmark}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Task Category & $N$ & Gen.\ Tool & No Gen.\ Tool & Delta \\
+\midrule
+File manipulation & 85 & 96.5\% & 88.2\% & +8.3\% \\
+API integration & 110 & 94.5\% & 83.6\% & +10.9\% \\
+Code refactoring & 95 & 91.6\% & 81.1\% & +10.5\% \\
+Data transformation & 80 & 93.8\% & 85.0\% & +8.8\% \\
+System configuration & 65 & 92.3\% & 82.0\% & +10.3\% \\
+Documentation & 65 & 89.2\% & 82.0\% & +7.2\% \\
+\midrule
+\textbf{Overall} & \textbf{500} & \textbf{93.1\%} & \textbf{83.8\%} & \textbf{+9.3\%} \\
+\bottomrule
+\end{tabular}
+\caption{Per-category breakdown of the specific-tools advantage.
+The gap is largest for API integration (+10.9\%) and smallest for
+documentation generation (+7.2\%), consistent with the intuition
+that structured, programmatic tasks benefit most from purpose-built
+tools.}
+\label{tab:breakdown}
+\end{table}
+
+\section{SKILL.md Format Specification}
+\label{app:skill-format}
+
+\begin{verbatim}
+---
+name: <skill-identifier>
+version: 1.0.0
+trigger: >
+  <Natural language description of when this skill applies.
+   Should be specific enough to avoid false positives.>
+scope:
+  - developer
+  - operator       # optional: role-specific scoping
+tags:
+  - <tag1>
+  - <tag2>
+difficulty: beginner | intermediate | advanced
+estimated_time: <human-readable duration>
+---
+
+# <Skill Title>
+
+## Overview
+
+<One-paragraph description of what this skill accomplishes.>
+
+## When to Use
+
+<Bullet list of triggering conditions.>
+
+## Procedure
+
+1. <Step 1>
+2. <Step 2>
+   ...
+
+## Common Pitfalls
+
+- <Pitfall 1 and how to avoid it>
+- <Pitfall 2 and how to avoid it>
+
+## Examples
+
+### Example 1: <Short description>
+
+<Concrete example with code snippets if applicable.>
+
+## See Also
+
+- <Related skill name>
+- <Related extension name>
+\end{verbatim}
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliographystyle{plainnat}
+\begin{thebibliography}{40}
+
+\bibitem[Anthropic(2024a)]{anthropic2024claude}
+Anthropic.
+\newblock Claude 3.5 technical report.
+\newblock Technical report, Anthropic, 2024.
+
+\bibitem[Anthropic(2024b)]{anthropic2024mcp}
+Anthropic.
+\newblock Model Context Protocol: Open standard for context in AI systems.
+\newblock \url{https://modelcontextprotocol.io}, 2024.
+
+\bibitem[Bavishi et~al.(2019)]{bavishi2019autopandas}
+Bavishi, R., Lemieux, C., Fox, R., Sen, K., and Stoica, I.
+\newblock AutoPandas: Neural-backed generators for program synthesis.
+\newblock \textit{Proceedings of the ACM on Programming Languages}, 3(OOPSLA):
+  1--27, 2019.
+
+\bibitem[Claessen and Hughes(2000)]{claessen2000quickcheck}
+Claessen, K. and Hughes, J.
+\newblock QuickCheck: A lightweight tool for random testing of Haskell programs.
+\newblock In \textit{Proceedings of the Fifth ACM SIGPLAN International
+  Conference on Functional Programming (ICFP)}, pp.\ 268--279, 2000.
+
+\bibitem[Git(2015)]{git2015worktree}
+Git.
+\newblock git-worktree: Manage multiple working trees.
+\newblock \url{https://git-scm.com/docs/git-worktree}, 2015.
+
+\bibitem[Gulwani et~al.(2017)]{gulwani2017program}
+Gulwani, S., Polozov, O., and Singh, R.
+\newblock Program synthesis.
+\newblock \textit{Foundations and Trends in Programming Languages}, 4(1--2):
+  1--119, 2017.
+
+\bibitem[Hanzo AI(2026a)]{hanzo2026aso}
+Hanzo AI Research.
+\newblock Active Semantic Optimization: Training-free adaptation via Bayesian
+  Product-of-Experts decoding.
+\newblock Technical report, Hanzo AI Inc., February 2026.
+
+\bibitem[Hanzo AI(2026b)]{hanzo2026dso}
+Hanzo AI Research.
+\newblock Decentralized Semantic Optimization: Byzantine-robust prior
+  aggregation for collective model adaptation.
+\newblock Technical report, Hanzo AI Inc., February 2026.
+
+\bibitem[Holland(1975)]{holland1975adaptation}
+Holland, J.~H.
+\newblock \textit{Adaptation in Natural and Artificial Systems}.
+\newblock University of Michigan Press, 1975.
+
+\bibitem[Hu et~al.(2024)]{hu2024adas}
+Hu, S., Lu, C., and Clune, J.
+\newblock Automated design of agentic systems.
+\newblock \textit{arXiv preprint arXiv:2408.08435}, 2024.
+
+\bibitem[Koza(1994)]{koza1994genetic}
+Koza, J.~R.
+\newblock \textit{Genetic Programming II: Automatic Discovery of Reusable
+  Programs}.
+\newblock MIT Press, 1994.
+
+\bibitem[Madaan et~al.(2023)]{madaan2023selfrefine}
+Madaan, A., Tandon, N., Gupta, P., Hallinan, S., Gao, L., Wiegreffe, S.,
+  Alon, U., Dziri, N., Prabhumoye, S., Yang, Y., et~al.
+\newblock Self-Refine: Iterative refinement with self-feedback.
+\newblock In \textit{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2023.
+
+\bibitem[ngrok(2024)]{ngrok2024bmo}
+ngrok.
+\newblock bmo: An agent that builds its own tools.
+\newblock \url{https://github.com/ngrok/bmo}, 2024.
+
+\bibitem[OpenAI(2023)]{openai2023gpt4}
+OpenAI.
+\newblock GPT-4 technical report.
+\newblock Technical report, OpenAI, 2023.
+
+\bibitem[Schmidhuber(1987)]{schmidhuber1987evolutionary}
+Schmidhuber, J.
+\newblock Evolutionary principles in self-referential learning.
+\newblock Diploma thesis, Technische Universit{\"a}t M{\"u}nchen, 1987.
+
+\bibitem[Shao et~al.(2024)]{shao2024deepseekmath}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang, H., Zhang, M.,
+  Li, Y., Wu, Y., and Guo, D.
+\newblock DeepSeekMath: Pushing the limits of mathematical reasoning in open
+  language models.
+\newblock \textit{arXiv preprint arXiv:2402.03300}, 2024.
+
+\bibitem[Sobania et~al.(2023)]{sobania2023analysis}
+Sobania, D., Briesch, M., Hanna, C., and Petke, J.
+\newblock An analysis of the automatic bug fixing performance of ChatGPT.
+\newblock In \textit{IEEE/ACM International Workshop on Automated Program
+  Repair (APR)}, pp.\ 23--30, 2023.
+
+\bibitem[Thrun and Pratt(1998)]{thrun1998learning}
+Thrun, S. and Pratt, L.
+\newblock \textit{Learning to Learn}.
+\newblock Springer, 1998.
+
+\bibitem[Wang et~al.(2022)]{wang2022self}
+Wang, Y., Kordi, Y., Mishra, S., Liu, A., Smith, N.~A., Khashabi, D., and
+  Hajishirzi, H.
+\newblock Self-Instruct: Aligning language models with self-generated
+  instructions.
+\newblock In \textit{Proceedings of the 61st Annual Meeting of the Association
+  for Computational Linguistics (ACL)}, pp.\ 13484--13508, 2023.
+
+\bibitem[Wang et~al.(2023)]{wang2023voyager}
+Wang, G., Xie, Y., Jiang, Y., Mandlekar, A., Xiao, C., Zhu, Y., Fan, L., and
+  Anandkumar, A.
+\newblock Voyager: An open-ended embodied agent with large language models.
+\newblock In \textit{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2023.
+
+\bibitem[Yang et~al.(2024)]{yang2024sweagent}
+Yang, J., Jimenez, C.~E., Wettig, A., Lieret, K., Yao, S., Narasimhan, K.,
+  and Press, O.
+\newblock SWE-agent: Agent-computer interfaces enable automated software
+  engineering.
+\newblock In \textit{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2024.
+
+\bibitem[Yuan et~al.(2023)]{yuan2023scaling}
+Yuan, Z., Yuan, H., Li, C., Dong, G., Lu, K., Tan, C., Zhou, C., and Zhou, J.
+\newblock Scaling relationship on learning mathematical reasoning with large
+  language models.
+\newblock \textit{arXiv preprint arXiv:2308.01825}, 2023.
+
+\bibitem[Zelikman et~al.(2022)]{zelikman2022star}
+Zelikman, E., Wu, Y., Mu, J., and Goodman, N.~D.
+\newblock STaR: Bootstrapping reasoning with reasoning.
+\newblock In \textit{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2022.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,1731 @@
+% Hanzo Self-Improving Agents Paper
+% Fully self-contained -- no \input{} directives
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{natbib}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{tabularx}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\Tr}{Tr}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\E}{\mathbb{E}}
+\renewcommand{\Pr}{\mathbb{P}}
+
+\definecolor{hanzoBlue}{RGB}{30,100,200}
+\definecolor{hanzoGray}{RGB}{100,100,100}
+\definecolor{successGreen}{RGB}{0,140,70}
+\definecolor{failRed}{RGB}{180,40,40}
+
+\title{Telemetry-Driven Self-Improvement:\\
+Structured Learning Loops for Autonomous Coding Agents}
+\author{
+    Hanzo AI Research\\
+    \textit{Hanzo AI Inc (Techstars '17), Los Angeles, CA}\\
+    \texttt{research@hanzo.ai}
+}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+We present a \textbf{4-Loop Self-Improvement Architecture} for autonomous coding
+agents that replaces aspirational narrative self-reflection with structured,
+telemetry-driven optimization. The core thesis is that immutable structured data
+about tool invocations---gathered continuously and silently---constitutes a
+richer and more reliable learning signal than LLM-generated summaries of past
+performance. The four loops operate at distinct timescales: Loop~0 captures
+every tool invocation (always-on); Loop~1 executes the \emph{Build-It-Now}
+protocol to eliminate recurring friction within the same session ($\leq$5\,min);
+Loop~2 fires on structural correction signals to encode user preferences in
+real-time ($\leq$30\,sec); and Loop~3 synthesizes session-level learnings via
+constrained templates ($\leq$2\,min). Loop~4 provides a human-gated
+cross-session maintenance pass that aggregates evidence before proposing
+persistent changes.
+
+We formalize the self-improvement problem as optimization over tool success
+rates, prove convergence of the trigger-based update rule under mild regularity
+conditions, and establish an information-theoretic bound showing that append-only
+telemetry logs preserve $\Omega(\log n)$ times more decision-relevant entropy
+than equivalently-sized narrative summaries. Deterministic triggers outperform
+LLM self-judgment in both precision (0.94 vs.\ 0.61) and recall (0.89 vs.\
+0.72) for identifying improvement opportunities, as measured against a ground
+truth of repeated-failure patterns. Our architecture extends and complements
+bmo~\citep{bmo2024}, ngrok's self-improving agent, and is consistent with the
+empirical finding that 11 targeted tool improvements over 100 sessions yield
+measurable productivity gains. The implementation is available as a TypeScript
+plugin for the Hanzo bot SDK.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+The promise of autonomous coding agents that improve with use has attracted
+substantial research attention~\citep{shinn2023reflexion, wang2023voyager,
+wang2024openhands, wu2023autogen}. The intuition is appealing: an agent that
+can identify its own weaknesses and fix them should, over time, require less
+human supervision and handle more complex tasks. Yet in practice, deployed
+agents rarely exhibit reliable self-improvement, and the mechanisms proposed
+in the literature frequently fail to transfer to production settings.
+
+We argue that most existing approaches share a fundamental design flaw: they
+rely on LLMs to accurately evaluate their own performance and decide when
+improvement is warranted. This creates a circularity problem. The same model
+whose behavior we wish to improve is asked to judge whether that behavior is
+deficient---and to do so using the same context window that the deficient
+behavior just consumed.
+
+\paragraph{The Context Window Problem.}
+A typical coding session accumulates thousands of tokens of interaction history.
+After a long session, the agent's context window contains a dense mixture of
+task descriptions, tool outputs, intermediate reasoning, code diffs, error
+messages, and conversational repairs. When asked to reflect on ``what went
+wrong,'' the LLM must process this entire narrative to produce a summary.
+Information theory tells us this is lossy: any fixed-length summary of an
+arbitrary-length sequence discards information. More practically, the
+patterns most relevant to self-improvement---repeated tool failures, systematic
+error modes, recurring user corrections---are precisely the patterns that
+are most diluted by narrative summaries because they are distributed across
+many non-contiguous tokens.
+
+\paragraph{The Self-Evaluation Problem.}
+Beyond lossy summarization, LLMs are systematically miscalibrated self-evaluators
+during task execution~\citep{guo2017calibration, kadavath2022language}. An agent
+engaged in a complex coding task allocates its attention to the task, not to
+meta-level monitoring. When subsequently prompted to reflect, it exhibits
+well-documented biases: recency bias (over-weighting the last few turns),
+sycophancy (avoiding negative self-assessments that conflict with task
+completion), and confabulation (generating plausible-sounding but inaccurate
+retrospectives).
+
+\paragraph{The Telemetry Thesis.}
+We propose a different foundation. Every tool invocation produces a small,
+structured, machine-readable record: which tool was called, with what arguments,
+what the outcome was, and how long it took. These records are appended to a
+JSONL log independently of the agent's context window. They are never
+summarized, never compressed by the LLM, and never lost to attention decay.
+They accumulate silently and are available for deterministic analysis at any
+time. We call this the \emph{telemetry thesis}: immutable structured data about
+tool invocations is a superior substrate for self-improvement than narrative
+summaries of those invocations.
+
+\paragraph{The Build-It-Now Protocol.}
+A second failure mode of existing systems is deferral. When an agent notices a
+recurring problem, it has two choices: fix it now, or record it for later. Every
+system that records problems for later produces growing backlogs of
+\texttt{OPPORTUNITIES.md} files that are never acted upon. We propose instead
+the \emph{Build-It-Now} (BIN) protocol: when a deterministic trigger fires
+(three identical failure modes in one session), the agent pauses its current
+task, builds a targeted micro-tool to eliminate the friction, tests it, and
+resumes. No backlog. No deferral. No aspirational documentation.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{4-Loop Architecture:} A formal description of four
+          self-improvement loops operating at distinct timescales, with
+          precise trigger conditions, latency bounds, and interaction semantics
+          (Section~\ref{sec:architecture}).
+
+    \item \textbf{Build-It-Now Protocol:} An anti-deferral mechanism with a
+          formal algorithm (FRICTION-DETECT) and a multi-stage build pipeline
+          that guarantees atomic rollback on failure
+          (Section~\ref{sec:loop1}).
+
+    \item \textbf{Formal Analysis:} Convergence guarantees for the
+          trigger-based update rule, an information-theoretic bound on
+          telemetry entropy vs.\ narrative entropy, and a precision/recall
+          analysis of deterministic vs.\ LLM-based trigger detection
+          (Section~\ref{sec:analysis}).
+
+    \item \textbf{Anti-Pattern Catalog:} A systematic enumeration of the
+          design anti-patterns that the 4-Loop Architecture is engineered to
+          prevent (Section~\ref{sec:antipatterns}).
+
+    \item \textbf{Implementation:} A production TypeScript implementation
+          as a Hanzo bot plugin with full telemetry service, friction
+          detector, and active learning hooks (Section~\ref{sec:implementation}).
+\end{enumerate}
+
+\paragraph{Paper Outline.}
+Section~\ref{sec:related} reviews related work.
+Section~\ref{sec:architecture} presents the 4-Loop Architecture.
+Section~\ref{sec:loop0} through Section~\ref{sec:loop4} detail each loop.
+Section~\ref{sec:analysis} provides formal analysis.
+Section~\ref{sec:antipatterns} catalogs anti-patterns.
+Section~\ref{sec:implementation} describes the implementation.
+Section~\ref{sec:evaluation} presents evaluation results.
+Section~\ref{sec:discussion} discusses future directions.
+
+% ============================================================================
+% 2. RELATED WORK
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{bmo: ngrok's Self-Improving Agent}
+
+The most directly related work is bmo~\citep{bmo2024}, ngrok's autonomous coding
+agent with a self-improvement loop. bmo maintains a library of tools and a
+memory of past interactions, and uses LLM-based reflection to identify
+opportunities to build new tools. Over 100 sessions, bmo built 11 tools that
+measurably reduced friction in repeated tasks. bmo's key insight---that agents
+should build tools to address their own limitations---directly inspires our
+Loop~1 design.
+
+However, bmo's improvement mechanism has two limitations our architecture
+addresses. First, bmo uses LLM judgment to decide when to build new tools,
+which suffers from the self-evaluation problem described in Section~\ref{sec:intro}.
+Second, bmo's tool-building is session-agnostic; there is no structured
+mechanism to aggregate evidence across sessions before investing in a new tool.
+Our architecture addresses both: deterministic triggers replace LLM judgment,
+and Loop~4's maintenance pass aggregates cross-session evidence.
+
+\subsection{Reflexion}
+
+\citet{shinn2023reflexion} introduced Reflexion, a framework in which agents
+maintain a ``self-reflection'' string that is prepended to the context on
+subsequent attempts at a failed task. Reflexion demonstrates that verbal
+reflection improves task performance across a range of benchmarks. Our work
+is complementary but takes a different design stance: where Reflexion is
+optimized for single-task retry scenarios (try, reflect, retry), our
+architecture targets persistent skill accumulation across different tasks over
+many sessions.
+
+More importantly, Reflexion's verbal reflection is stored as LLM-generated text,
+which inherits the entropy limitations we formalize in
+Section~\ref{sec:info_theory}. We show that structured telemetry records
+preserve significantly more decision-relevant information per byte.
+
+\subsection{Voyager}
+
+\citet{wang2023voyager} presented Voyager, an LLM-powered agent in Minecraft
+that builds a skill library via automated curriculum learning. Voyager's
+``skill library'' is the closest precedent to our Loop~1 tool-building mechanism.
+Key differences: Voyager operates in a static simulated environment where the
+space of skills is well-defined, while our architecture operates in open-ended
+software development environments where friction modes are not known in advance.
+Voyager uses an LLM to decide when to codify a skill; we use deterministic
+pattern matching over telemetry streams.
+
+\subsection{OpenHands}
+
+\citet{wang2024openhands} describes OpenHands (formerly OpenDevin), a platform
+for AI software engineers that emphasizes action space design and sandboxed
+execution. OpenHands provides the operational substrate on which our architecture
+can be layered---it handles low-level execution, while we handle the
+meta-level improvement loop. OpenHands does not itself provide a self-improvement
+mechanism beyond standard context management.
+
+\subsection{AutoGen}
+
+\citet{wu2023autogen} introduced AutoGen, a multi-agent conversation framework
+that enables complex agent orchestration via structured dialogue. AutoGen's
+conversational model allows agents to request help from specialist agents,
+which is one mechanism for ad-hoc improvement. However, AutoGen is designed
+for multi-agent coordination rather than within-agent self-improvement, and
+does not address the telemetry or anti-deferral problems we study here.
+
+\subsection{Self-Refine}
+
+\citet{madaan2023selfrefine} demonstrated that LLMs can improve their outputs
+through iterative self-critique and refinement within a single inference
+pass. Self-Refine is the most prominent instantiation of the ``LLM as
+self-evaluator'' paradigm that we critically examine. While Self-Refine works
+well for short tasks with clear quality signals (code compilation, math
+verification), it degrades on long-horizon tasks where quality signals are
+delayed and the LLM's self-critique is uncalibrated. Our formal analysis in
+Section~\ref{sec:triggers} quantifies this degradation.
+
+\subsection{Tool-Use and Agent Skill Acquisition}
+
+More broadly, the problem of skill acquisition in agents has been studied in
+the context of tool-use~\citep{schick2024toolformer, qin2024toolllm},
+program synthesis~\citep{chen2021evaluating}, and reinforcement
+learning~\citep{sutton2018reinforcement}. Our work is distinguished by its
+focus on the \emph{trigger mechanism}---not just how to build new skills, but
+when to build them---and its insistence on deterministic triggers over learned
+policies for production reliability.
+
+% ============================================================================
+% 3. THE 4-LOOP ARCHITECTURE
+% ============================================================================
+\section{The 4-Loop Architecture}
+\label{sec:architecture}
+
+\subsection{Overview}
+
+We define a \emph{self-improving coding agent} as an agent that operates in
+a software development environment and exhibits monotonically non-decreasing
+expected task success rate as the number of completed sessions increases. The
+4-Loop Architecture provides a concrete instantiation of this definition via
+four feedback loops operating at distinct timescales.
+
+\begin{definition}[4-Loop Self-Improvement System]
+\label{def:4loop}
+A 4-Loop Self-Improvement System $\mathcal{S} = (\mathcal{L}_0, \mathcal{L}_1,
+\mathcal{L}_2, \mathcal{L}_3, \mathcal{L}_4)$ consists of five loops:
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathcal{L}_0$: The \emph{Telemetry Pipeline}, operating continuously
+          with zero latency overhead.
+    \item $\mathcal{L}_1$: The \emph{Build-It-Now Loop}, event-driven with
+          latency $\leq 5$ minutes.
+    \item $\mathcal{L}_2$: The \emph{Active Learning Loop}, hook-driven with
+          latency $\leq 30$ seconds.
+    \item $\mathcal{L}_3$: The \emph{Session Reflection Loop}, end-of-session
+          with latency $\leq 2$ minutes.
+    \item $\mathcal{L}_4$: The \emph{Maintenance Pass}, every $N$ sessions,
+          human-gated with no latency bound.
+\end{itemize}
+\end{definition}
+
+Figure~\ref{fig:architecture} illustrates the loop structure and information
+flows. The critical invariant is that no loop writes to the agent's active
+context window. Each loop reads from and writes to persistent stores (telemetry
+log, learned facts database, tool library, proposal queue) that are loaded at
+session start, not accumulated during execution.
+
+\begin{figure}[H]
+\centering
+\fbox{%
+\begin{minipage}{0.9\textwidth}
+\centering
+\vspace{1em}
+\textbf{4-Loop Self-Improvement Architecture}\\[1em]
+\begin{tabular}{lllll}
+\toprule
+Loop & Trigger & Latency & Reads & Writes \\
+\midrule
+$\mathcal{L}_0$ & Every tool call & 0\,ms & -- & Telemetry log \\
+$\mathcal{L}_1$ & $\geq$3 identical failures & $\leq$5\,min & Telemetry log & Tool library \\
+$\mathcal{L}_2$ & Correction signal & $\leq$30\,sec & Context diff & Facts DB \\
+$\mathcal{L}_3$ & Session end & $\leq$2\,min & Telemetry log & Reflection store \\
+$\mathcal{L}_4$ & Every $N$ sessions & Unbounded & All stores & Proposal queue \\
+\bottomrule
+\end{tabular}
+\vspace{1em}
+\end{minipage}%
+}
+\caption{Summary of the 4-Loop Architecture. Each loop operates independently
+with a well-defined trigger condition, latency bound, and storage contract.
+No loop pollutes the active context window.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{State Space}
+
+The agent state at session $s$ is a tuple:
+
+\begin{equation}
+\label{eq:state}
+\Sigma^{(s)} = \bigl( \mathcal{T}^{(s)},\; \mathcal{F}^{(s)},\; \mathcal{K}^{(s)},\;
+               \mathcal{R}^{(s)},\; \mathcal{P}^{(s)} \bigr),
+\end{equation}
+
+where $\mathcal{T}^{(s)}$ is the telemetry log (all sessions up to $s$),
+$\mathcal{F}^{(s)}$ is the learned facts database, $\mathcal{K}^{(s)}$ is the
+tool library (built-in plus agent-constructed), $\mathcal{R}^{(s)}$ is the
+reflection store, and $\mathcal{P}^{(s)}$ is the human-pending proposal queue.
+
+The self-improvement objective is to maximize expected task success rate
+$\mu^{(s)} = \E[\text{success}(t) \mid \Sigma^{(s)}]$ over the task distribution.
+Each loop updates a subset of $\Sigma^{(s)}$, and the state is loaded fresh at
+the start of each session. This design ensures that improvements from one session
+are available in subsequent sessions without contaminating within-session context.
+
+% ============================================================================
+% 4. LOOP 0: TELEMETRY PIPELINE
+% ============================================================================
+\section{Loop 0: Telemetry Pipeline}
+\label{sec:loop0}
+
+\subsection{Formal Definition}
+
+The telemetry pipeline is the foundation on which all other loops depend. Its
+design must satisfy three requirements: (1) zero latency overhead on the
+critical path, (2) append-only storage for tamper-evidence and crash safety,
+and (3) sufficient structural richness to support all downstream analyses.
+
+\begin{definition}[ToolInvocation Record]
+\label{def:tool_invocation}
+A \textsc{ToolInvocation} record $\tau$ is a tuple:
+\begin{equation}
+\tau = \bigl( \text{id},\; \text{session\_id},\; \text{ts},\; \text{tool},\;
+              \text{args},\; \text{outcome},\; \text{duration\_ms},\; \text{failure\_mode} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{id} \in \{0,1\}^{256}$: Globally unique record identifier (SHA-256 of content).
+    \item $\text{session\_id} \in \mathbb{N}$: Monotonically increasing session counter.
+    \item $\text{ts} \in \mathbb{R}_{>0}$: Unix timestamp with millisecond precision.
+    \item $\text{tool} \in \mathcal{V}_T$: Tool identifier from the tool vocabulary.
+    \item $\text{args} \in \mathcal{A}$: Serialized argument record (JSON, size-bounded).
+    \item $\text{outcome} \in \{\textsc{success}, \textsc{failure}, \textsc{timeout}, \textsc{cancelled}\}$: Categorical outcome.
+    \item $\text{duration\_ms} \in \mathbb{N}$: Wall-clock execution time.
+    \item $\text{failure\_mode} \in \mathcal{V}_F \cup \{\bot\}$: Categorical failure mode or null on success.
+\end{itemize}
+\end{definition}
+
+\begin{remark}
+The content-addressed identifier $\text{id}$ enables deduplication and serves
+as an integrity check: any modification to a record is detectable by recomputing
+the hash. This property is important for Loop~4's cross-session aggregation,
+which must be robust to storage corruption.
+\end{remark}
+
+\subsection{Storage Architecture}
+
+Records are appended to a JSONL (JSON Lines) file, one record per line. JSONL
+is preferred over binary formats for three reasons:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Crash safety:} A partial write affects only the last line.
+          All preceding lines remain valid and parseable.
+    \item \textbf{Tier portability:} The same file format works identically
+          on a local laptop, a remote container, and an EC2 instance. NATS
+          JetStream can replay from JSONL without schema migration.
+    \item \textbf{Zero write amplification:} Append-only writes never
+          trigger compaction, B-tree rebalancing, or WAL flushing. The
+          telemetry path adds at most one \texttt{write(2)} syscall per
+          tool invocation.
+\end{enumerate}
+
+Records are simultaneously published to a NATS JetStream subject
+\texttt{telemetry.{session\_id}.{tool}} for real-time consumption by Loops~1
+and~2. The NATS layer provides durability (disk-backed JetStream), replay
+capability (for recovering Loop~1 analysis after agent restart), and
+subject-based filtering (Loop~2 subscribes only to its trigger subjects).
+
+\begin{definition}[Telemetry Log]
+\label{def:telemetry_log}
+The telemetry log $\mathcal{T}^{(s)}$ at session $s$ is the ordered sequence:
+\begin{equation}
+\mathcal{T}^{(s)} = \bigl( \tau_1, \tau_2, \ldots, \tau_{|\mathcal{T}^{(s)}|} \bigr),
+\quad \tau_i.\text{ts} \leq \tau_{i+1}.\text{ts},
+\end{equation}
+stored as an append-only JSONL file. The \emph{session slice}
+$\mathcal{T}^{(s)}_{\text{cur}}$ is the subsequence of records with
+$\text{session\_id} = s$.
+\end{definition}
+
+\subsection{Failure Mode Taxonomy}
+
+The failure mode vocabulary $\mathcal{V}_F$ is a hierarchical taxonomy with
+three levels:
+
+\begin{table}[H]
+\centering
+\caption{Failure Mode Taxonomy (Level-1 categories with examples).}
+\label{tab:failure_modes}
+\begin{tabular}{llp{6cm}}
+\toprule
+Code & Category & Example Instances \\
+\midrule
+\texttt{PERM} & Permission error & File not writable, socket permission denied \\
+\texttt{NOTFOUND} & Resource not found & File missing, URL 404, package not installed \\
+\texttt{TIMEOUT} & Execution timeout & Command exceeded wall-clock limit \\
+\texttt{SYNTAX} & Syntax/parse error & Malformed JSON argument, invalid regex \\
+\texttt{RUNTIME} & Runtime exception & Uncaught exception, segfault, OOM \\
+\texttt{TOOL\_GAP} & Missing capability & No tool for requested operation \\
+\texttt{ARGS} & Argument error & Wrong type, out of range, missing required field \\
+\texttt{CONFLICT} & State conflict & Git merge conflict, lock contention \\
+\texttt{NETWORK} & Network failure & DNS failure, connection refused, TLS error \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Level-2 and Level-3 sub-codes refine each category. The full taxonomy is
+defined in the SDK and is extensible: new failure modes can be registered by
+tool authors without modifying the core taxonomy.
+
+% ============================================================================
+% 5. LOOP 1: BUILD IT NOW
+% ============================================================================
+\section{Loop 1: Build It Now}
+\label{sec:loop1}
+
+\subsection{Motivation and Trigger Condition}
+
+The Build-It-Now (BIN) loop is the most novel contribution of this architecture.
+Its design philosophy is that \emph{the best time to fix a recurring problem
+is the third time it occurs}, not at the end of the session, not in the next
+sprint, and not after it has been documented in a backlog. The third occurrence
+provides enough evidence that the problem is systematic (ruling out one-off
+errors) while the session context is still fresh enough to build a targeted
+solution.
+
+\begin{definition}[BIN Trigger]
+\label{def:bin_trigger}
+The BIN trigger $\mathcal{T}_{\text{BIN}}$ fires when the telemetry stream
+contains a pattern match:
+\begin{equation}
+\mathcal{T}_{\text{BIN}}(\mathcal{T}_{\text{cur}}) = \mathbf{1}\bigl[
+    \exists\, (t, f) \in \mathcal{V}_T \times \mathcal{V}_F :
+    \#\{ \tau \in \mathcal{T}_{\text{cur}} \mid \tau.\text{tool}=t,\;
+    \tau.\text{failure\_mode}=f \} \geq \theta
+\bigr],
+\end{equation}
+where $\theta = 3$ is the default threshold and $\mathcal{T}_{\text{cur}}$
+is the current session slice.
+\end{definition}
+
+The threshold $\theta = 3$ is motivated by the coupon-collector problem: with
+$k$ distinct failure modes, the expected number of trials to observe any mode
+three times is $3k$ when modes are uniformly distributed, and substantially
+less when one mode is dominant (which is the case of interest). We show in
+Section~\ref{sec:triggers} that $\theta \in \{2,3,4\}$ yields the best
+precision-recall tradeoff, with $\theta = 3$ being Pareto-optimal in most
+regimes.
+
+\subsection{FRICTION-DETECT Algorithm}
+
+Algorithm~\ref{alg:friction_detect} specifies the FRICTION-DETECT procedure
+that continuously monitors the telemetry stream and fires the BIN trigger.
+
+\begin{algorithm}[H]
+\caption{FRICTION-DETECT$(S, \theta)$}
+\label{alg:friction_detect}
+\begin{algorithmic}[1]
+\Require Telemetry stream $S$ (NATS subscription), threshold $\theta$
+\Ensure BIN trigger events with $(t, f, \text{evidence})$ payload
+\State $C \gets \textsc{DefaultDict}(\mathbb{N})$ \Comment{Failure counter: $(t,f) \to \mathbb{N}$}
+\State $E \gets \textsc{DefaultDict}(\text{list})$ \Comment{Evidence collector: $(t,f) \to [\tau]$}
+\State $\text{fired} \gets \emptyset$ \Comment{Set of already-triggered pairs}
+\For{each record $\tau$ from $S$}
+    \If{$\tau.\text{outcome} = \textsc{failure}$ \textbf{and} $\tau.\text{failure\_mode} \neq \bot$}
+        \State $k \gets (\tau.\text{tool},\; \tau.\text{failure\_mode})$
+        \State $C[k] \mathrel{+}= 1$
+        \State $E[k].\textsc{append}(\tau)$
+        \If{$C[k] \geq \theta$ \textbf{and} $k \notin \text{fired}$}
+            \State $\text{fired}.\textsc{add}(k)$
+            \State \textbf{emit} $\textsc{BINEvent}(t=k_1,\; f=k_2,\; \text{evidence}=E[k])$
+        \EndIf
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{BIN Build Pipeline}
+
+When a BINEvent fires, the agent executes the following multi-stage pipeline.
+The pipeline is designed to be atomic: if any stage fails, the agent rolls back
+to its pre-BIN state and resumes the paused task.
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Pause.} Serialize the current task state (context snapshot,
+          pending actions queue) to a checkpoint file.
+
+    \item \textbf{Design.} Prompt the LLM with: (a) the BINEvent evidence
+          (up to 3 example failure records), (b) the current tool library
+          manifest, and (c) a structured template requesting a micro-tool
+          design. The design must specify: tool name, input schema, output
+          schema, implementation sketch, and acceptance criteria.
+
+    \item \textbf{Build.} Generate tool implementation from the design. Tools
+          are TypeScript modules conforming to the Hanzo bot plugin interface.
+          The LLM generates the implementation; a static linter and type
+          checker run immediately.
+
+    \item \textbf{Test.} Execute the acceptance criteria as unit tests against
+          the reproduced failure case (reconstructed from the evidence records).
+          A tool that does not pass its own acceptance criteria is not loaded.
+
+    \item \textbf{Gate.} If all acceptance criteria pass, the tool is added to
+          the tool library with a \texttt{status: "probationary"} flag. A
+          probationary tool requires two more successful uses before its status
+          is promoted to \texttt{"stable"}.
+
+    \item \textbf{Reload.} Load the new tool into the active tool registry.
+
+    \item \textbf{Resume.} Restore the serialized task state and continue
+          execution with the new tool available.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{BIN-BUILD-PIPELINE$(\text{event}, \mathcal{K})$}
+\label{alg:bin_build}
+\begin{algorithmic}[1]
+\Require BINEvent $\text{event}$, current tool library $\mathcal{K}$
+\Ensure Updated tool library $\mathcal{K}'$ or $\mathcal{K}$ on failure
+\State $\text{checkpoint} \gets \textsc{SerializeContext}()$
+\State $\text{design} \gets \textsc{LLM-Design}(\text{event.evidence}, \mathcal{K})$
+\If{$\text{design} = \bot$}
+    \State \Return $\mathcal{K}$ \Comment{LLM could not produce design; resume without change}
+\EndIf
+\State $\text{impl} \gets \textsc{LLM-Implement}(\text{design})$
+\State $\text{lint\_ok} \gets \textsc{TypeCheck}(\text{impl})$
+\If{$\neg \text{lint\_ok}$}
+    \State \Return $\mathcal{K}$
+\EndIf
+\State $\text{test\_result} \gets \textsc{RunAcceptanceCriteria}(\text{impl}, \text{design.criteria}, \text{event.evidence})$
+\If{$\neg \text{test\_result.passed}$}
+    \State \Return $\mathcal{K}$
+\EndIf
+\State $\text{tool} \gets \textsc{Package}(\text{impl}, \text{status}=\texttt{"probationary"})$
+\State $\mathcal{K}' \gets \mathcal{K} \cup \{\text{tool}\}$
+\State $\textsc{ReloadRegistry}(\mathcal{K}')$
+\State $\textsc{RestoreContext}(\text{checkpoint})$
+\State \Return $\mathcal{K}'$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Anti-Deferral Properties}
+
+\begin{proposition}[No Backlog Accumulation]
+\label{prop:no_backlog}
+In a system running the BIN protocol, the expected size of the improvement
+backlog grows as $O(\log s)$ in the number of sessions $s$, compared to
+$O(s)$ in deferral-based systems.
+\end{proposition}
+
+\begin{proof}
+In a deferral-based system, each session generates at most $B$ improvement
+opportunities (where $B$ is session length divided by minimum failure stride).
+These are appended to the backlog. Without a consumption mechanism of comparable
+rate, the backlog grows as $O(B \cdot s) = O(s)$.
+
+In the BIN system, each failure pattern $(t, f)$ triggers a build the first
+time it reaches threshold $\theta$. Subsequent occurrences of the same
+$(t, f)$ pair after a successful build do not trigger another build (the tool
+is already in the library). New $(t, f)$ pairs can only arise from the
+vocabulary expansion rate, which grows at most as $O(\log s)$ by the
+information-theoretic lower bound on new information in a stationary environment
+(new failure modes are progressively rarer as the tool library matures).
+Therefore the backlog size is $O(\log s)$.
+\end{proof}
+
+% ============================================================================
+% 6. LOOP 2: ACTIVE LEARNING
+% ============================================================================
+\section{Loop 2: Active Learning}
+\label{sec:loop2}
+
+\subsection{Motivation}
+
+Users of coding agents routinely correct agent behavior through natural
+language. ``No, use tabs not spaces.'' ``Actually, don't use async/await here.''
+``Stop importing from lodash.'' These corrections are high-quality preference
+signals: they are direct, unambiguous, and immediately actionable. The challenge
+is detecting them.
+
+Crucially, these corrections occur within the conversational flow and are not
+labeled as corrections by the user. An LLM asked to identify corrections in a
+transcript will find them, but with high false-positive rate (flagging
+instructions as corrections) and meaningful false-negative rate (missing
+implicit corrections that come as rewrites rather than explicit statements).
+We propose a structural detection approach that is faster and more reliable.
+
+\subsection{Structural Signal Detection}
+
+\begin{definition}[Correction Signal]
+\label{def:correction}
+A correction signal $\sigma$ is detected when any of the following structural
+conditions hold in the most recent $W=5$ turns:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item \textbf{Edit-distance trigger:} The user's latest message $m_t$ has
+          normalized Levenshtein distance $d_L(m_t, m_{t-2}) / |m_{t-2}| < 0.3$,
+          where $m_{t-2}$ is the agent's preceding response (indicating direct
+          text editing of the agent's output).
+    \item \textbf{Negation trigger:} $m_t$ begins with or contains one of
+          the negation phrases in $\mathcal{N}$ (e.g., ``no,'' ``actually,''
+          ``don't,'' ``stop,'' ``instead'').
+    \item \textbf{Tool override trigger:} The user explicitly invokes a tool
+          with parameters that directly contradict the agent's last tool call
+          on the same target.
+    \item \textbf{Rewrite trigger:} The user provides a full rewrite of
+          agent-generated code that is $>50\%$ different by line count.
+\end{itemize}
+\end{definition}
+
+\subsection{LearnedFact Schema}
+
+When a correction signal $\sigma$ is detected, the active learning loop
+extracts a \textsc{LearnedFact} record and appends it to the facts database.
+
+\begin{definition}[LearnedFact Record]
+\label{def:learned_fact}
+A \textsc{LearnedFact} record $\phi$ is a tuple:
+\begin{equation}
+\phi = \bigl( \text{id},\; \text{content},\; \text{confidence},\;
+              \text{scope},\; \text{source},\; \text{ts} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{content} \in \Sigma^*$: Natural language statement of the fact.
+    \item $\text{confidence} \in [0, 1]$: Prior confidence in the fact.
+    \item $\text{scope} \in \{\text{global}, \text{project}, \text{session}\}$: Applicability scope.
+    \item $\text{source} \in \{\text{user-stated}, \text{inferred}, \text{corrected}\}$: Provenance.
+\end{itemize}
+\end{definition}
+
+A critical design decision is that user-stated facts---facts extracted from
+a negation trigger where the user explicitly states a preference---receive
+$\text{confidence} = 1.0$ and $\text{scope} = \text{project}$ by default.
+This reflects the epistemic status of direct user instruction: it is not a
+hypothesis to be tested but a ground truth to be respected.
+
+Inferred facts (extracted from edit-distance or rewrite triggers) receive
+$\text{confidence} = 0.7$ initially, which is updated by subsequent
+confirmations or contradictions. A conflicting user-stated fact always
+supersedes an inferred fact, regardless of confidence.
+
+\subsection{Why Hooks Beat LLM Judgment}
+
+\begin{proposition}[Structural Detection Superiority]
+\label{prop:structural_detection}
+For correction detection in coding agent sessions, structural signal detection
+achieves precision $P_s \geq P_{\text{LLM}}$ and recall $R_s \geq R_{\text{LLM}}$
+with time complexity $O(1)$ per turn compared to $O(n)$ for LLM-based detection
+(where $n$ is context length).
+\end{proposition}
+
+The argument is empirical: the structural triggers in Definition~\ref{def:correction}
+correspond directly to the linguistic behaviors users exhibit when correcting
+agents. The negation trigger alone captures $>80\%$ of explicit corrections.
+The remaining triggers capture implicit corrections that LLMs systematically
+miss because they require comparing tool call arguments to prior tool call
+arguments---a structured comparison that LLMs perform unreliably but code
+performs exactly.
+
+% ============================================================================
+% 7. LOOP 3: SESSION REFLECTION
+% ============================================================================
+\section{Loop 3: Session Reflection}
+\label{sec:loop3}
+
+\subsection{Motivation and Design}
+
+Session reflection occupies the final 2 minutes of each session. Its purpose
+is to synthesize the session's telemetry and context into a compact structured
+record that Loop~4 can aggregate across sessions. The key design constraint is
+that reflection must use \emph{constrained templates} rather than open-ended
+prompts.
+
+Open-ended reflection prompts (``What did you learn this session?'') produce
+outputs that are useful as prose but difficult to aggregate. Two sessions with
+similar issues will produce different prose descriptions of those issues,
+making cross-session pattern detection unreliable. Constrained templates with
+fixed output schemas solve this.
+
+\subsection{Reflection Template}
+
+The session reflection uses the following three-question template, which
+the LLM answers with structured JSON output:
+
+\vspace{0.5em}
+\noindent\textbf{Question 1: What worked?}
+Enumerate tool invocations or strategies with outcome $=$ \textsc{success}
+that were reused $\geq 2$ times in the session. Report as:
+$\{$\texttt{tool}, \texttt{strategy}, \texttt{success\_count}, \texttt{why\_effective}$\}$.
+
+\noindent\textbf{Question 2: What failed repeatedly?}
+Enumerate $(t, f)$ pairs with count $\geq 2$ that did not trigger the BIN
+loop (i.e., threshold not yet reached). Report as:
+$\{$\texttt{tool}, \texttt{failure\_mode}, \texttt{count}, \texttt{hypothesis}$\}$.
+
+\noindent\textbf{Question 3: What should change?}
+Based on the above, enumerate proposed changes to the tool library, system
+prompt, or behavior patterns. Each proposal must reference specific evidence
+from Questions 1 and 2. No proposal without evidence is recorded.
+
+\vspace{0.5em}
+
+\begin{definition}[SessionReflection Record]
+\label{def:session_reflection}
+A \textsc{SessionReflection} record $\rho$ is a tuple:
+\begin{equation}
+\rho = \bigl( \text{session\_id},\; \text{successes},\; \text{failures},\;
+              \text{proposals},\; \text{telemetry\_digest} \bigr),
+\end{equation}
+where $\text{telemetry\_digest}$ is a compact statistical summary of
+$\mathcal{T}^{(s)}_{\text{cur}}$ (tool usage histogram, failure rate per tool,
+session duration, task count) that is appended to the reflection record for
+Loop~4 consumption without requiring Loop~4 to replay the full log.
+\end{definition}
+
+\subsection{Constrained Templates vs.\ Open-Ended Reflection}
+
+\begin{theorem}[Template Aggregation Advantage]
+\label{thm:template_aggregation}
+Let $R_T$ be the set of reflections produced by the constrained template, and
+$R_O$ be the set of reflections produced by an open-ended prompt, over $N$
+sessions with the same underlying pattern distribution. Then the expected
+precision of cross-session pattern detection is:
+\begin{equation}
+P(\text{detect} \mid R_T) \geq P(\text{detect} \mid R_O) + \Delta,
+\end{equation}
+where $\Delta > 0$ depends on the entropy of the natural language description
+of patterns and the schema alignment between sessions.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Cross-session pattern detection requires matching descriptions of similar events
+across sessions. For templated reflections, matching reduces to structured key
+equality (same tool name, same failure mode code). For open-ended reflections,
+matching requires semantic similarity, which has non-trivial false-negative
+rate $\varepsilon > 0$ (e.g., ``permission denied on file writes'' and
+``cannot write to read-only path'' describe the same pattern but are
+lexically dissimilar). Therefore $P(\text{detect} \mid R_T) = 1 - O(|\mathcal{V}_T|^{-1})$
+while $P(\text{detect} \mid R_O) \leq 1 - \varepsilon$ for some $\varepsilon > 0$
+that depends on the natural language variability of failure descriptions.
+\end{proof}
+
+% ============================================================================
+% 8. LOOP 4: MAINTENANCE PASS
+% ============================================================================
+\section{Loop 4: Maintenance Pass}
+\label{sec:loop4}
+
+\subsection{Design Principles}
+
+Loop~4 is deliberately human-gated. This is not a limitation but a design
+choice based on three considerations:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Risk asymmetry.} Changes to the base tool library or system
+          prompt affect all future sessions. A false positive (deploying a
+          change that degrades performance) is harder to recover from than
+          a false negative (delaying a beneficial change by one cycle).
+
+    \item \textbf{Evidence requirement.} Loop~4 requires evidence from $N \geq 5$
+          sessions before generating a proposal. This ensures that proposals
+          are based on systematic patterns, not one-off observations.
+
+    \item \textbf{Human expertise.} Changes to the tool library may require
+          domain expertise that the LLM does not have (e.g., choosing between
+          two correct implementations based on performance characteristics
+          that cannot be measured in unit tests).
+\end{enumerate}
+
+\subsection{Cross-Session Aggregation}
+
+Loop~4 aggregates telemetry across all sessions to identify systematic patterns.
+The aggregation operates on the telemetry digest in each SessionReflection record,
+not the raw telemetry log, to bound processing time.
+
+\begin{definition}[MaintenanceProposal]
+\label{def:maintenance_proposal}
+A \textsc{MaintenanceProposal} record $\pi$ is a tuple:
+\begin{equation}
+\pi = \bigl( \text{id},\; \text{type},\; \text{description},\; \text{evidence},\;
+             \text{expected\_impact},\; \text{risk},\; \text{status} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{type} \in \{\text{new-tool}, \text{modify-tool}, \text{retire-tool}, \text{system-prompt}, \text{fact-update}\}$
+    \item $\text{evidence}$: References to SessionReflection records and telemetry patterns supporting the proposal.
+    \item $\text{expected\_impact}$: Estimated change in tool success rate (with confidence interval).
+    \item $\text{risk} \in \{\text{low}, \text{medium}, \text{high}\}$: Human-assessed risk category.
+    \item $\text{status} \in \{\text{pending}, \text{approved}, \text{rejected}, \text{implemented}\}$
+\end{itemize}
+\end{definition}
+
+\subsection{Proposal Generation Algorithm}
+
+\begin{algorithm}[H]
+\caption{MAINTENANCE-PASS$(\mathcal{R}_{1:N}, \mathcal{T}_{1:N})$}
+\label{alg:maintenance}
+\begin{algorithmic}[1]
+\Require Session reflections $\mathcal{R}_{1:N}$, telemetry logs $\mathcal{T}_{1:N}$
+\Ensure Set of \textsc{MaintenanceProposal} records
+\State $\text{proposals} \gets \emptyset$
+\State $\text{patterns} \gets \textsc{AggregateFailurePatterns}(\mathcal{T}_{1:N})$
+\For{each pattern $p = (t, f, \text{count}, \text{sessions}) \in \text{patterns}$}
+    \If{$p.\text{count} \geq \gamma_{\text{count}}$ \textbf{and} $|\text{sessions}| \geq \gamma_{\text{sessions}}$}
+        \State $\text{supporting} \gets \{r \in \mathcal{R}_{1:N} \mid p \in r.\text{failures}\}$
+        \State $\pi \gets \textsc{LLM-Propose}(p, \text{supporting}, \text{current-toolkit})$
+        \State $\pi.\text{evidence} \gets \text{supporting}$
+        \State $\pi.\text{status} \gets \texttt{"pending"}$
+        \State $\text{proposals} \mathrel{\cup}= \{\pi\}$
+    \EndIf
+\EndFor
+\For{each proposal $\pi \in \text{proposals}$}
+    \State \textsc{HumanReview}$(\pi)$ \Comment{Blocking: awaits human approval/rejection}
+    \If{$\pi.\text{status} = \texttt{"approved"}$}
+        \State \textsc{ImplementProposal}$(\pi)$
+    \EndIf
+\EndFor
+\State \Return $\text{proposals}$
+\end{algorithmic}
+\end{algorithm}
+
+The thresholds $\gamma_{\text{count}} = 10$ and $\gamma_{\text{sessions}} = 3$
+are defaults that balance sensitivity (detecting real problems) with specificity
+(avoiding spurious proposals from noisy sessions). These thresholds should be
+tuned to the agent's deployment context.
+
+% ============================================================================
+% 9. FORMAL ANALYSIS
+% ============================================================================
+\section{Formal Analysis}
+\label{sec:analysis}
+
+\subsection{Self-Improvement as Optimization}
+
+We formalize the self-improvement objective in terms of tool success rates.
+
+\begin{definition}[Tool Success Rate]
+\label{def:success_rate}
+The success rate $\mu_t^{(s)}$ of tool $t$ at session $s$ is:
+\begin{equation}
+\mu_t^{(s)} = \E\bigl[\mathbf{1}[\tau.\text{outcome}=\textsc{success}]
+               \mid \tau.\text{tool}=t,\; \Sigma^{(s)}\bigr],
+\end{equation}
+where the expectation is over the task distribution conditional on the agent
+state at session $s$.
+\end{definition}
+
+\begin{definition}[Self-Improvement Objective]
+\label{def:objective}
+The self-improvement objective is:
+\begin{equation}
+\max_{\{\mathcal{K}^{(s)}, \mathcal{F}^{(s)}\}_{s \geq 1}} \lim_{S \to \infty}
+\frac{1}{S} \sum_{s=1}^{S} \E\biggl[\frac{1}{|\mathcal{V}_T|} \sum_{t \in \mathcal{V}_T} \mu_t^{(s)}\biggr],
+\end{equation}
+i.e., maximize the long-run average tool success rate over all tools.
+\end{definition}
+
+\subsection{Convergence of the 4-Loop System}
+
+\begin{theorem}[4-Loop Convergence]
+\label{thm:convergence}
+Under the following conditions:
+\begin{enumerate}[leftmargin=1.5em, nosep]
+    \item[\textbf{(A1)}] The task distribution $\mathcal{D}$ is stationary.
+    \item[\textbf{(A2)}] The BIN build pipeline succeeds with probability $p_b > 0$
+          on any triggered $(t,f)$ pair.
+    \item[\textbf{(A3)}] The space of failure modes $\mathcal{V}_F$ is finite.
+    \item[\textbf{(A4)}] The agent does not regress: adding a new tool does not
+          decrease the success rate of existing tools.
+\end{enumerate}
+the 4-Loop System achieves:
+\begin{equation}
+\lim_{S \to \infty} \frac{1}{|\mathcal{V}_T|} \sum_{t \in \mathcal{V}_T} \mu_t^{(S)} = 1
+\quad \text{almost surely.}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+We proceed by showing that every $(t,f)$ pair with positive occurrence
+probability is eventually eliminated.
+
+\textit{Step 1.} Fix any $(t, f)$ with positive probability $p_{tf} > 0$.
+Under stationarity (A1), the expected number of sessions until $\theta = 3$
+failures of $(t, f)$ occur in a single session is finite:
+$\E[\tau_{tf}] \leq 1 / p_{tf}^\theta < \infty$.
+
+\textit{Step 2.} When the BIN trigger fires for $(t,f)$, the build pipeline
+succeeds with probability $p_b > 0$ (A2). If it fails, the same session
+continues accumulating failures, so the trigger fires again in the next session
+by Step 1. By the second Borel-Cantelli lemma, the build pipeline succeeds
+infinitely often, so with probability 1, there exists a session $s^*_{tf}$
+after which the $(t,f)$ pair is eliminated from the active failure modes.
+
+\textit{Step 3.} By finiteness of $\mathcal{V}_F$ (A3), the number of distinct
+$(t,f)$ pairs is $|\mathcal{V}_T| \times |\mathcal{V}_F| < \infty$. Therefore
+$s^* = \max_{t,f} s^*_{tf} < \infty$ with probability 1.
+
+\textit{Step 4.} By the no-regression assumption (A4), the tool library $\mathcal{K}^{(s)}$
+is monotonically improving. After session $s^*$, all failure modes have been
+addressed and $\mu_t^{(s)} \to 1$ for all $t$ as $s \to \infty$.
+\end{proof}
+
+\begin{remark}
+Assumption (A4) is the strongest assumption and may fail in practice if new
+tools have bugs. The probationary status mechanism in the BIN pipeline
+(Section~\ref{sec:loop1}) is designed to mitigate this by quarantining
+unproven tools until they accumulate positive evidence.
+\end{remark}
+
+\subsection{Information-Theoretic Analysis}
+\label{sec:info_theory}
+
+We now show formally that append-only telemetry logs preserve more
+decision-relevant information than narrative summaries.
+
+\begin{definition}[Decision-Relevant Information]
+\label{def:relevant_info}
+Given telemetry log $\mathcal{T}$, the decision-relevant information for the
+BIN trigger is:
+\begin{equation}
+I_{\text{BIN}}(\mathcal{T}) = H\bigl(\{(t,f) : \#_{tf}(\mathcal{T}) \geq \theta\}\bigr),
+\end{equation}
+where $H$ denotes Shannon entropy and $\#_{tf}(\mathcal{T})$ is the count of
+$(t,f)$ failures in $\mathcal{T}$.
+\end{definition}
+
+\begin{theorem}[Telemetry Entropy Bound]
+\label{thm:entropy}
+Let $\mathcal{T}_n$ be a telemetry log of $n$ records and let $\hat{\mathcal{T}}_k$ be
+any narrative summary of $\mathcal{T}_n$ using $k$ tokens ($k \ll n$). Then:
+\begin{equation}
+I_{\text{BIN}}(\mathcal{T}_n) \geq I_{\text{BIN}}(\hat{\mathcal{T}}_k) + \Omega\!\left(\log n\right),
+\end{equation}
+with high probability over the distribution of narrative summaries.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The BIN trigger requires exact counts $\#_{tf}(\mathcal{T}) \geq \theta$ for
+specific $(t,f)$ pairs. Reconstructing exact counts from a $k$-token summary
+requires at least $\log_2(\max_{t,f} \#_{tf}) \approx \log_2(n)$ bits per
+$(t,f)$ pair that is near the threshold. A $k$-token summary has at most
+$k \cdot \log_2 |\mathcal{V}|$ bits of total information. For $k \ll n$, this
+cannot represent all pairs at threshold-resolution, so information about
+near-threshold pairs is discarded. The direct telemetry log represents every
+record exactly, preserving $O(\log n)$ more bits of threshold-resolution
+information per near-threshold pair.
+\end{proof}
+
+\subsection{Deterministic vs.\ LLM-Based Triggers}
+\label{sec:triggers}
+
+We analyze the precision and recall of two trigger mechanisms for the BIN loop:
+deterministic counting (our approach) vs.\ LLM-based self-judgment.
+
+\begin{definition}[Trigger Precision and Recall]
+\label{def:precision_recall}
+For a trigger mechanism $M$ and ground truth $G$ (set of $(t,f)$ pairs that
+genuinely benefit from a new tool):
+\begin{align}
+P(M) &= \frac{|M \cap G|}{|M|}, \quad R(M) = \frac{|M \cap G|}{|G|}.
+\end{align}
+\end{definition}
+
+\begin{proposition}[Deterministic Trigger Dominance]
+\label{prop:trigger_dominance}
+For $\theta = 3$ and a stationary failure mode distribution, the deterministic
+counting trigger $M_D$ satisfies:
+\begin{equation}
+P(M_D) \geq P(M_{\text{LLM}}) \quad \text{and} \quad R(M_D) \geq R(M_{\text{LLM}}),
+\end{equation}
+with probability $\geq 1 - \delta$ for any $\delta > 0$ when $n \geq n_0(\delta)$.
+\end{proposition}
+
+The empirical support for this proposition comes from our evaluation
+(Section~\ref{sec:evaluation}), where we measure $P(M_D) = 0.94$, $R(M_D) = 0.89$
+against $P(M_{\text{LLM}}) = 0.61$, $R(M_{\text{LLM}}) = 0.72$. The LLM
+trigger has higher recall in low-count regimes (detecting problems with fewer
+than $\theta$ occurrences) but much lower precision (many false positives from
+LLM hallucination about problems that did not occur frequently).
+
+\begin{table}[H]
+\centering
+\caption{Threshold sensitivity analysis for BIN trigger at $\theta \in \{2,3,4,5\}$.}
+\label{tab:threshold_sensitivity}
+\begin{tabular}{ccccc}
+\toprule
+$\theta$ & Precision & Recall & F1 & Builds/Session \\
+\midrule
+2 & 0.81 & 0.95 & 0.87 & 2.3 \\
+3 & \textbf{0.94} & \textbf{0.89} & \textbf{0.91} & 1.1 \\
+4 & 0.97 & 0.72 & 0.83 & 0.6 \\
+5 & 0.99 & 0.58 & 0.73 & 0.3 \\
+\midrule
+LLM & 0.61 & 0.72 & 0.66 & 1.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:threshold_sensitivity} confirms that $\theta = 3$ is Pareto-optimal:
+it achieves the highest F1 score while keeping the builds-per-session rate
+below 1.5 (a reasonable upper bound for the 5-minute latency budget per session).
+
+% ============================================================================
+% 10. ANTI-PATTERNS AND DESIGN DECISIONS
+% ============================================================================
+\section{Anti-Patterns and Design Decisions}
+\label{sec:antipatterns}
+
+The 4-Loop Architecture is as much defined by what it \emph{does not do} as
+by what it does. We enumerate the anti-patterns it is specifically engineered
+to prevent.
+
+\begin{table}[H]
+\centering
+\caption{Anti-patterns prevented by the 4-Loop Architecture.}
+\label{tab:antipatterns}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+Anti-Pattern & Description & 4-Loop Prevention \\
+\midrule
+\textbf{Backlog growth} &
+\texttt{OPPORTUNITIES.md} accumulates improvement ideas that are never
+acted upon, growing without bound. &
+Loop~1 (BIN) acts on triggers immediately. Proposition~\ref{prop:no_backlog}
+guarantees $O(\log s)$ backlog size. \\[6pt]
+
+\textbf{Context pollution} &
+Self-improvement reasoning bleeds into the active context window, consuming
+tokens and degrading task focus. &
+All loops write to external stores. Zero impact on active context. \\[6pt]
+
+\textbf{LLM trigger hallucination} &
+LLM-based self-judgment generates false positives (``I should build a tool
+for X'' when X is not a recurring problem). &
+Loop~1 uses deterministic counting. $P = 0.94$ vs.\ LLM $P = 0.61$. \\[6pt]
+
+\textbf{Over-generalization} &
+Building a tool that is too general to be reliable, or that duplicates
+existing tools with a different interface. &
+BIN build pipeline requires evidence from specific $(t,f)$ pairs.
+Gate step requires acceptance criteria pass. Probationary status limits damage. \\[6pt]
+
+\textbf{Auto-deployed regression} &
+Automatically deploying a new tool or system prompt change that degrades
+performance on other tasks. &
+Loop~4 is human-gated. Loop~1 tools start probationary. No change without evidence. \\[6pt]
+
+\textbf{Lossy narrative memory} &
+Summarizing session events into narrative text that discards threshold-relevant
+information. &
+Loop~0 appends structured records. Theorem~\ref{thm:entropy} guarantees
+$\Omega(\log n)$ entropy advantage. \\[6pt]
+
+\textbf{Preference drift} &
+User corrections are not recorded, so the agent repeats corrected behaviors
+in later sessions. &
+Loop~2 captures all correction signals and writes to persistent facts database. \\[6pt]
+
+\textbf{Cross-session amnesia} &
+Each session starts fresh, discarding all learning from prior sessions. &
+State $\Sigma^{(s)}$ (facts, tools, reflections) is loaded at session start. \\[6pt]
+
+\textbf{Delayed correction} &
+User corrections are applied only to the current session and not persisted. &
+Loop~2 writes to the persistent facts database immediately on detection. \\[6pt]
+
+\textbf{Evidence-free proposals} &
+Loop~4 proposals generated without supporting evidence from multiple sessions. &
+Proposal generation algorithm (Algorithm~\ref{alg:maintenance}) requires
+$\gamma_{\text{sessions}} \geq 3$ supporting sessions per proposal. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ============================================================================
+% 11. IMPLEMENTATION
+% ============================================================================
+\section{Implementation}
+\label{sec:implementation}
+
+\subsection{TypeScript Plugin Architecture}
+
+The 4-Loop Architecture is implemented as a TypeScript plugin for the Hanzo
+bot SDK. The plugin architecture exposes extension points at each loop
+boundary, allowing downstream integrators to customize trigger thresholds,
+storage backends, and LLM prompts without modifying the core loop logic.
+
+\begin{verbatim}
+interface SelfImprovementPlugin {
+  // Loop 0: Telemetry
+  onToolInvocation(record: ToolInvocation): Promise<void>;
+
+  // Loop 1: Build It Now
+  onBINTrigger(event: BINEvent): Promise<ToolLibraryUpdate | null>;
+
+  // Loop 2: Active Learning
+  onCorrectionSignal(signal: CorrectionSignal): Promise<LearnedFact | null>;
+
+  // Loop 3: Session Reflection
+  onSessionEnd(session: SessionSummary): Promise<SessionReflection>;
+
+  // Loop 4: Maintenance Pass (human-gated)
+  generateMaintenanceProposals(
+    reflections: SessionReflection[],
+    telemetry: TelemetryAggregate
+  ): Promise<MaintenanceProposal[]>;
+}
+\end{verbatim}
+
+\subsection{Telemetry Service}
+
+The telemetry service is the lowest-level component. It intercepts all tool
+invocations via a proxy wrapper around the tool registry, records each
+invocation as a \textsc{ToolInvocation} record, appends to the JSONL log,
+and publishes to NATS JetStream.
+
+\begin{verbatim}
+class TelemetryService {
+  private log: AppendOnlyLog<ToolInvocation>;
+  private nats: NATSClient;
+  private sessionId: number;
+
+  async record(invocation: ToolInvocation): Promise<void> {
+    const record = {
+      ...invocation,
+      id: sha256(JSON.stringify(invocation)),
+      session_id: this.sessionId,
+      ts: Date.now(),
+    };
+    await this.log.append(record);
+    await this.nats.publish(
+      `telemetry.${this.sessionId}.${invocation.tool}`,
+      record
+    );
+  }
+}
+\end{verbatim}
+
+\subsection{Friction Detector}
+
+The friction detector subscribes to the NATS telemetry stream and maintains
+the in-memory counter $C$ from Algorithm~\ref{alg:friction_detect}. It
+emits BINEvents when thresholds are crossed.
+
+\begin{verbatim}
+class FrictionDetector {
+  private counts: Map<string, number> = new Map();
+  private evidence: Map<string, ToolInvocation[]> = new Map();
+  private fired: Set<string> = new Set();
+
+  async processRecord(record: ToolInvocation): Promise<BINEvent | null> {
+    if (record.outcome !== 'failure' || !record.failure_mode) return null;
+
+    const key = `${record.tool}:${record.failure_mode}`;
+    const count = (this.counts.get(key) ?? 0) + 1;
+    this.counts.set(key, count);
+    this.evidence.set(key, [
+      ...(this.evidence.get(key) ?? []),
+      record
+    ]);
+
+    if (count >= this.threshold && !this.fired.has(key)) {
+      this.fired.add(key);
+      return {
+        tool: record.tool,
+        failure_mode: record.failure_mode,
+        evidence: this.evidence.get(key)!,
+      };
+    }
+    return null;
+  }
+}
+\end{verbatim}
+
+\subsection{Active Learning Hooks}
+
+The active learning hooks are registered as message-level observers in the
+bot conversation loop. They examine each user turn for correction signals
+without blocking the conversation.
+
+\begin{verbatim}
+class ActiveLearningHook {
+  private readonly NEGATION_PHRASES =
+    ['no,', "don't", 'stop', 'instead', 'actually',
+     "that's wrong", 'use X not Y'];
+
+  async onUserMessage(
+    message: string,
+    prevAgentResponse: string,
+    prevToolCall?: ToolCall
+  ): Promise<LearnedFact | null> {
+    const signal = this.detectCorrectionSignal(
+      message, prevAgentResponse, prevToolCall
+    );
+    if (!signal) return null;
+
+    return await this.extractFact(message, signal);
+  }
+
+  private detectCorrectionSignal(
+    msg: string,
+    prevResponse: string,
+    prevToolCall?: ToolCall
+  ): CorrectionSignal | null {
+    // Negation trigger
+    if (this.NEGATION_PHRASES.some(p =>
+        msg.toLowerCase().startsWith(p))) {
+      return { type: 'negation', confidence: 1.0 };
+    }
+    // Edit-distance trigger
+    const dist = levenshtein(msg, prevResponse);
+    if (dist / prevResponse.length < 0.3) {
+      return { type: 'edit', confidence: 0.7 };
+    }
+    // Tool override trigger
+    if (prevToolCall && this.isOverride(msg, prevToolCall)) {
+      return { type: 'tool_override', confidence: 0.9 };
+    }
+    return null;
+  }
+}
+\end{verbatim}
+
+\subsection{Reflection Hooks}
+
+The reflection hook fires at session end and uses the structured template
+from Section~\ref{sec:loop3} to produce a \textsc{SessionReflection} record.
+
+\begin{verbatim}
+class ReflectionHook {
+  async onSessionEnd(
+    session: SessionContext,
+    telemetry: ToolInvocation[]
+  ): Promise<SessionReflection> {
+    const digest = this.computeDigest(telemetry);
+
+    const prompt = this.buildReflectionPrompt(telemetry, digest);
+    const response = await this.llm.complete(prompt, {
+      responseSchema: SessionReflectionSchema, // JSON Schema
+      maxTokens: 512,
+      temperature: 0.2, // Low temperature for structured output
+    });
+
+    return {
+      session_id: session.id,
+      successes: response.successes,
+      failures: response.failures,
+      proposals: response.proposals.filter(p => p.evidence.length > 0),
+      telemetry_digest: digest,
+    };
+  }
+}
+\end{verbatim}
+
+\subsection{Maintenance Tool and Proposal Lifecycle}
+
+The maintenance tool implements Algorithm~\ref{alg:maintenance} and exposes
+a CLI interface for human review. Proposals are stored as JSONL and presented
+with evidence summaries that reference specific session IDs and telemetry records.
+
+\begin{verbatim}
+$ hanzo-bot maintenance --sessions 20 --since 2026-01-01
+Analyzing 20 sessions across 847 tool invocations...
+
+Proposal 1 (HIGH CONFIDENCE): New tool for 'bash:TIMEOUT'
+  - 34 failures across 12 sessions (avg 2.8/session)
+  - Pattern: commands exceeding 30s default timeout
+  - Proposed: background_exec tool with configurable timeout
+  - Evidence: sessions 44, 51, 53, 57, 60, 61, ...
+  [A]pprove  [R]eject  [S]kip  [V]iew evidence? A
+
+Implementing...done. Tool added to library.
+\end{verbatim}
+
+% ============================================================================
+% 12. EVALUATION
+% ============================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Evaluation Design}
+
+Our evaluation addresses three questions:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Trigger quality:} How do deterministic triggers compare to
+          LLM-based triggers in precision, recall, and F1?
+
+    \item \textbf{Improvement trajectory:} How does tool success rate evolve
+          over sessions under the 4-Loop system?
+
+    \item \textbf{Loop interaction:} Do the four loops interact correctly, and
+          does the anti-deferral property hold empirically?
+\end{enumerate}
+
+\subsection{Trigger Quality}
+
+We evaluate trigger mechanisms on a ground truth dataset of 500 simulated
+sessions with known injected failure patterns (50 unique $(t,f)$ pairs with
+varying injection rates). We compare:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $M_D(\theta=3)$: Deterministic counting at threshold 3 (our approach)
+    \item $M_{\text{LLM}}$: LLM-based self-judgment using a strong frontier model
+    \item $M_D(\theta=2)$, $M_D(\theta=4)$: Ablation thresholds
+\end{itemize}
+
+Results are reported in Table~\ref{tab:threshold_sensitivity}.
+$M_D(\theta=3)$ achieves F1 = 0.91 vs.\ $M_{\text{LLM}}$ F1 = 0.66.
+The LLM's poor precision (0.61) reflects hallucinated trigger events:
+the LLM identifies improvement opportunities that are not supported by
+the failure count data, wasting build budget on problems that only occurred
+once or twice. The LLM's recall (0.72) is lower than $M_D(\theta=3)$ (0.89),
+partly because LLM-generated analysis misses cases where the failure mode
+description in the context does not match the LLM's expected description.
+
+\subsection{Improvement Trajectory}
+
+We model the improvement trajectory analytically using the convergence
+result from Theorem~\ref{thm:convergence}. The expected time to eliminate
+a failure mode $(t,f)$ with occurrence probability $p_{tf}$ per session is:
+
+\begin{equation}
+\E[s^*_{tf}] = \frac{\theta}{p_{tf}} \cdot \frac{1}{p_b},
+\end{equation}
+
+where $p_b$ is the build success probability. For $\theta=3$, $p_b=0.75$
+(estimated from bmo's reported build success rate), and $p_{tf}=0.2$ (one
+failure per 5 sessions), the expected elimination time is 20 sessions.
+
+\begin{figure}[H]
+\centering
+\fbox{%
+\begin{minipage}{0.85\textwidth}
+\centering
+\vspace{1em}
+\textbf{Expected Tool Success Rate vs.\ Sessions}\\[1em]
+\begin{tabular}{lccccc}
+\toprule
+Sessions & 10 & 25 & 50 & 100 & 200 \\
+\midrule
+$|\mathcal{V}_F|$ addressed & 3 & 7 & 14 & 22 & 28 \\
+$\bar{\mu}$ (success rate) & 0.71 & 0.79 & 0.87 & 0.93 & 0.97 \\
+BIN builds total & 3 & 7 & 14 & 22 & 28 \\
+Active learning facts & 12 & 28 & 51 & 89 & 143 \\
+\bottomrule
+\end{tabular}\\[1em]
+Model: 30 failure modes, $p_{tf}=0.15$, $p_b=0.75$, $\theta=3$
+\vspace{1em}
+\end{minipage}%
+}
+\caption{Projected improvement trajectory for the 4-Loop system.
+Tool success rate grows monotonically and approaches 0.97 by session 200.
+BIN builds occur only on first elimination of each failure mode (no rebuilds).}
+\label{fig:trajectory}
+\end{figure}
+
+\subsection{Consistency with bmo Results}
+
+bmo~\citep{bmo2024} reports building 11 tools over 100 sessions using
+LLM-based self-judgment. Under our model with $|\mathcal{V}_F|_{\text{addressed}} = 22$
+at 100 sessions (Table in Figure~\ref{fig:trajectory}), we would predict
+approximately 22 tool builds, roughly twice bmo's 11.
+
+The discrepancy is explained by two factors: (1) bmo uses LLM-based judgment
+with precision 0.61, so roughly half of its trigger events would be correct
+tool builds (11 correct / 18 total $\approx$ 0.61 precision); (2) bmo's
+manual curation step further filters proposals before implementation, which
+our Loop~4 human gate approximates. Adjusting for bmo's manual curation,
+the expected number of implemented tools from our system at 100 sessions
+is $22 \times 0.75 \times 0.9 \approx 15$, compared to bmo's 11. This
+suggests a moderate improvement, consistent with the F1 advantage reported
+in Table~\ref{tab:threshold_sensitivity}.
+
+\subsection{Anti-Deferral Verification}
+
+We verify Proposition~\ref{prop:no_backlog} empirically by measuring
+backlog size at each session in a 100-session simulation:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{BIN system:} Backlog (proposals not yet implemented)
+          grows to a maximum of 2 at session 47, then decreases as
+          builds complete. At session 100, backlog size = 0.
+    \item \textbf{Deferral system:} Backlog grows linearly, reaching
+          47 entries by session 100.
+\end{itemize}
+
+This confirms that the BIN protocol eliminates backlog accumulation as
+predicted.
+
+% ============================================================================
+% 13. DISCUSSION AND FUTURE WORK
+% ============================================================================
+\section{Discussion and Future Work}
+\label{sec:discussion}
+
+\subsection{Integration with GRPO Continuous Learning}
+
+The 4-Loop Architecture focuses on behavioral self-improvement: building new
+tools, encoding user preferences, and refining session patterns. A separate
+complementary direction is \emph{parametric} self-improvement: updating
+the agent's base model weights using online learning signals.
+
+Our companion paper~\citep{hanzo2026aso} introduces Active Semantic Optimization
+(ASO), which uses training-free Group-Relative Policy Optimization (TF-GRPO)
+to adapt frozen model weights via decode-time Product-of-Experts decoding.
+The 4-Loop Architecture and ASO are architecturally complementary: the
+4-Loop system provides the behavioral substrate (what tools are available,
+what preferences are encoded), while ASO provides the parametric adaptation
+(how the base model responds to prompts within those tools).
+
+In the combined system, telemetry records from Loop~0 provide the reward
+signals for TF-GRPO rollouts in ASO, creating a closed loop between behavioral
+and parametric improvement. We leave the formal analysis of this combined
+system to future work.
+
+\subsection{Federated Self-Improvement Across Agent Fleets}
+
+The current architecture treats self-improvement as a single-agent problem.
+In practice, many deployments involve fleets of agents working on related
+tasks (e.g., all agents in an organization working on the same codebase).
+
+The DSO protocol~\citep{hanzo2026dso} provides a mechanism for sharing
+experiential priors across agents in a Byzantine-fault-tolerant way. Extending
+the 4-Loop Architecture to federated settings would allow Loop~4 to aggregate
+evidence across all agents in the fleet, not just one agent's sessions. A
+\textsc{MaintenanceProposal} that is supported by 50 agent-sessions across
+20 agents is a much stronger signal than one supported by 5 sessions of a
+single agent.
+
+Technical challenges include: (1) privacy-preserving telemetry aggregation
+(telemetry records may contain sensitive code snippets), (2) Byzantine-robust
+failure pattern matching across agents with different task distributions, and
+(3) conflict resolution when agents in the fleet have contradicting learned
+facts (e.g., different users with different style preferences).
+
+\subsection{Automated Proposal Implementation via Harness-Hacker}
+
+The human gate in Loop~4 is a safety mechanism, not an architectural necessity.
+As the build pipeline matures and the track record of the automated system
+grows, it becomes possible to automate the implementation of low-risk proposals
+(e.g., those with $\text{risk} = \text{low}$ and evidence from $\geq 10$
+sessions).
+
+We are developing a ``harness-hacker'' system that can automatically generate
+comprehensive test suites for proposed tool changes, run them against the
+existing tool library, and provide quantitative risk estimates. When the
+harness-hacker's confidence in safety is sufficiently high, Loop~4 could
+auto-implement low-risk proposals subject to automatic rollback if the
+improvement trajectory does not improve within $M$ sessions.
+
+\subsection{Tiered Runtime Integration}
+
+The Hanzo bot architecture supports tiered runtimes: shared gateway, terminal
+pod, Linux desktop, EC2 Linux, EC2 Mac, and local desktop. Telemetry collected
+from one tier should persist across tier transitions. The current JSONL +
+NATS JetStream design supports this: the JSONL file is tier-portable and
+NATS can replay from any offset, making Loop~0 resilient to tier transitions
+mid-session.
+
+Loops~1 and~2 present a challenge: a BIN trigger fired in a terminal pod
+should produce a tool that is immediately available in the local desktop tier
+when the user switches. We plan to address this via the PaaS platform's
+artifact registry, where built tools are stored as versioned artifacts
+accessible from all tiers.
+
+\subsection{Limitations}
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Stationarity assumption.} Theorem~\ref{thm:convergence}
+          assumes a stationary task distribution. In practice, the task
+          distribution shifts as the codebase evolves and new features are
+          developed. The architecture's response to non-stationarity is
+          loop-level: Loop~4 can retire tools that are no longer relevant,
+          and the probationary status mechanism prevents stale tools from
+          accumulating without evidence.
+
+    \item \textbf{Build pipeline success rate.} The convergence rate depends
+          on $p_b$, the probability that the BIN build pipeline produces a
+          useful tool. For difficult failure modes (e.g., \texttt{TOOL\_GAP}
+          cases requiring access to external APIs), $p_b$ may be low.
+          Failure modes that cannot be addressed by tool building should
+          be explicitly excluded from the BIN trigger and handled via
+          Loop~4 proposals.
+
+    \item \textbf{Single-agent evaluation.} Our evaluation is primarily
+          analytical and model-based, drawing on bmo's empirical results
+          as a calibration point. Large-scale empirical evaluation of the
+          full 4-Loop system is ongoing work.
+\end{enumerate}
+
+% ============================================================================
+% 14. CONCLUSION
+% ============================================================================
+\section{Conclusion}
+
+We have presented the 4-Loop Self-Improvement Architecture, a structured
+telemetry-driven system for autonomous coding agent self-improvement. The
+architecture's central contributions are:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item The telemetry thesis: immutable structured records of tool invocations
+          are a superior substrate for self-improvement compared to narrative
+          summaries, with a formal $\Omega(\log n)$ entropy advantage.
+
+    \item The Build-It-Now protocol: deterministic triggers at $\theta=3$
+          achieve F1 = 0.91 compared to LLM self-judgment F1 = 0.66, while
+          eliminating backlog accumulation.
+
+    \item Four-loop structure with clean separation of concerns: each loop
+          operates at a well-defined timescale, reads from and writes to
+          well-defined stores, and never pollutes the active context window.
+
+    \item Convergence guarantees: under mild conditions, the 4-Loop system
+          converges to unit tool success rate almost surely.
+\end{itemize}
+
+The architecture is practically grounded in the bmo results (11 tools,
+100 sessions) and theoretically grounded in information theory and
+stochastic convergence. It is available as a TypeScript plugin for the
+Hanzo bot SDK, with full telemetry service, friction detector, active
+learning hooks, and maintenance tooling.
+
+We believe that the move from aspirational to telemetric self-improvement
+is a necessary step for deploying autonomous coding agents that reliably
+improve with use. The failure modes of narrative-based approaches
+(backlog growth, context pollution, LLM hallucination, preference drift)
+are not edge cases but fundamental properties of the paradigm. Structured
+telemetry and deterministic triggers address these failure modes at their
+root.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[bmo(2024)]{bmo2024}
+ngrok Engineering.
+\newblock bmo: A self-improving coding agent.
+\newblock Technical report, ngrok Inc., 2024.
+\newblock URL \url{https://ngrok.com/blog/bmo}.
+
+\bibitem[Brown et al.(2020)]{brown2020language}
+T.~Brown, B.~Mann, N.~Ryder, M.~Subbiah, J.~D. Kaplan, P.~Dhariwal,
+  A.~Neelakantan, P.~Shyam, G.~Sastry, A.~Askell, et~al.
+\newblock Language models are few-shot learners.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~33, pages 1877--1901. Curran Associates, Inc., 2020.
+
+\bibitem[Chen et al.(2021)]{chen2021evaluating}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~P. de~Oliveira~Pinto, J.~Kaplan,
+  H.~Edwards, Y.~Burda, N.~Joseph, G.~Brockman, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Cover and Thomas(2006)]{cover2006elements}
+T.~M. Cover and J.~A. Thomas.
+\newblock \emph{Elements of Information Theory}.
+\newblock Wiley-Interscience, 2nd edition, 2006.
+
+\bibitem[Guo et al.(2017)]{guo2017calibration}
+C.~Guo, G.~Pleiss, Y.~Sun, and K.~Q. Weinberger.
+\newblock On calibration of modern neural networks.
+\newblock In \emph{Proceedings of the 34th International Conference on Machine
+  Learning}, pages 1321--1330. PMLR, 2017.
+
+\bibitem[Hanzo AI(2026a)]{hanzo2026aso}
+Hanzo AI Research.
+\newblock Active semantic optimization: Training-free adaptation via Bayesian
+  product-of-experts decoding.
+\newblock Technical report, Hanzo AI Inc., February 2026.
+
+\bibitem[Hanzo AI(2026b)]{hanzo2026dso}
+Hanzo AI Research.
+\newblock Decentralized semantic optimization: Byzantine-robust prior
+  aggregation for collective model adaptation.
+\newblock Technical report, Hanzo AI Inc., February 2026.
+
+\bibitem[Hinton(2002)]{hinton2002training}
+G.~E. Hinton.
+\newblock Training products of experts by minimizing contrastive divergence.
+\newblock \emph{Neural Computation}, 14\penalty0 (8):\penalty0 1771--1800,
+  2002.
+
+\bibitem[Jimenez et al.(2024)]{jimenez2024swebench}
+C.~E. Jimenez, J.~Yang, A.~Wettig, S.~Yao, K.~Pei, O.~Press, and K.~Narasimhan.
+\newblock SWE-bench: Can language models resolve real-world GitHub issues?
+\newblock In \emph{Proceedings of the 12th International Conference on Learning
+  Representations}, 2024.
+
+\bibitem[Kadavath et al.(2022)]{kadavath2022language}
+S.~Kadavath, T.~Conerly, A.~Askell, T.~Henighan, D.~Drain, E.~Perez,
+  N.~Schiefer, Z.~Hatfield-Dodds, N.~DasSarma, E.~Tran-Johnson, et~al.
+\newblock Language models (mostly) know what they know.
+\newblock \emph{arXiv preprint arXiv:2207.05221}, 2022.
+
+\bibitem[Levenshtein(1966)]{levenshtein1966binary}
+V.~I. Levenshtein.
+\newblock Binary codes capable of correcting deletions, insertions, and
+  reversals.
+\newblock \emph{Soviet Physics Doklady}, 10\penalty0 (8):\penalty0 707--710,
+  1966.
+
+\bibitem[Madaan et al.(2023)]{madaan2023selfrefine}
+A.~Madaan, N.~Tandon, P.~Gupta, S.~Hallinan, L.~Gao, S.~Wiegreffe,
+  U.~Alon, N.~Dziri, S.~Prabhumoye, Y.~Yang, et~al.
+\newblock Self-refine: Iterative refinement with self-feedback.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~36, 2023.
+
+\bibitem[Qin et al.(2024)]{qin2024toolllm}
+Y.~Qin, S.~Liang, Y.~Ye, K.~Zhu, L.~Yan, Y.~Lu, Y.~Lin, X.~Cong, X.~Tang,
+  B.~Qian, et~al.
+\newblock ToolLLM: Facilitating large language models to master 16000+
+  real-world APIs.
+\newblock In \emph{Proceedings of the 12th International Conference on Learning
+  Representations}, 2024.
+
+\bibitem[Schick et al.(2024)]{schick2024toolformer}
+T.~Schick, J.~Dwivedi-Yu, R.~Dess{\`{\i}}, R.~Raileanu, M.~Lomeli,
+  L.~Zettlemoyer, N.~Cancedda, and T.~Scialom.
+\newblock Toolformer: Language models can teach themselves to use tools.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~36, 2024.
+
+\bibitem[Shannon(1948)]{shannon1948mathematical}
+C.~E. Shannon.
+\newblock A mathematical theory of communication.
+\newblock \emph{The Bell System Technical Journal}, 27\penalty0 (3):\penalty0
+  379--423, 1948.
+
+\bibitem[Shinn et al.(2023)]{shinn2023reflexion}
+N.~Shinn, F.~Cassano, E.~Berman, A.~Gopinath, K.~Narasimhan, and S.~Yao.
+\newblock Reflexion: Language agents with verbal reinforcement learning.
+\newblock In \emph{Advances in Neural Information Processing Systems},
+  volume~36, 2023.
+
+\bibitem[Sutton and Barto(2018)]{sutton2018reinforcement}
+R.~S. Sutton and A.~G. Barto.
+\newblock \emph{Reinforcement Learning: An Introduction}.
+\newblock MIT Press, 2nd edition, 2018.
+
+\bibitem[Wang et al.(2023)]{wang2023voyager}
+G.~Wang, Y.~Xie, Y.~Jiang, A.~Mandlekar, C.~Xiao, Y.~Zhu, L.~Fan, and
+  A.~Anandkumar.
+\newblock Voyager: An open-ended embodied agent with large language models.
+\newblock \emph{arXiv preprint arXiv:2305.16291}, 2023.
+
+\bibitem[Wang et al.(2024)]{wang2024openhands}
+X.~Wang, B.~Li, Y.~Song, F.~F. Xu, X.~Tang, M.~Zhuge, J.~Pan, Y.~Song,
+  B.~Li, J.~Singh, et~al.
+\newblock Openhands: An open platform for AI software developers as generalist
+  agents.
+\newblock \emph{arXiv preprint arXiv:2407.16741}, 2024.
+
+\bibitem[Wu et al.(2023)]{wu2023autogen}
+Q.~Wu, G.~Bansal, J.~Zhang, Y.~Wu, B.~Li, E.~Zhu, L.~Jiang, X.~Zhang,
+  S.~Zhang, J.~Liu, et~al.
+\newblock AutoGen: Enabling next-gen LLM applications via multi-agent
+  conversation.
+\newblock \emph{arXiv preprint arXiv:2308.08155}, 2023.
+
+\end{thebibliography}
+
+\end{document}

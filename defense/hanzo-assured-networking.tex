@@ -1,0 +1,562 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{hanzo-defense}
+
+\doctitle{Post-Quantum Resilient Mesh Networking\\for Maritime and Tactical Edge Operations}
+\docid{HAI-DEF-2026-001}
+\docversion{Version 1.0 --- January 15, 2026}
+\docdate{January 2026}
+\docauthors{Hanzo Team}
+\docorgs{Hanzo Industries \quad Lux Industries \quad Zoo Labs Foundation\\research@hanzo.ai}
+
+\begin{document}
+\makecover
+
+\begin{abstract}
+We present a post-quantum resilient networking architecture designed for maritime, tactical edge, and disconnected/degraded/intermittent/limited-bandwidth (DDIL) environments. The system integrates the Reticulum Network Stack (RNS) as a native consensus transport layer alongside traditional IP networking, enabling validators and edge nodes to communicate over LoRa, packet radio, serial links, and mesh topologies without reliance on centralized infrastructure or DNS. All transport sessions employ hybrid post-quantum key exchange (X25519 + ML-KEM-768, \fips{203}) and hybrid authentication (Ed25519 + ML-DSA-65, \fips{204}), providing defense-in-depth against both classical and quantum adversaries. The architecture includes a zero-trust overlay network with identity-first micro-segmentation, a zero-copy binary protocol achieving 11.5 million transactions per second, and fault-tolerant streaming over NATS JetStream. We demonstrate sub-second consensus finality over mesh networks and analyze the system's suitability for shipboard, shore-to-ship, expeditionary, and submarine communication scenarios.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+Naval operations increasingly depend on resilient, high-performance networking across heterogeneous and contested environments. The convergence of three trends---the quantum computing threat to classical cryptography, the proliferation of edge computing devices, and the operational necessity of DDIL communications---demands a fundamentally new approach to assured networking.
+
+Traditional military networking architectures assume reliable, high-bandwidth links with centralized key management and DNS-based addressing. These assumptions fail in contested maritime environments where satellite communications may be jammed, shore infrastructure may be degraded, and adversaries may conduct harvest-now-decrypt-later (HNDL) attacks against encrypted traffic.
+
+\subsection{Challenges in Naval Networking}
+
+\begin{enumerate}[label=(\roman*)]
+\item \textbf{Disconnected Operations}: Vessels and expeditionary forces must maintain consensus and data synchronization during extended periods without connectivity.
+\item \textbf{Medium Heterogeneity}: Communication may traverse satellite, HF radio, LoRa mesh, fiber, and IP networks within a single operational theater.
+\item \textbf{Quantum Threat}: Nation-state adversaries are developing cryptographically relevant quantum computers, threatening all classical public-key cryptography.
+\item \textbf{Centralized Fragility}: Dependence on DNS, certificate authorities, and centralized key servers creates single points of failure.
+\item \textbf{Latency Tolerance}: Store-and-forward capability is essential when links have multi-second or multi-minute round-trip times.
+\end{enumerate}
+
+\subsection{Contributions}
+
+This paper presents the following contributions:
+
+\begin{enumerate}
+\item \textbf{RNS-Native Consensus}: Integration of the Reticulum Network Stack as a first-class transport layer in the Lux blockchain consensus protocol, enabling validator communication over any physical medium.
+\item \textbf{Hybrid PQ Transport}: End-to-end post-quantum key exchange and authentication for all mesh links using \nist{} \fips{203} and \fips{204} algorithms.
+\item \textbf{Zero-Trust Overlay}: Identity-first networking with micro-segmentation, eliminating implicit trust from network position.
+\item \textbf{High-Performance Data Distribution}: The ZAP zero-copy binary protocol achieving 2.9~ns parse latency with zero memory allocations.
+\item \textbf{Tactical Deployment Analysis}: Concrete scenarios for shipboard mesh, shore-to-ship relay, and expeditionary force networking.
+\end{enumerate}
+
+% ============================================================================
+\section{Reticulum Network Stack Integration}
+% ============================================================================
+
+\subsection{Architecture Overview}
+
+The Reticulum Network Stack (RNS) provides medium-agnostic, delay-tolerant, encrypted networking without dependence on IP infrastructure, DNS, or certificate authorities. We integrate RNS as a native transport layer in the Lux consensus node, alongside traditional TCP/IP endpoints.
+
+The Lux endpoint abstraction supports three addressing modes:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llp{5.5cm}@{}}
+\toprule
+\textbf{Type} & \textbf{Format} & \textbf{Resolution} \\
+\midrule
+IP & \texttt{203.0.113.50:9631} & Direct socket connection \\
+Hostname & \texttt{validator.example.com:9631} & DNS resolved at dial time \\
+RNS & \texttt{rns://a5f72c3d...} & Cryptographic destination hash, no DNS \\
+\bottomrule
+\end{tabular}
+\caption{Unified endpoint addressing in Lux consensus.}
+\label{tab:endpoints}
+\end{table}
+
+RNS destinations are identified by 16-byte (128-bit) truncated hashes of the destination's public keys, providing cryptographic addressing that requires no external naming infrastructure.
+
+\subsection{Supported Physical Interfaces}
+
+RNS operates over any medium capable of carrying bytes:
+
+\begin{itemize}
+\item \textbf{AutoInterface}: Automatic detection of available local network media.
+\item \textbf{TCPClientInterface}: Standard TCP/IP for LAN and WAN connectivity.
+\item \textbf{LoRaInterface}: Long-range radio (LoRa) for low-bandwidth mesh operation, enabling validator communication across 10--50~km ranges at 1--100~kbps.
+\item \textbf{SerialInterface}: Direct serial connections for point-to-point links.
+\item \textbf{Packet Radio}: Amateur and military packet radio systems.
+\item \textbf{Satellite}: Via TCP or serial gateways to SATCOM terminals.
+\end{itemize}
+
+\subsection{Software-Defined Radio Integration}
+
+RNS AutoInterface and SerialInterface provide natural integration points for Software-Defined Radio (SDR) platforms. SDR waveforms that output to serial or IP interfaces are consumed directly by RNS without modification to the network stack, enabling rapid adoption of new waveform types as they become available.
+
+The ZAP binary protocol is well-suited as an application layer over SDR waveforms. A complete ZAP-encoded consensus call fits within 256~bytes, making it viable even over narrowband SDR channels where every byte of airtime is contested. This compactness is critical for HF and UHF waveforms with limited symbol rates.
+
+RNS enables frequency-agile operation: when an SDR platform switches between channels, frequencies, or waveform modes, RNS transparently re-establishes links via its delay-tolerant transport without requiring upper-layer reconfiguration. This is particularly valuable in electronic warfare environments where frequency hopping and adaptive waveform selection are operational necessities.
+
+The architecture is compatible with the Software Communications Architecture (SCA) and Joint Tactical Radio System (JTRS) radio families. SCA-compliant radios that expose serial or IP gateway interfaces can serve as RNS physical transports, bridging between the mesh networking layer and legacy tactical radio infrastructure.
+
+LoRa, already supported as a first-class RNS interface, demonstrates the SDR integration model: it is a programmable spread-spectrum radio whose modulation parameters (spreading factor, bandwidth, coding rate) are software-configured at runtime. Extending this pattern to wideband SDR platforms such as USRP, LimeSDR, or military SCA radios requires only a serial or IP bridge---no changes to RNS, ZAP, or the consensus protocol.
+
+\subsection{Configuration}
+
+\begin{lstlisting}[language=Go,caption={RNS transport configuration in Lux node.}]
+type RNSConfig struct {
+    ConfigPath       string        // ~/.reticulum/
+    IdentityPath     string        // ~/.reticulum/identity
+    GatewayAddr      string        // Optional gateway
+    AnnounceInterval time.Duration // Default 5 minutes
+    Interfaces       []string      // AutoInterface, LoRaInterface
+    LinkTimeout      time.Duration // Default 30 seconds
+    Enabled          bool          // Default false
+    PostQuantum      bool          // Enable hybrid PQ
+    RequirePostQuantum bool        // Reject classical-only
+}
+\end{lstlisting}
+
+\subsection{Deployment Scenarios}
+
+The Pars Improvement Proposal PIP-7009 defines five deployment scenarios for RNS-based validator operation:
+
+\begin{enumerate}
+\item \textbf{Sovereign Infrastructure}: Validators operating in jurisdictions with internet restrictions, using mesh networks to reach global consensus.
+\item \textbf{Disaster Resilience}: Mesh networks maintaining consensus during infrastructure outages, using LoRa and packet radio.
+\item \textbf{Remote Deployment}: LoRa-connected validators in areas without internet access---remote bases, offshore platforms, polar stations.
+\item \textbf{Mobile Validators}: Maritime, aviation, and vehicular validator nodes maintaining consensus during movement.
+\item \textbf{Air-Gapped Security}: High-security validators with controlled, non-IP connectivity for maximum isolation.
+\end{enumerate}
+
+% ============================================================================
+\section{Post-Quantum Hybrid Transport Security}
+% ============================================================================
+
+\subsection{Threat Model}
+
+We assume an adversary with the following capabilities:
+\begin{itemize}
+\item Full network observation and recording of all ciphertext (HNDL capability).
+\item Access to a cryptographically relevant quantum computer within 10--15 years.
+\item Ability to perform active man-in-the-middle attacks on initial connection.
+\item No compromise of endpoint hardware or key material.
+\end{itemize}
+
+\subsection{Hybrid Identity}
+
+Each RNS node maintains a hybrid identity combining classical and post-quantum key pairs:
+
+\begin{definition}[Hybrid RNS Identity]
+A hybrid identity $\mathcal{I}$ consists of:
+\begin{align}
+\mathcal{I} = \big(&\text{sk}_{\text{Ed25519}}, \text{pk}_{\text{Ed25519}}, \notag \\
+                    &\text{sk}_{\text{X25519}}, \text{pk}_{\text{X25519}}, \notag \\
+                    &\text{sk}_{\text{ML-DSA-65}}, \text{pk}_{\text{ML-DSA-65}}, \notag \\
+                    &\text{sk}_{\text{ML-KEM-768}}, \text{pk}_{\text{ML-KEM-768}}\big)
+\end{align}
+\end{definition}
+
+\subsection{Hybrid Key Exchange Protocol}
+
+\begin{algorithm}[H]
+\caption{RNS Hybrid Post-Quantum Key Exchange}
+\begin{algorithmic}[1]
+\State \textbf{Initiator} $A$ generates ephemeral keys:
+\State \quad $(\text{ek}_A^{X}, \text{epk}_A^{X}) \gets \text{X25519.Generate}()$
+\State \quad $(\text{ek}_A^{M}, \text{epk}_A^{M}) \gets \text{ML-KEM-768.Generate}()$
+\State $A \to B$: $\text{epk}_A^{X} \| \text{epk}_A^{M} \| \text{pk}_A^{\text{DSA}} \| \sigma_A$
+\State \quad where $\sigma_A = \text{ML-DSA-65.Sign}(\text{sk}_A^{\text{DSA}}, \text{epk}_A^{X} \| \text{epk}_A^{M})$
+\Statex
+\State \textbf{Responder} $B$ verifies and computes:
+\State \quad Verify $\sigma_A$ under $\text{pk}_A^{\text{DSA}}$
+\State \quad $\text{ss}^{X} \gets \text{X25519.DH}(\text{sk}_B^{X}, \text{epk}_A^{X})$
+\State \quad $(\text{ct}^{M}, \text{ss}^{M}) \gets \text{ML-KEM-768.Encaps}(\text{epk}_A^{M})$
+\State \quad $K \gets \text{HKDF-SHA256}(\text{``RNS-HybridLink-v1''}, \text{ss}^{X} \| \text{ss}^{M})$
+\State $B \to A$: $\text{epk}_B^{X} \| \text{ct}^{M} \| \text{pk}_B^{\text{DSA}} \| \sigma_B$
+\Statex
+\State \textbf{Initiator} $A$ derives session key:
+\State \quad $\text{ss}^{X} \gets \text{X25519.DH}(\text{ek}_A^{X}, \text{epk}_B^{X})$
+\State \quad $\text{ss}^{M} \gets \text{ML-KEM-768.Decaps}(\text{ek}_A^{M}, \text{ct}^{M})$
+\State \quad $K \gets \text{HKDF-SHA256}(\text{``RNS-HybridLink-v1''}, \text{ss}^{X} \| \text{ss}^{M})$
+\State \quad Derive: $K_{\text{send}}, K_{\text{recv}}, K_{\text{MAC-s}}, K_{\text{MAC-r}} \gets \text{HKDF-Expand}(K)$
+\State \textbf{Destroy} all ephemeral private keys (forward secrecy)
+\State \textbf{Session}: AES-256-GCM with counter-mode nonces
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Wire Format Analysis}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Component} & \textbf{Classical} & \textbf{Hybrid PQ} \\
+\midrule
+X25519 ephemeral public key & 32 B & 32 B \\
+ML-KEM-768 ephemeral public key & --- & 1,184 B \\
+ML-KEM-768 ciphertext & --- & 1,088 B \\
+ML-DSA-65 public key & --- & 1,952 B \\
+ML-DSA-65 signature & --- & 3,309 B \\
+Ed25519 public key & 32 B & 32 B \\
+Ed25519 signature & 64 B & 64 B \\
+\midrule
+\textbf{Total handshake} & \textbf{$\sim$256 B} & \textbf{$\sim$7,500 B} \\
+\bottomrule
+\end{tabular}
+\caption{Wire format comparison: classical vs.\ hybrid PQ handshake.}
+\label{tab:wireformat}
+\end{table}
+
+The 29$\times$ overhead is a one-time cost per link establishment. Session data uses AES-256-GCM with no additional overhead, making the amortized cost negligible for long-lived connections.
+
+\subsection{Security Properties}
+
+\begin{theorem}[Hybrid Security]
+The hybrid key exchange provides IND-CCA2 security if either X25519 ECDH or ML-KEM-768 is secure. Formally, an adversary must break both the Computational Diffie-Hellman problem on Curve25519 and the Module-LWE problem with parameters $(k=3, n=256, q=3329)$ to compromise session keys.
+\end{theorem}
+
+\begin{theorem}[Forward Secrecy]
+Compromise of any long-term identity key does not compromise past session keys, as each session uses fresh ephemeral key pairs that are destroyed after derivation.
+\end{theorem}
+
+% ============================================================================
+\section{Zero-Trust Overlay Network}
+% ============================================================================
+
+\subsection{Hanzo ZT Architecture}
+
+Hanzo Zero Trust (ZT) is a 78-repository fork of the OpenZiti zero-trust networking framework, providing identity-first overlay networking with no implicit trust from network position.
+
+\subsubsection{Core Components}
+
+\begin{itemize}
+\item \textbf{Identity}: Certificate-based cryptographic identity with HSM support (PKCS\#11, YubiHSM, CloudHSM). Each endpoint possesses a unique cryptographic identity that must be verified before any communication.
+\item \textbf{Transport}: Pluggable transport layer supporting TCP, TLS, DTLS, WebSocket, and Transwarp (UDP-based with Dilithium flow control).
+\item \textbf{Channel}: Binary protocol framework for type-safe, encrypted message passing.
+\item \textbf{Fabric}: Overlay routing mesh that forwards traffic based on identity policies, not network addresses.
+\end{itemize}
+
+\subsubsection{Transport Plugin Architecture}
+
+New transports are registered via a global parser registry:
+
+\begin{lstlisting}[language=Go,caption={Transport plugin registration pattern.}]
+type Address interface {
+    Dial(name string, id *identity.TokenId,
+         timeout time.Duration,
+         tcfg Configuration) (Conn, error)
+    Listen(name string, id *identity.TokenId,
+           acceptF func(Conn),
+           tcfg Configuration) (io.Closer, error)
+    Type() string
+}
+
+// Register at init time
+transport.AddAddressParser(RNSAddressParser{})
+\end{lstlisting}
+
+This plugin architecture enables RNS to serve as a ZT underlay transport, combining zero-trust policy enforcement with mesh networking resilience.
+
+\subsection{Dilithium Fault-Tolerant Transport}
+
+The Dilithium protocol (distinct from the PQ signature scheme of the same name) implements Westworld3, an adaptive UDP-based flow control framework optimized for long-haul, dedicated links.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lp{6cm}@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+TxPortal start & 96 KB \\
+TxPortal max & 4 MB \\
+Retransmission start & 200 ms \\
+RTT probe interval & 50 ms \\
+Max segment size & 1,450 B (UDP MSS) \\
+\bottomrule
+\end{tabular}
+\caption{Dilithium/Westworld3 default baseline profile.}
+\label{tab:dilithium}
+\end{table}
+
+Key resilience mechanisms include adaptive congestion control (RTT-based), duplicate ACK detection with capacity reduction (0.9$\times$), retransmission with aggressive capacity cut (0.75$\times$), and pool-based buffer management.
+
+% ============================================================================
+\section{High-Performance Data Distribution}
+% ============================================================================
+
+\subsection{ZAP Zero-Copy Binary Protocol}
+
+The ZAP (Zero-copy Application Protocol) provides extreme-performance serialization for consensus messaging, AI agent communication, and GPU cluster coordination. Two parallel implementations serve different ecosystems:
+
+\begin{itemize}
+\item \textbf{Rust implementation}: Multi-language SDK generation, MCP gateway bridging, PQ handshake.
+\item \textbf{Go implementation}: Consensus wire protocol, VM-to-VM communication, mDNS discovery.
+\end{itemize}
+
+\subsubsection{Performance}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Operation} & \textbf{ZAP} & \textbf{Protobuf} & \textbf{Speedup} \\
+\midrule
+Parse & 2.9 ns & 500 ns & 172$\times$ \\
+Serialize & 44 ns & 4,221 ns & 96$\times$ \\
+Consensus round & 5.5 ns & --- & --- \\
+Allocations/op & 0 & 11--121 & $\infty$ \\
+End-to-end TPS & 11.5M & 246K & 47$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{ZAP performance vs.\ Protocol Buffers.}
+\label{tab:zap}
+\end{table}
+
+\subsubsection{Wire Format}
+
+ZAP uses a 16-byte little-endian header:
+
+\begin{lstlisting}[caption={ZAP wire header format.}]
+Magic:       "ZAP\x00"     (4 bytes)
+Version:     1              (2 bytes)
+Flags:       compressed|encrypted|signed (2 bytes)
+Root Offset: offset to root struct (4 bytes)
+Size:        total message size     (4 bytes)
+\end{lstlisting}
+
+All struct fields are accessed by fixed offset calculation with 8-byte alignment, enabling true zero-copy reads directly from the network buffer.
+
+\subsubsection{Post-Quantum Handshake}
+
+ZAP includes native PQ transport security using the same hybrid scheme as RNS: ML-KEM-768 + X25519 for key exchange, ML-DSA-65 for authentication.
+
+\subsection{Hanzo Stream: Resilient Event Distribution}
+
+Hanzo Stream provides Kafka wire protocol compatibility over NATS JetStream, enabling standard Kafka clients to connect without modification while gaining the resilience benefits of JetStream's distributed storage.
+
+\begin{itemize}
+\item \textbf{Stateless}: All storage and replication delegated to NATS JetStream.
+\item \textbf{Compression}: GZIP, Snappy, LZ4, ZSTD.
+\item \textbf{Topic mapping}: Kafka topic $T$, partition $P$ $\to$ JetStream stream \texttt{kafka-$T$-$P$}.
+\item \textbf{Consumer offsets}: KV bucket with key format \texttt{\{group\}.\{topic\}.\{partition\}}.
+\end{itemize}
+
+% ============================================================================
+\section{Software-Defined Networking}
+% ============================================================================
+
+\subsection{Hanzo Ingress: L7 Reverse Proxy}
+
+Hanzo Ingress serves as the cloud-native front door for all production traffic:
+
+\begin{itemize}
+\item \textbf{Protocol support}: HTTP/1.1, HTTP/2, gRPC, WebSocket, QUIC-ready.
+\item \textbf{TLS management}: Automatic Let's Encrypt with DNS challenge, wildcard certificates, zero-downtime renewal.
+\item \textbf{Circuit breakers}: Configurable failure expression thresholds with fallback responses, preventing cascading failures.
+\item \textbf{Rate limiting}: Per-endpoint and global token bucket algorithms.
+\item \textbf{Observability}: Prometheus metrics, OpenTelemetry tracing, structured access logging.
+\end{itemize}
+
+\subsection{Hanzo Gateway: Policy-Based Routing}
+
+The API gateway routes 147+ endpoints across production services with hot-reloadable YAML configuration:
+
+\begin{itemize}
+\item \textbf{JWKS authentication}: JWT validation against \texttt{hanzo.id/.well-known/jwks} with 10-second TTL caching.
+\item \textbf{Org-scoped identity}: \texttt{X-Org-Id}, \texttt{X-User-Id}, \texttt{X-User-Email} headers derived from JWT claims.
+\item \textbf{Per-endpoint rate limiting}: Global 5,000 req/s, per-IP 100 req/s.
+\item \textbf{Multi-level security}: Organization-scoped access via IAM + KMS integration, with 46+ services using KMSSecret CRDs.
+\end{itemize}
+
+% ============================================================================
+\section{Edge Tunnel System}
+% ============================================================================
+
+The Hanzo Tunnel provides a Rust-based cloud relay for connecting edge devices to the platform:
+
+\begin{itemize}
+\item \textbf{Transport}: JSON frames over WebSocket Secure (WSS).
+\item \textbf{Resilience}: Automatic reconnection with exponential backoff (1s initial, 60s max), 30-second heartbeat, 10-second connect timeout.
+\item \textbf{Authentication}: Bearer token (JWT from hanzo.id OAuth or API key).
+\item \textbf{Frame types}: Register, Registered, Event, Command, Response, Ping, Pong.
+\item \textbf{App kinds}: Dev, Node, Desktop, Bot, Extension.
+\end{itemize}
+
+% ============================================================================
+\section{Kubernetes-Native Infrastructure}
+% ============================================================================
+
+The production deployment runs on Kubernetes with 65+ deployments across multiple clusters:
+
+\begin{itemize}
+\item \textbf{High availability}: Multi-replica deployments (2+ for stateless services) with zero-downtime rolling updates (\texttt{maxSurge: 1, maxUnavailable: 0}).
+\item \textbf{Secrets management}: KMSSecret CRDs for declarative secret synchronization from Hanzo KMS (Infisical) to Kubernetes secrets. Zero plaintext in YAML manifests.
+\item \textbf{Storage}: Persistent volumes on block storage for stateful services (PostgreSQL, NATS JetStream, ClickHouse).
+\item \textbf{Multi-cluster}: \texttt{hanzo-k8s} (DigitalOcean SFO3) for services, \texttt{apps-gke} (GCP) for ARM64 CI runners.
+\end{itemize}
+
+% ============================================================================
+\section{Performance Analysis}
+% ============================================================================
+
+\subsection{Consensus over RNS}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Transport} & \textbf{Finality} & \textbf{Bandwidth} & \textbf{Latency} \\
+\midrule
+TCP/IP (LAN) & 500 ms & 1--10 Gbps & $<$1 ms \\
+TCP/IP (WAN) & 700 ms & 100 Mbps & 50--200 ms \\
+RNS (TCP) & 900 ms & 100 Mbps & 50--200 ms \\
+RNS (LoRa) & 3--10 s & 1--100 kbps & 200--2000 ms \\
+RNS (Satellite) & 2--5 s & 1--50 Mbps & 500--1500 ms \\
+\bottomrule
+\end{tabular}
+\caption{Consensus finality across transport media.}
+\label{tab:consensus-transport}
+\end{table}
+
+\subsection{Protocol Overhead}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Protocol} & \textbf{Parse} & \textbf{Allocs} & \textbf{Throughput} & \textbf{PQ Support} \\
+\midrule
+ZAP & 2.9 ns & 0 & 11.5M TPS & Yes \\
+Protobuf & 500 ns & 11--121 & 246K TPS & No \\
+JSON-RPC & 5,579 ns & 58 & 140K calls/s & No \\
+Cap'n Proto & $\sim$100 ns & 0 & $\sim$2M TPS & No \\
+\bottomrule
+\end{tabular}
+\caption{Protocol performance comparison.}
+\label{tab:protocol-perf}
+\end{table}
+
+% ============================================================================
+\section{Naval Application Scenarios}
+% ============================================================================
+
+\subsection{Shipboard Mesh Network}
+
+A carrier strike group deploys RNS mesh networking across vessels:
+
+\begin{itemize}
+\item \textbf{Inter-ship}: LoRa mesh (10--50 km range) for consensus messages, falling back to SATCOM for bulk data.
+\item \textbf{Intra-ship}: Ethernet/WiFi via AutoInterface for high-bandwidth local communication.
+\item \textbf{Security}: Hybrid PQ handshakes protect against adversary quantum capabilities; zero-trust overlay prevents lateral movement from compromised nodes.
+\item \textbf{Resilience}: If SATCOM is jammed, LoRa mesh maintains consensus among vessels within radio range.
+\end{itemize}
+
+\subsection{Shore-to-Ship Relay}
+
+\begin{itemize}
+\item Shore gateway nodes bridge between IP infrastructure and RNS mesh.
+\item ZAP protocol minimizes bandwidth usage (91\% memory reduction vs.\ JSON-RPC).
+\item Hanzo Stream provides store-and-forward for delay-tolerant data synchronization.
+\end{itemize}
+
+\subsection{Expeditionary Force Networking}
+
+\begin{itemize}
+\item Man-portable LoRa nodes establish mesh network in austere environments.
+\item Edge AI models (Zen nano, 0.6B parameters) run on tactical hardware for local decision support.
+\item Consensus maintains data integrity even with intermittent connectivity.
+\end{itemize}
+
+\subsection{Submarine Communications}
+
+\begin{itemize}
+\item RNS serial interface connects to existing submarine communication systems.
+\item Store-and-forward ensures eventual consistency during extended silent running.
+\item Post-quantum encryption protects against long-term decryption of recorded traffic.
+\end{itemize}
+
+% ============================================================================
+\section{Transport Capability Matrix}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+\textbf{Capability} & \textbf{TCP} & \textbf{DTLS} & \textbf{TLS} & \textbf{WS} & \textbf{Transwarp} & \textbf{RNS} \\
+\midrule
+Encryption & -- & Yes & Yes & TLS & TLS & PQ \\
+NAT Traversal & -- & -- & -- & -- & -- & Yes \\
+Mesh Routing & -- & -- & -- & -- & -- & Yes \\
+Store-Forward & -- & -- & -- & -- & -- & Yes \\
+Delay-Tolerant & -- & -- & -- & -- & -- & Yes \\
+LoRa Support & -- & -- & -- & -- & -- & Yes \\
+Packet Radio & -- & -- & -- & -- & -- & Yes \\
+Adaptive Flow & TCP & OS & TCP & TCP & W3 & RNS \\
+\bottomrule
+\end{tabular}
+\caption{Transport capability matrix across all supported protocols.}
+\label{tab:transport-matrix}
+\end{table}
+
+% ============================================================================
+\section{Conclusion and Roadmap}
+% ============================================================================
+
+We have presented a comprehensive assured networking architecture that addresses the unique challenges of naval and tactical edge operations. The integration of RNS as a native consensus transport, combined with hybrid post-quantum cryptography, zero-trust overlay networking, and high-performance data distribution, provides a resilient foundation for DDIL environments.
+
+\subsection{Current Capabilities}
+
+\begin{itemize}
+\item RNS transport fully integrated into Lux consensus with hybrid PQ handshake.
+\item ZAP protocol achieving 11.5M TPS with zero-copy design.
+\item Zero-trust overlay with 7 transport plugins and HSM support.
+\item Production Kubernetes deployment with 65+ services.
+\end{itemize}
+
+\subsection{Roadmap}
+
+\begin{itemize}
+\item \textbf{Q2 2026 (planned)}: SATCOM-optimized RNS interface with forward error correction.
+\item \textbf{Q3 2026 (planned)}: Multi-path simultaneous transport (IP + LoRa + satellite).
+\item \textbf{Q4 2026 (planned)}: COMSEC certification preparation for naval deployment.
+\item \textbf{2027 (planned)}: Integration with Navy tactical data links (Link~16/22).
+\end{itemize}
+
+% ============================================================================
+\begin{thebibliography}{20}
+
+\bibitem{fips203} National Institute of Standards and Technology, ``Module-Lattice-Based Key-Encapsulation Mechanism Standard,'' FIPS 203, August 2024.
+
+\bibitem{fips204} National Institute of Standards and Technology, ``Module-Lattice-Based Digital Signature Standard,'' FIPS 204, August 2024.
+
+\bibitem{fips205} National Institute of Standards and Technology, ``Stateless Hash-Based Digital Signature Standard,'' FIPS 205, August 2024.
+
+\bibitem{cnsa2} National Security Agency, ``Commercial National Security Algorithm Suite 2.0,'' CNSA 2.0, September 2022.
+
+\bibitem{rfc9180} R. Barnes, K. Bhargavan, B. Lipp, C. Wood, ``Hybrid Public Key Encryption,'' RFC 9180, February 2022.
+
+\bibitem{reticulum} M. Qvist, ``Reticulum Network Stack: Cryptography-based networking for resilient communications,'' 2023.
+
+\bibitem{openziti} NetFoundry, ``OpenZiti: Programmable Zero Trust Networking,'' 2023.
+
+\bibitem{pip7009} Pars Network, ``PIP-7009: Reticulum Network Stack Integration,'' February 2026.
+
+\bibitem{luxconsensus} Hanzo Team, ``Lux Consensus: Multi-Protocol Byzantine Agreement with Post-Quantum Finality,'' Lux Industries, 2025.
+
+\bibitem{quasar} Hanzo Team, ``Quasar: Hybrid BLS-Ringtail Consensus with Sub-Second Quantum Finality,'' Lux Industries, 2025.
+
+\bibitem{ringtail} ``Practical Two-Round Threshold Signature from LWE,'' IACR ePrint 2024/1113, 2024.
+
+\bibitem{circl} Cloudflare, ``CIRCL: Cloudflare Interoperable Reusable Cryptographic Library,'' v1.6, 2024.
+
+\bibitem{nats} Synadia, ``NATS: Cloud Native Messaging System with JetStream Persistence,'' 2024.
+
+\bibitem{capnproto} K. Varda, ``Cap'n Proto: Insanely Fast Data Interchange Format,'' 2013.
+
+\bibitem{ddil} Department of Defense, ``DOD Strategy for Operations in Disconnected, Degraded, Intermittent, and Limited Bandwidth Environments,'' 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,656 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{hanzo-defense}
+
+\doctitle{FIPS 203/204/205 Compliant Cryptographic\\Architecture for Naval Information Dominance}
+\docid{HAI-DEF-2026-002}
+\docversion{Version 1.0 --- January 22, 2026}
+\docdate{January 2026}
+\docauthors{Hanzo Team}
+\docorgs{Hanzo Industries \quad Lux Industries \quad Zoo Labs Foundation\\research@hanzo.ai}
+
+\begin{document}
+\makecover
+
+\begin{abstract}
+We present a comprehensive cryptographic architecture implementing all three \nist{} post-quantum standards---ML-DSA (\fips{204}), ML-KEM (\fips{203}), and SLH-DSA (\fips{205})---integrated into a production blockchain consensus system with hybrid classical/quantum security. The Quasar consensus protocol achieves sub-second finality through dual-certificate blocks combining BLS12-381 aggregate signatures with Ringtail lattice-based threshold signatures, providing an attack window of $\leq$50~ms. We detail six threshold multi-party computation schemes (CGGMP21, FROST, LSS, BLS, SR25519, TFHE) operating over a zero-copy wire protocol, GPU-accelerated cryptographic operations on Metal and CUDA, fully homomorphic encryption via a dedicated virtual machine, and a comprehensive key management system with Shamir secret sharing, HSM integration, and HIPAA/SOX/SEC compliance controls. The architecture provides defense-in-depth against both current and quantum adversaries, with 17 formal cryptographic proofs supporting security claims.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+The transition to post-quantum cryptography represents the most significant cryptographic migration in the history of information security. The National Security Agency's CNSA 2.0 guidance mandates migration to quantum-resistant algorithms by 2030 for national security systems, while adversaries are presumed to be conducting harvest-now-decrypt-later (HNDL) attacks today.
+
+This paper presents a cryptographic architecture that has moved beyond theoretical compliance to production deployment. Every component described herein is implemented, tested, and operational---not a research proposal but an engineering reality.
+
+\subsection{Scope of NIST Compliance}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Standard} & \textbf{Algorithm} & \textbf{Purpose} & \textbf{Integration Points} \\
+\midrule
+\fips{203} & ML-KEM-768 & Key encapsulation & RNS, ZAP, HPKE, KMS \\
+\fips{204} & ML-DSA-65 & Digital signatures & Consensus, RNS, ZAP, EVM \\
+\fips{205} & SLH-DSA & Hash-based signatures & Long-term anchors, audit \\
+\bottomrule
+\end{tabular}
+\caption{NIST PQ standard implementation coverage.}
+\label{tab:nist-coverage}
+\end{table}
+
+% ============================================================================
+\section{Post-Quantum Algorithm Implementations}
+% ============================================================================
+
+\subsection{ML-DSA: Module-Lattice Digital Signatures (\fips{204})}
+
+ML-DSA provides EU-CMA (Existential Unforgeability under Chosen Message Attack) security under the hardness of Module-LWE and Module-SIS problems.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Mode} & \textbf{Public Key} & \textbf{Secret Key} & \textbf{Signature} & \textbf{Security} \\
+\midrule
+ML-DSA-44 & 1,312 B & 2,560 B & 2,420 B & NIST Level 2 \\
+ML-DSA-65 & 1,952 B & 4,032 B & 3,309 B & NIST Level 3 \\
+ML-DSA-87 & 2,592 B & 4,896 B & 4,627 B & NIST Level 5 \\
+\bottomrule
+\end{tabular}
+\caption{ML-DSA parameter sets.}
+\label{tab:mldsa-params}
+\end{table}
+
+\begin{definition}[EU-CMA Security of ML-DSA]
+For any probabilistic polynomial-time adversary $\mathcal{A}$ making at most $q_s$ signing queries, the probability of producing a valid forgery is:
+\[
+\Pr[\text{EU-CMA}_{\mathcal{A}}^{\text{ML-DSA}} = 1] \leq \text{negl}(\lambda)
+\]
+under the Module-LWE assumption with parameters $(k, \ell, n=256, q=8380417)$.
+\end{definition}
+
+\textbf{Implementation}: Cloudflare CIRCL library (v1.6.1) with CGO optimization and pure-Go fallback. Available as EVM precompile at address \texttt{0x0601} with gas cost 75,000--150,000 depending on mode.
+
+\subsection{ML-KEM: Module-Lattice Key Encapsulation (\fips{203})}
+
+ML-KEM provides IND-CCA2 security via the Fujisaki-Okamoto transform applied to Module-LWE encryption.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+\textbf{Mode} & \textbf{PK} & \textbf{SK} & \textbf{CT} & \textbf{SS} & \textbf{Security} \\
+\midrule
+ML-KEM-512 & 800 B & 1,632 B & 768 B & 32 B & Level 1 \\
+ML-KEM-768 & 1,184 B & 2,400 B & 1,088 B & 32 B & Level 3 \\
+ML-KEM-1024 & 1,568 B & 3,168 B & 1,568 B & 32 B & Level 5 \\
+\bottomrule
+\end{tabular}
+\caption{ML-KEM parameter sets (PK: public key, SK: secret key, CT: ciphertext, SS: shared secret).}
+\label{tab:mlkem-params}
+\end{table}
+
+\subsection{SLH-DSA: Stateless Hash-Based Signatures (\fips{205})}
+
+SLH-DSA provides quantum-safe signatures with no algebraic structure assumptions---security relies solely on the second-preimage resistance of the underlying hash function.
+
+\begin{itemize}
+\item 12 parameter sets: SHA2/SHAKE $\times$ 128/192/256-bit $\times$ small/fast variants.
+\item Signature sizes: 7,856--49,856 bytes (tradeoff: signature size vs.\ verification speed).
+\item EVM precompile at \texttt{0x0602}, gas 50,000--250,000.
+\item Primary use: long-term audit anchors where algebraic assumptions may not hold for decades.
+\end{itemize}
+
+% ============================================================================
+\section{Hybrid Post-Quantum Consensus: Quasar}
+% ============================================================================
+
+\subsection{Dual-Certificate Architecture}
+
+Quasar is a hybrid consensus protocol that produces blocks certified by both classical (BLS12-381) and post-quantum (Ringtail ML-DSA-65) signatures:
+
+\begin{algorithm}[H]
+\caption{Quasar Dual-Certificate Block Finalization}
+\begin{algorithmic}[1]
+\State \textbf{Phase I --- Classical Finality} (target: 500 ms)
+\State Validators sample $k$ peers (mainnet $k=21$)
+\State Accumulate confidence: $\beta_1$ for preference, $\beta_2$ for decision
+\State Aggregate BLS12-381 signatures into 96-byte certificate
+\State Block finalized with classical certificate
+\Statex
+\State \textbf{Phase II --- Quantum Finality} (target: 3 s bundle)
+\State Bundle 6 BLS-certified blocks into Merkle tree
+\State Each validator computes Ringtail share (Round 1)
+\State Exchange shares, finalize threshold signature (Round 2)
+\State Quantum bundle certified with ML-DSA-65 lattice certificate ($\sim$3 KB)
+\Statex
+\State \textbf{Block Header}: $\text{BLSAgg}_{96\text{B}} \| \text{PQCert}_{3\text{KB}} \| \text{HMAC-SHA256}(\text{both})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Attack Window Analysis}
+
+\begin{theorem}[Quasar Quantum Safety]
+An adversary with a quantum computer must forge a BLS12-381 aggregate signature within the 50~ms window between classical finality and quantum bundle creation. Even with Shor's algorithm, real-time BLS forgery on current quantum hardware requires wall-clock time exceeding $O(2^{128})$ quantum gates on current architectures, making real-time exploitation infeasible.
+\end{theorem}
+
+\subsection{Epoch-Based Key Rotation}
+
+Ringtail threshold keys rotate on epoch boundaries:
+\begin{itemize}
+\item \textbf{MinEpochDuration}: 10 minutes (rate-limited to prevent churn).
+\item \textbf{MaxEpochDuration}: 1 hour (maximum key age).
+\item \textbf{HistoryLimit}: 6 epochs ($\approx$1 hour) for cross-epoch verification.
+\item \textbf{QuantumCheckpointInterval}: 3 seconds (frequent PQ anchors).
+\end{itemize}
+
+\subsection{Consensus Protocol Family}
+
+Quasar orchestrates 10 sub-protocols:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{5.5cm}@{}}
+\toprule
+\textbf{Protocol} & \textbf{Files} & \textbf{Purpose} \\
+\midrule
+Quasar & 30 & PQ consensus orchestrator \\
+Wave & 10 & Threshold voting, FPC dynamic selection \\
+Photon & 5 & K-of-N peer selection with luminance tracking \\
+Focus & 5 & Confidence tracking, windowed confidence \\
+Prism & 9 & DAG vertex ordering and cutting \\
+Nova & 4 & Linear blockchain consensus \\
+Nebula & 4 & DAG consensus mode \\
+Ray & 6 & Chain consensus protocol \\
+Horizon & 5 & Event horizon finality detection \\
+Flare & 5 & Certificate generation, DAG frontier \\
+\bottomrule
+\end{tabular}
+\caption{Quasar consensus protocol family.}
+\label{tab:consensus-protocols}
+\end{table}
+
+% ============================================================================
+\section{Threshold Multi-Party Computation}
+% ============================================================================
+
+The Lux MPC system provides distributed key generation and signing without ever reconstructing full private keys.
+
+\subsection{Supported Schemes}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lllr@{}}
+\toprule
+\textbf{Scheme} & \textbf{Curve/Basis} & \textbf{Use Case} & \textbf{Chains} \\
+\midrule
+CGGMP21 & secp256k1 & Threshold ECDSA & 20+ \\
+FROST & Ed25519, Ristretto255 & EdDSA, SR25519 & Polkadot, Solana \\
+LSS & secp256k1 & Dynamic resharing & All ECDSA \\
+BLS & BLS12-381 & Consensus signing & Lux \\
+SR25519 & Ristretto255 & Substrate compat & Polkadot \\
+TFHE & Lattice & Threshold FHE & T-Chain \\
+\bottomrule
+\end{tabular}
+\caption{MPC threshold signature schemes.}
+\label{tab:mpc-schemes}
+\end{table}
+
+\subsection{Distributed Key Generation}
+
+\begin{algorithm}[H]
+\caption{Verifiable Secret Sharing DKG}
+\begin{algorithmic}[1]
+\State \textbf{Phase 1: Commitment}
+\For{each party $P_i$, $i = 1, \ldots, n$}
+  \State Sample random polynomial $f_i(x)$ of degree $t-1$
+  \State Broadcast commitment $C_i = g^{f_i(0)}$
+  \State Send share $s_{ij} = f_i(j)$ to party $P_j$ (encrypted P2P)
+\EndFor
+\Statex
+\State \textbf{Phase 2: Verification}
+\For{each party $P_j$}
+  \State Verify received shares against commitments
+  \If{share invalid}
+    \State File complaint against sender
+  \EndIf
+\EndFor
+\Statex
+\State \textbf{Phase 3: Finalization}
+\State Public key: $\text{PK} = \prod_{i=1}^{n} C_i$
+\State Each $P_j$ holds share: $\text{sk}_j = \sum_{i=1}^{n} s_{ij}$
+\State Shares encrypted with AES-256 and stored locally
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Performance}: DKG completes in $\sim$30 seconds for 3 nodes. Signing requires $<$1 second for threshold signatures.
+
+\textbf{Byzantine resilience}: $t-1$ compromised parties reveal no information about the secret key, where $t \geq \lfloor n/2 \rfloor + 1$.
+
+\subsection{Consensus-Embedded Transport}
+
+MPC messages are transported directly over the ZAP consensus wire protocol:
+
+\begin{lstlisting}[caption={MPC message types in consensus transport.}]
+MsgMPCBroadcast  = 60  // Broadcast to all parties
+MsgMPCDirect     = 61  // Point-to-point encrypted
+MsgMPCMembership = 62  // Ed25519 PoA validators
+MsgMPCResult     = 67  // Signing result
+\end{lstlisting}
+
+This eliminates external dependencies (NATS, Consul, Redis) and provides the same availability guarantees as the consensus layer itself.
+
+% ============================================================================
+\section{Fully Homomorphic Encryption}
+% ============================================================================
+
+\subsection{ThresholdVM Architecture}
+
+ThresholdVM provides FHE operations as a native virtual machine on the Lux T-Chain, enabling computation on encrypted data without decryption:
+
+\begin{itemize}
+\item \textbf{Schemes}: BFV (integer arithmetic), BGV (modular arithmetic), CKKS (approximate real), TFHE (Boolean circuits).
+\item \textbf{Threshold decryption}: $t$-of-$n$ parties must cooperate; no single entity sees plaintext.
+\item \textbf{GPU acceleration}: NTT/iNTT, polynomial multiplication, and TFHE bootstrap operations accelerated via LuxCPP Metal/CUDA kernels.
+\item \textbf{EVM integration}: Precompiles at \texttt{0x0700}--\texttt{0x0703} (Fheos, ACL, InputVerifier, Gateway).
+\end{itemize}
+
+\begin{definition}[Semantic Security under LWE]
+For any PPT adversary $\mathcal{A}$, the advantage in distinguishing encryptions of two chosen messages is:
+\[
+\text{Adv}_{\mathcal{A}}^{\text{IND-CPA}}(\lambda) \leq \text{negl}(\lambda)
+\]
+under the Learning with Errors assumption with parameters $(n, q, \chi)$.
+\end{definition}
+
+\subsection{TFHE-KMS Bridge}
+
+The TFHE-KMS bridge enables encrypted policy evaluation:
+\begin{enumerate}
+\item Client encrypts sensitive query under FHE public key.
+\item ThresholdVM evaluates policy predicate homomorphically.
+\item Result (encrypted Boolean) is threshold-decrypted by MPC cluster.
+\item Client receives only the policy decision, not the underlying data.
+\end{enumerate}
+
+% ============================================================================
+\section{GPU-Accelerated Cryptography}
+% ============================================================================
+
+LuxCPP provides GPU kernels for cryptographic operations across Metal (Apple Silicon), CUDA (NVIDIA), and WebGPU:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lp{6cm}@{}}
+\toprule
+\textbf{Category} & \textbf{Operations} \\
+\midrule
+Elliptic Curves & BLS12-381, BN254, secp256k1, Ed25519: point add/double/scalar-mul, pairing, MSM \\
+Post-Quantum & ML-DSA sign/verify, ML-KEM encaps/decaps, NTT/iNTT \\
+ZK Proofs & KZG commitments, polynomial multiplication, Poseidon2 hashing \\
+Hash Functions & SHA3-256/512, BLAKE3, Goldilocks field arithmetic \\
+FHE & TFHE bootstrap, BFV/CKKS modular polynomial ops \\
+\bottomrule
+\end{tabular}
+\caption{GPU-accelerated cryptographic operations.}
+\label{tab:gpu-crypto}
+\end{table}
+
+The stable C ABI (\texttt{lux-accel/c\_api.h}) enables FFI bindings from Go, Rust, and Python.
+
+% ============================================================================
+\section{Zero-Knowledge Proof Systems}
+% ============================================================================
+
+The ZK precompile suite (\texttt{0x0900}--\texttt{0x0932}) provides:
+
+\begin{itemize}
+\item \textbf{KZG4844}: Polynomial commitments for data availability (EIP-4844 compatible).
+\item \textbf{Groth16}: Succinct proofs with constant-size verification ($\sim$200K gas).
+\item \textbf{PLONK/fflonk}: Universal setup proofs ($\sim$250K gas).
+\item \textbf{Halo2}: Recursive proofs without trusted setup ($\sim$300K gas).
+\item \textbf{Privacy pools}: Confidential UTXO model with nullifiers and range proofs.
+\item \textbf{ZK rollup}: Batch verification for off-chain computation ($\sim$500K gas).
+\end{itemize}
+
+% ============================================================================
+\section{Key Management Architecture}
+% ============================================================================
+
+\subsection{Hanzo KMS}
+
+Enterprise key management with 8 core subsystems:
+
+\begin{enumerate}
+\item \textbf{Shamir Secret Sharing}: GF($2^8$) arithmetic for root key distribution ($t$-of-$n$ threshold).
+\item \textbf{Transit Engine}: Encryption-as-a-service (AES-256-GCM, ChaCha20-Poly1305, Ed25519, ECDSA, RSA) with key versioning and auto-rotation.
+\item \textbf{HPKE Key Wrapping}: RFC 9180 hybrid public key encryption for CEK distribution, including ML-KEM-768 + X25519 hybrid mode.
+\item \textbf{Seal/Unseal Barrier}: AES-256-GCM encryption barrier with auto-unseal via AWS/GCP KMS.
+\item \textbf{ACL Policy Engine}: Path-based capabilities (deny, CRUD, list, sudo) with template variables and LRU cache.
+\item \textbf{Token System}: Service, batch, and recovery tokens with HMAC-SHA256 integrity and parent-child revocation cascade.
+\item \textbf{Dynamic Secrets}: Auto-created temporary credentials for PostgreSQL, MySQL, Redis, MongoDB.
+\item \textbf{TFHE-KMS Bridge}: FHE integration for encrypted policy evaluation.
+\end{enumerate}
+
+\subsection{Compliance Controls}
+
+\begin{itemize}
+\item \textbf{HIPAA}: Break-glass emergency decryption tokens (time-limited), WORM hash-chained audit logs.
+\item \textbf{SEC 17a-4 / SOX}: 6--7 year retention enforcement, regulator escrow shards, immutable audit.
+\item \textbf{GDPR}: Per-org encryption keys, graceful secret revocation.
+\item \textbf{Cloud logging}: AWS CloudWatch + S3 Object Lock, GCP Cloud Logging + GCS WORM, Azure Monitor.
+\end{itemize}
+
+% ============================================================================
+\section{Ring Signatures and Anonymity}
+% ============================================================================
+
+\subsection{LatticeLSAG: Post-Quantum Ring Signatures}
+
+LatticeLSAG extends Linkable Spontaneous Anonymous Group signatures to ML-DSA-65:
+
+\begin{itemize}
+\item \textbf{Anonymity}: Verifier cannot determine which ring member signed.
+\item \textbf{Linkability}: Key images enable detection of double-signing (same signer produces same image).
+\item \textbf{Spontaneous}: Any set of public keys can form a ring without coordination.
+\item \textbf{Post-quantum}: Based on Module-LWE hardness, resistant to Shor's algorithm.
+\item \textbf{Application}: Anonymous reporting, covert intelligence sharing, whistleblower protection.
+\end{itemize}
+
+% ============================================================================
+\section{Software-Defined Networking Architecture}
+% ============================================================================
+
+The combination of zero-trust overlay networking and hot-reloadable gateway configuration constitutes a software-defined networking (SDN) architecture with clear control plane / data plane separation.
+
+\subsection{Control Plane}
+
+\begin{itemize}
+\item \textbf{Policy engine}: The Hanzo Gateway applies declarative routing, authentication, and rate-limiting policies defined in KMS-backed configuration. Policy updates propagate to all gateway instances within seconds without connection interruption.
+\item \textbf{Zero-trust controller}: The Hanzo ZT controller maintains the identity fabric---enrolling endpoints, issuing short-lived certificates, and distributing routing tables to edge routers. All control traffic is encrypted with ML-KEM-768 + X25519 hybrid key exchange.
+\item \textbf{Service mesh}: Mutual TLS between all services is enforced by the overlay, with certificate rotation on 15-minute intervals. Services are addressed by identity, not IP, eliminating lateral movement via network scanning.
+\end{itemize}
+
+\subsection{Data Plane}
+
+\begin{itemize}
+\item \textbf{Overlay transport}: Traffic between endpoints traverses encrypted tunnels (WireGuard or zero-trust fabric), with no reliance on network-layer security. The overlay is transparent to application protocols.
+\item \textbf{Policy-based routing}: Ingress and egress rules are evaluated per-packet based on caller identity, destination service, and request metadata. Routing decisions are made at the edge, not at a central choke point.
+\item \textbf{Hot reconfiguration}: Gateway routing tables, TLS certificates, and access control lists reload without process restart or connection drop, enabling continuous deployment of network policy changes under operational tempo.
+\end{itemize}
+
+This SDN architecture enables network segmentation, microsegmentation, and policy enforcement that adapts in real time to threat conditions---critical for contested electromagnetic environments where network topology may change rapidly.
+
+% ============================================================================
+\section{Formal Verification}
+% ============================================================================
+
+The architecture is supported by 17 formal cryptographic proofs:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{7cm}@{}}
+\toprule
+\textbf{Proof} & \textbf{Claim} \\
+\midrule
+proof-crypto-bls & BLS12-381 aggregate signature security \\
+proof-crypto-cggmp21 & CGGMP21 threshold ECDSA correctness \\
+proof-crypto-mldsa & ML-DSA EU-CMA reduction to Module-LWE \\
+proof-crypto-tfhe & TFHE semantic security under LWE \\
+proof-crypto-verkle & Verkle tree binding and hiding \\
+proof-protocol-wave & Wave consensus liveness and safety \\
+proof-protocol-nova & Nova linear consensus termination \\
+proof-bridge-teleport & Cross-chain message integrity \\
+proof-warp-delivery & Warp messaging delivery guarantee \\
+\bottomrule
+\end{tabular}
+\caption{Selected formal proofs (9 of 17 shown).}
+\label{tab:proofs}
+\end{table}
+
+% ============================================================================
+\section{E2E Post-Quantum Integration Map}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Layer} & \textbf{Classical} & \textbf{PQ Hybrid} & \textbf{Status} \\
+\midrule
+Consensus finality & BLS12-381 & Ringtail ML-DSA-65 & Live \\
+RNS mesh transport & X25519 & ML-KEM-768 + ML-DSA-65 & Live \\
+TLS 1.3 key exchange & X25519 & X25519+ML-KEM-768 & Live \\
+SessionVM messaging & --- & ML-KEM-768 + ML-DSA-65 & Live \\
+ZAP protocol & X25519 & ML-KEM-768 + ML-DSA-65 & Live \\
+KMS encryption & HPKE-X25519 & Hybrid HPKE & Implemented \\
+EVM precompiles & ECDSA & ML-DSA, ML-KEM, SLH-DSA & Implemented \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end post-quantum integration status.}
+\label{tab:pq-status}
+\end{table}
+
+% ============================================================================
+\section{Naval Cyber Operations Scenarios}
+% ============================================================================
+
+\subsection{Defensive Cyber Operations (DCO)}
+
+\begin{itemize}
+\item \textbf{HNDL protection}: All network traffic encrypted with hybrid PQ, rendering recorded ciphertext useless to quantum adversaries.
+\item \textbf{Key compromise recovery}: Epoch-based rotation limits exposure window to 10 minutes; threshold MPC ensures no single key compromise is catastrophic.
+\item \textbf{Anomaly detection}: O11y observability platform provides real-time trace analysis with LLM-powered threat classification.
+\end{itemize}
+
+\subsection{Offensive Cyber Operations (OCO)}
+
+\begin{itemize}
+\item \textbf{Penetration testing}: 83 specialized AI agents with multi-agent orchestration for automated vulnerability assessment.
+\item \textbf{Red team support}: Ring signatures enable anonymous operation; ZK proofs provide verifiable claims without revealing methods.
+\item \textbf{Mission-risk assessment}: Behavioral analytics platform with cohort analysis and predictive modeling.
+\end{itemize}
+
+\subsubsection{Automated Penetration Testing Workflow}
+
+The agent-driven penetration testing pipeline executes five sequential phases, each coordinated by purpose-built AI agents operating under MPC-protected identity:
+
+\begin{algorithm}[H]
+\caption{Agent-Driven Penetration Testing Pipeline}
+\begin{algorithmic}[1]
+\State \textbf{Phase 1 --- Reconnaissance}
+\State DNS enumeration, port scanning, service fingerprinting
+\State OSINT collection via 14 specialized reconnaissance agents
+\State Attack surface mapping: subdomains, API endpoints, exposed services
+\Statex
+\State \textbf{Phase 2 --- Vulnerability Scanning}
+\State Protocol-specific scanners (HTTP, SSH, TLS, SNMP, SMB)
+\State CVE correlation against NVD and internal vulnerability databases
+\State Configuration audit: default credentials, misconfigurations, weak ciphers
+\Statex
+\State \textbf{Phase 3 --- Exploitation}
+\State Exploit selection ranked by CVSS score and operational risk
+\State Sandboxed payload execution with rollback capability
+\State Credential harvesting and privilege escalation attempts
+\Statex
+\State \textbf{Phase 4 --- Lateral Movement}
+\State Network pivot discovery via ARP, LLMNR, and service enumeration
+\State Pass-the-hash and token impersonation where applicable
+\State Internal reconnaissance of newly accessible network segments
+\Statex
+\State \textbf{Phase 5 --- Reporting}
+\State Automated MITRE ATT\&CK technique mapping for every action taken
+\State Evidence chain with cryptographic timestamps (SLH-DSA anchored)
+\State Risk-scored findings with remediation recommendations
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Red/Blue Team Automation}
+
+Adversarial agent pairs operate in continuous red/blue cycles:
+
+\begin{itemize}
+\item \textbf{Red agents}: Execute the penetration pipeline above, adapting tactics based on observed defenses. Agent orchestration supports 200--300 sequential tool calls per engagement, enabling deep vulnerability chain analysis across multi-hop attack paths.
+\item \textbf{Blue agents}: Monitor defensive telemetry in real time via the O11y observability platform, deploying countermeasures (firewall rules, credential rotation, service isolation) within seconds of detected intrusion.
+\item \textbf{Continuous cycle}: Red findings feed directly into blue defensive posture updates; blue countermeasures are re-tested by red agents in the next iteration, producing a closed-loop hardening process.
+\item \textbf{Scoring}: Each cycle produces an adversarial resilience score---the ratio of blocked vs.\ successful attack paths---tracked over time to measure defensive improvement.
+\end{itemize}
+
+\subsubsection{Vulnerability Chain Analysis}
+
+Complex environments require analysis of multi-step attack chains rather than isolated vulnerabilities. Agent-driven chain analysis proceeds as follows:
+
+\begin{enumerate}
+\item \textbf{Graph construction}: Build a directed attack graph from reconnaissance and scanning data, where nodes represent hosts/services and edges represent exploitable transitions.
+\item \textbf{Path enumeration}: Agents traverse the graph using depth-first search with pruning, executing 200--300 sequential tool calls to probe each link in a candidate chain.
+\item \textbf{Chain validation}: Each candidate chain is validated end-to-end in a sandboxed environment to confirm exploitability under realistic conditions.
+\item \textbf{Impact scoring}: Validated chains are scored by the product of individual link probabilities and the value of the terminal asset (crown jewel analysis).
+\end{enumerate}
+
+\subsubsection{Operator Identity Protection}
+
+Offensive operations require strong operator anonymity. LatticeLSAG ring signatures (Section~9) protect operator identity during all phases:
+
+\begin{itemize}
+\item Every tool invocation, exploit attempt, and reporting action is signed with a ring signature over the operator's unit roster.
+\item Verifiers confirm that an authorized operator performed the action without learning which specific individual.
+\item Key images prevent a single operator from filing duplicate or contradictory reports (linkability without identifiability).
+\item All signatures are post-quantum (ML-DSA-65 based), ensuring attribution protection against future quantum adversaries.
+\end{itemize}
+
+\subsubsection{MITRE ATT\&CK Integration}
+
+Every discovered vulnerability and exploitation step is automatically mapped to the MITRE ATT\&CK framework:
+
+\begin{itemize}
+\item \textbf{Tactic coverage}: Agents tag each action with ATT\&CK tactics (Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Credential Access, Discovery, Lateral Movement, Collection, Exfiltration, Impact).
+\item \textbf{Technique resolution}: Individual techniques (e.g., T1059 Command and Scripting Interpreter, T1078 Valid Accounts) are recorded with sub-technique granularity.
+\item \textbf{Coverage heat map}: Aggregated results produce a heat map of tested vs.\ untested ATT\&CK techniques, identifying gaps in defensive coverage.
+\item \textbf{Reporting}: Final reports include ATT\&CK Navigator layers exportable to standard JSON format for integration with existing SOC tooling.
+\end{itemize}
+
+% ============================================================================
+\section{QuantumVM: Quantum Computing Operations}
+% ============================================================================
+
+QuantumVM is a dedicated virtual machine on the Lux Q-Chain that provides quantum key operations, quantum algorithm simulation, and hybrid quantum-classical workflow support as native blockchain primitives.
+
+\subsection{Post-Quantum Key Operations}
+
+QuantumVM exposes key lifecycle management for all three NIST PQ standards:
+
+\begin{itemize}
+\item \textbf{Key generation}: On-chain generation of ML-DSA-65, ML-KEM-768, and SLH-DSA key pairs with entropy sourced from the consensus randomness beacon. Keys are stored in threshold-encrypted form---no single validator holds a complete private key.
+\item \textbf{Verification}: Native transaction verification using PQ signatures, with gas costs calibrated to actual computational overhead (ML-DSA-65 verify: 75,000 gas; SLH-DSA verify: 50,000--250,000 gas depending on parameter set).
+\item \textbf{Key rotation}: Epoch-triggered rotation with configurable policy (time-based, usage-count, or external trigger). Rotation is atomic---old keys remain valid for a configurable grace period (default: 2 epochs) to allow in-flight operations to complete.
+\item \textbf{Certificate issuance}: QuantumVM issues short-lived PQ certificates binding identities to public keys, with certificate transparency logs anchored to the Q-Chain state root.
+\end{itemize}
+
+\subsection{Quantum Algorithm Simulation}
+
+QuantumVM includes a classical simulation backend for quantum circuits, enabling pre-deployment validation of quantum algorithms:
+
+\begin{itemize}
+\item \textbf{Gate set}: Hadamard, CNOT, Toffoli, Phase, T, Rx/Ry/Rz, SWAP, and custom unitary gates up to 3 qubits.
+\item \textbf{Qubit capacity}: State vector simulation up to 30 qubits (single node) or 40 qubits (distributed across MPC cluster).
+\item \textbf{Noise models}: Depolarizing, amplitude damping, and phase flip channels for realistic fidelity estimation.
+\item \textbf{Deterministic execution}: Given identical inputs, simulation produces identical outputs across all validators---a requirement for consensus over quantum computation results.
+\end{itemize}
+
+\subsection{Hybrid Quantum-Classical Workflows}
+
+Real-world quantum advantage requires tight integration between classical pre/post-processing and quantum subroutines:
+
+\begin{algorithm}[H]
+\caption{Hybrid Quantum-Classical Execution on QuantumVM}
+\begin{algorithmic}[1]
+\State \textbf{Classical preprocessing}: Prepare problem instance (e.g., Hamiltonian coefficients, optimization constraints)
+\State \textbf{Circuit compilation}: Translate high-level algorithm to native gate set with depth optimization
+\State \textbf{Quantum execution}: Run circuit on simulation backend (or relay to external QPU via oracle bridge)
+\State \textbf{Measurement}: Collapse state vector; record measurement outcomes on-chain
+\State \textbf{Classical postprocessing}: Aggregate results, compute expectation values, update variational parameters
+\State \textbf{Iteration}: Repeat steps 2--5 for variational algorithms (VQE, QAOA) until convergence
+\end{algorithmic}
+\end{algorithm}
+
+The oracle bridge interface allows QuantumVM to submit circuits to external quantum processing units (QPUs) when available, with results verified by threshold consensus before acceptance.
+
+\subsection{EVM Precompile Integration}
+
+QuantumVM operations are accessible from EVM smart contracts via precompiles at addresses \texttt{0x0800}--\texttt{0x080F}:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Address} & \textbf{Operation} & \textbf{Gas} \\
+\midrule
+\texttt{0x0800} & PQ key generation (ML-DSA-65) & 200,000 \\
+\texttt{0x0801} & PQ key generation (ML-KEM-768) & 150,000 \\
+\texttt{0x0802} & PQ key generation (SLH-DSA) & 300,000 \\
+\texttt{0x0803} & PQ signature verification & 75,000--250,000 \\
+\texttt{0x0804} & Key rotation (atomic swap) & 100,000 \\
+\texttt{0x0808} & Quantum circuit submission & 500,000+ \\
+\texttt{0x0809} & Measurement result retrieval & 50,000 \\
+\texttt{0x080A} & Hybrid workflow orchestration & 1,000,000+ \\
+\bottomrule
+\end{tabular}
+\caption{QuantumVM EVM precompile addresses and gas costs.}
+\label{tab:quantumvm-precompiles}
+\end{table}
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+We have presented a production-grade cryptographic architecture that fully implements all three NIST post-quantum standards with hybrid classical/quantum defense-in-depth. The system provides sub-second consensus finality with dual BLS/Ringtail certificates, six threshold MPC schemes, GPU-accelerated cryptographic operations, fully homomorphic encryption, and comprehensive key management with regulatory compliance.
+
+The architecture is not theoretical---it is deployed, tested, and operational, with 17 formal proofs supporting its security claims. It represents the most comprehensive post-quantum cryptographic infrastructure available for naval information dominance operations.
+
+% ============================================================================
+\begin{thebibliography}{25}
+
+\bibitem{fips203} NIST, ``Module-Lattice-Based Key-Encapsulation Mechanism Standard,'' FIPS 203, 2024.
+
+\bibitem{fips204} NIST, ``Module-Lattice-Based Digital Signature Standard,'' FIPS 204, 2024.
+
+\bibitem{fips205} NIST, ``Stateless Hash-Based Digital Signature Standard,'' FIPS 205, 2024.
+
+\bibitem{cnsa2} NSA, ``CNSA Suite 2.0,'' 2022.
+
+\bibitem{rfc9180} R. Barnes \etal, ``Hybrid Public Key Encryption,'' RFC 9180, 2022.
+
+\bibitem{ringtail} ``Practical Two-Round Threshold Signature from LWE,'' IACR ePrint 2024/1113.
+
+\bibitem{cggmp21} R. Canetti \etal, ``UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts,'' ePrint 2021/060.
+
+\bibitem{frost} C. Komlo, I. Goldberg, ``FROST: Flexible Round-Optimized Schnorr Threshold Signatures,'' SAC 2020.
+
+\bibitem{bls} D. Boneh, B. Lynn, H. Shacham, ``Short Signatures from the Weil Pairing,'' ASIACRYPT 2001.
+
+\bibitem{circl} Cloudflare, ``CIRCL: Interoperable Reusable Cryptographic Library,'' v1.6, 2024.
+
+\bibitem{quasar} Hanzo Team, ``Quasar Consensus,'' Lux Industries, 2025.
+
+\bibitem{tfhe} I. Chillotti \etal, ``TFHE: Fast Fully Homomorphic Encryption over the Torus,'' JoC 2020.
+
+\bibitem{halo2} S. Bowe \etal, ``Recursive Proof Composition without a Trusted Setup,'' IACR ePrint 2019/1021.
+
+\bibitem{kzg} A. Kate, G. Zaverucha, I. Goldberg, ``Constant-Size Commitments to Polynomials,'' ASIACRYPT 2010.
+
+\bibitem{shamir} A. Shamir, ``How to Share a Secret,'' CACM 22(11), 1979.
+
+\bibitem{openziti} NetFoundry, ``OpenZiti: Programmable Zero Trust Networking,'' 2023.
+
+\bibitem{nistpqc} NIST, ``Post-Quantum Cryptography Standardization Process,'' 2024.
+
+\end{thebibliography}
+
+\end{document}

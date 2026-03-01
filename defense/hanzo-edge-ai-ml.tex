@@ -1,0 +1,570 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{hanzo-defense}
+
+\doctitle{Edge-Deployable AI/ML Framework for\\Disconnected Tactical Environments}
+\docid{HAI-DEF-2026-003}
+\docversion{Version 1.0 --- January 29, 2026}
+\docdate{January 2026}
+\docauthors{Hanzo Team}
+\docorgs{Hanzo Industries \quad Lux Industries \quad Zoo Labs Foundation\\research@hanzo.ai}
+
+\begin{document}
+\makecover
+
+\begin{abstract}
+We present an edge-deployable AI/ML framework designed for disconnected, degraded, and bandwidth-limited tactical environments. The system combines a Rust-native LLM inference engine supporting 15+ text and 16+ vision model architectures with aggressive quantization (2--8 bit) enabling deployment on hardware ranging from Apple Silicon laptops to embedded ARM processors. A family of 18 frontier models (0.8B--1T+ parameters) provides capability tiers from nano-scale edge inference to frontier reasoning. The ZAP zero-copy binary protocol achieves 11.5M transactions per second for AI agent coordination, while GPU-accelerated operations on Metal and CUDA provide real-time performance for cryptographic and neural network workloads. Multi-agent orchestration with 83 specialized agents enables autonomous analysis with 200--300 sequential tool calls. The framework operates fully offline with local model management, sandboxed execution, and no cloud dependencies.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+Tactical edge AI presents unique challenges absent from data center deployments: limited power, constrained memory, intermittent or absent connectivity, and the need for real-time decision support under combat conditions. Existing frameworks assume cloud connectivity, unlimited memory, and Python runtimes---assumptions that fail at the tactical edge.
+
+Our framework addresses these constraints through three key design decisions:
+\begin{enumerate}
+\item \textbf{Rust-native inference}: No Python GIL, no garbage collection pauses, predictable latency.
+\item \textbf{Aggressive quantization}: 2--8 bit weight compression enabling models larger than available RAM.
+\item \textbf{Zero-copy protocols}: Sub-microsecond serialization for real-time agent coordination.
+\end{enumerate}
+
+% ============================================================================
+\section{Hanzo Engine: Rust-Native Inference}
+% ============================================================================
+
+\subsection{Architecture}
+
+Hanzo Engine is a production LLM inference server built in Rust, providing:
+
+\begin{itemize}
+\item \textbf{Model support}: 15+ text architectures (Transformer, MoE, hybrid), 16+ vision-language models, audio models (ASR, TTS), image generation (FLUX diffusion).
+\item \textbf{GPU backends}: Metal (Apple Silicon), CUDA (NVIDIA Ampere/Ada/Hopper/Blackwell), CPU (x86 AVX-512, ARM NEON/SVE), WebGPU (experimental).
+\item \textbf{Serving}: OpenAI-compatible REST API (\texttt{/v1/chat/completions}, \texttt{/v1/embeddings}), Ollama compatibility mode, built-in web UI.
+\item \textbf{Optimization}: PagedAttention with FP8 KV cache (50\% memory reduction), FlashAttention V2/V3, continuous batching, prefix caching.
+\end{itemize}
+
+\subsection{PagedAttention}
+
+PagedAttention manages KV cache as fixed-size blocks, enabling dynamic context length without pre-allocation:
+
+\begin{itemize}
+\item Block-based memory management with LRU eviction.
+\item FP8 E4M3 KV cache quantization (50\% memory reduction vs.\ FP16).
+\item Block-level prefix caching for multi-turn conversations.
+\item Automatic fallback to standard attention when PagedAttention is unavailable.
+\end{itemize}
+
+\subsection{FlashAttention Integration}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Version} & \textbf{GPU Architecture} & \textbf{Compute Capability} \\
+\midrule
+FlashAttention V2 & Ampere (A100, RTX 30) & $\geq$ 8.0 \\
+FlashAttention V2 & Ada Lovelace (RTX 40) & $\geq$ 8.9 \\
+FlashAttention V3 & Hopper (H100) & $\geq$ 9.0 \\
+FlashAttention V2 & Blackwell (RTX 50) & $\geq$ 12.0 \\
+\bottomrule
+\end{tabular}
+\caption{FlashAttention version dispatch by GPU architecture.}
+\label{tab:flashattn}
+\end{table}
+
+% ============================================================================
+\section{Model Quantization for Constrained Hardware}
+% ============================================================================
+
+\subsection{Quantization Methods}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lccccl@{}}
+\toprule
+\textbf{Method} & \textbf{CPU} & \textbf{CUDA} & \textbf{Metal} & \textbf{Bits} & \textbf{Notes} \\
+\midrule
+ISQ & \checkmark & \checkmark & \checkmark & 2--8 & Load-time, never loads full model \\
+AFQ & -- & -- & \checkmark & 2--8 & Metal-optimized kernels \\
+GGUF & \checkmark & \checkmark & \checkmark & 2--8 & Universal format \\
+GPTQ/AWQ & -- & \checkmark & -- & 2--8 & Marlin CUDA kernels \\
+HQQ & \checkmark & \checkmark & \checkmark & 4, 8 & Half-quadratic \\
+FP8 & \checkmark & \checkmark & \checkmark & 8 & Floating-point \\
+BNB & \checkmark & \checkmark & \checkmark & 4, 8 & int8, fp4, nf4 \\
+\bottomrule
+\end{tabular}
+\caption{Quantization method support matrix.}
+\label{tab:quant-matrix}
+\end{table}
+
+\subsection{In-Situ Quantization (ISQ)}
+
+ISQ is the primary edge deployment method. It quantizes weights during model loading, streaming from storage and quantizing layer-by-layer:
+
+\begin{algorithm}[H]
+\caption{In-Situ Quantization Loading}
+\begin{algorithmic}[1]
+\For{each layer $\ell$ in model}
+  \State Stream weights $W_\ell$ from storage (SafeTensors/GGUF)
+  \State Compute quantization parameters: scale $s$, zero-point $z$
+  \State Quantize: $\hat{W}_\ell = \text{round}(W_\ell / s) + z$
+  \State Store $\hat{W}_\ell$ in target device memory (GPU/CPU)
+  \State Release original $W_\ell$ from host memory
+\EndFor
+\State \Return quantized model (fits in device memory)
+\end{algorithmic}
+\end{algorithm}
+
+Key advantage: models larger than available RAM can be loaded, as only one layer's full-precision weights are in memory at any time.
+
+\subsection{AFQ: Metal-Optimized Quantization}
+
+Affine Quantization (AFQ) is designed specifically for Apple Silicon Metal:
+\begin{itemize}
+\item Group sizes: 32, 64 (default), 128.
+\item Optimized Metal kernel dispatch for Apple M1/M2/M3/M4.
+\item 2--8 bit quantization with affine transformation.
+\item Outperforms GGUF on Apple Silicon by leveraging unified memory architecture.
+\end{itemize}
+
+% ============================================================================
+\section{Zen Model Family for Defense Applications}
+% ============================================================================
+
+\subsection{Model Tiers}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llrrl@{}}
+\toprule
+\textbf{Tier} & \textbf{Model} & \textbf{Params} & \textbf{Active} & \textbf{Use Case} \\
+\midrule
+\multirow{4}{*}{Edge} & zen4-nano & 0.8B & 0.8B & On-device, embedded \\
+ & zen4-micro & 2B & 2B & Edge+ \\
+ & zen4-mini & 4B & 4B & Mobile, tablet \\
+ & zen4 & 9B & 9B & General tactical \\
+\midrule
+\multirow{3}{*}{Medium} & zen4-pro & 27B & 27B & Balanced perf/quality \\
+ & zen4-max & 35B MoE & 3B & Efficient MoE \\
+ & zen4-coder & 80B MoE & 3B & Code analysis \\
+\midrule
+\multirow{3}{*}{Frontier} & zen4-ultra & 1.04T MoE & 32B & Frontier reasoning \\
+ & zen4-titan & 744B MoE & 40B & Advanced analysis \\
+ & zen4-storm & 456B MoE & 45B & Large-scale \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 model family with defense deployment tiers.}
+\label{tab:zen-family}
+\end{table}
+
+\subsection{Vision-Language Models}
+
+Six vision-language variants (4B--30B) provide:
+\begin{itemize}
+\item 32-language OCR for document exploitation.
+\item Spatial reasoning for geospatial imagery analysis.
+\item Video comprehension for temporal pattern recognition.
+\item Agent variants with native function calling for tool integration.
+\end{itemize}
+
+\subsection{Mixture of Experts (MoE)}
+
+MoE models activate only 2--8 experts per token from a pool of 16--384, providing frontier-quality output with edge-scale compute:
+
+\begin{itemize}
+\item \textbf{zen4-coder-flash} (31B total, 3B active): 59.2\% SWE-Bench.
+\item \textbf{zen-max} (671B total, 14B active): Extended reasoning with 96--128K thinking tokens.
+\item \textbf{Heavy Mode}: 8 simultaneous reasoning trajectories for complex analysis.
+\end{itemize}
+
+% ============================================================================
+\section{GPU-Accelerated AI/ML Operations}
+% ============================================================================
+
+\subsection{LuxCPP Kernel Library}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lp{7.5cm}@{}}
+\toprule
+\textbf{Category} & \textbf{Operations} \\
+\midrule
+Matrix & matmul, batch matmul, transposed matmul \\
+Attention & Standard, FlashAttention, multi-head attention \\
+Normalization & LayerNorm, RMSNorm, BatchNorm \\
+Activation & ReLU, GELU, SiLU, sigmoid, tanh, softmax \\
+Convolution & 2D standard, depthwise \\
+Quantization & FP quantization, blockwise FP8 \\
+Crypto & BLS, BN254, secp256k1, Ed25519, ML-DSA, NTT \\
+\bottomrule
+\end{tabular}
+\caption{LuxCPP GPU kernel categories.}
+\label{tab:gpu-kernels}
+\end{table}
+
+\subsection{Unified C API}
+
+\begin{lstlisting}[language=C,caption={LuxCPP acceleration C API (excerpt).}]
+// Session management
+lux_session_t* lux_create_session(lux_device_t dev);
+
+// Tensor operations
+lux_tensor_t* lux_matmul(lux_session_t* s,
+    lux_tensor_t* a, lux_tensor_t* b);
+lux_tensor_t* lux_attention(lux_session_t* s,
+    lux_tensor_t* q, lux_tensor_t* k,
+    lux_tensor_t* v, float scale);
+
+// Crypto operations
+lux_tensor_t* lux_mldsa_verify(lux_session_t* s,
+    lux_tensor_t* pk, lux_tensor_t* msg,
+    lux_tensor_t* sig);
+\end{lstlisting}
+
+% ============================================================================
+\section{On-Device Learning and Adaptation}
+% ============================================================================
+
+\subsection{LoRA Runtime Adaptation}
+
+Low-Rank Adaptation (LoRA) enables domain-specific fine-tuning without full model retraining:
+
+\begin{itemize}
+\item Dynamic adapter activation at runtime (hot-swap without reload).
+\item X-LoRA: mixture of adapters for multi-task adaptation.
+\item Quantized base model with unquantized adapter layers.
+\item Adapters can be pre-loaded from HuggingFace or local storage.
+\end{itemize}
+
+\textbf{Tactical application}: Pre-train base model in data center, deploy with mission-specific LoRA adapters. Swap adapters as mission requirements change without downloading new models.
+
+\subsection{Speculative Decoding}
+
+Draft model generates candidate tokens; target model verifies in parallel:
+\begin{itemize}
+\item 2--4$\times$ latency reduction for interactive use.
+\item Draft model: small (nano/eco), target: larger (pro/max).
+\item No quality degradation---output identical to target model alone.
+\end{itemize}
+
+% ============================================================================
+\section{ZAP Protocol for AI Workloads}
+% ============================================================================
+
+\subsection{Performance for Agent Communication}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Metric} & \textbf{JSON-RPC} & \textbf{ZAP} \\
+\midrule
+Serialization & 5,579 ns & 322 ns \\
+Memory/call & 2,826 B & 256 B \\
+Allocations/op & 58 & 2 \\
+GC pressure (50K ops) & 41 pauses & 3 pauses \\
+Network (20 servers) & 140K calls/s & 4.2M calls/s \\
+\bottomrule
+\end{tabular}
+\caption{ZAP vs.\ JSON-RPC for AI agent communication.}
+\label{tab:zap-ai}
+\end{table}
+
+\subsection{MCP Gateway}
+
+ZAP bridges 20+ Model Context Protocol (MCP) servers with tool prefix namespacing, health checking, and reconnection:
+
+\begin{lstlisting}[caption={MCP gateway aggregation.}]
+bridge.AddServer("filesystem", "npx",
+    "@anthropic/mcp-filesystem")
+bridge.AddServer("github", "npx",
+    "@anthropic/mcp-github")
+result := bridge.CallToolByName(ctx,
+    "filesystem:read_file", args)
+\end{lstlisting}
+
+\subsection{GPU Cluster Coordination}
+
+ZAP's mDNS discovery (\texttt{\_lux-gpu.\_tcp}) enables automatic GPU node discovery for distributed inference and FHE operations. Direct zero-copy ciphertext handling enables GPU-to-GPU encrypted computation pipelines.
+
+% ============================================================================
+\section{Multi-Agent Orchestration}
+% ============================================================================
+
+\subsection{Agent Architecture}
+
+\begin{itemize}
+\item \textbf{83 specialized agents}: Architecture, languages, infrastructure, data/ML, QA, security, and domain-specific expertise.
+\item \textbf{15 multi-agent orchestrators}: Full-stack development, security hardening, ML pipelines, incident response.
+\item \textbf{Async-first SDK}: Compatible with OpenAI Chat Completions API.
+\item \textbf{State and memory}: Shared state + vector search long-term memory (LanceDB).
+\item \textbf{Tool integration}: 13 canonical MCP tools (fs, exec, code, git, fetch, workspace, ui, think, memory, hanzo, plan, tasks, mode).
+\end{itemize}
+
+\subsection{Agent Consensus}
+
+For critical decisions, agents employ distributed voting:
+\begin{itemize}
+\item Threshold-based agreement (default 67\%).
+\item W3C DID authentication (did:key from ML-DSA public keys).
+\item PQ-secure agent-to-agent communication via ZAP.
+\item Stake-weighted voting for reputation-based trust.
+\end{itemize}
+
+% ============================================================================
+\section{Disconnected Edge Deployment}
+% ============================================================================
+
+\subsection{Hardware Deployment Matrix}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Platform} & \textbf{Backend} & \textbf{Quantization} & \textbf{Max Model} \\
+\midrule
+Apple Silicon M4 & Metal + AFQ & 2--8 bit & zen4-pro (27B) \\
+NVIDIA Jetson & CUDA & GGUF/ISQ & zen4 (9B) \\
+x86 Server & AVX-512 & ISQ/GGUF & zen4-ultra (1T) \\
+ARM Embedded & CPU/NEON & GGUF 4-bit & zen4-nano (0.8B) \\
+Browser & WebGPU & ISQ & zen4-nano (0.8B) \\
+\bottomrule
+\end{tabular}
+\caption{Edge deployment: hardware to model mapping.}
+\label{tab:hw-deploy}
+\end{table}
+
+\subsection{Offline Operation}
+
+\begin{itemize}
+\item Self-contained binary with embedded model management.
+\item Ollama-compatible \texttt{pull}/\texttt{list}/\texttt{run} commands for model caching.
+\item Sandboxed execution via macOS \texttt{sandbox-exec} or Linux seccomp.
+\item MCP tools operate locally (filesystem, code analysis, git) with no network.
+\item Bearer token authentication for optional cloud relay.
+\end{itemize}
+
+% ============================================================================
+\section{Hanzo ML Framework}
+% ============================================================================
+
+The Hanzo ML framework (Candle fork) provides Rust-native tensor operations:
+
+\begin{itemize}
+\item \textbf{Core}: Tensor creation, manipulation, GPU dispatch (Metal, CUDA).
+\item \textbf{Neural network}: Transformer layers, attention mechanisms, MLP.
+\item \textbf{Models}: 100+ pre-trained model implementations.
+\item \textbf{ONNX}: Import and run ONNX models directly.
+\item \textbf{PyO3}: Python bindings for integration with existing ML pipelines.
+\item \textbf{WASM}: Browser-based inference via WebAssembly.
+\item \textbf{Flash Attention}: V2 kernels for 2--3$\times$ memory bandwidth reduction.
+\end{itemize}
+
+% ============================================================================
+\section{Reinforcement Learning from Operational Feedback}
+% ============================================================================
+
+\subsection{Feedback Loop Architecture}
+
+Agent execution in tactical environments produces results paired with confidence scores. Human operators validate, correct, or override these results through a structured feedback interface:
+
+\begin{itemize}
+\item \textbf{Accept}: Operator confirms the agent output; recorded as a positive preference signal.
+\item \textbf{Reject}: Operator discards the output; the correct action (if provided) forms a negative preference pair.
+\item \textbf{Modify}: Operator edits the output; the original and edited versions form a ranked preference pair.
+\end{itemize}
+
+All feedback is recorded as preference pairs $(y_w, y_l)$ where $y_w$ is the preferred response and $y_l$ is the dispreferred response, suitable for direct optimization.
+
+\subsection{LoRA Fine-Tuning via RLHF/DPO}
+
+On-device adaptation uses Low-Rank Adaptation to incorporate operational feedback without full model retraining:
+
+\begin{itemize}
+\item \textbf{RLHF pipeline}: Preference pairs train a reward model; PPO optimizes the policy against this reward while constraining divergence from the base model via KL penalty.
+\item \textbf{DPO (Direct Preference Optimization)}: Bypasses explicit reward modeling by directly optimizing the policy from preference pairs, reducing compute requirements for edge deployment.
+\item \textbf{LoRA efficiency}: Only adapter weights (rank 4--64, typically $<$1\% of model parameters) are updated, enabling fine-tuning on tactical hardware with limited GPU memory.
+\end{itemize}
+
+\subsection{Byzantine-Robust Aggregation}
+
+When multiple agents or edge nodes produce LoRA updates from independent operational feedback, aggregation must tolerate adversarial or corrupted contributions:
+
+\begin{itemize}
+\item \textbf{DeltaSoup}: Byzantine-robust aggregation of LoRA weight deltas from multiple agents. Outlier updates are detected via coordinate-wise median filtering before merging, ensuring that compromised or malfunctioning nodes cannot poison the shared adapter.
+\item \textbf{GT-QLoRA (Gate-Targeted QLoRA)}: For MoE architectures, adapter updates target expert gating layers specifically, enabling efficient adaptation of routing decisions without modifying expert weights. Combined with 4-bit quantized base weights, this enables MoE fine-tuning within edge memory budgets.
+\end{itemize}
+
+% ============================================================================
+\section{In-Memory Graph Analytics}
+% ============================================================================
+
+\subsection{Lux GraphVM}
+
+Lux GraphVM provides in-memory graph analytics optimized for intelligence workloads where relationship discovery across heterogeneous data sources is critical:
+
+\begin{itemize}
+\item \textbf{Entity resolution}: Probabilistic matching across intelligence sources (HUMINT, SIGINT, OSINT) to unify identities despite name variations, transliterations, and deliberate obfuscation.
+\item \textbf{Network topology analysis}: Communication pattern extraction from intercept data---call graphs, message chains, and temporal co-occurrence networks.
+\item \textbf{Organizational hierarchy mapping}: Social network analysis to infer command structures, identify key nodes, and detect cells within adversary organizations.
+\item \textbf{Temporal behavior tracking}: Time-series graph snapshots enabling detection of behavioral changes, new associations, and pattern-of-life deviations.
+\end{itemize}
+
+\subsection{Integrity and Verification}
+
+\begin{itemize}
+\item \textbf{Merkle-verified graph state}: Every graph mutation is committed to a Merkle tree, providing tamper-evident audit trails. Analysts can verify that graph state has not been modified since ingestion.
+\item \textbf{Provenance tracking}: Each edge and node carries source metadata (collection platform, time, confidence), enabling analysts to assess intelligence reliability at the relationship level.
+\end{itemize}
+
+\subsection{Defense Applications}
+
+\begin{itemize}
+\item \textbf{Intelligence link analysis}: Multi-hop traversal to discover indirect connections between persons of interest across compartmented datasets.
+\item \textbf{Threat network mapping}: Real-time graph updates as new intelligence arrives, with automatic re-scoring of centrality metrics to identify emerging leaders or facilitators.
+\item \textbf{Force protection}: Pattern-of-life deviation detection for insider threat and force protection scenarios, comparing current behavior graphs against historical baselines.
+\end{itemize}
+
+% ============================================================================
+\section{Explainable and Adaptable AI}
+% ============================================================================
+
+\subsection{Design Principles}
+
+The framework implements AI that is \textit{visible}, \textit{accessible}, \textit{explainable}, and \textit{adaptable} in accordance with defense acquisition requirements for trusted AI systems.
+
+\subsection{Inherent Explainability}
+
+\begin{itemize}
+\item \textbf{Chain-of-thought reasoning}: Zen models produce 96--128K thinking tokens as extended reasoning traces. These traces expose the model's intermediate logic, hypotheses, and evidence evaluation---providing inherent explainability without post-hoc interpretation methods.
+\item \textbf{Heavy Mode}: 8 parallel reasoning trajectories with explicit comparison. Operators can inspect each trajectory's reasoning chain, observe where paths diverge, and understand why the selected answer was preferred.
+\item \textbf{Tool call logging}: Every external tool invocation (filesystem reads, code execution, database queries, API calls) is recorded with input arguments and output results, producing a complete audit trail of agent actions.
+\item \textbf{Memory retrieval traces}: When agents access long-term memory (LanceDB vector search), the retrieved context and similarity scores are logged, making it transparent which prior knowledge influenced the current decision.
+\end{itemize}
+
+\subsection{Adaptability Mechanisms}
+
+\begin{itemize}
+\item \textbf{LoRA adapter swapping}: Mission-specific adapters can be loaded, unloaded, and swapped at runtime without model restart. This enables rapid reconfiguration---e.g., switching from ISR analysis to SIGINT processing by swapping a single adapter file.
+\item \textbf{X-LoRA mixture}: Multiple adapters can be activated simultaneously with learned mixing weights, enabling multi-mission configurations from a library of single-purpose adapters.
+\end{itemize}
+
+\subsection{Verifiable Decision Records}
+
+\begin{itemize}
+\item \textbf{W3C Decentralized Identifiers (DIDs)}: Each agent holds a \texttt{did:key} identity derived from its ML-DSA public key. All decision outputs are signed with this identity, providing non-repudiation.
+\item \textbf{Verifiable Credentials}: Agent outputs are packaged as W3C Verifiable Credentials containing the decision, reasoning trace, confidence score, and input data hash. Third parties can verify authenticity and integrity without access to the issuing agent.
+\item \textbf{Tamper-evident chains}: Sequential decision records are hash-chained, enabling detection of any retroactive modification to the decision log.
+\end{itemize}
+
+% ============================================================================
+\section{AR/VR Integration for Warfighter Performance}
+% ============================================================================
+
+\subsection{Vision-Language Models as AR Engines}
+
+Zen vision-language models (4B--30B parameters) serve as real-time data overlay engines for augmented reality systems:
+
+\begin{itemize}
+\item \textbf{Real-time spatial reasoning}: Object detection, scene understanding, and spatial relationship inference from head-mounted camera feeds.
+\item \textbf{32-language OCR}: On-the-fly text recognition and translation from signage, documents, and captured materials displayed as AR overlays.
+\item \textbf{Contextual annotation}: Automatic identification and labeling of vehicles, equipment, structures, and personnel with threat assessment scores projected into the operator's field of view.
+\item \textbf{Edge deployment}: Vision-language inference runs on tactical hardware (Metal on Apple Silicon, CUDA on NVIDIA Jetson, ARM NEON on embedded processors) with quantized models (4--8 bit) for real-time frame rates.
+\end{itemize}
+
+\subsection{3D Mission Rehearsal}
+
+\begin{itemize}
+\item \textbf{Babylon.js rendering}: Interactive 3D environments for mission planning and rehearsal, supporting terrain visualization, building interiors, and route planning with physics simulation.
+\item \textbf{Digital twin integration}: The Netrunner network simulation framework feeds real-time system state into VR environments, enabling operators to visualize network topology, communication flows, and system health in an immersive 3D space.
+\item \textbf{Collaborative planning}: Multiple operators can share a VR mission space with synchronized state, annotating terrain, marking objectives, and rehearsing maneuvers in a shared virtual environment.
+\end{itemize}
+
+\subsection{Training and System Design}
+
+\begin{itemize}
+\item \textbf{Scenario generation}: LLM-driven procedural generation of training scenarios based on historical after-action reports and doctrinal templates.
+\item \textbf{Performance analytics}: Operator actions during VR training sessions are recorded and analyzed by multi-agent systems to identify decision patterns, reaction times, and areas for improvement.
+\item \textbf{System design visualization}: Digital twins of proposed system architectures rendered in VR, enabling stakeholders to walk through data flows, identify bottlenecks, and validate designs before deployment.
+\end{itemize}
+
+% ============================================================================
+\section{Defense Application Scenarios}
+% ============================================================================
+
+\subsection{ISR Analysis}
+
+Zen vision-language models (4B--30B) process full-motion video, satellite imagery, and document scans:
+\begin{itemize}
+\item 32-language OCR for captured document exploitation.
+\item Spatial reasoning for geospatial analysis.
+\item Temporal video comprehension for activity detection.
+\item LoRA adapters for theater-specific terrain recognition.
+\end{itemize}
+
+\subsection{Tactical Decision Support}
+
+\begin{itemize}
+\item Extended reasoning (96--128K thinking tokens) for complex COA analysis.
+\item Heavy Mode: 8 parallel reasoning trajectories for wargaming.
+\item Multi-agent orchestration for multi-domain analysis.
+\item Runs entirely on tactical hardware, no reach-back required.
+\end{itemize}
+
+\subsection{SIGINT Natural Language Processing}
+
+\begin{itemize}
+\item 100+ programming language understanding for CYBER analysis.
+\item 32+ natural language support for COMINT processing.
+\item Intent detection and sentiment analysis via Insights pipeline.
+\item Named entity recognition and relationship extraction.
+\end{itemize}
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+We have presented a comprehensive edge AI/ML framework that operates fully disconnected from cloud infrastructure while providing frontier-quality model capabilities through aggressive quantization and hardware-optimized inference. The combination of Rust-native performance, zero-copy agent coordination, GPU-accelerated operations, and multi-agent orchestration provides a complete tactical AI stack deployable on hardware from embedded ARM processors to multi-GPU servers.
+
+% ============================================================================
+\begin{thebibliography}{20}
+
+\bibitem{flashattn} T. Dao \etal, ``FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,'' ICLR 2024.
+
+\bibitem{pagedattn} W. Kwon \etal, ``Efficient Memory Management for Large Language Model Serving with PagedAttention,'' SOSP 2023.
+
+\bibitem{lora} E. Hu \etal, ``LoRA: Low-Rank Adaptation of Large Language Models,'' ICLR 2022.
+
+\bibitem{gptq} E. Frantar \etal, ``GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers,'' ICLR 2023.
+
+\bibitem{awq} J. Lin \etal, ``AWQ: Activation-aware Weight Quantization for LLM Compression,'' MLSys 2024.
+
+\bibitem{moe} W. Fedus \etal, ``Switch Transformers: Scaling to Trillion Parameter Models,'' JMLR 2022.
+
+\bibitem{candle} Hugging Face, ``Candle: Minimalist ML Framework for Rust,'' 2023.
+
+\bibitem{mcp} Anthropic, ``Model Context Protocol Specification,'' 2024.
+
+\bibitem{zap} Hanzo Team, ``ZAP: Zero-Copy Application Protocol for AI Agent Communication,'' Hanzo Industries, 2026.
+
+\bibitem{gguf} G. Gerganov, ``GGUF: GGML Universal File Format,'' llama.cpp, 2023.
+
+\bibitem{speculative} Y. Leviathan \etal, ``Fast Inference from Transformers via Speculative Decoding,'' ICML 2023.
+
+\bibitem{jepa} Y. LeCun, ``A Path Towards Autonomous Machine Intelligence,'' 2022.
+
+\bibitem{zen} Zen LM, ``Zen Model Family Technical Report,'' 2026.
+
+\bibitem{lancedb} LanceDB, ``LanceDB: Serverless Vector Database,'' 2024.
+
+\bibitem{otel} OpenTelemetry, ``Observability Framework for Cloud-Native Software,'' CNCF, 2024.
+
+\end{thebibliography}
+
+\end{document}

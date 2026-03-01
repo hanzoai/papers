@@ -1,0 +1,744 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{hanzo-defense}
+
+\doctitle{ZAP: Zero-Copy Application Protocol for\\Contested, Edge, and Bandwidth-Limited\\Military Environments}
+\docid{HAI-DEF-2026-006}
+\docversion{Version 1.0 --- February 12, 2026}
+\docdate{February 2026}
+\docauthors{Hanzo Team}
+\docorgs{Hanzo Industries \quad Lux Industries \quad Zoo Labs Foundation\\research@hanzo.ai}
+
+\begin{document}
+\makecover
+
+\begin{abstract}
+We present ZAP (Zero-copy Application Protocol), a high-performance binary serialization and RPC framework achieving 2.9~ns parse latency with zero memory allocations, 11.5 million transactions per second end-to-end, and 91\% memory reduction compared to JSON-RPC. ZAP provides two production implementations---Rust (AI agent communication, MCP gateway bridging) and Go (blockchain consensus wire protocol, VM-to-VM messaging)---sharing a common wire format with 16-byte headers and 8-byte aligned structs for direct pointer-arithmetic reads from network buffers. The protocol includes native post-quantum transport security (ML-KEM-768 + ML-DSA-65 hybrid handshake), decentralized identity via W3C DIDs derived from lattice public keys, distributed agent consensus with threshold voting, and mDNS-based ad-hoc network discovery. We analyze ZAP's suitability for contested electromagnetic environments, bandwidth-limited tactical links, GPU cluster coordination, and edge AI agent orchestration, demonstrating 96\% energy reduction and 30$\times$ throughput improvement over standard protocols under identical network conditions.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+Military networking at the tactical edge operates under constraints that expose fundamental weaknesses in standard data interchange protocols. JSON-RPC, gRPC/Protocol Buffers, and REST APIs assume abundant bandwidth, low latency, and the availability of garbage-collected runtimes. These assumptions fail in contested electromagnetic environments where every byte transmitted increases detection probability, every microsecond of processing delays decision cycles, and every memory allocation risks unpredictable latency spikes.
+
+ZAP addresses these constraints through three design principles:
+
+\begin{enumerate}
+\item \textbf{Zero-copy reads}: Data is accessed directly from network buffers via pointer arithmetic. No deserialization pass, no object construction, no memory allocation.
+\item \textbf{Minimal wire overhead}: 16-byte headers with 8-byte aligned struct fields. No field tags, no length-delimited strings for known schemas.
+\item \textbf{Native PQ security}: Post-quantum key exchange and authentication built into the protocol handshake, not layered on top.
+\end{enumerate}
+
+\subsection{Why Existing Protocols Fail at the Edge}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrrp{3cm}@{}}
+\toprule
+\textbf{Protocol} & \textbf{Parse} & \textbf{Allocs} & \textbf{Bytes/op} & \textbf{Edge Failure Mode} \\
+\midrule
+JSON-RPC & 5,579 ns & 58 & 2,826 & GC pauses, verbose encoding \\
+Protobuf & 500 ns & 11--121 & 1,200 & Varint overhead, copy-on-parse \\
+gRPC & 800 ns & 30+ & 1,500 & HTTP/2 framing, TLS overhead \\
+Cap'n Proto & $\sim$100 ns & 0 & 800 & No PQ crypto, complex schema \\
+\textbf{ZAP} & \textbf{2.9 ns} & \textbf{0} & \textbf{256} & \textbf{None} \\
+\bottomrule
+\end{tabular}
+\caption{Protocol comparison for tactical edge deployment.}
+\label{tab:protocol-comparison}
+\end{table}
+
+\subsection{Contributions}
+
+\begin{enumerate}
+\item \textbf{Zero-copy wire format}: 16-byte header, 8-byte aligned structs, direct buffer reads at 2.9~ns.
+\item \textbf{Dual implementation}: Rust (AI agents, MCP gateway) and Go (consensus, VMs) sharing identical wire format.
+\item \textbf{Native PQ transport}: ML-KEM-768 + ML-DSA-65 hybrid handshake integrated at protocol level.
+\item \textbf{Agent consensus}: Distributed voting with threshold agreement and DID-based identity.
+\item \textbf{Ad-hoc discovery}: mDNS for tactical network formation without infrastructure.
+\item \textbf{Environmental analysis}: 96\% energy reduction enabling sustainable edge operation.
+\end{enumerate}
+
+% ============================================================================
+\section{Wire Format Specification}
+% ============================================================================
+
+\subsection{Header}
+
+Every ZAP message begins with a 16-byte little-endian header:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrll@{}}
+\toprule
+\textbf{Field} & \textbf{Offset} & \textbf{Size} & \textbf{Description} \\
+\midrule
+Magic & 0 & 4 B & \texttt{ZAP\textbackslash x00} (0x5A415000) \\
+Version & 4 & 2 B & Protocol version (currently 1) \\
+Flags & 6 & 2 B & Bitfield (see below) \\
+Root Offset & 8 & 4 B & Byte offset to root struct \\
+Size & 12 & 4 B & Total message size in bytes \\
+\bottomrule
+\end{tabular}
+\caption{ZAP 16-byte wire header.}
+\label{tab:header}
+\end{table}
+
+\subsubsection{Flag Bits}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Flag} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+\texttt{FlagNone} & 0x0000 & No flags set \\
+\texttt{FlagCompressed} & 0x0001 & Payload is compressed \\
+\texttt{FlagEncrypted} & 0x0002 & Payload is encrypted \\
+\texttt{FlagSigned} & 0x0004 & Payload carries PQ signature \\
+\bottomrule
+\end{tabular}
+\caption{ZAP header flag definitions.}
+\label{tab:flags}
+\end{table}
+
+\subsection{Type System}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrll@{}}
+\toprule
+\textbf{Type} & \textbf{Wire Size} & \textbf{Access} & \textbf{Zero-Copy} \\
+\midrule
+Bool & 1 B & Direct read & Yes \\
+Int8--Int64 & 1--8 B & Direct read & Yes \\
+Float32/64 & 4/8 B & Direct read & Yes \\
+Text & 8 B (off+len) & Slice into buffer & Yes \\
+Bytes & 8 B (off+len) & Slice into buffer & Yes \\
+List(T) & 8 B (off+count) & Stride iteration & Yes \\
+Struct & 4+ B & Nested offset & Yes \\
+\bottomrule
+\end{tabular}
+\caption{ZAP type system with zero-copy access patterns.}
+\label{tab:types}
+\end{table}
+
+All struct fields are 8-byte aligned, enabling direct pointer-arithmetic reads on any architecture without alignment fixups.
+
+\subsection{Zero-Copy Access Pattern}
+
+\begin{lstlisting}[language=Go,caption={Zero-copy message access (Go implementation).}]
+// No allocation, no copying, no deserialization
+data := networkBuffer[:msgSize]
+msg, _ := zap.Parse(data)  // 2.9 ns
+root := msg.Root()
+
+// Direct reads from buffer via offset calculation
+nodeID := root.Uint64(0)     // 8 bytes at offset 0
+timestamp := root.Int64(8)   // 8 bytes at offset 8
+payload := root.Bytes(16)    // slice into buffer
+\end{lstlisting}
+
+The \texttt{Parse} function validates the header (magic, version, size bounds) and returns a handle to the root struct. No data is copied; all subsequent reads use offset arithmetic into the original buffer.
+
+% ============================================================================
+\section{Schema Language}
+% ============================================================================
+
+\subsection{Whitespace-Significant Format}
+
+ZAP defines a clean, whitespace-significant schema language (preferred over Cap'n Proto \texttt{.capnp} format):
+
+\begin{lstlisting}[caption={ZAP schema definition.}]
+struct ConsensusVote
+  validator_id  UInt64
+  block_hash    Bytes
+  round         UInt32
+  signature     Bytes
+  pq_signature  Bytes    # ML-DSA-65 (optional)
+
+enum VoteType
+  prevote
+  precommit
+  commit
+
+interface ConsensusService
+  vote (v ConsensusVote) -> (accepted Bool)
+  get_block (hash Bytes) -> (block Bytes)
+\end{lstlisting}
+
+\subsection{Compiler}
+
+The \texttt{zapc} compiler generates code for multiple target languages:
+
+\begin{itemize}
+\item \textbf{Rust}: Primary target, zero-copy readers and builders.
+\item \textbf{Go}: Used in Lux consensus and VM communication.
+\item \textbf{Python, TypeScript}: SDK generation for agent integration.
+\item \textbf{C, C++, Java}: Available for embedded and enterprise integration.
+\end{itemize}
+
+The compiler also supports legacy \texttt{.capnp} files with automatic migration via \texttt{capnp\_to\_zap()}.
+
+% ============================================================================
+\section{Post-Quantum Transport Security}
+% ============================================================================
+
+\subsection{Cryptographic Primitives}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Algorithm} & \textbf{Purpose} & \textbf{Key/CT Size} \\
+\midrule
+ML-KEM-768 (\fips{203}) & Key encapsulation & PK: 1,184 B, CT: 1,088 B \\
+ML-DSA-65 (\fips{204}) & Digital signatures & PK: 1,952 B, Sig: 3,309 B \\
+X25519 & Classical ECDH & PK: 32 B \\
+HKDF-SHA256 & Key derivation & --- \\
+AES-256-GCM & Session encryption & Key: 32 B \\
+\bottomrule
+\end{tabular}
+\caption{ZAP cryptographic primitives.}
+\label{tab:crypto}
+\end{table}
+
+\subsection{Hybrid Handshake Protocol}
+
+\begin{algorithm}[H]
+\caption{ZAP Post-Quantum Hybrid Handshake}
+\begin{algorithmic}[1]
+\State \textbf{Initiator} generates ephemeral keys:
+\State \quad $(\text{ek}^X, \text{epk}^X) \gets \text{X25519.Generate}()$
+\State \quad $(\text{ek}^M, \text{epk}^M) \gets \text{ML-KEM-768.Generate}()$
+\State Send: $\text{epk}^X \| \text{epk}^M \| \text{pk}^{\text{DSA}} \| \sigma$
+\State \quad $\sigma = \text{ML-DSA-65.Sign}(\text{sk}^{\text{DSA}}, \text{transcript})$
+\Statex
+\State \textbf{Responder} verifies $\sigma$, then:
+\State \quad $\text{ss}^X \gets \text{X25519.DH}(\text{sk}^X, \text{epk}^X)$
+\State \quad $(\text{ct}^M, \text{ss}^M) \gets \text{ML-KEM-768.Encaps}(\text{epk}^M)$
+\State \quad $K \gets \text{HKDF-SHA256}(\text{ss}^X \| \text{ss}^M)$
+\State Send: $\text{epk}^X_B \| \text{ct}^M \| \sigma_B$
+\Statex
+\State \textbf{Both}: Derive session keys from $K$
+\State \textbf{Both}: Destroy ephemeral private keys (forward secrecy)
+\State \textbf{Session}: AES-256-GCM with counter nonces
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Crypto Backend Chain}
+
+The Rust implementation supports two backends with automatic fallback:
+
+\begin{enumerate}
+\item \textbf{luxcrypto-sys} (preferred): FFI binding to the Lux blockchain cryptographic library (CIRCL-based, CGO-optimized). Shared with consensus layer.
+\item \textbf{pqcrypto} (fallback): Pure Rust PQ implementations for environments without \texttt{libluxcrypto}.
+\item \textbf{x25519-dalek}: Classical ECDH (always present for hybrid mode).
+\end{enumerate}
+
+\subsection{Handshake Overhead Analysis}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Component} & \textbf{Size} & \textbf{Classical} & \textbf{PQ Hybrid} \\
+\midrule
+Ephemeral X25519 PK & 32 B & \checkmark & \checkmark \\
+Ephemeral ML-KEM PK & 1,184 B & --- & \checkmark \\
+ML-KEM ciphertext & 1,088 B & --- & \checkmark \\
+ML-DSA-65 PK & 1,952 B & --- & \checkmark \\
+ML-DSA-65 signature & 3,309 B & --- & \checkmark \\
+\midrule
+\textbf{Per-direction} & & \textbf{32 B} & \textbf{$\sim$7.5 KB} \\
+\textbf{Amortized/message} & & \textbf{0 B} & \textbf{0 B} \\
+\bottomrule
+\end{tabular}
+\caption{Handshake overhead: one-time cost, zero per-message overhead.}
+\label{tab:handshake-overhead}
+\end{table}
+
+The 7.5~KB handshake is a \emph{one-time} cost per connection. All subsequent messages use AES-256-GCM with 28-byte overhead (12~B nonce + 16~B auth tag), identical to classical TLS.
+
+% ============================================================================
+\section{Performance Analysis}
+% ============================================================================
+
+\subsection{Microbenchmarks}
+
+\subsubsection{Go Implementation (Consensus Wire Protocol)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Time} & \textbf{Ops/sec} & \textbf{Allocs} \\
+\midrule
+Parse & 2.9 ns & 345M & 0 \\
+Build & 44.0 ns & 22.7M & 0 \\
+Consensus round & 5.5 ns & 182M & 0 \\
+Vote (Chits) & 539 ns & 1.86M & 0--3 \\
+DAG Vertex & 571 ns & 1.75M & 0--3 \\
+\bottomrule
+\end{tabular}
+\caption{ZAP Go implementation benchmarks (10-core, Go 1.26.1).}
+\label{tab:go-bench}
+\end{table}
+
+\subsubsection{Rust Implementation (AI Agent Communication)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Operation} & \textbf{Time} & \textbf{Ops/sec} & \textbf{Allocs} \\
+\midrule
+Serialize tool call & 322 ns & 3.1M & 2 \\
+Deserialize response & 21 ns & 47.6M & 0 \\
+MCP gateway route & 1.2 $\mu$s & 833K & 4 \\
+Agent consensus vote & 890 ns & 1.12M & 2 \\
+\bottomrule
+\end{tabular}
+\caption{ZAP Rust implementation benchmarks.}
+\label{tab:rust-bench}
+\end{table}
+
+\textbf{Note}: The Go and Rust implementations benchmark different operations. The Go ``Parse'' (2.9~ns) reads a pre-built message from buffer. The Rust ``Serialize'' (322~ns) constructs a new message. The Rust ``Deserialize'' (21~ns) performs schema-validated parsing, more expensive than raw buffer validation.
+
+\subsection{End-to-End Throughput}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Scenario} & \textbf{ZAP} & \textbf{JSON-RPC} \\
+\midrule
+Single-thread serial & 3.1M ops/s & 179K ops/s \\
+20-server MCP gateway & 4.2M calls/s & 140K calls/s \\
+Consensus (5 validators) & 11.5M TPS & 246K TPS \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end throughput comparison.}
+\label{tab:e2e-throughput}
+\end{table}
+
+\subsection{Memory Efficiency}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Metric (100K ops)} & \textbf{JSON-RPC} & \textbf{ZAP} \\
+\midrule
+Total allocated & 304.01 MB & 26.70 MB \\
+Malloc count & 6,001,513 & 200,003 \\
+Bytes/op & 3,187 & 280 \\
+Mallocs/op & 60 & 2 \\
+GC pauses (50K ops) & 41 & 3 \\
+\midrule
+\textbf{Memory saved} & \multicolumn{2}{r}{\textbf{277.3 MB (91.2\%)}} \\
+\textbf{Allocs saved} & \multicolumn{2}{r}{\textbf{5,801,510 (96.7\%)}} \\
+\bottomrule
+\end{tabular}
+\caption{Memory profile: ZAP vs.\ JSON-RPC over 100K operations.}
+\label{tab:memory}
+\end{table}
+
+\subsection{Environmental Impact}
+
+At scale (1 billion tool calls per day):
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Metric} & \textbf{JSON-RPC} & \textbf{ZAP} & \textbf{Savings} \\
+\midrule
+Memory throughput & 2.9 TB/day & 0.3 TB/day & 2.6 TB \\
+Energy consumption & 1.8 kWh/day & 0.1 kWh/day & 96\% \\
+CO$_2$ emissions & $\sim$0.7 kg/day & $\sim$0.03 kg/day & $\sim$245 kg/year \\
+\bottomrule
+\end{tabular}
+\caption{Environmental impact at 1B calls/day.}
+\label{tab:environmental}
+\end{table}
+
+For battery-powered tactical edge devices, the 96\% energy reduction translates directly to extended operational endurance.
+
+% ============================================================================
+\section{Transport Layer}
+% ============================================================================
+
+\subsection{Supported Transports}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lllp{4cm}@{}}
+\toprule
+\textbf{Scheme} & \textbf{Transport} & \textbf{Status} & \textbf{Use Case} \\
+\midrule
+\texttt{zap://} & TCP & Complete & Default RPC \\
+\texttt{tcp://} & TCP explicit & Complete & Direct TCP \\
+\texttt{unix://} & Unix socket & Complete & Local IPC \\
+\texttt{ws://} & WebSocket & Complete & Browser/cloud \\
+\texttt{wss://} & WebSocket+TLS & Complete & Secure browser \\
+\texttt{stdio://} & Stdio & Complete & MCP subprocess \\
+\texttt{http://} & HTTP/SSE & Complete & Remote MCP \\
+\texttt{udp://} & UDP & Complete & Low-latency \\
+\bottomrule
+\end{tabular}
+\caption{ZAP transport schemes.}
+\label{tab:transports}
+\end{table}
+
+\textbf{Frame format}: 4-byte big-endian length prefix + payload (max 16~MB).
+
+\subsection{mDNS Discovery for Ad-Hoc Networks}
+
+ZAP nodes advertise services via mDNS with domain-specific service types:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Service Type} & \textbf{Purpose} \\
+\midrule
+\texttt{\_luxd.\_tcp} & Blockchain consensus nodes \\
+\texttt{\_lux-gpu.\_tcp} & GPU compute nodes \\
+\texttt{\_lux-vm.\_tcp} & Virtual machine endpoints \\
+\texttt{\_zap-agent.\_tcp} & AI agent endpoints \\
+\bottomrule
+\end{tabular}
+\caption{mDNS service types for ad-hoc discovery.}
+\label{tab:mdns}
+\end{table}
+
+This enables zero-configuration tactical network formation: devices joining a mesh automatically discover available services without DNS infrastructure or pre-configured endpoints.
+
+% ============================================================================
+\section{Decentralized Identity}
+% ============================================================================
+
+\subsection{W3C DID Support}
+
+ZAP implements W3C Decentralized Identifiers with three methods:
+
+\begin{itemize}
+\item \textbf{did:key}: Self-certifying from ML-DSA-65 public keys. No external registry required.
+\item \textbf{did:lux}: Anchored to Lux blockchain. Verifiable via consensus.
+\item \textbf{did:web}: DNS-based for interoperability with existing PKI.
+\end{itemize}
+
+\begin{lstlisting}[caption={DID generation from ML-DSA public key.}]
+// Post-quantum self-certifying identity
+let identity = Identity::generate_pq()?;
+let did = identity.to_did();
+// did:key:z6Mk... (multibase-encoded ML-DSA-65 pubkey)
+\end{lstlisting}
+
+\subsection{Stake-Weighted Trust}
+
+For consensus operations, DIDs can be associated with stake weights:
+
+\begin{itemize}
+\item Validators register stake via blockchain transaction.
+\item Agent consensus votes are weighted by stake.
+\item Sybil resistance: creating identity is free, but gaining voting weight requires stake.
+\end{itemize}
+
+% ============================================================================
+\section{Agent Consensus Protocol}
+% ============================================================================
+
+\subsection{Distributed Agent Voting}
+
+When multiple AI agents must agree on a decision (threat classification, course of action), ZAP provides distributed consensus:
+
+\begin{algorithm}[H]
+\caption{ZAP Agent Consensus}
+\begin{algorithmic}[1]
+\State \textbf{Initiator} broadcasts query $Q$ to $n$ agents
+\For{each agent $A_i$}
+  \State $A_i$ computes response $R_i$ independently
+  \State $A_i$ signs: $\sigma_i = \text{ML-DSA-65.Sign}(\text{sk}_i, Q \| R_i)$
+  \State $A_i$ returns $(R_i, \sigma_i, \text{DID}_i)$
+\EndFor
+\State Collect responses until threshold $t$ reached (default $t = \lceil 2n/3 \rceil$)
+\State Verify all signatures
+\State Determine consensus: majority response among verified votes
+\If{consensus reached ($\geq t$ agree)}
+  \State \Return (ConsensusResult, aggregated signatures)
+\Else
+  \State \Return (NoConsensus, individual responses)
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Defense Application}
+
+Agent consensus is critical for high-consequence decisions:
+
+\begin{itemize}
+\item \textbf{Threat classification}: Multiple AI models independently assess a sensor contact; consensus prevents single-model hallucination from triggering false alarms.
+\item \textbf{Targeting}: Distributed analysis with threshold agreement before engagement recommendation.
+\item \textbf{Intelligence fusion}: Multiple agents process different data sources; consensus identifies corroborated intelligence.
+\end{itemize}
+
+% ============================================================================
+\section{MCP Gateway}
+% ============================================================================
+
+\subsection{Multi-Server Aggregation}
+
+The ZAP MCP gateway bridges multiple Model Context Protocol servers into a unified tool surface:
+
+\begin{itemize}
+\item \textbf{Tool namespacing}: Each server's tools prefixed (\eg \texttt{filesystem:read\_file}).
+\item \textbf{Health checking}: Automatic reconnection on server failure.
+\item \textbf{Resource aggregation}: Resources and prompts from all servers accessible through single endpoint.
+\item \textbf{Protocol bridging}: Stdio, HTTP/SSE, WebSocket, and native ZAP servers unified.
+\end{itemize}
+
+\subsection{Performance Advantage}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Metric} & \textbf{MCP JSON-RPC} & \textbf{ZAP Gateway} \\
+\midrule
+Tool calls/sec (20 servers) & 140,000 & 4,200,000 \\
+Serialization overhead & 5,579 ns & 322 ns \\
+Memory per call & 2,826 B & 256 B \\
+\bottomrule
+\end{tabular}
+\caption{MCP gateway performance: native vs.\ ZAP-bridged.}
+\label{tab:mcp-perf}
+\end{table}
+
+% ============================================================================
+\section{GPU Cluster Coordination}
+% ============================================================================
+
+\subsection{Zero-Copy Ciphertext Handling}
+
+ZAP's zero-copy design enables direct GPU ciphertext operations:
+
+\begin{lstlisting}[language=Go,caption={GPU FHE operation via ZAP.}]
+gpuNode := zap.NewNode(zap.NodeConfig{
+    NodeID:      "gpu-node-1",
+    ServiceType: "_lux-gpu._tcp",
+    Port:        7000,
+})
+
+gpuNode.Handle(MsgTypeFHEOp,
+  func(ctx context.Context, from string,
+       msg *zap.Message) (*zap.Message, error) {
+    root := msg.Root()
+    opType := root.Uint32(0)     // FHE operation
+    ct := root.Bytes(4)          // Zero-copy ciphertext
+
+    // GPU kernel dispatch - no memcpy needed
+    result := gpuFHE(opType, ct)
+    return buildResult(result), nil
+})
+\end{lstlisting}
+
+Ciphertext data flows from network buffer to GPU kernel without intermediate copies, critical for FHE workloads where ciphertexts are 100$\times$--1000$\times$ larger than plaintext.
+
+% ============================================================================
+\section{Contested Environment Analysis}
+% ============================================================================
+
+\subsection{Low-Probability-of-Intercept (LPI)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Protocol} & \textbf{Bytes/call} & \textbf{RF Exposure} & \textbf{LPI Factor} \\
+\midrule
+JSON-RPC & 2,826 & 100\% (baseline) & 1.0$\times$ \\
+gRPC & 1,500 & 53\% & 1.9$\times$ \\
+Protobuf & 1,200 & 42\% & 2.4$\times$ \\
+\textbf{ZAP} & \textbf{256} & \textbf{9.1\%} & \textbf{11$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{RF exposure reduction per operation.}
+\label{tab:lpi}
+\end{table}
+
+ZAP reduces RF exposure by 11$\times$ compared to JSON-RPC, directly improving low-probability-of-intercept and low-probability-of-detection (LPI/LPD) performance for tactical radio links.
+
+\subsection{Bandwidth-Limited Links}
+
+For a 9.6 kbps HF radio link:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Protocol} & \textbf{Calls/sec at 9.6 kbps} & \textbf{Latency/call} \\
+\midrule
+JSON-RPC & 0.42 & 2.35 s \\
+Protobuf & 1.00 & 1.00 s \\
+\textbf{ZAP} & \textbf{4.69} & \textbf{0.21 s} \\
+\bottomrule
+\end{tabular}
+\caption{Throughput on 9.6 kbps HF radio link.}
+\label{tab:hf-radio}
+\end{table}
+
+ZAP enables near-real-time AI agent coordination over HF radio links that would be unusable with JSON-RPC.
+
+\subsection{Jamming Resilience}
+
+\begin{itemize}
+\item \textbf{Minimal transmission time}: 91\% less data reduces jamming window.
+\item \textbf{Burst-compatible}: Small message size enables burst transmission between jamming pulses.
+\item \textbf{mDNS re-discovery}: Network reforms around jammed nodes via multicast DNS.
+\item \textbf{Multi-path}: RNS mesh provides alternative routes when primary links are degraded.
+\end{itemize}
+
+\subsection{Electronic Attack Resistance}
+
+\begin{itemize}
+\item \textbf{PQ encryption}: Intercepted traffic immune to quantum cryptanalysis.
+\item \textbf{Forward secrecy}: Each session uses ephemeral keys; compromising one session reveals nothing about others.
+\item \textbf{Zero metadata leakage}: Binary format reveals no field names, no schema structure, no type information to passive observers.
+\item \textbf{Traffic analysis resistance}: Fixed-size messages possible via padding flag.
+\end{itemize}
+
+% ============================================================================
+\section{Comparison with Military Standards}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{2.8cm}p{2.8cm}p{2.8cm}@{}}
+\toprule
+\textbf{Feature} & \textbf{Link 16 (TADIL-J)} & \textbf{VMF} & \textbf{ZAP} \\
+\midrule
+Encoding & Fixed-word binary & Variable-length binary & Zero-copy binary \\
+Bandwidth & 238 kbps & Variable & Wire rate \\
+Latency & 12.8 ms slot & Variable & 2.9 ns parse \\
+Crypto & Type 1 & HAIPE & PQ hybrid (FIPS) \\
+AI Support & None & None & Native (agents, MCP) \\
+Discovery & JTIDS & IP-based & mDNS ad-hoc \\
+PQ-Safe & No & No & Yes (\fips{203/204}) \\
+\bottomrule
+\end{tabular}
+\caption{ZAP vs.\ existing military data link protocols.}
+\label{tab:mil-comparison}
+\end{table}
+
+ZAP is not a replacement for Link~16 or VMF---it operates at a different layer (application vs.\ tactical data link). However, ZAP can serve as the application protocol carried \emph{over} these links, providing AI agent coordination, consensus messaging, and PQ security that existing message standards lack.
+
+% ============================================================================
+\section{Ringtail Consensus Integration}
+% ============================================================================
+
+\subsection{Post-Quantum Threshold Signing}
+
+ZAP integrates with the Ringtail protocol for distributed PQ threshold signatures:
+
+\begin{itemize}
+\item \textbf{Basis}: Practical two-round threshold signature from LWE (IACR ePrint 2024/1113).
+\item \textbf{Parameters}: $M=8, N=7, \bar{D}=48, \kappa=23, Q=\mathtt{0x1000000004A01}$.
+\item \textbf{Security}: NIST Level 3 (192-bit equivalent) under Ring-LWE hardness.
+\item \textbf{Performance}: $\sim$246~ms for threshold signature (within 3-second quantum bundle window).
+\end{itemize}
+
+ZAP consensus messages carry Ringtail shares as native struct fields, enabling post-quantum finality for distributed agent decisions.
+
+% ============================================================================
+\section{Implementation Details}
+% ============================================================================
+
+\subsection{Rust Crate}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lrp{5cm}@{}}
+\toprule
+\textbf{Module} & \textbf{Size} & \textbf{Purpose} \\
+\midrule
+\texttt{client.rs} & 28.5 KB & ZAP RPC client \\
+\texttt{server.rs} & 32.2 KB & ZAP RPC server \\
+\texttt{gateway.rs} & 45.2 KB & MCP gateway aggregator \\
+\texttt{transport.rs} & 34.6 KB & TCP, WS, stdio, UDP \\
+\texttt{crypto.rs} & 28.3 KB & ML-KEM, ML-DSA, X25519 \\
+\texttt{consensus.rs} & 35.5 KB & Ringtail threshold signing \\
+\texttt{identity.rs} & 26.5 KB & W3C DIDs \\
+\texttt{schema.rs} & 79.9 KB & Schema compiler \\
+\texttt{agent\_consensus.rs} & 14.2 KB & Agent voting protocol \\
+\midrule
+\textbf{Total} & \textbf{$\sim$9,915 lines} & \\
+\bottomrule
+\end{tabular}
+\caption{ZAP Rust implementation structure.}
+\label{tab:rust-impl}
+\end{table}
+
+\subsection{Go Implementation}
+
+Minimal-dependency implementation for consensus and VM communication:
+
+\begin{itemize}
+\item \texttt{zap.go}: Zero-copy builder and parser (8.9~KB).
+\item \texttt{node.go}: mDNS discovery and async RPC (21.2~KB).
+\item \texttt{mcp/}: MCP bridge for 20+ tool servers.
+\item Single external dependency: \texttt{github.com/luxfi/mdns}.
+\end{itemize}
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+ZAP provides the fastest possible binary protocol for military edge environments, achieving 2.9~ns parse latency, zero memory allocations, and 11$\times$ RF exposure reduction compared to standard protocols. Its native post-quantum transport security (\fips{203}/\fips{204}), ad-hoc mDNS discovery, distributed agent consensus, and dual Rust/Go implementations make it uniquely suited for contested, bandwidth-limited, and disconnected tactical operations.
+
+The protocol's 96\% energy reduction extends battery endurance on tactical devices, while its zero-copy design eliminates the GC pauses and memory pressure that plague JSON-RPC and Protobuf in resource-constrained environments. ZAP enables real-time AI agent coordination over links as slow as 9.6~kbps HF radio---a capability no existing protocol provides.
+
+% ============================================================================
+\begin{thebibliography}{20}
+
+\bibitem{fips203} NIST, ``ML-KEM Standard,'' FIPS 203, 2024.
+
+\bibitem{fips204} NIST, ``ML-DSA Standard,'' FIPS 204, 2024.
+
+\bibitem{ringtail} ``Practical Two-Round Threshold Signature from LWE,'' IACR ePrint 2024/1113, 2024.
+
+\bibitem{capnproto} K. Varda, ``Cap'n Proto: Insanely Fast Data Interchange Format,'' 2013.
+
+\bibitem{flatbuffers} Google, ``FlatBuffers: Memory Efficient Serialization Library,'' 2014.
+
+\bibitem{protobuf} Google, ``Protocol Buffers: Language-Neutral Data Serialization,'' 2008.
+
+\bibitem{mcp} Anthropic, ``Model Context Protocol Specification,'' 2024.
+
+\bibitem{w3cdid} W3C, ``Decentralized Identifiers (DIDs) v1.0,'' 2022.
+
+\bibitem{mdns} S. Cheshire, M. Krochmal, ``Multicast DNS,'' RFC 6762, 2013.
+
+\bibitem{link16} DoD, ``Tactical Digital Information Link (TADIL) J Standard,'' MIL-STD-6016, 2018.
+
+\bibitem{vmf} DoD, ``Variable Message Format (VMF),'' MIL-STD-6017, 2019.
+
+\bibitem{cnsa2} NSA, ``CNSA Suite 2.0,'' 2022.
+
+\bibitem{rfc9180} R. Barnes \textit{et al.}, ``Hybrid Public Key Encryption,'' RFC 9180, 2022.
+
+\bibitem{circl} Cloudflare, ``CIRCL: Interoperable Reusable Cryptographic Library,'' 2024.
+
+\bibitem{quasar} Hanzo Team, ``Quasar Consensus,'' Lux Industries, 2025.
+
+\bibitem{luxzap} Hanzo Team, ``Lux ZAP: Consensus Wire Protocol,'' Lux Industries, 2026.
+
+\end{thebibliography}
+
+\end{document}

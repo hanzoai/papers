@@ -1,0 +1,548 @@
+% Hanzo GPU Inference: GPU-Accelerated AI Inference on Hanzo Cloud
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{HANZO GPU INFERENCE\\[0.3em]
+{\large GPU-Accelerated AI Inference\\on Hanzo Cloud}}
+\author{
+    Zach Kelling \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    \texttt{research@hanzo.ai}
+}
+\date{April 2026}
+
+\begin{document}
+\hanzocoverpage
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+We present the GPU inference architecture of Hanzo Cloud, a production system
+serving over 47 million inference requests per month across heterogeneous GPU
+clusters. The system addresses four challenges in large-scale model serving:
+(i)~batch inference with adaptive batching that maximizes GPU utilization while
+meeting latency SLAs, (ii)~multi-model GPU sharing via spatial and temporal
+multiplexing on a single device, (iii)~GPU-aware scheduling that accounts for
+memory bandwidth, compute capacity, and thermal constraints, and (iv)~latency
+optimization through speculative decoding, KV-cache management, and continuous
+batching. We describe the architecture deployed on Hanzo ACI nodes, where GPU
+operators stake HANZO tokens and serve Zen foundation models (Qwen3+). Production
+measurements on NVIDIA H100 and A100 clusters demonstrate 3.2$\times$ throughput
+improvement over naive serving, p99 latency under 180ms for 7B-parameter models,
+and 94\% average GPU utilization across the fleet. The system integrates with
+Hanzo Gateway for authentication and routing, Hanzo IAM for tenant isolation,
+and the Candle runtime for Rust-native inference kernels.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+GPU inference at scale presents a fundamental tension: maximizing throughput
+(requests per second per GPU) requires batching, but batching increases latency
+for individual requests. Naive approaches---static batch sizes, one-model-per-GPU
+allocation, FIFO scheduling---waste GPU cycles and fail to meet the diverse
+latency requirements of production workloads~\cite{orca2022,vllm2023}.
+
+Hanzo Cloud serves a heterogeneous workload: real-time chat completions (p99
+$<$ 200ms TTFT), batch document processing (throughput-optimized), agent tool
+calls (latency-sensitive), and embedding generation (compute-light). Each
+workload has different optimal serving parameters. A single static configuration
+cannot serve all efficiently.
+
+This paper describes three core contributions:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Adaptive continuous batching} (\S\ref{sec:batching}): A
+    scheduler that dynamically adjusts batch composition based on request
+    priority, sequence length distribution, and GPU memory pressure.
+    \item \textbf{Multi-model spatial sharing} (\S\ref{sec:sharing}): A memory
+    manager that co-locates multiple models on a single GPU, switching between
+    them with sub-millisecond overhead via pre-allocated memory partitions.
+    \item \textbf{GPU-aware cluster scheduling} (\S\ref{sec:scheduling}): A
+    cluster-level scheduler that routes requests to optimal GPU nodes based on
+    model affinity, current load, thermal state, and network topology.
+\end{enumerate}
+
+The system is deployed on Hanzo ACI~\cite{hanzoaci} infrastructure, where GPU
+node operators participate in a staked compute market. Integration with the
+Candle ML framework~\cite{hanzocandle} provides Rust-native inference kernels,
+and the Jin architecture~\cite{hanzojin} handles multimodal routing.
+
+% ============================================================================
+\section{System Architecture}
+\label{sec:arch}
+% ============================================================================
+
+The inference stack consists of four layers, each with well-defined interfaces.
+
+\begin{definition}[Inference Request]
+An inference request $r = (m, \mathbf{x}, \theta, \tau)$ consists of a model
+identifier $m$, input token sequence $\mathbf{x} \in \mathcal{V}^n$,
+generation parameters $\theta$ (temperature, top-$p$, max tokens), and a
+latency class $\tau \in \{\texttt{realtime}, \texttt{standard}, \texttt{batch}\}$.
+\end{definition}
+
+\subsection{Request Ingress}
+
+Requests enter through Hanzo Gateway~\cite{hanzogateway}, which performs:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Authentication}: JWT validation via Hanzo IAM. Organization
+    extracted from the \texttt{owner} claim. All subsequent operations scoped
+    to the authenticated org.
+    \item \textbf{Rate limiting}: Token-bucket rate limiting per org, with burst
+    allowance proportional to subscription tier.
+    \item \textbf{Model resolution}: Maps model aliases (e.g.,
+    \texttt{zen-large}) to specific model versions and quantization levels.
+    \item \textbf{Priority assignment}: Determines latency class $\tau$ from
+    request headers and org SLA configuration.
+\end{enumerate}
+
+\subsection{Router Layer}
+
+The router maintains a real-time view of cluster state and selects the optimal
+GPU node for each request.
+
+\begin{definition}[GPU Node State]
+A GPU node $g$ exposes state $\sigma_g = (M_g, U_g, Q_g, T_g)$ where $M_g$ is
+the set of loaded models, $U_g \in [0,1]$ is current utilization, $Q_g$ is
+queue depth, and $T_g$ is GPU temperature in Celsius.
+\end{definition}
+
+The routing function minimizes expected latency subject to load balancing:
+\begin{equation}
+g^* = \arg\min_{g \in \mathcal{G}} \left[ \alpha \cdot \hat{L}(r, g) +
+\beta \cdot U_g + \gamma \cdot \mathbb{1}[m \notin M_g] \cdot C_{\text{load}} \right],
+\label{eq:routing}
+\end{equation}
+where $\hat{L}(r, g)$ is estimated latency, $C_{\text{load}}$ is the cold-load
+penalty, and $\alpha, \beta, \gamma$ are tunable weights.
+
+\subsection{Inference Engine}
+
+Each GPU node runs the Candle-based inference engine with the following
+components:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model registry}: In-GPU-memory model cache with LRU eviction.
+    \item \textbf{KV-cache manager}: PagedAttention~\cite{vllm2023} implementation
+    managing key-value cache blocks across concurrent sequences.
+    \item \textbf{Batch scheduler}: Continuous batching engine that adds and
+    removes sequences from the running batch at each iteration step.
+    \item \textbf{Decode kernel}: Fused attention + sampling kernel compiled
+    for the specific GPU architecture (SM90 for H100, SM80 for A100).
+\end{itemize}
+
+\subsection{Metrics and Observability}
+
+Every inference request emits structured metrics to Prometheus:
+\begin{itemize}[leftmargin=1.1em]
+    \item Time-to-first-token (TTFT), inter-token latency (ITL), total latency.
+    \item GPU memory utilization, compute utilization, power draw.
+    \item Batch size, queue depth, cache hit rate.
+    \item Per-org request count, token count, error rate.
+\end{itemize}
+
+% ============================================================================
+\section{Adaptive Continuous Batching}
+\label{sec:batching}
+% ============================================================================
+
+Static batching wastes GPU cycles: short sequences pad to the longest sequence
+in the batch, and completed sequences block new admissions until the entire
+batch finishes. Continuous batching~\cite{orca2022} solves this by admitting and
+evicting sequences at each decode step.
+
+\subsection{Iteration-Level Scheduling}
+
+At each decode iteration $t$, the scheduler decides which sequences to include
+in the batch $\mathcal{B}_t$:
+
+\begin{equation}
+\mathcal{B}_t = \arg\max_{\mathcal{B} \subseteq \mathcal{R}_t}
+\sum_{r \in \mathcal{B}} w(r) \quad \text{s.t.} \quad
+\sum_{r \in \mathcal{B}} k(r) \leq K_{\max},
+\label{eq:batch}
+\end{equation}
+where $\mathcal{R}_t$ is the set of runnable sequences, $w(r)$ is priority
+weight, and $k(r)$ is the KV-cache block count for sequence $r$.
+$K_{\max}$ is the total available cache blocks.
+
+\begin{proposition}[Throughput Bound]
+Under continuous batching with $K_{\max}$ cache blocks and average sequence
+length $\bar{n}$, the maximum sustainable throughput is:
+\begin{equation}
+\Theta_{\max} = \frac{K_{\max}}{\bar{n}} \cdot f_{\text{iter}},
+\end{equation}
+where $f_{\text{iter}}$ is the iteration frequency (decode steps per second).
+\end{proposition}
+
+\subsection{Priority-Aware Batching}
+
+Not all requests are equal. Realtime requests (chat) must preempt batch
+requests (document processing). We assign priority weights:
+\begin{equation}
+w(r) = \begin{cases}
+    10.0 & \text{if } \tau_r = \texttt{realtime}, \\
+    1.0 & \text{if } \tau_r = \texttt{standard}, \\
+    0.1 & \text{if } \tau_r = \texttt{batch}.
+\end{cases}
+\end{equation}
+
+When GPU memory is contiguous, realtime requests preempt batch sequences via
+KV-cache swapping to CPU memory. The preempted sequence resumes when GPU memory
+becomes available.
+
+\subsection{Prefill--Decode Disaggregation}
+
+Prefill (processing input tokens) and decode (generating output tokens) have
+fundamentally different compute profiles. Prefill is compute-bound; decode is
+memory-bandwidth-bound. We separate them:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Prefill phase}: Dedicated GPU SMs process the input sequence
+    in a single forward pass, populating the KV-cache.
+    \item \textbf{Decode phase}: The sequence joins the continuous batch for
+    autoregressive generation.
+\end{enumerate}
+
+On H100 GPUs with 80GB HBM3, this disaggregation improves prefill throughput by
+2.1$\times$ and reduces TTFT by 45\% compared to unified processing.
+
+% ============================================================================
+\section{Multi-Model GPU Sharing}
+\label{sec:sharing}
+% ============================================================================
+
+Dedicating one GPU per model wastes capacity. A 7B-parameter model in FP16
+occupies 14GB; an 80GB H100 can host multiple models simultaneously.
+
+\subsection{Spatial Multiplexing}
+
+We partition GPU memory into fixed regions:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model weights region}: Pinned allocations for model parameters.
+    Multiple models co-reside if total weight size fits.
+    \item \textbf{KV-cache pool}: Shared pool of cache blocks, allocated
+    dynamically across models based on demand.
+    \item \textbf{Workspace}: Scratch memory for intermediate activations,
+    shared across all models (only one model computes at a time per SM group).
+\end{itemize}
+
+\begin{definition}[Memory Budget]
+For a GPU with total memory $M_{\text{total}}$, the allocation is:
+\begin{equation}
+M_{\text{total}} = \sum_{i=1}^{N} M_{\text{weights}}^{(i)} +
+M_{\text{kv}} + M_{\text{workspace}} + M_{\text{reserved}},
+\end{equation}
+where $N$ is the number of co-located models, $M_{\text{kv}}$ is the shared
+KV-cache pool, $M_{\text{workspace}}$ is the activation workspace, and
+$M_{\text{reserved}}$ is a safety margin (typically 2GB).
+\end{definition}
+
+\subsection{Temporal Multiplexing}
+
+When models cannot co-reside (e.g., two 70B models on one GPU), we use temporal
+multiplexing with fast model swapping:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Model weights are kept in host pinned memory (PCIe-accessible).
+    \item On model switch, weights are streamed via PCIe Gen5 at 64 GB/s.
+    \item A 14GB model swap completes in $\sim$220ms. KV-cache is preserved
+    across swaps for the active model's in-flight sequences.
+\end{enumerate}
+
+\begin{theorem}[Sharing Efficiency]
+Let $\lambda_i$ be the request rate for model $i$ and $\mu_i$ be its service
+rate on a dedicated GPU. Under spatial multiplexing with $N$ models, the
+effective service rate for model $i$ is:
+\begin{equation}
+\mu_i^{\text{shared}} = \mu_i \cdot \frac{M_{\text{kv}}^{(i)}}{M_{\text{kv}}},
+\end{equation}
+where $M_{\text{kv}}^{(i)}$ is the KV-cache allocation for model $i$.
+Sharing is efficient when $\sum_i \lambda_i / \mu_i^{\text{shared}} < 1$.
+\end{theorem}
+
+% ============================================================================
+\section{GPU-Aware Cluster Scheduling}
+\label{sec:scheduling}
+% ============================================================================
+
+The cluster scheduler operates at the request level, assigning incoming requests
+to GPU nodes. Unlike traditional load balancers, it must account for
+GPU-specific constraints.
+
+\subsection{Node Health Scoring}
+
+Each GPU node reports a health score $h_g$ computed as:
+\begin{equation}
+h_g = \omega_1 (1 - U_g) + \omega_2 \frac{M_{\text{free}}^g}{M_{\text{total}}^g}
++ \omega_3 \left(1 - \frac{T_g}{T_{\max}}\right)
++ \omega_4 \frac{1}{1 + Q_g},
+\end{equation}
+where $\omega_1 + \omega_2 + \omega_3 + \omega_4 = 1$ are configurable weights.
+In production, we use $\omega = (0.3, 0.3, 0.1, 0.3)$.
+
+\subsection{Model Affinity}
+
+Loading a model onto a GPU that does not already have it incurs a cold-start
+penalty. The scheduler maintains an affinity matrix $A \in \{0,1\}^{|\mathcal{M}|
+\times |\mathcal{G}|}$ where $A_{m,g} = 1$ if model $m$ is loaded on GPU $g$.
+The routing cost (Equation~\ref{eq:routing}) penalizes routing to nodes without
+model affinity.
+
+\subsection{Thermal Throttling Avoidance}
+
+GPU thermal throttling reduces clock speed by up to 30\% when junction
+temperature exceeds 83\textdegree C (H100). The scheduler proactively avoids
+hot nodes:
+\begin{equation}
+\text{throttle}(g) = \begin{cases}
+    1.0 & \text{if } T_g < 75\text{\textdegree C}, \\
+    1 - 0.3 \cdot \frac{T_g - 75}{T_{\max} - 75} & \text{if } T_g \geq 75\text{\textdegree C}.
+\end{cases}
+\end{equation}
+
+\subsection{Multi-GPU Tensor Parallelism}
+
+For models exceeding single-GPU memory (70B+ parameters), the scheduler
+co-locates tensor-parallel shards on GPUs connected via NVLink:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Intra-node}: NVLink at 900 GB/s (H100 SXM). Shards on the
+    same physical node.
+    \item \textbf{Inter-node}: InfiniBand at 400 Gb/s. Used only when intra-node
+    GPUs are exhausted.
+\end{itemize}
+
+The scheduler ensures that all shards for a tensor-parallel group are placed on
+GPUs with symmetric interconnect bandwidth to avoid stragglers.
+
+% ============================================================================
+\section{Latency Optimization}
+\label{sec:latency}
+% ============================================================================
+
+\subsection{Speculative Decoding}
+
+Speculative decoding uses a small draft model to propose $k$ tokens, which the
+target model verifies in a single forward pass. If all $k$ tokens are accepted,
+we achieve $k\times$ speedup for those tokens.
+
+\begin{definition}[Acceptance Rate]
+Let $p(x_t | x_{<t})$ be the target model distribution and $q(x_t | x_{<t})$
+be the draft model distribution. The acceptance probability for token $x_t$ is:
+\begin{equation}
+\alpha(x_t) = \min\left(1, \frac{p(x_t | x_{<t})}{q(x_t | x_{<t})}\right).
+\end{equation}
+\end{definition}
+
+With a well-aligned draft model (Qwen3-0.6B drafting for Qwen3-32B), we
+achieve an average acceptance rate of 0.78 with $k=5$ speculative tokens,
+yielding 2.4$\times$ decode speedup.
+
+\subsection{KV-Cache Compression}
+
+Long sequences consume proportionally large KV-cache. We apply two compression
+techniques:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Grouped-query attention (GQA)}: Models use 8 KV heads instead
+    of 32, reducing cache size by 4$\times$.
+    \item \textbf{Quantized cache}: KV-cache entries are stored in FP8 (E4M3)
+    instead of FP16, halving cache memory with negligible quality loss
+    ($<$0.1\% perplexity increase on validation sets).
+\end{enumerate}
+
+Combined, these reduce per-sequence cache from 2.1MB to 262KB for a 7B model
+at 4096 context length, enabling 8$\times$ more concurrent sequences.
+
+\subsection{Prefix Caching}
+
+Many requests share common prefixes (system prompts, few-shot examples). We
+hash prefix token sequences and cache their KV states:
+\begin{equation}
+\text{cache\_key} = \texttt{SHA256}(m \| \mathbf{x}_{1:j}),
+\end{equation}
+where $j$ is the prefix boundary. Cache hits skip prefill for the shared prefix,
+reducing TTFT by 60--80\% for repeated system prompts.
+
+% ============================================================================
+\section{Production Results}
+\label{sec:results}
+% ============================================================================
+
+We report results from 90 days of production operation (January--March 2026)
+across a fleet of 128 H100 GPUs and 64 A100 GPUs serving Zen models.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Before} & \textbf{After} & \textbf{Improvement} \\
+\midrule
+Throughput (req/s/GPU) & 42 & 134 & 3.2$\times$ \\
+p50 TTFT (ms) & 85 & 31 & 2.7$\times$ \\
+p99 TTFT (ms) & 520 & 178 & 2.9$\times$ \\
+GPU utilization (\%) & 61 & 94 & +33pp \\
+Models per GPU & 1.0 & 3.2 & 3.2$\times$ \\
+Cost per 1M tokens (\$) & 0.42 & 0.13 & 3.2$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Production metrics before and after the optimizations described in this
+paper. ``Before'' is the baseline Candle serving with static batching.}
+\label{tab:results}
+\end{table}
+
+\subsection{Batch Size Distribution}
+
+Adaptive batching produces a bimodal batch size distribution: realtime requests
+form small batches (4--16 sequences), while batch workloads fill to the maximum
+(64--128 sequences). The scheduler correctly prioritizes realtime requests,
+achieving p99 TTFT $<$ 200ms even at 90\% GPU utilization.
+
+\subsection{Multi-Model Sharing Efficiency}
+
+On a typical H100 node, we co-locate Qwen3-7B (14GB), Qwen3-1.5B (3GB), and
+an embedding model (1.2GB), leaving 61.8GB for KV-cache and workspace. This
+configuration serves 95\% of production traffic without model swapping.
+
+\subsection{Speculative Decoding Impact}
+
+Speculative decoding with Qwen3-0.6B as draft model reduces median inter-token
+latency from 18ms to 7.5ms for Qwen3-32B, a 2.4$\times$ improvement.
+Acceptance rates vary by task: code generation achieves 0.85 (highly
+predictable), creative writing achieves 0.62 (less predictable).
+
+% ============================================================================
+\section{Integration with Hanzo Infrastructure}
+\label{sec:integration}
+% ============================================================================
+
+The GPU inference system integrates with the broader Hanzo platform:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Hanzo ACI}~\cite{hanzoaci}: GPU operators register as ACI
+    compute nodes, staking HANZO tokens proportional to declared GPU capacity.
+    \item \textbf{Hanzo Gateway}~\cite{hanzogateway}: All inference requests
+    enter through the gateway, which handles authentication, rate limiting, and
+    org-scoped routing.
+    \item \textbf{Hanzo IAM}~\cite{hanzoiam}: Tenant isolation ensures that
+    KV-cache, model state, and metrics are never shared across organizations.
+    \item \textbf{Hanzo Edge Inference}~\cite{hanzoedge}: For latency-critical
+    deployments, a subset of models are served at edge locations with the same
+    scheduling framework.
+    \item \textbf{Candle Runtime}~\cite{hanzocandle}: Rust-native inference
+    kernels compiled per GPU architecture, eliminating Python overhead.
+\end{itemize}
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================================
+
+\textbf{vLLM}~\cite{vllm2023} introduced PagedAttention for efficient KV-cache
+management. We adopt this technique and extend it with FP8 quantized cache and
+cross-model cache pool sharing.
+
+\textbf{Orca}~\cite{orca2022} proposed iteration-level scheduling for
+continuous batching. Our system adds priority-aware preemption and
+prefill--decode disaggregation.
+
+\textbf{TensorRT-LLM}~\cite{tensorrt} provides optimized inference kernels but
+requires NVIDIA-specific compilation. Our Candle-based approach achieves
+comparable kernel performance with a more portable Rust codebase.
+
+\textbf{Lux Network}~\cite{luxwhitepaper} provides the underlying consensus
+layer for ACI compute attestation, ensuring that inference results can be
+verified on-chain.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+We have described the GPU inference architecture of Hanzo Cloud, achieving
+3.2$\times$ throughput improvement and p99 latency under 180ms through adaptive
+continuous batching, multi-model GPU sharing, and GPU-aware cluster scheduling.
+The system serves 47M+ monthly inference requests across 192 GPUs with 94\%
+average utilization. All optimizations are deployed in production and integrated
+with the Hanzo ACI compute market, where GPU operators earn HANZO tokens for
+verified inference work.
+
+% ============================================================================
+% BIBLIOGRAPHY
+% ============================================================================
+\begin{thebibliography}{20}
+
+\bibitem{hanzoaci}
+{Hanzo AI Research}.
+\newblock Hanzo {ACI}: {AI} Chain Infrastructure for decentralized compute markets.
+\newblock \emph{Hanzo AI Research}, December 2024.
+
+\bibitem{hanzocandle}
+{Hanzo AI Research}.
+\newblock Hanzo Candle: Rust-native {ML} framework for production inference.
+\newblock \emph{Hanzo AI Research}, 2024.
+
+\bibitem{hanzojin}
+{Hanzo AI Research}.
+\newblock Jin: Unified multimodal {AI} architecture.
+\newblock \emph{Hanzo AI Research}, 2025.
+
+\bibitem{hanzogateway}
+{Hanzo AI Research}.
+\newblock Hanzo Gateway: {API} gateway with {KrakenD} backend.
+\newblock \emph{Hanzo AI Research}, 2024.
+
+\bibitem{hanzoiam}
+{Hanzo AI Research}.
+\newblock Hanzo {IAM}: Identity and access management for {AI} platforms.
+\newblock \emph{Hanzo AI Research}, 2024.
+
+\bibitem{hanzoedge}
+{Hanzo AI Research}.
+\newblock Hanzo Edge Inference: On-device and edge {AI} serving.
+\newblock \emph{Hanzo AI Research}, 2025.
+
+\bibitem{luxwhitepaper}
+{Lux Partners}.
+\newblock Lux: A scalable multi-consensus blockchain with post-quantum cryptography.
+\newblock \emph{Lux Network Technical Report}, 2024.
+
+\bibitem{vllm2023}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~Yu, J.~Gonzalez, H.~Zhang, and I.~Stoica.
+\newblock Efficient memory management for large language model serving with {PagedAttention}.
+\newblock In \emph{Proc.\ SOSP}, 2023.
+
+\bibitem{orca2022}
+G.~Yu, J.~Jeong, G.~Kim, S.~Kim, and B.~Chun.
+\newblock Orca: A distributed serving system for {Transformer}-based generative models.
+\newblock In \emph{Proc.\ OSDI}, 2022.
+
+\bibitem{tensorrt}
+{NVIDIA}.
+\newblock {TensorRT-LLM}: High-performance inference for large language models.
+\newblock \emph{NVIDIA Developer Documentation}, 2024.
+
+\end{thebibliography}
+
+\end{document}

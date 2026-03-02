@@ -634,7 +634,7 @@ export const siteConfig: SiteConfig = {
       id: 'zen-technical-paper',
       title: 'Zen Technical Architecture',
       subtitle: 'MoDE Architecture and Training Methodology',
-      abstract: 'Technical architecture report covering the MoDE (Mixture of Distilled Experts) design and training methodology.',
+      abstract: 'Technical architecture report covering the MoDE (Mixture of Diverse Experts) design and training methodology.',
       pdfUrl: 'https://github.com/hanzoai/papers/raw/main/pdfs/zen/zen-technical-paper.pdf',
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/zen/zen-technical-paper.tex',
       githubUrl: 'https://github.com/hanzoai/papers',

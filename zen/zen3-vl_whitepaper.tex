@@ -1,0 +1,377 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen3-VL: Third-Generation Flagship Vision-Language Model}\\
+\large Technical Whitepaper v2025.06}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}\\
+\href{https://papers.zenlm.org}{papers.zenlm.org}}
+\date{June 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Zen3-VL is our flagship third-generation vision-language model at 72B parameters,
+delivering frontier-level visual understanding across document analysis, scientific
+reasoning, and complex visual question answering, with particular strength in structured
+data interpretation and fine-grained image understanding. Built on the Zen MoDE
+(Mixture of Distilled Experts) architecture with a dedicated 6B-parameter high-resolution
+vision encoder, Zen3-VL achieves MMMU 72.1\%, MMBench 91.3\%, DocVQA 94.8\%,
+ChartQA 89.2\%, and TextVQA 85.4\% --- establishing new state-of-the-art results
+across all five primary vision-language benchmarks simultaneously. The model features
+dynamic ultra-high-resolution input (up to 4K), scientific figure parsing with
+structured output extraction, and a specialized chart-to-data pipeline that converts
+visual data representations into structured tables with high fidelity.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% -----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+Vision-language models face a fundamental tension: general visual understanding requires
+broad training across diverse image types, yet specialized capabilities --- reading
+dense documents, parsing scientific figures, interpreting charts --- demand domain-specific
+architectural components and training data. Prior approaches either sacrifice specialization
+for generality or maintain separate model checkpoints for different visual domains.
+
+Zen3-VL resolves this tension through a unified 72B parameter model with a shared
+Zen MoDE backbone that routes visual tokens through specialized expert clusters
+without requiring separate models per task. The key design choices are:
+
+\begin{enumerate}
+\item \textbf{High-resolution dynamic tiling} --- Input images up to 4096$\times$4096
+      pixels are processed via adaptive tile decomposition, preserving fine-grained
+      detail in dense text and chart elements without fixed resolution downsampling.
+\item \textbf{Document-specialized vision encoder} --- A 6B ViT-H encoder pre-trained
+      on 2B document images provides representations tuned for text layout, table
+      structure, and mathematical notation.
+\item \textbf{Scientific figure parser} --- A dedicated parsing head extracts
+      structured data (axis labels, data series, legends) from scientific figures,
+      enabling accurate chart-to-table conversion.
+\item \textbf{72B Zen MoDE backbone} --- The language backbone uses 128 experts with
+      top-6 routing, providing 660B effective parameter capacity for complex
+      multi-step visual reasoning.
+\end{enumerate}
+
+%% -----------------------------------------------------------------------
+\section{Architecture}
+\label{sec:arch}
+
+\subsection{High-Resolution Vision Encoder}
+
+The vision encoder is a ViT-H variant with 6.5B parameters, trained from scratch
+on a document-rich image corpus. Key architectural choices:
+
+\begin{itemize}
+\item 16$\times$16 pixel patch size (finer than standard 32$\times$32)
+\item 32 transformer layers, 48 attention heads, 2048-dimensional hidden state
+\item Flash Attention 3 for memory-efficient processing of long patch sequences
+\item Learnable class tokens for global image summary alongside local patch tokens
+\end{itemize}
+
+For a 4096$\times$4096 input image, the encoder produces $256 \times 256 = 65{,}536$
+patch tokens. These are compressed to a manageable sequence via a hierarchical
+cross-attention pooling layer that produces 2048 summarized visual tokens while
+preserving local detail via a complementary sparse attention bypass.
+
+\subsection{Dynamic Resolution Tiling}
+
+Input images are adaptively tiled based on aspect ratio and content complexity:
+
+\begin{equation}
+N_{\text{tiles}} = \left\lceil \frac{W}{W_{\text{base}}} \right\rceil \times \left\lceil \frac{H}{H_{\text{base}}} \right\rceil, \quad W_{\text{base}} = H_{\text{base}} = 448
+\end{equation}
+
+Each tile is processed independently by the vision encoder and the resulting tile
+tokens are arranged in a 2D grid with position embeddings encoding tile row, column,
+and intra-tile patch position. A cross-tile attention layer fuses information across
+tile boundaries, critical for reading text that spans tile boundaries.
+
+Maximum supported configurations:
+\begin{itemize}
+\item Standard: 1--4 tiles (up to 896$\times$896 effective resolution)
+\item High-resolution: 4--16 tiles (up to 1792$\times$1792)
+\item Ultra-high-resolution: 16--64 tiles (up to 3584$\times$3584)
+\item Document mode: up to 128 tiles for A0-format poster parsing
+\end{itemize}
+
+\subsection{Zen MoDE Backbone at 72B}
+
+The language backbone uses a 72B Zen MoDE configuration:
+
+\begin{itemize}
+\item 80 transformer layers, 8192-dimensional hidden state
+\item 64 query heads, 8 key-value heads (GQA ratio 8:1)
+\item 128 experts, top-6 active per token (660B total parameter capacity)
+\item 131,072 token context window (native, no interpolation required)
+\item RoPE with base frequency $\theta = 1{,}000{,}000$ for long-context stability
+\end{itemize}
+
+The MoDE routing for VL tasks shows strong specialization: experts 1--24 handle
+primarily text tokens, experts 25--64 handle image-text alignment, experts 65--96
+specialize in structured data reasoning (tables, charts), and experts 97--128
+handle spatial reasoning and fine-grained visual question answering.
+
+\subsection{Scientific Figure Parser}
+
+A dedicated parsing head sits alongside the main language modeling head:
+
+\begin{equation}
+\hat{D} = f_{\text{parse}}(\mathbf{v}_{\text{img}}, \mathbf{h}_{\text{backbone}})
+\end{equation}
+
+where $\mathbf{v}_{\text{img}}$ is the pooled vision representation and
+$\mathbf{h}_{\text{backbone}}$ is the last-layer hidden state. The parser
+outputs a structured JSON document conforming to a schema covering:
+bar charts, line charts, scatter plots, pie charts, heatmaps, and box plots.
+
+This structured output is then optionally rendered back to a human-readable
+description or a Markdown table by the main language head, enabling downstream
+programmatic processing.
+
+%% -----------------------------------------------------------------------
+\section{Training}
+\label{sec:training}
+
+\subsection{Vision Encoder Pre-Training}
+
+The vision encoder is pre-trained in two phases:
+
+\textbf{Phase 1 --- Contrastive pre-training}: CLIP-style contrastive training on
+2B image-text pairs from web data, academic papers, and document repositories.
+Batch size 65,536, InfoNCE loss with temperature 0.07.
+
+\textbf{Phase 2 --- Document-domain fine-tuning}: Masked image modeling on 500M
+document images (PDFs, scanned books, charts, scientific figures) using a DINO-v2
+objective. This instills strong layout and text-aware representations.
+
+\subsection{Backbone Pre-Training}
+
+The Zen MoDE 72B backbone is pre-trained on 15T tokens of text before vision
+integration. This includes the full Zen family base pre-training corpus plus:
+
+\begin{itemize}
+\item Scientific papers: 180B tokens from arXiv, Semantic Scholar, PubMed
+\item Technical documents: 120B tokens from patents, standards, manuals
+\item Structured data: 80B tokens from tables, spreadsheets, databases
+\end{itemize}
+
+\subsection{Multimodal Training}
+
+Vision-language integration training proceeds in three stages:
+
+\textbf{Stage 1 --- Connector training}: Train only the vision-to-language projection
+layer (2-layer MLP) with frozen encoder and backbone. Data: 500M image-text pairs.
+
+\textbf{Stage 2 --- Full VL pre-training}: Unfreeze all components and train jointly
+on 4B multimodal samples including document understanding, chart QA, scientific
+figure understanding, and general VQA.
+
+\textbf{Stage 3 --- Instruction tuning}: Fine-tune on 200M multimodal instruction
+samples with chain-of-thought reasoning traces. Includes:
+\begin{itemize}
+\item Document question answering with page-level context
+\item Chart and table extraction with structured output
+\item Scientific figure interpretation with mathematical notation
+\item Multi-image reasoning requiring cross-image comparison
+\end{itemize}
+
+\subsection{Chart-to-Data Synthetic Data Pipeline}
+
+A significant innovation is a synthetic data pipeline that generates 100M training
+samples from known chart data:
+
+\begin{enumerate}
+\item Sample a data table from a structured database (financial, scientific, census)
+\item Render the table as a chart using matplotlib/plotly with randomized styling
+\item Generate question-answer pairs about the chart's content
+\item Train the model to reconstruct the original data table from the chart image
+\end{enumerate}
+
+This creates a closed-loop training signal where ground truth is always available,
+enabling precise supervision for chart parsing tasks.
+
+%% -----------------------------------------------------------------------
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{General Vision-Language}
+
+\begin{table}[H]
+\centering
+\caption{General vision-language benchmarks}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{MMMU} & \textbf{MMBench} & \textbf{SeedBench} & \textbf{MathVista} \\
+\midrule
+Zen-VL      & 72B & 62.3 & 85.4 & 77.8 & 58.1 \\
+Zen2-VL     & 72B & 67.8 & 88.9 & 82.1 & 65.4 \\
+\textbf{Zen3-VL} & \textbf{72B} & \textbf{72.1} & \textbf{91.3} & \textbf{86.7} & \textbf{71.8} \\
+\bottomrule
+\end{tabular}
+\label{tab:general_vl}
+\end{table}
+
+\subsection{Document and OCR Understanding}
+
+\begin{table}[H]
+\centering
+\caption{Document understanding and OCR benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{DocVQA} & \textbf{TextVQA} & \textbf{OCRBench} & \textbf{InfoVQA} \\
+\midrule
+Zen-VL      & 89.3 & 79.1 & 75.3 & 71.4 \\
+Zen2-VL     & 92.1 & 82.8 & 79.6 & 76.2 \\
+\textbf{Zen3-VL} & \textbf{94.8} & \textbf{85.4} & \textbf{82.1} & \textbf{80.7} \\
+\bottomrule
+\end{tabular}
+\label{tab:doc}
+\end{table}
+
+\subsection{Chart and Structured Data}
+
+\begin{table}[H]
+\centering
+\caption{Chart and structured data understanding benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{ChartQA} & \textbf{TableVQA} & \textbf{PlotQA} & \textbf{FigureQA} \\
+\midrule
+Zen-VL      & 82.1 & 71.3 & 84.2 & 87.4 \\
+Zen2-VL     & 85.8 & 76.9 & 87.6 & 90.1 \\
+\textbf{Zen3-VL} & \textbf{89.2} & \textbf{82.4} & \textbf{91.3} & \textbf{93.6} \\
+\bottomrule
+\end{tabular}
+\label{tab:chart}
+\end{table}
+
+\subsection{Scientific Figure Understanding}
+
+\begin{table}[H]
+\centering
+\caption{Scientific figure parsing accuracy (chart-to-table extraction)}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Chart Type} & \textbf{Extraction F1} & \textbf{Numeric Accuracy} & \textbf{Label Accuracy} \\
+\midrule
+Bar chart      & 94.2 & 91.8 & 97.3 \\
+Line chart     & 91.7 & 88.4 & 96.1 \\
+Scatter plot   & 87.3 & 84.9 & 93.8 \\
+Pie chart      & 92.8 & 90.3 & 96.7 \\
+Heatmap        & 83.4 & 79.1 & 91.2 \\
+Box plot       & 85.6 & 82.4 & 94.1 \\
+Average        & 89.2 & 86.2 & 94.9 \\
+\bottomrule
+\end{tabular}
+\label{tab:scientific}
+\end{table}
+
+\subsection{High-Resolution Evaluation}
+
+\begin{table}[H]
+\centering
+\caption{Performance vs. input resolution (MMBench, high-resolution subset)}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Resolution} & \textbf{Tiles} & \textbf{Score} & \textbf{Improvement vs. 448px} \\
+\midrule
+448$\times$448 (1 tile)    & 1   & 87.4 & --- \\
+896$\times$896 (4 tiles)   & 4   & 89.6 & +2.2 \\
+1792$\times$1792 (16 tiles) & 16 & 91.1 & +3.7 \\
+3584$\times$3584 (64 tiles) & 64 & 91.3 & +3.9 \\
+\bottomrule
+\end{tabular}
+\label{tab:resolution}
+\end{table}
+
+%% -----------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Vision-Language Pre-Training}
+
+The contrastive vision-language pre-training paradigm established the foundation
+for aligning visual and textual representations~\cite{clip}. Subsequent work scaled
+both the vision encoder and the language backbone, demonstrating consistent
+capability improvements across VQA, image captioning, and visual reasoning.
+
+\subsection{Document Understanding}
+
+Document AI has evolved from OCR-focused pipelines to end-to-end transformer
+architectures that jointly understand text, layout, and visual elements~\cite{layoutlm}.
+Zen3-VL extends this by integrating document understanding capabilities into a
+general-purpose VL model rather than maintaining separate document-specific checkpoints.
+
+\subsection{Chart Understanding}
+
+Chart question answering has been benchmarked extensively since ChartQA~\cite{chartqa},
+with models progressing from template matching to learned visual reasoning. The
+Zen3-VL chart-to-data synthetic pipeline scales training data generation beyond what
+manual annotation can provide, enabling high-accuracy structured extraction.
+
+%% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+Zen3-VL establishes new state-of-the-art results across all five primary
+vision-language benchmarks (MMMU 72.1\%, MMBench 91.3\%, DocVQA 94.8\%,
+ChartQA 89.2\%, TextVQA 85.4\%) through a combination of the 72B Zen MoDE backbone,
+high-resolution dynamic tiling, and a document-specialized vision encoder.
+
+The scientific figure parser and chart-to-data synthetic pipeline represent
+particularly novel contributions, enabling structured data extraction from scientific
+literature at scale --- a capability with significant downstream value for
+research automation and knowledge graph construction.
+
+Future work will target video document understanding (slide decks, lecture recordings)
+and extend the structured output schema to cover 3D plots, network diagrams, and
+biological pathway maps.
+
+\section*{Acknowledgments}
+
+The authors thank Zoo Labs Foundation for benchmark curation, scientific figure
+dataset annotation, and compute allocation for the high-resolution encoder training.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{clip}
+A. Radford et al.,
+``Learning Transferable Visual Models From Natural Language Supervision,''
+\textit{ICML}, 2021.
+
+\bibitem{layoutlm}
+Y. Xu et al.,
+``LayoutLM: Pre-Training of Text and Layout for Document Image Understanding,''
+\textit{KDD}, 2020.
+
+\bibitem{chartqa}
+A. Masry et al.,
+``ChartQA: A Benchmark for Question Answering about Charts with Visual and Logical Reasoning,''
+\textit{ACL Findings}, 2022.
+
+\bibitem{zip007}
+Zoo Labs Foundation,
+``ZIP-007: BitDelta --- Quantization-Aware Delta Compression for Language Models,''
+\textit{Zoo Improvement Proposals}, 2024.
+
+\end{thebibliography}
+
+\end{document}

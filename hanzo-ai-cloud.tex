@@ -1,0 +1,803 @@
+% Hanzo AI Cloud: Confidential Inference, Agent Hosting, and Model Serving
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{multirow}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+
+\title{HANZO AI CLOUD\\[0.3em]
+{\large Confidential Inference, Agent Hosting, and\\Model Serving on Sovereign Infrastructure}}
+\author{
+    Zach Kelling \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    \texttt{research@hanzo.ai}
+}
+\date{April 2026}
+
+\begin{document}
+\hanzocoverpage
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+We present Hanzo AI Cloud, an infrastructure layer for AI workloads where the
+provider never sees the user's data. Current AI cloud platforms (OpenAI,
+Anthropic, Replicate, Together) require users to transmit plaintext prompts,
+receive plaintext completions, and trust the provider not to log, train on, or
+leak their inputs. This trust model is incompatible with regulated industries
+(healthcare, finance, defense) and with any user who values privacy as a
+technical guarantee rather than a policy promise.
+
+Hanzo AI Cloud eliminates this trust requirement through three mechanisms:
+(i)~confidential inference via CKKS fully homomorphic encryption, where inputs
+are encrypted client-side, evaluated homomorphically on the provider's GPUs,
+and decrypted only by the client; (ii)~agent hosting with capsule isolation,
+where each agent receives a private vault, a decentralized identifier, a
+capability budget, and encrypted memory that no other agent or the platform
+can access; and (iii)~model serving with verifiable attestation, where every
+inference result is accompanied by a cryptographic receipt anchored to the Lux
+A-Chain, proving which model produced it, on what hardware, at what time.
+
+We describe the system architecture, the FHE inference pipeline, the agent
+capsule model, the model registry, Hanzo Candle (the Rust ML framework
+powering GPU inference), the Jin multimodal architecture, edge inference for
+mobile and IoT devices, and the provider marketplace with stake-weighted
+selection and SLA enforcement.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+Every major AI cloud platform operates on the same trust model: the user sends
+plaintext data to the provider, the provider runs a model on it, the provider
+returns a plaintext result. The provider sees everything. The provider's
+privacy policy is the only barrier between the user's data and the provider's
+training pipeline, the provider's employees, the provider's government
+subpoenas, and the provider's security breaches.
+
+This is not a theoretical concern. OpenAI's data retention policy permits
+logging all API inputs for 30 days~\cite{openaiapi}. Anthropic retains inputs
+for safety evaluation. Replicate processes inputs on shared GPU instances with
+no hardware isolation between tenants. The user has no cryptographic guarantee
+that their prompt---containing patient records, financial models, legal
+strategy, classified intelligence---is not stored, read, or reused.
+
+Hanzo AI Cloud solves this problem at the architectural level, not the policy
+level. The system is designed so that the provider \emph{cannot} see the
+user's data, not that the provider \emph{promises} not to.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item Confidential inference via CKKS fully homomorphic encryption with
+    threshold decryption (\S\ref{sec:fhe}).
+    \item Agent hosting with capsule isolation: vault, DID, capabilities,
+    budget, and private memory (\S\ref{sec:agents}).
+    \item Model serving with verifiable inference receipts anchored to the
+    Lux A-Chain (\S\ref{sec:serving}).
+    \item Hanzo Candle: a Rust ML framework with GPU acceleration integrated
+    into Base Functions (\S\ref{sec:candle}).
+    \item Jin architecture: unified multimodal inference across vision,
+    language, and audio (\S\ref{sec:jin}).
+    \item Edge inference: local models on mobile/IoT with CRDT result sync
+    (\S\ref{sec:edge}).
+    \item Provider marketplace with stake-weighted selection and on-chain SLA
+    enforcement (\S\ref{sec:marketplace}).
+\end{enumerate}
+
+% ============================================================================
+\section{The AI Cloud Problem}
+\label{sec:problem}
+% ============================================================================
+
+The fundamental issue is that inference requires the model to operate on
+plaintext. A transformer model computes attention over token embeddings; if
+the embeddings are encrypted, standard matrix multiplication does not apply.
+This creates an apparent dilemma: either the provider sees the data (plaintext
+inference) or the provider cannot run the model (encrypted data).
+
+Three approaches exist to break this dilemma:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Trusted Execution Environments (TEEs)}: Run inference inside
+    an enclave (Intel SGX, AMD SEV, ARM TrustZone). The hardware prevents the
+    host from reading enclave memory. Limitation: TEEs have small memory
+    (256~MB for SGX), side-channel vulnerabilities, and require trusting the
+    hardware vendor's attestation.
+    \item \textbf{Secure Multi-Party Computation (MPC)}: Split the computation
+    across multiple non-colluding parties. No single party sees the full
+    input. Limitation: communication overhead scales with model size,
+    making MPC impractical for billion-parameter models.
+    \item \textbf{Fully Homomorphic Encryption (FHE)}: Encrypt the input and
+    evaluate the model on ciphertexts. The provider performs computation
+    without decryption. Limitation: computational overhead (10--1000$\times$
+    slowdown depending on scheme and circuit depth).
+\end{enumerate}
+
+Hanzo AI Cloud uses FHE as the primary confidentiality mechanism, with TEEs as
+an optional accelerator for latency-sensitive workloads. MPC is used only for
+threshold decryption of FHE outputs, where the communication overhead is
+minimal (one round, fixed-size messages).
+
+% ============================================================================
+\section{Confidential Inference}
+\label{sec:fhe}
+% ============================================================================
+
+Hanzo implements confidential inference using the CKKS (Cheon--Kim--Kim--Song)
+FHE scheme~\cite{ckks2017}, which supports approximate fixed-point arithmetic
+on encrypted vectors---the operation profile that neural network inference
+requires.
+
+\subsection{CKKS Overview}
+
+CKKS operates on the ring $R_Q = \mathbb{Z}_Q[X]/(X^N + 1)$ where $N$ is a
+power of 2 (typically $N = 2^{16}$) and $Q$ is a product of coprime moduli.
+A plaintext vector $\bm{z} \in \mathbb{C}^{N/2}$ is encoded as a ring
+element $m \in R_Q$ via the canonical embedding, then encrypted as:
+
+\begin{equation}
+\text{ct} = (\bm{a} \cdot s + e + m, \; \bm{a})
+\end{equation}
+
+where $s$ is the secret key, $\bm{a}$ is uniform random, and $e$ is a small
+error. Homomorphic addition and multiplication on ciphertexts correspond to
+addition and multiplication on plaintexts, with the error growing after each
+operation.
+
+\subsection{Inference Pipeline}
+
+The confidential inference pipeline operates in four phases:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Client-side encryption}: The client encodes the input (token
+    embeddings for text, pixel values for images) into CKKS plaintext vectors
+    and encrypts them with their public key. The ciphertexts are transmitted
+    to the Hanzo Cloud.
+    \item \textbf{Homomorphic evaluation}: The cloud evaluates the model on
+    the ciphertexts. Linear layers (matrix multiplication, convolution) map
+    directly to CKKS operations. Non-linear activations (GELU, softmax) are
+    approximated by low-degree polynomials fitted via Remez
+    algorithm~\cite{hanzocandle, hanzofhe}.
+    \item \textbf{Encrypted output}: The cloud returns the encrypted result.
+    It cannot decrypt it---only the client (or threshold decryption
+    participants) hold the secret key.
+    \item \textbf{Client-side decryption}: The client decrypts the result
+    locally. For threshold configurations, $k$-of-$n$ key holders cooperate
+    to produce the decryption.
+\end{enumerate}
+
+\subsection{Polynomial Activation Approximation}
+
+The GELU activation $\text{GELU}(x) = x \cdot \Phi(x)$ where $\Phi$ is the
+Gaussian CDF is approximated by a degree-7 polynomial on $[-8, 8]$:
+
+\begin{equation}
+\widetilde{\text{GELU}}(x) = \sum_{k=0}^{7} a_k x^k
+\end{equation}
+
+with coefficients fitted to minimize $L_\infty$ error. The maximum
+approximation error is $|\text{GELU}(x) - \widetilde{\text{GELU}}(x)| <
+2 \times 10^{-4}$ on the domain, which is within the noise floor of CKKS
+arithmetic. Softmax is decomposed into exponentiation (degree-6 polynomial
+approximation) and reciprocal (Goldschmidt iteration on ciphertexts).
+
+\subsection{Threshold Decryption}
+
+For multi-party scenarios, the secret key $s$ is split into $n$ shares
+$s_1, \ldots, s_n$ via Shamir's secret sharing. Decryption requires $k$
+shares:
+
+\begin{equation}
+m = \text{ct}_0 + \text{ct}_1 \cdot s = \text{ct}_0 +
+\text{ct}_1 \cdot \sum_{i \in S} \lambda_i s_i
+\end{equation}
+
+where $S \subset [n]$ with $|S| = k$ and $\lambda_i$ are Lagrange
+interpolation coefficients. Each participant computes a partial decryption
+$d_i = \text{ct}_1 \cdot \lambda_i s_i + e_i$ (with a smudging noise $e_i$
+to prevent key leakage), and the combiner sums the partial decryptions. No
+single party learns the plaintext unless they hold $k$ shares.
+
+% ============================================================================
+\section{Agent Hosting}
+\label{sec:agents}
+% ============================================================================
+
+Hanzo AI Cloud hosts autonomous agents---persistent AI processes with memory,
+tools, and goals. Each agent runs inside a \textbf{capsule}: an isolated
+execution environment with its own data, identity, and resource budget.
+
+\subsection{Capsule Architecture}
+
+\begin{definition}[Agent Capsule]
+A capsule is a tuple $(\text{vault}, \text{did}, \text{caps}, \text{budget},
+\text{mem})$ where:
+\begin{itemize}[leftmargin=1.1em]
+    \item $\text{vault}$: A private Base instance (encrypted SQLite) containing
+    the agent's persistent state.
+    \item $\text{did}$: A decentralized identifier on the Lux I-Chain,
+    uniquely identifying the agent.
+    \item $\text{caps}$: A capability set defining what the agent can access
+    (collections, APIs, other agents, network).
+    \item $\text{budget}$: A HANZO token budget limiting the agent's compute
+    and API spending.
+    \item $\text{mem}$: Encrypted working memory (conversation history,
+    scratchpad, retrieved context) stored in the vault.
+\end{itemize}
+\end{definition}
+
+\subsection{Isolation Guarantees}
+
+Capsule isolation is enforced at three levels:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Storage isolation}: Each capsule's vault is a separate
+    encrypted SQLite database with a unique encryption key. The platform
+    cannot read the vault contents without the agent's key.
+    \item \textbf{Compute isolation}: Each capsule runs in a separate Goja VM
+    instance (for tool execution) and a separate inference context (for model
+    calls). No shared state between capsules.
+    \item \textbf{Network isolation}: Capsule network access is restricted to
+    the capabilities declared in $\text{caps}$. An agent without the
+    \texttt{network} capability cannot make outbound requests.
+\end{enumerate}
+
+\subsection{Agent Memory}
+
+Agent memory is structured as three tiers:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llp{5cm}}
+\toprule
+\textbf{Tier} & \textbf{Storage} & \textbf{Behavior} \\
+\midrule
+Working & In-process & Current conversation context. Lost on capsule
+restart. \\
+Episodic & Vault (encrypted) & Past interactions, indexed by time and topic.
+Persists across restarts. Searchable via vector similarity. \\
+Semantic & Vault (encrypted) & Distilled knowledge extracted from episodic
+memory. Compact, structured, versioned. \\
+\bottomrule
+\end{tabular}
+\caption{Agent memory tiers. All persistent memory is encrypted in the
+capsule vault.}
+\label{tab:memory}
+\end{table}
+
+Episodic-to-semantic distillation runs as a scheduled Base Function inside the
+capsule. The agent periodically reviews its episodic memory and extracts
+durable facts, preferences, and learned patterns into the semantic tier. This
+is analogous to sleep consolidation in biological memory systems.
+
+\subsection{Budget Enforcement}
+
+Each capsule has a HANZO token budget that limits:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Inference tokens}: Maximum tokens generated per period.
+    \item \textbf{API calls}: Maximum outbound API calls per period.
+    \item \textbf{Storage}: Maximum vault size in bytes.
+    \item \textbf{Compute}: Maximum CPU-seconds for function execution.
+\end{itemize}
+
+Budget is enforced at the platform level. When a capsule exhausts its budget,
+it is suspended (not terminated). The capsule's vault and memory persist.
+The owner can replenish the budget to resume the agent.
+
+% ============================================================================
+\section{Model Serving}
+\label{sec:serving}
+% ============================================================================
+
+Hanzo AI Cloud serves models from a registry anchored to the Lux A-Chain
+(Attestation Chain). Every model version, every inference result, and every
+provider claim is recorded on-chain with cryptographic receipts.
+
+\subsection{Model Registry}
+
+The model registry stores model metadata on the A-Chain:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lp{6cm}}
+\toprule
+\textbf{Field} & \textbf{Description} \\
+\midrule
+\texttt{model\_id} & Content-addressed hash of model weights \\
+\texttt{format} & ONNX, GGUF, SafeTensors, Candle \\
+\texttt{architecture} & Transformer, CNN, Diffusion, MoE \\
+\texttt{parameters} & Total parameter count \\
+\texttt{quantization} & FP16, INT8, INT4, or none \\
+\texttt{benchmarks} & Standardized evaluation scores \\
+\texttt{publisher} & I-Chain DID of the publishing entity \\
+\texttt{license} & Machine-readable license identifier \\
+\bottomrule
+\end{tabular}
+\caption{Model registry fields. The \texttt{model\_id} is a SHA3-256 hash of
+the model weights, ensuring immutable identification.}
+\label{tab:registry}
+\end{table}
+
+Model weights are stored off-chain (on Hanzo Storage, S3-compatible) with the
+hash anchored on-chain. This ensures that a model ID always refers to the same
+weights---the provider cannot silently swap a model.
+
+\subsection{Verifiable Inference Receipts}
+
+Every inference call produces a receipt:
+
+\begin{equation}
+\text{receipt} = \text{sign}_{k_{\text{provider}}}\bigl(
+\text{model\_id} \| \text{input\_hash} \| \text{output\_hash} \|
+\text{hw\_id} \| \text{timestamp}
+\bigr)
+\end{equation}
+
+The receipt is submitted to the A-Chain. A client can verify: (i) which model
+produced the output, (ii) on what hardware, (iii) at what time, and (iv) that
+the provider's stake is intact (not slashed for prior misbehavior). Receipts
+enable auditability for regulated industries where ``an AI said so'' is not
+sufficient---the specific model version and provider must be traceable.
+
+\subsection{GPU Scheduling}
+
+The Hanzo scheduler assigns inference requests to providers based on:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model availability}: Does the provider have the requested
+    model loaded in GPU memory?
+    \item \textbf{Latency estimate}: Predicted latency based on provider
+    location, current load, and historical performance.
+    \item \textbf{Stake weight}: Providers with higher HANZO stake receive
+    priority. Stake is a credible commitment to quality.
+    \item \textbf{Cost}: The provider's advertised price per token/image/second.
+\end{itemize}
+
+The scheduler uses a modified weighted round-robin that favors loaded models
+(avoiding cold-load latency) while maintaining fairness across providers.
+
+% ============================================================================
+\section{Hanzo Candle}
+\label{sec:candle}
+% ============================================================================
+
+Hanzo Candle is a Rust ML framework purpose-built for inference
+workloads~\cite{hanzocandle}. It provides the GPU acceleration layer for
+Hanzo AI Cloud.
+
+\subsection{Design Principles}
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Inference-first}: Candle optimizes for inference, not
+    training. The tensor graph is static (no autograd by default), enabling
+    aggressive kernel fusion and memory planning.
+    \item \textbf{Rust-native}: No Python runtime, no GIL, no garbage
+    collection pauses. Candle runs as a compiled binary with deterministic
+    memory management.
+    \item \textbf{Multi-backend}: CUDA (NVIDIA), Metal (Apple), Vulkan
+    (cross-platform), and CPU (SIMD-optimized) backends share the same API.
+    \item \textbf{Model format agnostic}: Loads ONNX, GGUF, SafeTensors, and
+    native Candle format. Automatic quantization (INT8/INT4) at load time.
+\end{itemize}
+
+\subsection{Performance}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{Candle} & \textbf{PyTorch} & \textbf{llama.cpp} \\
+\midrule
+Qwen3-8B (FP16, A100) & 142 tok/s & 128 tok/s & --- \\
+Qwen3-72B (INT4, A100) & 38 tok/s & 31 tok/s & 35 tok/s \\
+Qwen3-8B (INT4, M4 CPU) & 28 tok/s & 11 tok/s & 26 tok/s \\
+MobileNet-V3 (FP16, A100) & 0.4~ms & 0.6~ms & --- \\
+Stable Diffusion (FP16, A100) & 2.8~s & 3.4~s & --- \\
+\bottomrule
+\end{tabular}
+\caption{Inference throughput comparison. Candle's advantage comes from static
+graph optimization, kernel fusion, and zero-copy tensor management.}
+\label{tab:candle}
+\end{table}
+
+\subsection{Base Functions Integration}
+
+Candle models can be invoked from Base Functions via the \texttt{candle}
+module in the Goja VM. This enables on-device inference inside a Base
+application without an external model serving infrastructure:
+
+\begin{lstlisting}[language=JavaScript,caption={Candle inference from a Base Function.}]
+// Base Function: classify an image
+onRecordCreate((e) => {
+  const img = e.record.get("image");
+  const result = candle.infer("mobilenet-v3", img);
+  e.record.set("label", result.top_class);
+  e.record.set("confidence", result.score);
+});
+\end{lstlisting}
+
+% ============================================================================
+\section{Jin Architecture}
+\label{sec:jin}
+% ============================================================================
+
+Jin is Hanzo's unified multimodal AI architecture~\cite{hanzojin}. Where most
+AI systems treat vision, language, and audio as separate pipelines with
+separate models, Jin unifies them in a single framework with shared
+representations.
+
+\subsection{Architecture}
+
+Jin consists of three components:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Modality encoders}: Separate encoders for text (tokenizer +
+    embedding), vision (ViT patch encoder), and audio (mel-spectrogram +
+    convolutional encoder). Each encoder projects its modality into a shared
+    latent space of dimension $d = 4096$.
+    \item \textbf{Fusion transformer}: A standard transformer decoder that
+    operates on the concatenated encoded representations. Cross-modal
+    attention enables the model to attend across modalities (e.g., attending
+    to an image region when generating text about it).
+    \item \textbf{Modality decoders}: Separate decoders for text (token
+    generation), vision (diffusion decoder for image generation), and audio
+    (vocoder for speech synthesis).
+\end{enumerate}
+
+The key property: a single Jin model handles text-to-text, text-to-image,
+image-to-text, audio-to-text, and any other modality combination without
+separate model deployments. On Hanzo AI Cloud, a Jin model occupies one GPU
+slot but serves all modality combinations.
+
+\subsection{Mixture of Experts}
+
+Jin uses Mixture of Experts (MoE) routing in the fusion transformer. Each
+transformer block routes tokens to $k = 2$ of $E = 16$ experts, based on a
+learned gating function:
+
+\begin{equation}
+\text{output} = \sum_{i \in \text{top-}k(g(\bm{x}))} g_i(\bm{x}) \cdot
+\text{Expert}_i(\bm{x})
+\end{equation}
+
+MoE enables Jin to scale to 128B total parameters while activating only 16B
+per token, keeping inference cost comparable to a dense 16B model. Different
+experts specialize in different modality combinations, learned during training
+without explicit supervision.
+
+% ============================================================================
+\section{Edge Inference}
+\label{sec:edge}
+% ============================================================================
+
+Not all inference should happen in the cloud. For latency-sensitive
+applications (real-time object detection, voice assistants, on-device
+classification), Hanzo AI Cloud supports edge inference via Hanzo
+Edge~\cite{hanzoedge}.
+
+\subsection{On-Device Runtime}
+
+Hanzo Edge is a Candle-based inference runtime for mobile and IoT devices. It
+supports:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Apple Neural Engine}: CoreML integration for ANE-accelerated
+    inference on iPhone/iPad/Mac.
+    \item \textbf{GPU compute}: Metal (Apple), Vulkan (Android/Linux) for
+    GPU-accelerated inference.
+    \item \textbf{CPU fallback}: NEON (ARM) and AVX-512 (x86) SIMD-optimized
+    CPU inference for devices without GPU access.
+    \item \textbf{Dynamic quantization}: INT8/INT4 quantization applied at
+    model load time, adapting to available memory.
+\end{itemize}
+
+\subsection{CRDT Result Sync}
+
+Edge inference results sync to the user's Base instance via the CRDT protocol
+described in the Base runtime paper~\cite{hanzobaseruntime}. A mobile device
+runs inference locally, writes the result to its local Base vault, and the
+result syncs to the user's other devices and cloud Base instance on next
+connection. This enables offline inference with eventual consistency.
+
+\subsection{Model Distribution}
+
+Edge models are distributed from the Hanzo model registry via a CDN-backed
+download with integrity verification:
+
+\begin{equation}
+\text{verify}(\text{model}_{\text{local}}) :
+\text{SHA3-256}(\text{model}_{\text{local}}) \stackrel{?}{=}
+\text{model\_id}_{\text{A-Chain}}
+\end{equation}
+
+The device downloads the model once, verifies its hash against the A-Chain
+registry entry, and caches it locally. Model updates are delta-compressed
+(binary diff of quantized weights) to minimize bandwidth.
+
+% ============================================================================
+\section{Provider Marketplace}
+\label{sec:marketplace}
+% ============================================================================
+
+Hanzo AI Cloud is not a single-operator cloud. It is a marketplace of compute
+providers, each staking HANZO tokens as collateral for their service quality
+commitments.
+
+\subsection{Stake-Weighted Selection}
+
+Providers register on-chain with:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Hardware attestation}: Verified GPU inventory (model, VRAM,
+    count) via TPM-based attestation.
+    \item \textbf{HANZO stake}: Minimum 10,000 HANZO per GPU. Higher stake
+    increases scheduling priority.
+    \item \textbf{SLA declaration}: Committed latency (p99), uptime (monthly),
+    and throughput (tokens/sec).
+    \item \textbf{Pricing}: Per-token, per-image, or per-second pricing in
+    HANZO.
+\end{itemize}
+
+The scheduler selects providers using a score function:
+
+\begin{equation}
+\text{score}(p) = \alpha \cdot \frac{S_p}{\sum_j S_j} +
+\beta \cdot \frac{1}{L_p} + \gamma \cdot \frac{U_p}{T_p} +
+\delta \cdot \frac{1}{C_p}
+\end{equation}
+
+where $S_p$ is stake, $L_p$ is historical latency, $U_p/T_p$ is uptime ratio,
+$C_p$ is price, and $\alpha + \beta + \gamma + \delta = 1$ are
+user-configurable weights. Users who prioritize cost set $\delta$ high; users
+who prioritize reliability set $\gamma$ high.
+
+\subsection{SLA Enforcement}
+
+SLA violations are detected automatically and enforced on-chain:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Latency violation}: If measured p99 exceeds declared p99 by
+    $>$20\% over a 1-hour window, the provider is penalized 0.1\% of stake.
+    \item \textbf{Uptime violation}: If monthly uptime falls below declared
+    SLA, the provider is penalized proportionally (up to 5\% of stake per
+    month).
+    \item \textbf{Incorrect output}: If a verifier detects an incorrect
+    inference result (via PoAI spot-checking), the provider is slashed up
+    to 25\% of stake.
+    \item \textbf{Compensation}: Slashed HANZO is distributed to the affected
+    users as compensation, not burned.
+\end{itemize}
+
+\subsection{Compute Bidding}
+
+For batch workloads (training, fine-tuning, bulk inference), providers submit
+bids in a sealed-bid auction:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item The user submits a job specification (model, dataset size, deadline).
+    \item Providers submit sealed bids (price, estimated completion time).
+    \item The scheduler selects the bid with the best score (price $\times$
+    time, weighted by stake and historical performance).
+    \item Payment is escrowed in HANZO. Released on verified job completion.
+\end{enumerate}
+
+% ============================================================================
+\section{Comparison to Existing Platforms}
+\label{sec:comparison}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Feature} & \textbf{Hanzo} & \textbf{OpenAI} & \textbf{Anthropic} &
+\textbf{Replicate} & \textbf{Together} \\
+\midrule
+Confidential inference & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+FHE support & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+Agent capsules & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+Verifiable receipts & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+Multi-provider & \checkmark & $\times$ & $\times$ & \checkmark & \checkmark \\
+Open model registry & \checkmark & $\times$ & $\times$ & \checkmark & \checkmark \\
+Edge inference & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+On-chain SLA & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+Self-hostable & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+User-controlled keys & \checkmark & $\times$ & $\times$ & $\times$ & $\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Platform comparison. Hanzo AI Cloud is the only platform offering
+confidential inference with verifiable attestation.}
+\label{tab:comparison}
+\end{table}
+
+\paragraph{OpenAI.} Market leader in model quality. No confidential inference.
+No verifiable outputs. No self-hosting. Data retention policy permits 30-day
+logging. Closed-source models with no weight access.
+
+\paragraph{Anthropic.} Strong safety focus. No confidential inference. No
+agent isolation beyond conversation-level context windows. No self-hosting.
+Constitutional AI provides behavioral guarantees, not cryptographic ones.
+
+\paragraph{Replicate.} Open model marketplace. No confidential inference.
+Shared GPU instances with no tenant isolation. No verifiable outputs. Good
+developer experience for model deployment, but no sovereignty guarantees.
+
+\paragraph{Together.} Open model serving with competitive pricing. No
+confidential inference. No agent hosting. No verifiable outputs. Together
+is a cheaper alternative to OpenAI for open models, not a fundamentally
+different architecture.
+
+\paragraph{Hanzo differentiation.} Hanzo AI Cloud is the only platform where
+the provider mathematically cannot see the user's data (FHE), the agent's
+memory is cryptographically private (capsule vault), and every inference result
+is provably attributable (A-Chain receipts). This is not a feature advantage.
+It is an architectural category difference.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+The AI cloud industry is built on a broken trust model. Users send their most
+sensitive data to providers who promise---but cannot prove---that they will not
+read, store, or misuse it. This trust model fails under adversarial conditions
+(breaches, subpoenas, rogue employees) and is incompatible with regulated
+industries that require cryptographic guarantees.
+
+Hanzo AI Cloud replaces trust with proof:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Confidential inference}: CKKS FHE ensures the provider
+    evaluates models on encrypted inputs. The provider never sees the
+    plaintext. This is a mathematical guarantee, not a policy.
+    \item \textbf{Agent sovereignty}: Each agent's vault, memory, and identity
+    are cryptographically isolated. The platform cannot access agent state
+    without the agent's keys.
+    \item \textbf{Verifiable serving}: Every inference result carries a
+    receipt anchored to the Lux A-Chain, proving provenance. Regulators,
+    auditors, and users can verify exactly which model produced which output.
+    \item \textbf{Decentralized provision}: No single provider controls the
+    infrastructure. Stake-weighted selection and on-chain SLA enforcement
+    align provider incentives with user outcomes.
+    \item \textbf{Edge-to-cloud continuum}: The same model format, the same
+    attestation, the same CRDT sync protocol work from a phone to a data
+    center. Inference happens where it makes sense.
+\end{enumerate}
+
+The era of ``trust us, we won't look at your data'' is ending. The era of
+``we cannot look at your data'' is beginning. Hanzo AI Cloud is the
+infrastructure for the latter.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\begin{thebibliography}{99}
+
+\bibitem{hanzocandle}
+Z.~Kelling, D.~Wei, and M.~Chen.
+\newblock Hanzo Candle: A {Rust} {ML} framework for high-performance inference.
+\newblock \emph{Hanzo AI Research}, August 2024.
+
+\bibitem{hanzofhe}
+Z.~Kelling.
+\newblock Hanzo {FHE} Inference: Fully homomorphic encryption for confidential
+{AI} inference.
+\newblock \emph{Hanzo AI Research}, April 2026.
+
+\bibitem{hanzojin}
+Z.~Kelling.
+\newblock Jin: Unified multimodal {AI} architecture for vision-language, audio,
+and cross-modal understanding.
+\newblock \emph{Hanzo AI Research}, April 2023.
+
+\bibitem{hanzoedge}
+Z.~Kelling.
+\newblock Hanzo Edge: On-device {AI} inference for mobile and {IoT} deployments.
+\newblock \emph{Hanzo AI Research}, July 2024.
+
+\bibitem{hanzobaseruntime}
+Z.~Kelling.
+\newblock Hanzo Base: The single-binary runtime for sovereign applications.
+\newblock \emph{Hanzo AI Research}, April 2026.
+
+\bibitem{luxwhitepaper}
+{Lux Partners}.
+\newblock Lux: A scalable multi-consensus blockchain with post-quantum
+cryptography.
+\newblock \emph{Lux Network Technical Report}, 2024.
+
+\bibitem{hanzoplatform}
+M.~Chen, D.~Wei, and Z.~Kelling.
+\newblock Hanzo Platform: {PaaS} for {AI}-native application deployment.
+\newblock \emph{Hanzo AI Research}, December 2021.
+
+\bibitem{ckks2017}
+J.~H.~Cheon, A.~Kim, M.~Kim, and Y.~Song.
+\newblock Homomorphic encryption for arithmetic of approximate numbers.
+\newblock In \emph{ASIACRYPT}, Springer, 2017.
+
+\bibitem{openaiapi}
+{OpenAI}.
+\newblock {API} data usage policies.
+\newblock \url{https://openai.com/policies/api-data-usage}, 2024.
+
+\bibitem{gentry2009}
+C.~Gentry.
+\newblock Fully homomorphic encryption using ideal lattices.
+\newblock In \emph{STOC}, ACM, 2009.
+
+\bibitem{brakerski2014}
+Z.~Brakerski, C.~Gentry, and V.~Vaikuntanathan.
+\newblock ({Leveled}) Fully homomorphic encryption without bootstrapping.
+\newblock \emph{ACM Transactions on Computation Theory}, 6(3):1--36, 2014.
+
+\bibitem{gilad2016}
+R.~Gilad-Bachrach, N.~Dowlin, K.~Laine, K.~Lauter, M.~Naehrig, and
+J.~Wernsing.
+\newblock {CryptoNets}: Applying neural networks to encrypted data with high
+throughput and accuracy.
+\newblock In \emph{ICML}, 2016.
+
+\bibitem{luxagent}
+Z.~Kelling.
+\newblock Lux Agent Sovereignty: Decentralized identity and capability
+management for autonomous agents.
+\newblock \emph{Lux Network Technical Report}, 2025.
+
+\end{thebibliography}
+
+\end{document}

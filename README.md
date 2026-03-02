@@ -3,10 +3,10 @@
   <h1>Hanzo AI Research Papers</h1>
 </div>
 
-[![Papers](https://img.shields.io/badge/papers-5-blue)](https://github.com/hanzoai/papers)
+[![Papers](https://img.shields.io/badge/papers-70-blue)](https://github.com/hanzoai/papers)
 [![License](https://img.shields.io/badge/license-CC--BY--4.0-green)](LICENSE)
 
-Academic and technical papers for Hanzo AI compute infrastructure and protocols.
+Academic and technical papers for Hanzo AI compute infrastructure, defense applications, and Zen model family.
 
 **Organization**: https://github.com/hanzoai
 **Website**: https://hanzo.ai
@@ -14,177 +14,172 @@ Academic and technical papers for Hanzo AI compute infrastructure and protocols.
 
 ---
 
-## 📚 Overview
+## Overview
 
-Hanzo AI research is organized into **5 comprehensive papers** covering the complete AI compute infrastructure stack (Layer-1) that enables decentralized model training and inference.
-
----
-
-## 📄 Papers Collection (5 Papers)
-
-### 1. Hanzo ASO (Active Semantic Optimization)
-
-**File**: [`hanzo-aso.tex`](hanzo-aso.tex) → `hanzo-aso.pdf`
-**HIP**: [HIP-002-aso.md](../hips/HIP-002-aso.md)
-**Status**: ✅ Published October 2025
-
-**Title**: "Training-Free Adaptation via Active Semantic Optimization and Product-of-Experts Decoding"
-
-**Abstract**: A training-free adaptation framework for agentic code generation built on TF-GRPO and PoE decoding.
-
-**Key Contributions**:
-- Training-Free GRPO (TF-GRPO) with epistemic utility
-- Product-of-Experts (PoE) decoding at token level
-- 1-bit semantic compression (BitDelta) - 29.5× savings
-- Hanzo Dev CLI agent with SWE-bench integration
-- **18.2% resolved rate** on SWE-bench Verified
-
-**Sections**: tf-grpo.tex, poe-decoding.tex, bitdelta.tex, swe-bench-eval.tex
+Hanzo AI research is organized into **70 papers** across three categories:
+- **34 core papers** covering AI compute infrastructure, agents, and platform services
+- **10 defense papers** on military/security AI applications
+- **26 zen papers** on the Zen model family (co-developed with Zoo Labs Foundation)
 
 ---
 
-### 2. Hanzo DSO (Decentralized Semantic Optimization)
+## Core Papers (34)
 
-**File**: [`hanzo-dso.tex`](hanzo-dso.tex) → `hanzo-dso.pdf`
-**HIP**: [HIP-003-dso.md](../hips/HIP-003-dso.md)
-**Status**: ✅ Published October 2025
+### AI Infrastructure (5)
 
-**Title**: "Decentralized Semantic Optimization with Byzantine-Robust Prior Aggregation"
+| # | Paper | File |
+|---|-------|------|
+| 1 | ASO (Active Semantic Optimization) | [`hanzo-aso.tex`](hanzo-aso.tex) |
+| 2 | DSO (Decentralized Semantic Optimization) | [`hanzo-dso.tex`](hanzo-dso.tex) |
+| 3 | HMM (Hamiltonian Market Maker) | [`hanzo-hmm.tex`](hanzo-hmm.tex) |
+| 4 | Network Architecture | [`hanzo-network-architecture.tex`](hanzo-network-architecture.tex) |
+| 5 | Network Whitepaper | [`hanzo-network-whitepaper.tex`](hanzo-network-whitepaper.tex) |
 
-**Abstract**: A protocol for sharing and aggregating experiential priors across distributed language model agents without parameter updates.
+### AI Agents (5)
 
-**Key Contributions**:
-- Byzantine-robust median voting with stake weighting
-- ExperienceRegistry smart contract (IPFS/Arweave storage)
-- P2P gossip protocol for prior synchronization
-- Quality scoring and slashing mechanism
-- **15.2% improvement** in multi-agent tasks vs isolated operation
+| # | Paper | File |
+|---|-------|------|
+| 6 | Agent SDK | [`hanzo-agent-sdk.tex`](hanzo-agent-sdk.tex) |
+| 7 | Agent GRPO | [`hanzo-agent-grpo.tex`](hanzo-agent-grpo.tex) |
+| 8 | Federated Agents | [`hanzo-federated-agents.tex`](hanzo-federated-agents.tex) |
+| 9 | Self-Improving Agents | [`hanzo-self-improving-agents.tex`](hanzo-self-improving-agents.tex) |
+| 10 | Operative | [`hanzo-operative.tex`](hanzo-operative.tex) |
 
-**Sections**: dso-core.tex, bitdelta.tex
+### ML & Inference (4)
 
----
+| # | Paper | File |
+|---|-------|------|
+| 11 | ML Framework | [`hanzo-ml-framework.tex`](hanzo-ml-framework.tex) |
+| 12 | Candle | [`hanzo-candle.tex`](hanzo-candle.tex) |
+| 13 | Analytics ML | [`hanzo-analytics-ml.tex`](hanzo-analytics-ml.tex) |
+| 14 | Jin Architecture | [`hanzo-jin-architecture.tex`](hanzo-jin-architecture.tex) |
 
-### 3. Hanzo HMM (Hamiltonian Market Maker)
+### Platform & Commerce (8)
 
-**File**: [`hanzo-hmm.tex`](hanzo-hmm.tex) → `hanzo-hmm.pdf`
-**HIP**: [HIP-004-hmm.md](../hips/HIP-004-hmm.md)
-**Status**: ✅ Published October 2025
+| # | Paper | File |
+|---|-------|------|
+| 15 | Platform | [`hanzo-platform.tex`](hanzo-platform.tex) |
+| 16 | AI Commerce | [`hanzo-ai-commerce.tex`](hanzo-ai-commerce.tex) |
+| 17 | Checkout | [`hanzo-checkout.tex`](hanzo-checkout.tex) |
+| 18 | Flow | [`hanzo-flow.tex`](hanzo-flow.tex) |
+| 19 | Search | [`hanzo-search.tex`](hanzo-search.tex) |
+| 20 | Chat | [`hanzo-chat.tex`](hanzo-chat.tex) |
+| 21 | Webhooks | [`hanzo-webhooks.tex`](hanzo-webhooks.tex) |
+| 22 | SDK Ecosystem | [`hanzo-sdk-ecosystem.tex`](hanzo-sdk-ecosystem.tex) |
 
-**Title**: "Hamiltonian Market Maker for Decentralized AI Compute Exchange"
+### Infrastructure & Security (6)
 
-**Abstract**: An automated market maker for pricing heterogeneous AI compute resources via conserved Hamiltonian invariants.
+| # | Paper | File |
+|---|-------|------|
+| 23 | ACI (AI Chain Infrastructure) | [`hanzo-aci.tex`](hanzo-aci.tex) |
+| 24 | API Gateway | [`hanzo-api-gateway.tex`](hanzo-api-gateway.tex) |
+| 25 | LLM Gateway | [`hanzo-llm-gateway.tex`](hanzo-llm-gateway.tex) |
+| 26 | MCP Server | [`hanzo-mcp-server.tex`](hanzo-mcp-server.tex) |
+| 27 | Identity NFT | [`hanzo-identity-nft.tex`](hanzo-identity-nft.tex) |
+| 28 | Jin | [`hanzo-jin.tex`](hanzo-jin.tex) |
 
-**Key Contributions**:
-- Hamiltonian invariant H(Ψ,Θ) = κ for oracle-free pricing
-- Multi-asset routing with SLA-aware path solver
-- Risk-adjusted fee structure for inventory management
-- PoAI integration for verifiable job settlement
-- **< 200ms quote latency**, **98.7% price stability** (vs 89.2% oracle-based)
+### Harness & Testing (2)
 
-**Sections**: hmm.tex, poai.tex, token-economics.tex
+| # | Paper | File |
+|---|-------|------|
+| 29 | Unified Harness | [`hanzo-unified-harness.tex`](hanzo-unified-harness.tex) |
+| 30 | Harness Hacking | [`hanzo-harness-hacking.tex`](hanzo-harness-hacking.tex) |
 
----
+### Legacy & Historical (4)
 
-### 4. Hanzo Network Architecture
-
-**File**: [`hanzo-network-architecture.tex`](hanzo-network-architecture.tex) → `hanzo-network-architecture.pdf`
-**Status**: ✅ Published
-
-**Title**: "Hanzo Network: Decentralized AI Compute Infrastructure"
-
-**Abstract**: Complete architectural specification of Hanzo's Layer-1 compute infrastructure, including consensus mechanism, TEE attestation, GPU node management, and integration with Lux (L0) and Zoo (L2).
-
-**Key Contributions**:
-- Layered architecture design (Lux → Hanzo → Zoo)
-- Self-mining consensus (0 token requirement for validators)
-- GPU compute verification via Lux A-Chain TEE attestation
-- Integration with Zoo's Experience Ledger and HLLM framework
-- Multi-GPU support (tensor/pipeline/sequence parallelism)
-
----
-
-### 5. Hanzo Network Whitepaper
-
-**File**: [`hanzo-network-whitepaper.tex`](hanzo-network-whitepaper.tex) → `hanzo-network-whitepaper.pdf`
-**Status**: ✅ Published
-
-**Title**: "Hanzo Network: Economic Model and Tokenomics"
-
-**Abstract**: Comprehensive overview of Hanzo's economic model, validator incentives, and governance mechanisms.
-
-**Key Contributions**:
-- Self-mining model (validators earn through compute contribution)
-- Integration with HMM for dynamic pricing
-- Cross-chain economic settlement via Lux Bridge
-- Governance framework for network parameters
+| # | Paper | File |
+|---|-------|------|
+| 31 | Astle Reactive SDK | [`astle-reactive-sdk.tex`](astle-reactive-sdk.tex) |
+| 32 | Crowdstart Commerce | [`crowdstart-commerce.tex`](crowdstart-commerce.tex) |
+| 33 | Earle Genetic Marketing | [`earle-genetic-marketing.tex`](earle-genetic-marketing.tex) |
+| 34 | Verus Analytics | [`verus-analytics.tex`](verus-analytics.tex) |
 
 ---
 
-## 🌐 Cross-Ecosystem Research
+## Defense Papers (10)
 
-The Lux-Hanzo-Zoo-Zen ecosystem has published **58 comprehensive research papers**:
-
-- **[Lux](https://github.com/luxfi/papers)** (L0): **24 papers** on consensus, post-quantum crypto, DeFi, cross-chain
-- **[Hanzo](https://github.com/hanzoai/papers)** (L1): **5 papers** on compute infrastructure, ASO/DSO, HMM
-- **[Zoo](https://github.com/zooai/gym/tree/main/papers)** (L2): **7 papers** on AI training, tokenomics, HLLM
-- **[Zen](https://github.com/zenlm/papers)**: **22 papers** on efficient LLMs with spatial reasoning
-
-### Cross-Layer Innovations
-
-**Validator Economics**:
-- Lux validators: **1M LUX stake** (PoS + Genesis, high security, L0 foundation)
-- Hanzo validators: **1 AI token** (PoW compute, self-mined on any device, participate in HMM market)
-- Zoo validators: **1,000 ZOO stake** (PoAI - weighted by LLM experience sharing and semantic contributions)
-
-**Research Integration**:
-- Lux A-Chain provides TEE attestation for Hanzo compute verification
-- Hanzo ASO/DSO powers Zoo's Training-Free GRPO implementation
-- Hanzo HMM enables economic settlement for Zoo Experience Ledger
-- Zen models (7680-dim embeddings) serve as base frontier models
+| # | Paper | File |
+|---|-------|------|
+| 1 | Agentic AI | [`defense/hanzo-agentic-ai.tex`](defense/hanzo-agentic-ai.tex) |
+| 2 | Assured Networking | [`defense/hanzo-assured-networking.tex`](defense/hanzo-assured-networking.tex) |
+| 3 | Countermeasures | [`defense/hanzo-countermeasures.tex`](defense/hanzo-countermeasures.tex) |
+| 4 | Cross-Domain | [`defense/hanzo-cross-domain.tex`](defense/hanzo-cross-domain.tex) |
+| 5 | Edge AI/ML | [`defense/hanzo-edge-ai-ml.tex`](defense/hanzo-edge-ai-ml.tex) |
+| 6 | Formal Verification | [`defense/hanzo-formal-verification.tex`](defense/hanzo-formal-verification.tex) |
+| 7 | Full Spectrum Cyber | [`defense/hanzo-full-spectrum-cyber.tex`](defense/hanzo-full-spectrum-cyber.tex) |
+| 8 | Quantum Sensing & QKD | [`defense/hanzo-quantum-sensing-qkd.tex`](defense/hanzo-quantum-sensing-qkd.tex) |
+| 9 | Test & Evaluation | [`defense/hanzo-test-evaluation.tex`](defense/hanzo-test-evaluation.tex) |
+| 10 | ZAP Protocol | [`defense/hanzo-zap-protocol.tex`](defense/hanzo-zap-protocol.tex) |
 
 ---
 
-## 🔗 Related Papers by Ecosystem
+## Zen Model Papers (26)
 
-### Lux Network (Base Layer - L0)
-**24 foundational papers** covering consensus, post-quantum cryptography, DeFi, and cross-chain:
-- [**Consensus**](https://github.com/luxfi/papers): Multi-consensus, Quantum, Quasar, FPC (4 papers)
-- [**Chain Architecture**](https://github.com/luxfi/papers): A-Chain (TEE), G-Chain (GraphQL), M-Chain (MPC), Z-Chain (Privacy) (4 papers)
-- [**DeFi**](https://github.com/luxfi/papers): Lightspeed DEX, Credit Lending, Oracle, Perpetuals (4 papers)
-- [**Web3**](https://github.com/luxfi/papers): NFT Market, ID IAM, DID Specification (3 papers)
-- [**Governance**](https://github.com/luxfi/papers): DAO frameworks (2 papers)
-- [**Post-Quantum**](https://github.com/luxfi/papers): NTT, ETHFALCON, Threshold Signatures (3 papers)
-- [**Scalability**](https://github.com/luxfi/papers): Verkle Trees, Fraud Proofs, TEE Mesh (3 papers)
+Co-developed with Zoo Labs Foundation. Canonical repo: https://github.com/zenlm/papers
 
-### Zoo Network (AI/ML Specialization - L2)
-**7 papers** on AI training infrastructure and tokenomics:
-- [**Foundation Mission**](https://github.com/zooai/gym/blob/main/papers/zoo-foundation-mission.tex): 501(c)(3) non-profit charter
-- [**Network Architecture**](https://github.com/zooai/gym/blob/main/papers/zoo-network-architecture.tex): Layered AI infrastructure
-- [**Tokenomics**](https://github.com/zooai/gym/blob/main/papers/zoo-tokenomics.tex): $AI token economics & governance
-- [**Gym Platform**](https://github.com/zooai/gym/blob/main/papers/gym-training-platform.tex): AI training infrastructure
-- [**HLLM Training-Free GRPO**](https://github.com/zooai/gym/blob/main/papers/hllm-training-free-grpo.tex): Hamiltonian LLM framework
-- [**Experience Ledger DSO**](https://github.com/zooai/gym/blob/main/papers/dso_whitepaper/main.tex): Semantic memory system
-- [**ZIP-002 Zen Reranker**](https://github.com/zooai/gym/blob/main/papers/zip-002-zen-reranker.tex): Cross-model ranking
+### Overview (1)
 
-### Zen Language Models (Base Frontier Models)
-**22 papers** on efficient LLMs with spatial reasoning:
-- [**Family Overview**](https://github.com/zenlm/papers/blob/main/zen_family_overview.tex): Complete ecosystem (600M-480B params)
-- **Core Models** (6): Nano, Eco, Coder, Omni, Next, Guard
-- **Creative Models** (4): Artist, Artist-Edit, Designer-Instruct, Designer-Thinking
-- **Specialized Models** (7): Scribe, Director, Foley, Musician, Video, Voyager, World
-- **Advanced** (4): 3D, Agent, Technical, Reranker
-- **Complete listing**: [Zen Papers Repository](https://github.com/zenlm/papers)
+| # | Paper | File |
+|---|-------|------|
+| 1 | Family Overview | [`zen/zen_family_overview.tex`](zen/zen_family_overview.tex) |
+
+### Core Models (6)
+
+| # | Paper | File |
+|---|-------|------|
+| 2 | Nano | [`zen/zen-nano_whitepaper.tex`](zen/zen-nano_whitepaper.tex) |
+| 3 | Eco | [`zen/zen-eco_whitepaper.tex`](zen/zen-eco_whitepaper.tex) |
+| 4 | Coder | [`zen/zen-coder_whitepaper.tex`](zen/zen-coder_whitepaper.tex) |
+| 5 | Omni | [`zen/zen-omni_whitepaper.tex`](zen/zen-omni_whitepaper.tex) |
+| 6 | Next | [`zen/zen-next_whitepaper.tex`](zen/zen-next_whitepaper.tex) |
+| 7 | Guard | [`zen/zen-guard_whitepaper.tex`](zen/zen-guard_whitepaper.tex) |
+
+### Creative Models (4)
+
+| # | Paper | File |
+|---|-------|------|
+| 8 | Artist | [`zen/zen-artist_whitepaper.tex`](zen/zen-artist_whitepaper.tex) |
+| 9 | Artist Edit | [`zen/zen-artist-edit_whitepaper.tex`](zen/zen-artist-edit_whitepaper.tex) |
+| 10 | Designer Instruct | [`zen/zen-designer-instruct_whitepaper.tex`](zen/zen-designer-instruct_whitepaper.tex) |
+| 11 | Designer Thinking | [`zen/zen-designer-thinking_whitepaper.tex`](zen/zen-designer-thinking_whitepaper.tex) |
+
+### Specialized Models (7)
+
+| # | Paper | File |
+|---|-------|------|
+| 12 | Scribe | [`zen/zen-scribe_whitepaper.tex`](zen/zen-scribe_whitepaper.tex) |
+| 13 | Director | [`zen/zen-director.tex`](zen/zen-director.tex) |
+| 14 | Foley | [`zen/zen-foley.tex`](zen/zen-foley.tex) |
+| 15 | Musician | [`zen/zen-musician.tex`](zen/zen-musician.tex) |
+| 16 | Video | [`zen/zen-video.tex`](zen/zen-video.tex) |
+| 17 | Voyager | [`zen/zen-voyager.tex`](zen/zen-voyager.tex) |
+| 18 | World | [`zen/zen-world.tex`](zen/zen-world.tex) |
+
+### Advanced Models (8)
+
+| # | Paper | File |
+|---|-------|------|
+| 19 | 3D | [`zen/zen-3d.tex`](zen/zen-3d.tex) |
+| 20 | Agent | [`zen/zen-agent.tex`](zen/zen-agent.tex) |
+| 21 | Technical | [`zen/zen-technical-paper.tex`](zen/zen-technical-paper.tex) |
+| 22 | Reranker | [`zen/zen-reranker.tex`](zen/zen-reranker.tex) |
+| 23 | Medical | [`zen/zen-medical.tex`](zen/zen-medical.tex) |
+| 24 | Reasoning | [`zen/zen-reasoning.tex`](zen/zen-reasoning.tex) |
+| 25 | Translator | [`zen/zen-translator.tex`](zen/zen-translator.tex) |
+| 26 | Voice Clone | [`zen/zen-voice-clone.tex`](zen/zen-voice-clone.tex) |
 
 ---
 
-## 🛠️ Building Papers
+## Cross-Ecosystem Research
 
-### Requirements
+- **[Lux](https://github.com/luxfi/papers)** (L0): **101 documents** (47 papers + 4 FHE + 50 proofs)
+- **[Hanzo](https://github.com/hanzoai/papers)** (L1): **70 papers** (34 core + 10 defense + 26 zen)
+- **[Zoo](https://github.com/zooai/papers)** (L2): **26 papers** on AI training, tokenomics, conservation
+- **[Zen](https://github.com/zenlm/papers)**: **26 papers** on efficient LLMs
 
-- LaTeX distribution (TeX Live, MacTeX, BasicTeX) **OR**
-- Docker/Colima for containerized builds
+---
 
-### Quick Build
+## Building Papers
 
 ```bash
 # Using Docker (auto-detected if LaTeX not installed)
@@ -198,212 +193,30 @@ make view
 make clean
 ```
 
-### Native LaTeX (Recommended for Regular Use)
+### Native LaTeX
 
 ```bash
-# Install LaTeX (macOS)
 brew install --cask basictex
-# or
-make install-latex
-
-# Add to PATH
-echo 'export PATH="/Library/TeX/texbin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-
-# Install additional packages
-sudo tlmgr update --self
-sudo tlmgr install collection-latexextra
-
-# Build
-make
-```
-
-### Docker Build
-
-```bash
-# Start Docker daemon (if using Colima)
-colima start
-
-# Build (Docker auto-detected)
 make
 ```
 
 ---
 
-## 📦 Makefile Commands
-
-```bash
-# Build all papers
-make                  # Build all PDFs (ASO, DSO, HMM, Architecture, Whitepaper)
-make all              # Same as above
-
-# Build individual papers
-make aso              # Build hanzo-aso.pdf only
-make dso              # Build hanzo-dso.pdf only
-make hmm              # Build hanzo-hmm.pdf only
-make architecture     # Build hanzo-network-architecture.pdf only
-make whitepaper       # Build hanzo-network-whitepaper.pdf only
-
-# Cleaning
-make clean            # Remove intermediate files (.aux, .log, etc.)
-make distclean        # Remove all generated files including PDFs
-
-# Utilities
-make view             # Open all PDFs (macOS)
-make help             # Show all targets with descriptions
-make docker-pull      # Pull Docker image (first time setup)
-```
-
----
-
-## 📝 LaTeX Packages Used
-
-All papers use standard LaTeX packages included in TeX Live:
-
-- **Math**: amsmath, amssymb, amsthm, mathtools, bm
-- **Graphics**: graphicx, xcolor
-- **Tables**: booktabs, multirow
-- **Algorithms**: algorithm, algpseudocode
-- **Navigation**: hyperref (with colored links)
-- **Lists**: enumitem
-- **Layout**: geometry
-
----
-
-## 🤝 Contributing
-
-### Adding New Papers
-
-1. Create LaTeX source file `paper-name.tex`
-2. Update Makefile if needed
-3. Build PDF: `make`
-4. Update this README with paper description
-5. Commit both `.tex` source and `.pdf` output
-
-### Paper Style Guidelines
-
-- Use 11pt article class
-- 1-inch margins (geometry package)
-- Colored hyperlinks (black text, blue citations/URLs)
-- Algorithms in pseudocode format
-- Tables with booktabs styling
-- Include abstract and conclusion
-- Provide Solidity interfaces for protocol papers
-- Include implementation plan/roadmap
-
----
-
-## 📂 File Organization
-
-```
-papers/
-├── README.md                        # This file
-├── Makefile                         # Build automation (multi-paper support)
-├── .gitignore                       # LaTeX artifacts
-│
-├── hanzo-aso.tex                    # ASO paper source
-├── hanzo-aso.pdf                    # ASO paper PDF (7 pages)
-├── hanzo-dso.tex                    # DSO paper source
-├── hanzo-dso.pdf                    # DSO paper PDF (6 pages)
-├── hanzo-hmm.tex                    # HMM paper source
-├── hanzo-hmm.pdf                    # HMM paper PDF (7 pages)
-├── hanzo-network-architecture.tex   # Architecture paper source
-├── hanzo-network-architecture.pdf   # Architecture paper PDF
-├── hanzo-network-whitepaper.tex     # Whitepaper source
-├── hanzo-network-whitepaper.pdf     # Whitepaper PDF
-│
-└── sections/                        # Reusable LaTeX sections (shared across papers)
-    ├── tf-grpo.tex                  # Training-Free GRPO formulation
-    ├── poe-decoding.tex             # Product-of-Experts decoding
-    ├── bitdelta.tex                 # 1-bit compression (BitDelta)
-    ├── swe-bench-eval.tex           # SWE-bench evaluation protocol
-    ├── dso-core.tex                 # DSO protocol specification
-    ├── hmm.tex                      # Hamiltonian Market Maker mechanics
-    ├── poai.tex                     # Proof of AI attestations
-    └── token-economics.tex          # Token economics
-```
-
-**Modular Design**: Papers use `\input{sections/...}` to share common sections, reducing duplication and ensuring consistency across the research ecosystem.
-
----
-
-## 📖 Citation
-
-If you use Hanzo in your research, please cite the relevant paper(s):
+## Citation
 
 ```bibtex
 @techreport{hanzo2025aso,
   title={Training-Free Adaptation via Active Semantic Optimization and Product-of-Experts Decoding},
   author={Hanzo Industries Inc.},
   year={2025},
-  month={October},
   institution={Hanzo Industries Inc.},
-  address={995 Market St, San Francisco, CA},
-  note={HIP-002},
-  url={https://github.com/hanzoai/papers}
-}
-
-@techreport{hanzo2025dso,
-  title={Decentralized Semantic Optimization with Byzantine-Robust Prior Aggregation},
-  author={Hanzo Industries Inc.},
-  year={2025},
-  month={October},
-  institution={Hanzo Industries Inc.},
-  address={995 Market St, San Francisco, CA},
-  note={HIP-003},
-  url={https://github.com/hanzoai/papers}
-}
-
-@techreport{hanzo2025hmm,
-  title={Hamiltonian Market Maker for Decentralized AI Compute Exchange},
-  author={Hanzo Industries Inc.},
-  year={2025},
-  month={October},
-  institution={Hanzo Industries Inc.},
-  address={995 Market St, San Francisco, CA},
-  note={HIP-004},
   url={https://github.com/hanzoai/papers}
 }
 ```
 
-**Cross-ecosystem citations**:
-- Lux: https://github.com/luxfi/papers (24 papers on L0 infrastructure)
-- Zoo: https://github.com/zooai/gym/tree/main/papers (7 papers on AI/ML)
-- Zen: https://github.com/zenlm/papers (22 papers on efficient LLMs)
-
 ---
 
-## 🔗 Related Projects
-
-### Hanzo AI Projects
-- **Hanzo Node**: https://github.com/hanzoai/hanzo (Rust blockchain implementation)
-- **Agent SDK**: https://github.com/hanzoai/agent (Python multi-agent framework)
-- **MCP Tools**: https://github.com/hanzoai/mcp (Model Context Protocol)
-- **Jin**: Multimodal LLM architecture (text/vision/audio/3D)
-
-### Zoo Labs Foundation (Partner Organization)
-- **Zoo Papers**: https://github.com/zooai/gym/tree/main/papers
-- **Zoo ZIPs**: Zoo Improvement Proposals for decentralized learning protocols
-- **DSO (ZIP-001)**: Decentralized Semantic Optimization - Byzantine-robust prior aggregation
-  - *Built on Hanzo's ASO (HIP-002) and HMM (HIP-004)*
-  - *Years of co-development between Hanzo AI Inc and Zoo Labs Foundation (501c3)*
-
-### ZenLM (Co-developed Models)
-- **Zen Models**: https://github.com/zenlm/papers
-- **Base Frontier Models**: Shared foundation for both Hanzo and Zoo ecosystems
-- **Partnership**: Hanzo AI Inc (Techstars '17) & Zoo Labs Foundation (501c3)
-
----
-
-## 📜 License
-
-Papers are published under Creative Commons Attribution 4.0 International (CC BY 4.0).
-
-Code examples and implementations referenced in papers follow their respective project licenses.
-
----
-
-## 📧 Contact
+## Contact
 
 - **Email**: contact@hanzo.ai
 - **Website**: https://hanzo.ai
@@ -416,10 +229,6 @@ Code examples and implementations referenced in papers follow their respective p
 995 Market St, San Francisco, CA
 https://hanzo.ai
 
----
-
-**Last Updated**: January 28, 2025
-**Total Papers**: 5
+**Last Updated**: March 31, 2026
+**Total Papers**: 70 (34 core + 10 defense + 26 zen)
 **Status**: Active Development
-
-*Building decentralized AI compute infrastructure for the next generation of language models.*

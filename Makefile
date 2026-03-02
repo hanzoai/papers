@@ -30,12 +30,16 @@ all: $(ALL_PDFS)
 	@find pdfs -name '*.pdf' | sort
 
 # Rule for root-level papers: pdfs/foo.pdf from foo.tex
+# Build in-place (not -output-directory) so shared/ sty resolves correctly
 pdfs/%.pdf: %.tex
 	@mkdir -p $(dir $@)
 	@echo "Compiling $< ..."
-	@pdflatex -interaction=nonstopmode -output-directory=$(dir $@) $< > /dev/null 2>&1 || true
-	@cd $(dir $@) && bibtex $(basename $(notdir $@)) > /dev/null 2>&1 || true
-	@pdflatex -interaction=nonstopmode -output-directory=$(dir $@) $< > /dev/null 2>&1 || true
+	@pdflatex -interaction=nonstopmode $< > /dev/null 2>&1 || true
+	@bibtex $(*F) > /dev/null 2>&1 || true
+	@pdflatex -interaction=nonstopmode $< > /dev/null 2>&1 || true
+	@pdflatex -interaction=nonstopmode $< > /dev/null 2>&1 || true
+	@[ -f "$(*F).pdf" ] && mv "$(*F).pdf" $@ || true
+	@rm -f $(*F).aux $(*F).log $(*F).bbl $(*F).blg $(*F).out $(*F).toc 2>/dev/null || true
 	@if [ -f "$@" ]; then \
 		echo "  OK  $@"; \
 	else \

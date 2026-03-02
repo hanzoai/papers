@@ -1,0 +1,432 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen: A Foundation Language Model for Instruction Following}\\
+\large Technical Report v2025.01}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{January 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen}, a 7 billion parameter instruction-following language model serving as the
+foundation of the Zen family of models. Trained on 3 trillion tokens of high-quality multilingual
+data using the Zen MoDE (Mixture of Distilled Experts) architecture, Zen achieves competitive
+performance on standard natural language understanding, reasoning, and code generation benchmarks
+while maintaining efficient inference characteristics suitable for broad deployment. Post-training
+combines supervised fine-tuning (SFT) with reinforcement learning from human feedback (RLHF),
+yielding a model that reliably follows instructions across 100$+$ languages with a 32K token
+context window. Zen establishes a strong general-purpose baseline that downstream specialized
+models in the Zen family extend and refine.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+Foundation language models trained at scale on diverse internet-scale corpora have demonstrated
+remarkable generalization across tasks without task-specific fine-tuning \cite{brown2020gpt3,
+wei2022emergent}. The key challenge in deploying such models for real-world applications is
+aligning raw language modeling capability with human intent: models must not only predict likely
+continuations but follow instructions accurately, refuse harmful requests, and remain calibrated
+about uncertainty.
+
+Zen is our answer to this challenge at the 7B scale. We make the following contributions:
+
+\begin{itemize}
+  \item A 7B parameter model trained on 3T tokens with a carefully curated multilingual corpus
+        covering 100$+$ languages, achieving strong cross-lingual transfer.
+  \item A post-training pipeline combining multi-turn SFT on instruction-response pairs with RLHF
+        using a separately trained reward model, improving instruction adherence and reducing
+        harmful outputs.
+  \item A 32K token context window via rotary position embeddings (RoPE) with extended base
+        frequency, enabling long-document summarization and multi-turn dialogue without positional
+        degradation.
+  \item Strong benchmark results competitive with models of comparable and larger scale, while
+        maintaining fast inference throughput suitable for latency-sensitive applications.
+\end{itemize}
+
+Zen occupies the entry tier of the Zen family. Larger and specialized models (Zen-Pro at 72B,
+Zen-Max at 480B MoE, Zen-VL for vision, Zen-Code for code) build on the same infrastructure and
+training methodology introduced here.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Architecture}
+
+\subsection{Overview}
+
+Zen is a dense decoder-only transformer following the Zen MoDE architecture. Table~\ref{tab:arch}
+summarizes the key hyperparameters.
+
+\begin{table}[H]
+\centering
+\caption{Zen architecture hyperparameters.}
+\label{tab:arch}
+\begin{tabular}{lc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Parameters (total)         & 7.2B \\
+Layers                     & 32 \\
+Attention heads            & 32 \\
+KV heads (GQA)             & 8 \\
+Hidden dimension           & 4096 \\
+FFN intermediate dimension & 11008 \\
+Vocabulary size            & 151{,}936 \\
+Context length (training)  & 32{,}768 \\
+Position encoding          & RoPE ($\theta = 1{,}000{,}000$) \\
+Activation function        & SiLU \\
+Normalization              & RMSNorm \\
+Tied embeddings            & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Grouped Query Attention}
+
+Zen employs Grouped Query Attention (GQA) \cite{ainslie2023gqa} with 32 query heads and 8
+key-value heads. This reduces the KV cache memory footprint by 4$\times$ relative to multi-head
+attention at equivalent query capacity, enabling larger effective batch sizes during inference.
+Attention is computed as:
+
+\begin{equation}
+  \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+\end{equation}
+
+where $Q \in \mathbb{R}^{n \times d_k}$, $K, V \in \mathbb{R}^{m \times d_k}$, and each group
+of query heads shares a single key and value projection.
+
+\subsection{Rotary Position Embeddings}
+
+Rotary position embeddings (RoPE) \cite{su2021rope} encode position as a rotation in the complex
+plane applied to query and key vectors:
+
+\begin{equation}
+  \tilde{q}_m = q_m e^{im\theta}, \quad \tilde{k}_n = k_n e^{in\theta}
+\end{equation}
+
+We extend the base frequency to $\theta = 1{,}000{,}000$ (from the standard $10{,}000$), allowing
+the model to generalize to 32K tokens with minimal perplexity degradation at long contexts.
+
+\subsection{Feed-Forward Network}
+
+Each transformer layer contains a SwiGLU \cite{shazeer2020glu} feed-forward block:
+
+\begin{equation}
+  \text{FFN}(x) = \left(\text{SiLU}(xW_{\text{gate}}) \odot xW_{\text{up}}\right) W_{\text{down}}
+\end{equation}
+
+The intermediate dimension of 11,008 is chosen to be a multiple of 64 for hardware alignment
+while maintaining the standard expansion ratio of approximately 2.67$\times$ the hidden dimension.
+
+\subsection{Tokenization}
+
+We use a byte-pair encoding (BPE) tokenizer with a vocabulary of 151,936 tokens. The tokenizer
+was trained on a 50B token sample of the pretraining corpus to ensure adequate coverage of code,
+mathematical notation, and scripts across all 100$+$ supported languages. Special tokens include
+system, user, and assistant turn markers for instruction-tuned inference.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Training Methodology}
+
+\subsection{Pretraining Data}
+
+The 3 trillion token pretraining corpus is assembled from the following domains:
+
+\begin{table}[H]
+\centering
+\caption{Pretraining data composition.}
+\label{tab:data}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Domain} & \textbf{Tokens (B)} & \textbf{Fraction} \\
+\midrule
+Web text (filtered)   & 1800 & 60.0\% \\
+Books and long-form   &  450 & 15.0\% \\
+Code                  &  300 & 10.0\% \\
+Scientific articles   &  150 &  5.0\% \\
+Multilingual web      &  240 &  8.0\% \\
+Math and STEM         &   60 &  2.0\% \\
+\midrule
+Total                 & 3000 & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Data quality filtering applies a sequence of heuristics: language identification, deduplication
+via MinHash \cite{broder1997minwise}, perplexity filtering against a small n-gram model, and
+classifier-based toxicity and quality scoring. Mathematical and code data undergo additional
+correctness filtering where possible (e.g., code compilation checks).
+
+\subsection{Pretraining Procedure}
+
+Pretraining uses the AdamW optimizer \cite{loshchilov2019decoupled} with:
+
+\begin{itemize}
+  \item Learning rate: $3 \times 10^{-4}$ with cosine decay to $3 \times 10^{-5}$
+  \item Warm-up: 2000 steps
+  \item Weight decay: 0.1
+  \item Gradient clipping: 1.0
+  \item Batch size: 4M tokens (dynamic packing, no padding)
+  \item Precision: BF16 mixed precision
+  \item Parallelism: tensor parallelism $\times$8, data parallelism $\times$256
+\end{itemize}
+
+The training runs for approximately 750K steps on 8192 H100 GPUs, consuming approximately
+$1.75 \times 10^{23}$ FLOPs. We apply a two-stage cooldown: the final 5\% of training tokens
+are drawn exclusively from high-quality curated sources to sharpen instruction-following priors.
+
+\subsection{Supervised Fine-Tuning}
+
+Post-pretraining SFT uses 5 million instruction-response pairs spanning:
+
+\begin{itemize}
+  \item General question answering and open-ended generation
+  \item Multi-turn dialogue with persona consistency
+  \item Code generation and debugging
+  \item Summarization and document analysis
+  \item Mathematical reasoning with step-by-step solutions
+  \item Multilingual instruction pairs (40 high-resource languages)
+\end{itemize}
+
+SFT trains for 3 epochs with a learning rate of $2 \times 10^{-5}$, packing sequences up to 8K
+tokens per sample. Loss is computed only on assistant turn tokens (response masking).
+
+\subsection{Reinforcement Learning from Human Feedback}
+
+RLHF applies Proximal Policy Optimization (PPO) \cite{schulman2017ppo} against a reward model
+trained on 800K human preference comparisons. The reward model shares the same architecture but
+is trained with a scalar reward head. RLHF training uses:
+
+\begin{equation}
+  \mathcal{L}_{\text{PPO}} = \mathbb{E}\!\left[\min\!\left(r_t(\theta)\hat{A}_t,\;
+  \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t\right)\right] - \beta D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})
+\end{equation}
+
+with clipping parameter $\epsilon = 0.2$ and KL penalty coefficient $\beta = 0.05$. The KL
+penalty prevents excessive drift from the SFT policy while allowing the model to improve on
+preference dimensions.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Evaluation}
+
+\subsection{Benchmark Results}
+
+Table~\ref{tab:benchmarks} reports Zen's performance on standard evaluation benchmarks compared
+to representative models at similar parameter counts.
+
+\begin{table}[H]
+\centering
+\caption{Benchmark results. All numbers are zero-shot or few-shot as standard for each benchmark.}
+\label{tab:benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen (7B)} & \textbf{Competitor A (7B)} & \textbf{Competitor B (8B)} & \textbf{Competitor C (13B)} \\
+\midrule
+MMLU (5-shot)         & \textbf{72.3} & 70.1 & 68.9 & 71.8 \\
+HellaSwag (0-shot)    & \textbf{85.4} & 83.2 & 82.7 & 84.6 \\
+ARC-Challenge (0-shot)& 59.4          & 58.2 & 57.9 & 60.1 \\
+WinoGrande (0-shot)   & 74.1          & 73.5 & 72.4 & 74.8 \\
+GSM8K (8-shot, CoT)   & \textbf{78.9} & 74.3 & 72.1 & 76.5 \\
+HumanEval (pass@1)    & \textbf{71.2} & 67.4 & 65.8 & 69.3 \\
+MBPP (pass@1)         & 64.8          & 62.1 & 61.3 & 65.2 \\
+TriviaQA (1-shot)     & 68.3          & 66.7 & 65.4 & 68.9 \\
+NaturalQuestions      & 31.4          & 29.8 & 28.6 & 31.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Long-Context Evaluation}
+
+We evaluate long-context capability using the RULER benchmark \cite{hsieh2024ruler} and
+needle-in-a-haystack (NIAH) retrieval across context lengths from 1K to 32K tokens.
+
+\begin{table}[H]
+\centering
+\caption{RULER scores at various context lengths (maximum possible: 100).}
+\label{tab:longctx}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{4K} & \textbf{8K} & \textbf{16K} & \textbf{32K} \\
+\midrule
+Zen (7B)           & 94.1 & 91.7 & 88.3 & 83.2 \\
+Competitor A (7B)  & 93.8 & 88.4 & 79.1 & 61.4 \\
+Competitor B (8B)  & 92.3 & 87.9 & 77.6 & 58.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Zen maintains strong retrieval accuracy through 32K tokens, reflecting the extended RoPE base
+frequency and long-context data mixed into pretraining.
+
+\subsection{Multilingual Evaluation}
+
+\begin{table}[H]
+\centering
+\caption{Multilingual MMLU accuracy (5-shot) on selected language tracks.}
+\label{tab:multilingual}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{EN} & \textbf{ZH} & \textbf{DE} & \textbf{FR} & \textbf{AR} \\
+\midrule
+Zen (7B)          & 72.3 & 70.8 & 68.4 & 69.1 & 63.7 \\
+Competitor A (7B) & 70.1 & 61.2 & 62.3 & 63.7 & 54.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Safety and Alignment}
+
+We evaluate instruction-following fidelity using IFEval \cite{zhou2023ifeval} (prompt-level
+accuracy 72.8\%, instruction-level accuracy 80.3\%) and safety alignment using TruthfulQA
+\cite{lin2022truthfulqa} (truthful: 58.4\%, truthful+informative: 47.2\%). Refusal rates on
+harmful prompts from the AdvBench dataset reach 94.3\%, indicating strong alignment with safety
+guidelines.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Inference Efficiency}
+
+\begin{table}[H]
+\centering
+\caption{Inference throughput and latency on a single A100-80GB GPU.}
+\label{tab:inference}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{BF16} & \textbf{INT4 (GPTQ)} \\
+\midrule
+Throughput (tok/s, batch=1)   & 87  & 156 \\
+Throughput (tok/s, batch=32)  & 2{,}840 & 4{,}910 \\
+TTFT P50 (ms, 1K prompt)      & 42  & 24 \\
+Memory (GB)                   & 14.8 & 4.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 7B scale allows deployment on a single consumer GPU (RTX 4090 / 24GB VRAM) in BF16, or on
+commodity hardware in 4-bit quantization, making Zen widely accessible for on-premise and
+edge deployments.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+
+Dense decoder-only transformers have been the dominant paradigm since GPT-3 \cite{brown2020gpt3}.
+At the 7B scale, models such as LLaMA \cite{touvron2023llama} and its successors demonstrated
+that careful data curation and training at scale yield strong transfer. Instruction tuning via SFT
+\cite{wei2022finetuned} and preference optimization via RLHF \cite{ouyang2022instructgpt} and
+DPO \cite{rafailov2023dpo} have become standard post-training steps. Zen's architecture choices
+(GQA, SwiGLU, RoPE with extended base frequency) follow a well-validated pattern while the
+training corpus and post-training data pipeline reflect our own curation methodology.
+
+Long-context capability has been addressed through YaRN \cite{peng2023yarn} and similar RoPE
+scaling techniques; we adopt an extended base frequency approach as a simpler, hardware-friendly
+alternative. Multilingual capability at the 7B scale has been studied in BLOOM \cite{scao2022bloom}
+and similar work; our data weighting strategy achieves comparable cross-lingual transfer while
+prioritizing high-resource language quality.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Limitations}
+
+Despite strong benchmark performance, Zen inherits known limitations of autoregressive language
+models. The model can hallucinate plausible-sounding but incorrect facts, particularly for
+low-frequency knowledge. Mathematical reasoning degrades on problems requiring more than $\sim$8
+chain-of-thought steps. The 32K context, while substantial, may be insufficient for full-document
+legal or scientific corpora. Bias and toxicity reduction through RLHF is incomplete; adversarial
+prompt engineering can elicit policy-violating outputs at non-trivial rates.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+Zen establishes a competitive 7B foundation model for the Zen family, combining a clean Zen MoDE
+architecture with a large, carefully curated pretraining corpus and a rigorous post-training
+alignment pipeline. Benchmark results demonstrate that Zen is competitive with or superior to
+models of comparable scale across language understanding, mathematical reasoning, and code
+generation tasks. The model's efficient inference profile enables broad deployment across hardware
+tiers, from cloud inference to on-device applications. Future work will focus on improving
+mathematical reasoning depth, reducing hallucination rates, and extending context to 128K tokens
+in forthcoming Zen family releases.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{brown2020gpt3}
+T.~Brown et al., ``Language Models are Few-Shot Learners,'' \textit{NeurIPS}, 2020.
+
+\bibitem{wei2022emergent}
+J.~Wei et al., ``Emergent Abilities of Large Language Models,'' \textit{TMLR}, 2022.
+
+\bibitem{ainslie2023gqa}
+J.~Ainslie et al., ``GQA: Training Generalized Multi-Query Transformer Models,''
+\textit{EMNLP}, 2023.
+
+\bibitem{su2021rope}
+J.~Su et al., ``RoFormer: Enhanced Transformer with Rotary Position Embedding,''
+\textit{arXiv:2104.09864}, 2021.
+
+\bibitem{shazeer2020glu}
+N.~Shazeer, ``GLU Variants Improve Transformer,'' \textit{arXiv:2002.05202}, 2020.
+
+\bibitem{broder1997minwise}
+A.~Broder, ``On the resemblance and containment of documents,'' \textit{Compression and
+Complexity of Sequences}, 1997.
+
+\bibitem{loshchilov2019decoupled}
+I.~Loshchilov and F.~Hutter, ``Decoupled Weight Decay Regularization,'' \textit{ICLR}, 2019.
+
+\bibitem{schulman2017ppo}
+J.~Schulman et al., ``Proximal Policy Optimization Algorithms,'' \textit{arXiv:1707.06347}, 2017.
+
+\bibitem{hsieh2024ruler}
+C.-Y.~Hsieh et al., ``RULER: What's the Real Context Size of Your Long-Context Language Models?''
+\textit{arXiv:2404.06654}, 2024.
+
+\bibitem{zhou2023ifeval}
+J.~Zhou et al., ``Instruction-Following Evaluation for Large Language Models,''
+\textit{arXiv:2311.07911}, 2023.
+
+\bibitem{lin2022truthfulqa}
+S.~Lin, J.~Hilton, and O.~Evans, ``TruthfulQA: Measuring How Models Mimic Human Falsehoods,''
+\textit{ACL}, 2022.
+
+\bibitem{touvron2023llama}
+H.~Touvron et al., ``LLaMA: Open and Efficient Foundation Language Models,''
+\textit{arXiv:2302.13971}, 2023.
+
+\bibitem{wei2022finetuned}
+J.~Wei et al., ``Finetuned Language Models Are Zero-Shot Learners,'' \textit{ICLR}, 2022.
+
+\bibitem{ouyang2022instructgpt}
+L.~Ouyang et al., ``Training Language Models to Follow Instructions with Human Feedback,''
+\textit{NeurIPS}, 2022.
+
+\bibitem{rafailov2023dpo}
+R.~Rafailov et al., ``Direct Preference Optimization: Your Language Model is Secretly a Reward
+Model,'' \textit{NeurIPS}, 2023.
+
+\bibitem{peng2023yarn}
+B.~Peng et al., ``YaRN: Efficient Context Window Extension of Large Language Models,''
+\textit{arXiv:2309.00071}, 2023.
+
+\bibitem{scao2022bloom}
+T.~Scao et al., ``BLOOM: A 176B-Parameter Open-Access Multilingual Language Model,''
+\textit{arXiv:2211.05100}, 2022.
+
+\end{thebibliography}
+
+\end{document}

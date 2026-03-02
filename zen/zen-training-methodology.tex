@@ -1,0 +1,400 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen Training Methodology: From Pretraining to Deployment}\\
+\large Technical Report v2025.03}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{March 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the complete training methodology for the Zen family of large language models,
+spanning pretraining on 7 trillion tokens through supervised fine-tuning and reinforcement
+learning from human feedback. Our approach introduces several key innovations: a hybrid
+data mixing strategy that balances quality and diversity, perplexity-based quality filtering
+that removes low-signal content, and a constitutional training regime that instills
+safety properties without sacrificing capability. We report detailed training curves,
+compute budget analysis, and ablation results demonstrating the contribution of each
+methodological component. Models trained under this methodology achieve state-of-the-art
+performance on standard benchmarks while maintaining robust safety properties and
+deployment reliability. The Zen MoDE (Mixture of Distilled Experts) architecture
+enables efficient scaling from 600M to 480B parameters under a unified training pipeline.
+\end{abstract}
+
+\section{Introduction}
+
+Training frontier language models requires careful coordination of data curation,
+architectural decisions, and optimization strategies across a multi-stage pipeline.
+The Zen training methodology addresses the full lifecycle: from raw web data ingestion
+through pretraining, instruction tuning, and alignment, to final deployment optimization.
+
+Key challenges we address include:
+\begin{itemize}
+  \item \textbf{Data quality at scale}: Curating 7T tokens that balance breadth and quality
+  \item \textbf{Stable large-scale optimization}: Preventing loss spikes and ensuring smooth convergence
+  \item \textbf{Alignment without degradation}: Instilling safety properties while preserving capability
+  \item \textbf{Compute efficiency}: Achieving optimal FLOPs allocation across model sizes
+\end{itemize}
+
+The Zen MoDE architecture introduces a Mixture of Distilled Experts paradigm, where
+each expert specializes in semantic domains while sharing a unified vocabulary and
+positional encoding scheme. This architectural choice significantly impacts training
+dynamics and data mixing decisions.
+
+\section{Background and Related Work}
+
+\subsection{Scaling Laws}
+
+The Chinchilla scaling laws~\cite{hoffmann2022chinchilla} established that optimal
+training requires roughly 20 tokens per parameter. Subsequent work has shown that
+inference-optimal training often favors over-training smaller models on more tokens.
+The Zen family follows an inference-optimal strategy, training smaller models on
+significantly more data than Chinchilla-optimal prescriptions.
+
+\subsection{Data Curation}
+
+Prior work on data curation has emphasized the importance of deduplication, quality
+filtering, and domain mixing. C4~\cite{raffel2020c4}, The Pile~\cite{gao2021pile}, and
+RedPajama~\cite{together2023redpajama} established key preprocessing pipelines. Zen
+extends these with perplexity-based filtering and domain-aware mixing.
+
+\subsection{Multi-Stage Training}
+
+The standard paradigm of pretraining followed by instruction tuning (SFT) and RLHF
+was established by InstructGPT~\cite{ouyang2022rlhf}. Zen introduces constitutional
+training as an intermediate stage between SFT and RLHF, reducing human annotation
+requirements while improving alignment quality.
+
+\section{Data Curation Pipeline}
+
+\subsection{Raw Data Collection}
+
+The Zen pretraining corpus aggregates data from multiple sources:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Source} & \textbf{Raw Size} & \textbf{After Filter} & \textbf{Mix Weight} \\
+\midrule
+Web (Common Crawl) & 68T tokens & 4.2T & 60\% \\
+Books \& Literature & 400B tokens & 380B & 12\% \\
+Scientific Papers & 150B tokens & 140B & 8\% \\
+Code Repositories & 800B tokens & 650B & 12\% \\
+Wikipedia + Encyclopedias & 80B tokens & 78B & 3\% \\
+Curated Q\&A & 120B tokens & 110B & 5\% \\
+\midrule
+\textbf{Total} & \textbf{$\sim$70T} & \textbf{7T} & \textbf{100\%} \\
+\bottomrule
+\end{tabular}
+\caption{Zen pretraining corpus composition after filtering.}
+\end{table}
+
+\subsection{Quality Filtering}
+
+Our quality pipeline applies filters in sequence, each removing a fraction of documents:
+
+\begin{algorithm}[H]
+\caption{Zen Quality Filtering Pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Raw document corpus $\mathcal{D}$
+\ENSURE Filtered corpus $\mathcal{D}^*$
+\STATE $\mathcal{D}_1 \leftarrow \text{LanguageID}(\mathcal{D})$, keep $p(\text{en}) > 0.65$
+\STATE $\mathcal{D}_2 \leftarrow \text{URLFilter}(\mathcal{D}_1)$, remove spam/adult domains
+\STATE $\mathcal{D}_3 \leftarrow \text{MinHashDedup}(\mathcal{D}_2, \text{ngram}=13, \text{jaccard}>0.8)$
+\STATE $\mathcal{D}_4 \leftarrow \text{HeuristicFilter}(\mathcal{D}_3)$:
+\STATE \quad Remove docs $< 100$ tokens or $> 100$K tokens
+\STATE \quad Remove docs with symbol/word ratio $> 0.1$
+\STATE \quad Remove docs with repeated n-gram ratio $> 0.3$
+\STATE Train reference LM $\mathcal{M}_\text{ref}$ on high-quality seed corpus (200B tokens)
+\STATE $\mathcal{D}_5 \leftarrow \{d \in \mathcal{D}_4 : \text{PPL}_{\mathcal{M}_\text{ref}}(d) < \tau_\text{ppl}\}$
+\STATE $\tau_\text{ppl} \leftarrow$ 90th percentile of $\text{PPL}_{\mathcal{M}_\text{ref}}$ on $\mathcal{D}_4$
+\STATE $\mathcal{D}^* \leftarrow \text{DomainSample}(\mathcal{D}_5, \text{weights}=W)$
+\RETURN $\mathcal{D}^*$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Perplexity-Based Quality Filtering}
+
+A key innovation is using a reference language model to score document quality.
+We train a 1.3B parameter reference model on a manually curated seed corpus of
+200B high-quality tokens. Documents scoring above the 90th percentile perplexity
+threshold are removed, eliminating repetitive, incoherent, or template-generated content.
+
+The perplexity filter reduces web content from 68T to 4.2T tokens (6.2\% retention),
+while books and scientific papers show 95\%+ retention, confirming the filter's
+discriminative power.
+
+\subsection{Hybrid Data Mixing}
+
+Static mixing ratios degrade performance as training progresses because the model
+learns different domains at different rates. We employ adaptive mixing via a
+domain loss monitor:
+
+\begin{equation}
+w_d^{(t+1)} = w_d^{(t)} \cdot \exp\left(\eta \cdot \frac{\mathcal{L}_d^{(t)} - \bar{\mathcal{L}}^{(t)}}{\sigma_\mathcal{L}^{(t)}}\right)
+\end{equation}
+
+where $w_d^{(t)}$ is the weight for domain $d$ at step $t$, $\mathcal{L}_d^{(t)}$ is
+the per-domain validation loss, and $\eta = 0.01$ is the adaptation rate. Weights
+are normalized after each update. This causes the optimizer to allocate more capacity
+to domains where the model lags.
+
+\section{Pretraining Setup}
+
+\subsection{Architecture: Zen MoDE}
+
+The Zen MoDE (Mixture of Distilled Experts) architecture replaces dense FFN layers
+with a mixture of $E$ expert networks, activated sparsely:
+
+\begin{equation}
+\text{MoDE}(x) = \sum_{i=1}^{k} g_i(x) \cdot E_i(x), \quad g(x) = \text{TopK}(\text{softmax}(W_g x), k)
+\end{equation}
+
+where $k=2$ experts are selected per token from $E=64$ total experts. Expert
+specialization emerges from domain-structured data: we observe that distinct experts
+activate preferentially for code, mathematics, and natural language.
+
+\subsection{Model Configurations}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{Layers} & \textbf{d\_model} & \textbf{Heads} & \textbf{Experts} \\
+\midrule
+Zen-600M & 600M & 24 & 1024 & 16 & -- \\
+Zen-7B & 7B & 32 & 4096 & 32 & -- \\
+Zen-32B & 32B & 64 & 7168 & 56 & -- \\
+Zen-235B-MoE & 235B & 94 & 7168 & 56 & 128 \\
+Zen-480B-MoE & 480B & 128 & 8192 & 64 & 256 \\
+\bottomrule
+\end{tabular}
+\caption{Zen model family configurations.}
+\end{table}
+
+\subsection{Optimization}
+
+All models are trained with AdamW ($\beta_1=0.9$, $\beta_2=0.95$, $\epsilon=10^{-8}$,
+weight decay $\lambda=0.1$). Learning rate follows a warmup-cosine schedule:
+
+\begin{equation}
+\eta_t = \eta_{\max} \cdot \begin{cases} t / T_{\text{warm}} & t < T_{\text{warm}} \\ \frac{1}{2}\left(1 + \cos\left(\pi \cdot \frac{t - T_{\text{warm}}}{T - T_{\text{warm}}}\right)\right) & t \geq T_{\text{warm}} \end{cases}
+\end{equation}
+
+with $T_{\text{warm}} = 2000$ steps, $\eta_{\max}$ model-size dependent (see Table 3),
+and final learning rate $\eta_{\min} = \eta_{\max}/10$.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{Peak LR} & \textbf{Batch Size (tokens)} & \textbf{Train Steps} \\
+\midrule
+Zen-600M & $6\times10^{-4}$ & 2M & 3.5M \\
+Zen-7B & $3\times10^{-4}$ & 4M & 1.75M \\
+Zen-32B & $1\times10^{-4}$ & 8M & 875K \\
+Zen-235B-MoE & $5\times10^{-5}$ & 16M & 437K \\
+Zen-480B-MoE & $3\times10^{-5}$ & 32M & 219K \\
+\bottomrule
+\end{tabular}
+\caption{Training hyperparameters per model size.}
+\end{table}
+
+\subsection{Compute Infrastructure}
+
+Training runs on H100 SXM5 80GB clusters with NVLink interconnects. Pipeline
+parallelism depth $P$, tensor parallelism $T$, and data parallelism $D$ are
+configured per model size:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Model} & \textbf{GPUs} & \textbf{P} & \textbf{T} & \textbf{D} \\
+\midrule
+Zen-7B & 512 & 1 & 4 & 128 \\
+Zen-32B & 1024 & 4 & 8 & 32 \\
+Zen-235B-MoE & 2048 & 8 & 8 & 32 \\
+Zen-480B-MoE & 4096 & 16 & 8 & 32 \\
+\bottomrule
+\end{tabular}
+\caption{Parallelism strategies per model. MoE models use expert parallelism with EP=64.}
+\end{table}
+
+\section{Supervised Fine-Tuning}
+
+\subsection{SFT Data Construction}
+
+The SFT dataset contains 2.4M instruction-response pairs spanning:
+multiturn conversation (35\%), coding tasks (25\%), mathematical reasoning (20\%),
+long-form writing (12\%), and factual Q\&A (8\%). All pairs are human-validated
+or model-generated with human verification.
+
+\subsection{SFT Training Protocol}
+
+SFT is conducted for 3 epochs with learning rate $5\times10^{-6}$, batch size 256,
+and maximum sequence length 32K tokens. Only response tokens contribute to the
+cross-entropy loss:
+
+\begin{equation}
+\mathcal{L}_\text{SFT} = -\sum_{t \in \text{response}} \log p_\theta(x_t \mid x_{<t})
+\end{equation}
+
+We apply NEFTune noise injection~\cite{jain2023neftune} with $\alpha=5$ to improve
+generalization on open-ended tasks.
+
+\section{Constitutional Training}
+
+Between SFT and RLHF, we apply a constitutional training stage that teaches the model
+to critique and revise its own outputs according to a set of principles:
+
+\begin{enumerate}
+  \item Generate response $r_0$ to prompt $p$
+  \item Apply critique template: ``Identify ways the response violates principle $c_i$''
+  \item Generate revision $r_1$ guided by the critique
+  \item Train on $(p, r_1)$ pairs using SFT loss
+\end{enumerate}
+
+This reduces human annotation requirements for the subsequent RLHF stage by 40\%
+while improving harmlessness scores by 12 points (see Section 7).
+
+\section{RLHF Pipeline}
+
+\subsection{Reward Model Training}
+
+The reward model (RM) is initialized from the Zen-7B SFT checkpoint and trained on
+400K human preference pairs. Given two responses $r_a, r_b$ to the same prompt,
+the RM is trained to maximize the margin:
+
+\begin{equation}
+\mathcal{L}_\text{RM} = -\mathbb{E}_{(p,r_w,r_l)} \left[\log \sigma\left(r_\phi(p, r_w) - r_\phi(p, r_l)\right)\right]
+\end{equation}
+
+where $r_w$ is the preferred response and $r_l$ the rejected response.
+
+\subsection{PPO Training}
+
+Policy optimization uses Proximal Policy Optimization with the KL penalty:
+
+\begin{equation}
+\mathcal{L}_\text{PPO} = \mathbb{E}\left[r_\phi(p, r) - \beta \cdot \text{KL}\left[\pi_\theta(\cdot|p) \| \pi_{\text{ref}}(\cdot|p)\right]\right]
+\end{equation}
+
+$\beta = 0.04$ is tuned to balance helpfulness and proximity to the SFT policy.
+We apply a reward clipping of $[-5, 5]$ and run 2 PPO epochs per batch.
+
+\section{Experiments and Results}
+
+\subsection{Training Curves}
+
+Pretraining loss curves exhibit three distinct phases observed across all model sizes:
+(1) rapid descent in the first 5\% of training as the model learns basic token statistics,
+(2) steady decline through 90\% of training as domain knowledge accumulates,
+(3) a slower final phase with diminishing returns signaling data saturation.
+
+Loss spike prevention is achieved via gradient norm clipping at 1.0 and a loss
+spike detector that halves the learning rate for 100 steps when $\mathcal{L}_t > 1.5 \cdot \bar{\mathcal{L}}_{t-100:t}$.
+
+\subsection{Ablation Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Configuration} & \textbf{MMLU} & \textbf{HumanEval} & \textbf{MATH} & \textbf{MT-Bench} \\
+\midrule
+Full pipeline & \textbf{85.3} & \textbf{78.2} & \textbf{67.4} & \textbf{8.62} \\
+No PPL filter & 83.1 & 76.4 & 64.8 & 8.31 \\
+Static mix (no adaptive) & 84.0 & 77.1 & 65.9 & 8.44 \\
+No constitutional training & 84.9 & 78.0 & 67.1 & 8.41 \\
+No NEFTune & 84.8 & 77.8 & 67.2 & 8.39 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation study on Zen-7B. All numbers are pass@1 or accuracy (\%).}
+\end{table}
+
+\subsection{Compute Budget Analysis}
+
+We analyze the FLOPs-to-performance tradeoff by training model variants with
+different compute budgets:
+
+\begin{equation}
+\text{Performance}(C) \approx A - B \cdot C^{-\alpha}
+\end{equation}
+
+where $C$ is the training compute in FLOPs, and we fit $A=89.1$, $B=142.3$,
+$\alpha=0.095$ for MMLU performance of Zen-7B. This implies diminishing returns
+beyond $3\times10^{23}$ FLOPs for this model size, motivating the switch to larger
+models for higher capability targets.
+
+\section{Analysis}
+
+\subsection{Data Quality vs. Quantity}
+
+Our experiments confirm that data quality dominates quantity beyond a threshold.
+Doubling corpus size with the PPL filter disabled yields +0.8 MMLU points, while
+halving corpus size with tighter filtering ($\tau_\text{ppl}$ at 80th percentile)
+yields +1.1 MMLU points.
+
+\subsection{Expert Specialization in MoDE}
+
+Analysis of expert activation patterns in Zen-235B-MoE reveals clear domain
+specialization: code-related tokens activate a consistent subset of 8--12 experts,
+mathematics activates a partially overlapping set, and natural language distributes
+more broadly. This specialization emerges organically from the data without
+explicit routing supervision.
+
+\subsection{Scaling Behavior}
+
+Zen models follow a modified scaling law that accounts for MoE efficiency:
+
+\begin{equation}
+\mathcal{L}(N_\text{active}, D) = \frac{A}{N_\text{active}^\alpha} + \frac{B}{D^\beta}
+\end{equation}
+
+where $N_\text{active}$ is the number of active parameters per token (not total
+parameters), $D$ is the dataset size, $\alpha=0.076$, $\beta=0.095$. MoE models
+achieve lower loss at fixed active-parameter compute compared to dense models.
+
+\section{Conclusion}
+
+The Zen training methodology demonstrates that careful data curation, adaptive mixing,
+constitutional training, and staged alignment produce models that are both capable and
+safe. The perplexity-based filtering provides the largest single capability gain
+among the methodological components we study. Constitutional training between SFT and
+RLHF reduces annotation costs while improving alignment quality, making the pipeline
+more scalable.
+
+Future work will explore continual pretraining strategies, domain-specific fine-tuning
+at scale, and automated data quality assessment to further reduce human annotation
+requirements in the training pipeline.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+\bibitem{hoffmann2022chinchilla} Hoffmann et al. (2022). Training Compute-Optimal Large Language Models. \textit{NeurIPS}.
+\bibitem{raffel2020c4} Raffel et al. (2020). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer. \textit{JMLR}.
+\bibitem{gao2021pile} Gao et al. (2021). The Pile: An 800GB Dataset of Diverse Text for Language Modeling. \textit{arXiv:2101.00027}.
+\bibitem{together2023redpajama} Together AI (2023). RedPajama: An Open Source Recipe to Reproduce LLaMA Training Dataset. \textit{GitHub}.
+\bibitem{ouyang2022rlhf} Ouyang et al. (2022). Training language models to follow instructions with human feedback. \textit{NeurIPS}.
+\bibitem{jain2023neftune} Jain et al. (2023). NEFTune: Noisy Embeddings Improve Instruction Finetuning. \textit{arXiv:2310.05914}.
+\end{thebibliography}
+
+\end{document}

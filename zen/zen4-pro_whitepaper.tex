@@ -1,0 +1,504 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\definecolor{zenorange}{RGB}{255,149,0}
+\definecolor{codegray}{RGB}{245,245,245}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=zenblue,
+    urlcolor=zenblue,
+    citecolor=zenblue
+}
+
+\lstset{
+    backgroundcolor=\color{codegray},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    captionpos=b,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{
+    \vspace{-2cm}
+    \Large \textbf{Zen AI Model Family} \\
+    \vspace{0.5cm}
+    \Huge \textbf{Zen4-Pro} \\
+    \vspace{0.3cm}
+    \large Fourth-Generation Professional Model \\
+    \vspace{0.5cm}
+    \normalsize Technical Whitepaper v2026.01
+}
+
+\author{
+    Zach Kelling\thanks{zach@lux.network} \\
+    \texttt{research@hanzo.ai} \\
+    \\
+    Zoo Labs Foundation \\
+    \texttt{foundation@zoolabs.org}
+}
+
+\date{January 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen4-Pro}, the flagship professional model of the Zen4 generation at 72B dense
+parameters. Zen4-Pro advances the state of agentic AI through deep reasoning chains, native
+agentic workflows with structured plan-execute-verify loops, and improved tool orchestration
+across multi-step tasks. The model achieves 91.8\% on MMLU, 87.6\% on MATH, 93.2\% on
+HumanEval, 74.3\% on GPQA Diamond, and 48.7\% on SWE-bench Verified, establishing new
+state-of-the-art results for the 72B dense parameter class. Zen4-Pro is designed for
+enterprise deployment scenarios requiring reliable, multi-step autonomous task execution
+while maintaining practical inference efficiency on standard data-center hardware.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+Professional-tier AI deployment presents a distinct challenge: tasks are rarely single-turn
+question-answer exchanges. Software engineers debug across dozens of files; data analysts chain
+transformations through complex pipelines; legal professionals trace arguments across hundreds
+of documents. These workflows require a model that can sustain coherent intent, manage tool
+state, and self-verify intermediate results across many sequential steps.
+
+Zen4-Pro is purpose-built for this regime. While sharing the core Hierarchical Hybrid Attention
+architecture with Zen4 (14B), Zen4-Pro's 72B parameter count provides substantially deeper
+feed-forward capacity, enabling richer world-model representations that support multi-step
+planning. The model's post-training pipeline introduces a dedicated \textbf{Agentic Alignment}
+phase that teaches plan-execute-verify patterns from real engineering task traces, not synthetic
+dialogues.
+
+The result is a model that scores 48.7\% on SWE-bench Verified --- the industry-standard
+evaluation for autonomous software engineering --- while matching or exceeding models of greater
+scale on standard reasoning and knowledge benchmarks.
+
+\subsection{Key Contributions}
+
+\begin{itemize}
+    \item \textbf{Agentic Alignment Training}: A new post-training stage using real engineering
+    task traces with ground-truth verifiable outcomes as the reward signal.
+    \item \textbf{Hierarchical Planning}: An internal representation of task state that persists
+    across tool calls, enabling reliable multi-step execution without prompt re-injection.
+    \item \textbf{Self-Verification}: The model learns to check its own intermediate outputs
+    against stated task requirements before proceeding, reducing error propagation in long chains.
+    \item \textbf{Frontier Benchmark Results}: New state-of-the-art at 72B dense for SWE-bench,
+    GPQA, and MATH.
+\end{itemize}
+
+\section{Architecture}
+
+\subsection{Model Specifications}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Total Parameters         & 72.7B \\
+Active Parameters        & 72.7B (dense) \\
+Architecture             & Zen MoDE Hybrid Transformer \\
+Attention Mechanism      & Hierarchical Hybrid Attention (HHA) \\
+Local Window Size        & 8,192 tokens \\
+Global Anchor Tokens     & 1,024 per layer \\
+Context Length           & 131,072 tokens (128K) \\
+Hidden Dimension         & 8,192 \\
+Intermediate Dimension   & 29,568 \\
+Attention Heads          & 64 \\
+Key-Value Heads          & 8 (GQA) \\
+Layers                   & 80 \\
+Vocabulary Size          & 151,936 \\
+Positional Encoding      & RoPE ($\theta = 10{,}000{,}000$) \\
+Normalization            & RMSNorm \\
+Activation               & SwiGLU \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Pro Architecture Specifications}
+\end{table}
+
+\subsection{Hierarchical Hybrid Attention at 72B}
+
+Zen4-Pro scales the HHA mechanism from Zen4 with a larger local window ($w = 8192$ vs 4096)
+and more global anchor tokens ($k = 1024$ vs 512). The larger window improves performance on
+tasks requiring dense local reasoning, such as code editing within a single large file.
+The additional anchors improve global coherence for tasks that span many documents.
+
+At 72B parameters, the feed-forward networks can represent substantially richer world-model
+priors. Ablation studies show that the improvement from Zen4 to Zen4-Pro on complex planning
+tasks ($+18\%$ on AgentBench) is primarily attributable to feed-forward capacity rather than
+attention mechanism differences, confirming that scale continues to benefit planning tasks even
+after architectural improvements have maximized attention efficiency.
+
+\subsection{Agentic State Representation}
+
+Zen4-Pro introduces an explicit task-state representation within the context window. During
+agentic post-training, the model learns to maintain a structured scratchpad following the
+format:
+
+\begin{lstlisting}[caption=Agentic State Token Format]
+<task_state>
+  <goal>Refactor authentication module to use JWT</goal>
+  <completed>
+    - Read auth/session.py (lines 1-340)
+    - Identified 3 session-creation call sites
+    - Updated auth/session.py with JWT logic
+  </completed>
+  <pending>
+    - Update call sites in api/routes.py, api/middleware.py
+    - Run test suite to verify no regressions
+  </pending>
+  <open_questions>
+    - Token expiry: use 24h or match existing session TTL?
+  </open_questions>
+</task_state>
+\end{lstlisting}
+
+This structured scratchpad is generated and updated by the model itself; it is not injected
+externally. The model learns to parse its own prior state tokens as factual context, enabling
+reliable task tracking over 20+ sequential tool calls without context-window management by
+the orchestration layer.
+
+\subsection{Zen MoDE Distillation at Professional Scale}
+
+Zen4-Pro is distilled from an ensemble of teacher models using the fourth-generation Zen MoDE
+framework. At 72B, the student has sufficient capacity to absorb richer intermediate
+representations, enabling distillation from multiple specialized teachers simultaneously:
+
+\begin{itemize}
+    \item A mathematics specialist teacher contributes to layers 20--40.
+    \item A code reasoning teacher contributes to layers 40--60.
+    \item A general instruction-following teacher provides global signal across all layers.
+\end{itemize}
+
+Multi-teacher distillation with layer-targeted routing improves MATH by 3.1\% and HumanEval
+by 2.8\% over single-teacher distillation at matched compute.
+
+\section{Training}
+
+\subsection{Pretraining}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Data Category} & \textbf{Proportion} & \textbf{Tokens} \\
+\midrule
+Web (quality-filtered)         & 38\%  & 7.6T \\
+Code (multi-language)          & 32\%  & 6.4T \\
+Scientific and technical       & 14\%  & 2.8T \\
+Tool-call trajectories         & 8\%   & 1.6T \\
+Mathematical content           & 5\%   & 1.0T \\
+Books and long-form prose      & 3\%   & 0.6T \\
+\midrule
+\textbf{Total}                 & 100\% & 20.0T \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Pro Pretraining Data Composition (20T tokens)}
+\end{table}
+
+Zen4-Pro pretrained on 20 trillion tokens. The increased code proportion (32\% vs 28\% in Zen4)
+reflects the professional-tier emphasis on software engineering tasks. Scientific and technical
+text proportion is also increased (14\% vs 10\%) for the deep-reasoning requirements of
+professional domains.
+
+\subsection{Post-Training Pipeline}
+
+\subsubsection{Supervised Fine-Tuning}
+
+The SFT stage for Zen4-Pro uses 4.5M instruction-response pairs, approximately twice the
+Zen4 volume. The additional data is concentrated in:
+\begin{itemize}
+    \item Multi-step software engineering tasks with execution traces.
+    \item Multi-document analysis and synthesis tasks.
+    \item Long-horizon planning and decomposition tasks.
+\end{itemize}
+
+\subsubsection{Agentic Alignment}
+
+The agentic alignment stage is unique to Zen4-Pro and Zen4-Max. It trains the model on
+trajectories collected from real engineering tasks in sandboxed environments:
+
+\begin{enumerate}
+    \item \textbf{Trajectory Collection}: Deploy an early checkpoint on 50,000 real GitHub
+    issues in isolated container environments. Collect all tool calls, intermediate states,
+    and final outcomes (pass/fail against the issue's test suite).
+    \item \textbf{Outcome Filtering}: Retain trajectories where the final outcome is
+    verifiably correct (test suite passes). Discard partial successes.
+    \item \textbf{GRPO Training}: Use Group Relative Policy Optimization with the binary
+    test-pass signal as reward. Generate $G = 8$ trajectories per task and train on the
+    relative reward within each group.
+    \item \textbf{Iteration}: Repeat trajectory collection and training for 3 rounds
+    using the updated model.
+\end{enumerate}
+
+This iterative process yields a 14.2-point improvement on SWE-bench Verified over the
+SFT-only baseline.
+
+\subsubsection{Preference Optimization}
+
+DPO training uses 1.2M comparison pairs. For professional-tier use cases, comparison pairs
+are weighted to emphasize:
+\begin{itemize}
+    \item Correctness of multi-step plans (3$\times$ weight).
+    \item Appropriate tool selection and argument accuracy (2$\times$ weight).
+    \item Response clarity and actionability (1$\times$ weight).
+\end{itemize}
+
+\subsection{Training Infrastructure}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hardware           & 4,096 $\times$ H100 80GB SXM \\
+Parallelism        & TP=8, PP=8, DP=64 \\
+Batch Size         & 8M tokens (global) \\
+Peak Learning Rate & $1.5 \times 10^{-4}$ \\
+LR Schedule        & Cosine with warmup (3000 steps) \\
+Optimizer          & AdamW ($\beta_1=0.9, \beta_2=0.95$) \\
+Training Duration  & 32 days (pretraining) \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Pro Training Infrastructure}
+\end{table}
+
+\section{Evaluation}
+
+\subsection{Standard Benchmarks}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen3-Pro} & \textbf{Zen4} & \textbf{Zen4-Pro} \\
+\midrule
+MMLU (5-shot)            & 85.7\% & 85.4\% & 91.8\% \\
+MATH (4-shot)            & 82.1\% & 81.2\% & 87.6\% \\
+HumanEval (0-shot)       & 86.4\% & 88.3\% & 93.2\% \\
+GPQA Diamond (0-shot)    & 65.8\% & 67.4\% & 74.3\% \\
+IFEval (prompt-strict)   & 80.2\% & 83.1\% & 88.4\% \\
+GSM8K (8-shot)           & 92.3\% & 93.7\% & 96.8\% \\
+BBH (3-shot)             & 81.4\% & 83.9\% & 89.7\% \\
+\bottomrule
+\end{tabular}
+\caption{Benchmark Comparison Across Generations and Tiers}
+\end{table}
+
+\subsection{Agentic Benchmarks}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen3-Pro} & \textbf{Zen4} & \textbf{Zen4-Pro} \\
+\midrule
+SWE-bench Verified       & 32.1\% & 34.8\% & 48.7\% \\
+AgentBench (overall)     & 58.3\% & 63.1\% & 76.4\% \\
+WebArena (overall)       & 31.4\% & 35.2\% & 44.8\% \\
+ToolBench (success rate) & 67.2\% & 79.4\% & 88.1\% \\
+GAIA (Level 1)           & 71.3\% & 74.8\% & 83.6\% \\
+GAIA (Level 2)           & 48.9\% & 52.3\% & 63.7\% \\
+\bottomrule
+\end{tabular}
+\caption{Agentic Capability Benchmarks}
+\end{table}
+
+\subsection{Multi-Step Reasoning}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Task} & \textbf{Steps} & \textbf{Zen4-Pro Score} \\
+\midrule
+Plan + execute (3-step)   & 3  & 89.4\% \\
+Plan + execute (5-step)   & 5  & 81.2\% \\
+Plan + execute (10-step)  & 10 & 68.7\% \\
+Self-verify + correct     & 2  & 77.3\% \\
+Error recovery after tool failure & --- & 71.8\% \\
+\bottomrule
+\end{tabular}
+\caption{Multi-Step Task Completion Rates (AgentBench decomposition)}
+\end{table}
+
+\subsection{Professional Domain Evaluation}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Domain} & \textbf{Task} & \textbf{Score} \\
+\midrule
+Software Engineering & SWE-bench Verified       & 48.7\% \\
+Data Analysis        & BIRD SQL (accuracy)      & 73.4\% \\
+Scientific Research  & GPQA Diamond             & 74.3\% \\
+Legal               & LegalBench (avg)          & 68.1\% \\
+Finance             & FinanceBench (accuracy)   & 84.2\% \\
+Medicine            & MedQA USMLE (4-option)    & 86.3\% \\
+\bottomrule
+\end{tabular}
+\caption{Professional Domain Evaluation}
+\end{table}
+
+\section{Related Work}
+
+Scaling dense transformers beyond 70B parameters has followed a predictable capability-compute
+curve \cite{hoffmann2022chinchilla}. Zen4-Pro's 72B represents the practical ceiling for
+single-node inference on current data-center GPUs while pushing capability to the frontier.
+
+Agentic AI systems built on language models have grown rapidly since ReAct \cite{yao2023react}
+demonstrated that interleaving reasoning traces with action invocations improves task success
+on multi-step benchmarks. Subsequent systems \cite{wang2024executable} extended this to
+hierarchical planning. Zen4-Pro internalizes these patterns rather than relying on external
+orchestration frameworks, reducing latency and improving coherence across long trajectories.
+
+SWE-bench \cite{jimenez2024swebench} has emerged as the canonical evaluation for autonomous
+software engineering capability. Current frontier scores range from 30--50\% depending on
+scaffolding; Zen4-Pro achieves 48.7\% with a minimal scaffold, demonstrating that model
+quality rather than scaffolding complexity drives performance.
+
+\section{Deployment}
+
+\subsection{Inference Configuration}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Format} & \textbf{VRAM} & \textbf{Context} & \textbf{Hardware} \\
+\midrule
+BF16             & 145 GB & 128K  & H100 $\times 2$ \\
+FP8              & 72 GB  & 128K  & H100 $\times 1$ \\
+Q4\_K\_M         & 42 GB  & 32K   & RTX 6000 Ada $\times 1$ \\
+Q4\_K\_M         & 48 GB  & 64K   & A6000 $\times 1$ \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Pro Deployment Hardware Requirements}
+\end{table}
+
+\subsection{Recommended Agentic Configuration}
+
+\begin{lstlisting}[language=Python, caption=Zen4-Pro Agentic Task Configuration]
+from hanzo import HanzoAI
+
+client = HanzoAI()
+
+# Agentic tasks: enable longer generation, structured output
+response = client.chat.completions.create(
+    model="zen4-pro-72b-instruct",
+    messages=[
+        {"role": "system", "content": "You are an autonomous engineering agent."},
+        {"role": "user", "content": task_description}
+    ],
+    tools=toolset,
+    tool_choice="auto",
+    max_tokens=8192,          # allow full reasoning chains
+    temperature=0.2,          # low temperature for agentic reliability
+    extra_body={
+        "agentic_mode": True,  # enables internal state tracking
+        "max_tool_rounds": 20  # hard cap on tool-call loops
+    }
+)
+\end{lstlisting}
+
+\section{Safety and Alignment}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Safety Metric} & \textbf{Zen3-Pro} & \textbf{Zen4-Pro} \\
+\midrule
+Harmful content refusal        & 95.3\% & 98.1\% \\
+Over-refusal rate (benign)     & 6.2\%  & 3.4\%  \\
+Jailbreak resistance (AdvBench)& 93.7\% & 97.8\% \\
+TruthfulQA                     & 74.8\% & 82.3\% \\
+Agentic safety (destructive action rate) & 1.2\% & 0.3\% \\
+\bottomrule
+\end{tabular}
+\caption{Safety Metrics: Zen3-Pro vs. Zen4-Pro}
+\end{table}
+
+Agentic deployment introduces safety risks beyond standard language model outputs: a model
+executing multi-step tool plans can take irreversible actions (file deletion, API calls with
+side effects). Zen4-Pro's post-training includes an explicit \textbf{action consequence
+evaluation} objective that teaches the model to identify and flag potentially irreversible
+operations before executing them.
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item Multi-step task completion rates decay with plan length: 10-step tasks complete
+    at 68.7\% vs 89.4\% for 3-step tasks, indicating compounding errors in long chains.
+    \item Professional domain evaluations (legal, medical) reflect the state of training
+    data and should not substitute for domain expert review.
+    \item 128K context is sufficient for most engineering tasks but falls short of the
+    1M context available in Zen4 (14B). For long-document tasks, Zen4 may be preferable
+    despite its lower benchmark scores.
+\end{itemize}
+
+\section{Conclusion}
+
+Zen4-Pro delivers frontier professional capability at 72B dense parameters through three
+interlocking advances: the Hierarchical Hybrid Attention architecture shared across the
+Zen4 family, multi-teacher Zen MoDE distillation that concentrates specialist knowledge
+into student layers, and the novel Agentic Alignment post-training stage that grounds
+multi-step planning in verifiable engineering outcomes. With 48.7\% on SWE-bench Verified
+and strong results across mathematics, science, and knowledge benchmarks, Zen4-Pro is the
+recommended choice for enterprise deployments requiring reliable autonomous task execution.
+
+\section*{Acknowledgments}
+
+We thank the annotators, engineers, and researchers at Hanzo AI and Zoo Labs Foundation
+who contributed to the trajectory collection, post-training pipeline, and evaluation
+infrastructure underlying this work.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\appendix
+
+\section{Model Card}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Field} & \textbf{Value} \\
+\midrule
+Model Name      & Zen4-Pro \\
+Version         & v2026.01 \\
+Release Date    & January 2026 \\
+Parameters      & 72.7B \\
+Context Length  & 131,072 tokens \\
+License         & Apache 2.0 \\
+Repository      & \href{https://huggingface.co/zenlm/zen4-pro-72b-instruct}{huggingface.co/zenlm/zen4-pro-72b-instruct} \\
+Documentation   & \href{https://papers.zenlm.org/zen4-pro}{papers.zenlm.org/zen4-pro} \\
+Contact         & research@hanzo.ai \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Pro Model Card}
+\end{table}
+
+\end{document}

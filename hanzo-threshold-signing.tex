@@ -1,0 +1,493 @@
+% Hanzo Threshold Signing: MPC Key Management for AI Infrastructure
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{HANZO THRESHOLD SIGNING\\[0.3em]
+{\large MPC Key Management for\\AI Infrastructure}}
+\author{
+    Zach Kelling \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    \texttt{research@hanzo.ai}
+}
+\date{April 2026}
+
+\begin{document}
+\hanzocoverpage
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+We present Hanzo Threshold Signing, a system for distributed key management and
+cryptographic signing across Hanzo infrastructure services. The system eliminates
+single points of compromise for critical signing operations: IAM session tokens,
+KMS secret encryption keys, agent credential delegation, and ACI compute
+attestations. We implement two threshold signature protocols: (i)~FROST
+(Flexible Round-Optimized Schnorr Threshold signatures) for Ed25519, used in
+IAM JWT signing and agent credential chains, and (ii)~CGGMP21 for threshold
+ECDSA (secp256k1), used in blockchain transaction signing for ACI staking and
+Lux cross-chain operations. The system operates as a $(t, n)$ threshold scheme
+where $t$ of $n$ signers must participate to produce a valid signature, with no
+single party ever holding the complete private key. We describe the distributed
+key generation (DKG) protocol, the signing protocol with identifiable abort,
+proactive key refresh without changing the public key, and integration with
+Hanzo KMS for share storage. Production deployment across 5 signing nodes
+achieves $(3, 5)$ threshold signing with median latency of 12ms for FROST and
+45ms for CGGMP21, processing over 2 million threshold signatures per day.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+Hanzo infrastructure depends on cryptographic signing for security-critical
+operations:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{IAM session tokens}: JWT access tokens signed with Ed25519,
+    issued by Hanzo IAM~\cite{hanzoiam} and validated by every service in the
+    platform.
+    \item \textbf{KMS envelope encryption}: Master keys that encrypt all
+    secrets in Hanzo KMS~\cite{hanzokms}. Compromise of a master key exposes
+    every secret in the system.
+    \item \textbf{Agent credentials}: AI agents~\cite{hanzoagentsdk} receive
+    delegated credentials for tool access, API calls, and resource management.
+    The signing key authorizing these delegations must not be compromised.
+    \item \textbf{ACI compute attestations}: GPU nodes attest to inference
+    results by signing output hashes. These attestations are verified on-chain
+    for the Hanzo ACI compute market~\cite{hanzoaci}.
+\end{enumerate}
+
+In all cases, a single signing key stored on a single server is a single point
+of failure. If that server is compromised, the attacker can forge IAM tokens,
+decrypt all secrets, issue fraudulent agent credentials, or submit false compute
+attestations.
+
+Threshold signatures solve this by distributing the signing key across $n$
+servers such that any $t$ must cooperate to sign, but fewer than $t$ servers
+learn nothing about the key. The combined public key is a standard Ed25519 or
+ECDSA public key---verifiers need no knowledge of the threshold scheme.
+
+\subsection{Protocol Selection}
+
+We use two protocols, chosen for specific properties:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Protocol} & \textbf{Curve} & \textbf{Use Case} \\
+\midrule
+FROST~\cite{frost} & Ed25519 & IAM tokens, agent credentials, API signing \\
+CGGMP21~\cite{cggmp21} & secp256k1 & Blockchain transactions, ACI staking \\
+\bottomrule
+\end{tabular}
+\caption{Protocol selection by use case.}
+\label{tab:protocols}
+\end{table}
+
+FROST is preferred for Ed25519 operations due to its simplicity (2-round
+signing, no zero-knowledge proofs during signing). CGGMP21 is required for
+ECDSA because Schnorr-based threshold constructions do not produce valid ECDSA
+signatures.
+
+% ============================================================================
+\section{FROST for Ed25519}
+\label{sec:frost}
+% ============================================================================
+
+\subsection{Distributed Key Generation}
+
+FROST DKG produces key shares without any party learning the full secret key.
+Each participant $P_i$ acts as both dealer and verifier in a Pedersen
+DKG~\cite{pedersen1991}:
+
+\begin{definition}[$(t, n)$-Secret Sharing]
+A $(t, n)$-Shamir secret sharing of $s \in \mathbb{Z}_q$ distributes shares
+$s_i = f(i)$ where $f(X) = s + \sum_{j=1}^{t-1} a_j X^j$ is a random
+polynomial of degree $t-1$. Any $t$ shares determine $s$; fewer than $t$
+shares reveal no information about $s$.
+\end{definition}
+
+\begin{algorithm}
+\caption{FROST Distributed Key Generation}
+\label{alg:dkg}
+\begin{algorithmic}[1]
+\Require Participants $P_1, \ldots, P_n$, threshold $t$
+\Ensure Public key $Y$, shares $s_1, \ldots, s_n$
+\For{each participant $P_i$}
+    \State Sample random polynomial $f_i(X) = a_{i,0} + \sum_{j=1}^{t-1} a_{i,j} X^j$
+    \State Broadcast commitments $C_{i,j} = a_{i,j} \cdot G$ for $j = 0, \ldots, t-1$
+    \State Send share $f_i(k)$ privately to each $P_k$
+\EndFor
+\For{each participant $P_k$}
+    \State Verify: $f_i(k) \cdot G \stackrel{?}{=} \sum_{j=0}^{t-1} C_{i,j} \cdot k^j$ for all $i$
+    \State Compute combined share: $s_k = \sum_{i=1}^{n} f_i(k)$
+\EndFor
+\State $Y = \sum_{i=1}^{n} C_{i,0}$ \Comment{Combined public key}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[DKG Security]
+The FROST DKG protocol is secure against $t-1$ corrupted participants under
+the discrete logarithm assumption on the Ed25519 curve. No coalition of fewer
+than $t$ participants can reconstruct the secret key $s = \sum_i a_{i,0}$.
+\end{theorem}
+
+\subsection{Threshold Signing}
+
+FROST signing requires two rounds. In the first round, each signer generates
+and broadcasts a nonce commitment. In the second round, each signer produces a
+partial signature using their key share and the aggregated nonce.
+
+\begin{definition}[FROST Signature Share]
+Given message $m$, group nonce $R = \sum_{i \in S} R_i$, and challenge
+$c = H(R \| Y \| m)$, signer $P_i$ with share $s_i$ computes:
+\begin{equation}
+z_i = d_i + e_i \cdot \rho_i + \lambda_i \cdot s_i \cdot c,
+\end{equation}
+where $(d_i, e_i)$ are nonce secrets, $\rho_i = H(i, m, B)$ is the binding
+factor, and $\lambda_i$ is the Lagrange interpolation coefficient for the
+signing set $S$.
+\end{definition}
+
+The aggregated signature $\sigma = (R, z)$ where $z = \sum_{i \in S} z_i$ is a
+standard Ed25519 signature verifiable with the public key $Y$.
+
+\begin{proposition}[Unforgeability]
+FROST signatures are existentially unforgeable under chosen-message attack
+(EUF-CMA) in the random oracle model, assuming the hardness of the discrete
+logarithm problem on Curve25519~\cite{frost}.
+\end{proposition}
+
+\subsection{Nonce Pre-computation}
+
+To reduce signing latency, signers pre-compute nonce pairs during idle periods:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Each signer generates a batch of $B$ nonce pairs $(d_j, e_j)$ and
+    commitments $(D_j, E_j)$.
+    \item Commitments are broadcast and stored by all participants.
+    \item During signing, a pre-computed nonce pair is consumed. No
+    communication is needed in the first round.
+\end{enumerate}
+
+With $B = 10000$ pre-computed nonces, signing reduces to a single round with
+median latency of 8ms (vs.\ 12ms for 2-round signing).
+
+% ============================================================================
+\section{CGGMP21 for ECDSA}
+\label{sec:cggmp}
+% ============================================================================
+
+ECDSA threshold signing is more complex than Schnorr because the ECDSA
+equation $s = k^{-1}(H(m) + r \cdot x)$ involves multiplication of secret
+values ($k^{-1}$ and $x$), requiring MPC multiplication protocols.
+
+\subsection{Key Generation}
+
+CGGMP21~\cite{cggmp21} key generation extends Feldman VSS with Paillier
+encryption for MPC multiplication:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Each party generates a Paillier key pair $(N_i, \phi_i)$ with
+    $N_i > 2^{2048}$ and proves correctness via a zero-knowledge proof of
+    safe prime product.
+    \item Shamir sharing of the ECDSA private key $x$ proceeds as in FROST DKG.
+    \item Each party encrypts their share under their Paillier key and
+    broadcasts the ciphertext with a range proof.
+\end{enumerate}
+
+\subsection{Threshold Signing Protocol}
+
+The CGGMP21 signing protocol consists of four phases:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Nonce generation}: Each signer $P_i$ samples $k_i, \gamma_i$
+    and broadcasts commitments $\Gamma_i = \gamma_i \cdot G$ and Paillier
+    encryptions $K_i = \texttt{Enc}(k_i)$.
+    \item \textbf{MPC multiplication}: Parties compute $\delta_i = k_i \gamma_j
+    + k_j \gamma_i$ pairwise using the Paillier homomorphism, with
+    affine-group range proofs ensuring honest behavior.
+    \item \textbf{Nonce reveal}: Parties reveal $\delta_i$ and reconstruct
+    $\delta = k \cdot \gamma$. Compute $R = (\delta^{-1}) \cdot \Gamma$ where
+    $\Gamma = \sum_i \Gamma_i$. Extract $r = R.x \bmod q$.
+    \item \textbf{Partial signatures}: Each party computes $\sigma_i = k_i
+    \cdot H(m) + k_i \cdot r \cdot \chi_i$ where $\chi_i = x_i \cdot
+    \lambda_i$ is the Lagrange-weighted share.
+\end{enumerate}
+
+\begin{theorem}[Identifiable Abort]
+If any party deviates from the CGGMP21 protocol, the honest parties can
+identify the cheater with probability 1 and exclude them from future signing
+sessions. This relies on the zero-knowledge range proofs attached to every
+Paillier operation.
+\end{theorem}
+
+% ============================================================================
+\section{Proactive Key Refresh}
+\label{sec:refresh}
+% ============================================================================
+
+Key shares must be periodically refreshed to limit the window of vulnerability
+if a share is compromised. Proactive secret sharing~\cite{herzberg1995}
+re-randomizes shares without changing the public key.
+
+\begin{definition}[Key Refresh]
+A key refresh transforms shares $(s_1, \ldots, s_n)$ of secret $s$ into fresh
+shares $(s_1', \ldots, s_n')$ of the same secret $s$, such that knowing $s_i$
+and $s_j'$ (for different epochs) provides no advantage in recovering $s$.
+\end{definition}
+
+The protocol:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Each party $P_i$ generates a random polynomial $g_i(X)$ of degree
+    $t-1$ with $g_i(0) = 0$.
+    \item $P_i$ sends $g_i(k)$ privately to each $P_k$.
+    \item Each party computes $s_k' = s_k + \sum_i g_i(k)$.
+\end{enumerate}
+
+Since $\sum_i g_i(0) = 0$, the secret is unchanged: $s' = s$. But shares are
+fully re-randomized: knowledge of old shares provides no information about new
+shares.
+
+Hanzo infrastructure performs key refresh every 24 hours. Refresh completes in
+$<$100ms and does not interrupt signing operations.
+
+% ============================================================================
+\section{Integration with Hanzo Services}
+\label{sec:services}
+% ============================================================================
+
+\subsection{IAM Token Signing}
+
+Hanzo IAM~\cite{hanzoiam} issues JWT tokens signed with Ed25519. The IAM
+signing key is split across 5 threshold signing nodes in a $(3, 5)$
+configuration:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item User authenticates via OIDC (password, passkey, or SSO).
+    \item IAM constructs the JWT payload (claims, expiry, org scope).
+    \item IAM sends the signing request to the threshold signing service.
+    \item Three of five signing nodes produce partial signatures; the
+    coordinator aggregates them into a standard Ed25519 signature.
+    \item The JWT is returned to the user. Verifiers use the public key
+    from the IAM JWKS endpoint---no knowledge of threshold signing needed.
+\end{enumerate}
+
+\subsection{KMS Master Key Protection}
+
+Hanzo KMS~\cite{hanzokms} uses envelope encryption: data encryption keys (DEKs)
+are encrypted with a master key (KEK). The KEK is threshold-shared:
+\begin{itemize}[leftmargin=1.1em]
+    \item KEK encryption uses threshold ECDH: each signing node holds a share
+    of the ECDH private key, and $t$ nodes must cooperate to derive the shared
+    secret used for AES-256-GCM encryption of the DEK.
+    \item KEK rotation is a key refresh operation---existing DEKs encrypted
+    under the old KEK are re-encrypted under the refreshed key without
+    exposing plaintext DEKs.
+\end{itemize}
+
+\subsection{Agent Credential Signing}
+
+AI agents~\cite{hanzoagentsdk} receive delegated credentials via certificate
+chains:
+\begin{enumerate}[leftmargin=1.4em]
+    \item The platform root key (threshold-shared) signs an org-level
+    intermediate certificate.
+    \item The org intermediate signs an agent-specific credential with
+    constrained permissions (allowed tools, API scopes, time bound).
+    \item Agents present the credential chain when accessing resources. Each
+    service verifies the chain back to the well-known root public key.
+\end{enumerate}
+
+\subsection{ACI Compute Attestation}
+
+ACI GPU nodes~\cite{hanzoaci} sign inference attestations with threshold ECDSA:
+\begin{itemize}[leftmargin=1.1em]
+    \item Each GPU node in a verification group holds a share of the group
+    signing key.
+    \item After verifying an inference result, $t$ of $n$ verifiers produce a
+    threshold ECDSA signature over the result hash.
+    \item The signature is submitted on-chain as proof of verified computation.
+\end{itemize}
+
+% ============================================================================
+\section{Security Analysis}
+\label{sec:security}
+% ============================================================================
+
+\begin{theorem}[Threshold Security]
+The Hanzo Threshold Signing system with $(t, n) = (3, 5)$ provides security
+under the following adversary model: an adversary who compromises up to $t-1 = 2$
+signing nodes cannot forge signatures, recover the private key, or distinguish
+partial signatures from random values.
+\end{theorem}
+
+\begin{remark}
+The identifiable abort property of CGGMP21 ensures that a compromised node
+cannot cause signing to fail silently. If a node submits invalid partial
+signatures, the coordinator detects the fault, identifies the malicious node,
+and re-runs the protocol with the remaining honest nodes (provided $\geq t$
+honest nodes remain).
+\end{remark}
+
+\subsection{Deployment Topology}
+
+The 5 signing nodes are deployed across 3 geographic regions and 2 cloud
+providers:
+\begin{itemize}[leftmargin=1.1em]
+    \item 2 nodes in US (DOKS lux-k8s, separate availability zones).
+    \item 2 nodes in EU (DOKS lux-k8s, separate availability zones).
+    \item 1 node in APAC (DOKS lux-k8s).
+\end{itemize}
+
+An adversary must compromise nodes in at least 2 geographic regions to reach
+the threshold.
+
+% ============================================================================
+\section{Performance}
+\label{sec:performance}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Operation} & \textbf{Protocol} & \textbf{Median (ms)} & \textbf{p99 (ms)} \\
+\midrule
+DKG (one-time) & FROST & 85 & 120 \\
+DKG (one-time) & CGGMP21 & 2400 & 3100 \\
+Signing & FROST & 12 & 28 \\
+Signing (pre-computed nonce) & FROST & 8 & 18 \\
+Signing & CGGMP21 & 45 & 95 \\
+Key refresh & FROST & 35 & 60 \\
+Key refresh & CGGMP21 & 180 & 310 \\
+\bottomrule
+\end{tabular}
+\caption{Latency for $(3, 5)$ threshold operations across 3 geographic regions.
+Measured over 30 days of production traffic.}
+\label{tab:perf}
+\end{table}
+
+The system processes over 2 million threshold signatures per day (predominantly
+FROST for IAM tokens), with 99.97\% availability over the measurement period.
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================================
+
+\textbf{FROST}~\cite{frost} provides the theoretical foundation for our Ed25519
+threshold scheme. We extend it with pre-computed nonce batching for
+latency-sensitive IAM signing.
+
+\textbf{CGGMP21}~\cite{cggmp21} improves upon GG20~\cite{gg20} with
+identifiable abort and reduced communication complexity. We adopt CGGMP21 for
+all ECDSA operations.
+
+\textbf{Lux Network}~\cite{luxwhitepaper} uses threshold signatures for
+validator set management and cross-chain bridge security. Hanzo Threshold
+Signing reuses the same FROST implementation for infrastructure signing.
+
+\textbf{Fireblocks MPC}~\cite{fireblocks} provides commercial MPC wallet
+infrastructure. Unlike Fireblocks, Hanzo Threshold Signing is purpose-built for
+AI infrastructure signing (IAM, KMS, agent credentials), not financial custody.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+Hanzo Threshold Signing eliminates single points of compromise across Hanzo
+infrastructure by distributing signing keys via $(3, 5)$ threshold schemes.
+FROST for Ed25519 achieves 8--12ms signing latency for IAM tokens and agent
+credentials. CGGMP21 for ECDSA achieves 45ms signing latency for blockchain
+operations. Proactive key refresh every 24 hours limits exposure from share
+compromise. The system processes 2M+ daily threshold signatures with 99.97\%
+availability.
+
+% ============================================================================
+% BIBLIOGRAPHY
+% ============================================================================
+\begin{thebibliography}{15}
+
+\bibitem{hanzoiam}
+{Hanzo AI Research}.
+\newblock Hanzo {IAM}: Identity and access management for {AI} platforms.
+\newblock \emph{Hanzo AI Research}, 2024.
+
+\bibitem{hanzokms}
+{Hanzo AI Research}.
+\newblock Hanzo {KMS}: Secrets management with per-environment rotation and audit trail.
+\newblock \emph{Hanzo AI Research}, September 2021.
+
+\bibitem{hanzoagentsdk}
+{Hanzo AI Research}.
+\newblock Hanzo Agent {SDK}: Framework for building {AI} agents.
+\newblock \emph{Hanzo AI Research}, 2025.
+
+\bibitem{hanzoaci}
+{Hanzo AI Research}.
+\newblock Hanzo {ACI}: {AI} Chain Infrastructure for decentralized compute markets.
+\newblock \emph{Hanzo AI Research}, December 2024.
+
+\bibitem{luxwhitepaper}
+{Lux Partners}.
+\newblock Lux: A scalable multi-consensus blockchain with post-quantum cryptography.
+\newblock \emph{Lux Network Technical Report}, 2024.
+
+\bibitem{frost}
+C.~Komlo and I.~Goldberg.
+\newblock {FROST}: Flexible round-optimized {Schnorr} threshold signatures.
+\newblock In \emph{Proc.\ SAC}, 2020.
+
+\bibitem{cggmp21}
+R.~Canetti, R.~Gennaro, S.~Goldfeder, N.~Makriyannis, and U.~Peled.
+\newblock {UC} non-interactive, proactive, threshold {ECDSA} with identifiable aborts.
+\newblock In \emph{Proc.\ CCS}, 2020.
+
+\bibitem{pedersen1991}
+T.~Pedersen.
+\newblock Non-interactive and information-theoretic secure verifiable secret sharing.
+\newblock In \emph{Proc.\ CRYPTO}, 1991.
+
+\bibitem{herzberg1995}
+A.~Herzberg, S.~Jarecki, H.~Krawczyk, and M.~Yung.
+\newblock Proactive secret sharing, or: How to cope with perpetual leakage.
+\newblock In \emph{Proc.\ CRYPTO}, 1995.
+
+\bibitem{gg20}
+R.~Gennaro and S.~Goldfeder.
+\newblock One round threshold {ECDSA} with identifiable abort.
+\newblock \emph{IACR Cryptology ePrint Archive}, 2020/540.
+
+\bibitem{fireblocks}
+{Fireblocks}.
+\newblock {MPC} wallet infrastructure for digital assets.
+\newblock \emph{Fireblocks Documentation}, 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,430 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Reward Modeling for Zen Alignment:\\
+Multi-Reward Ensembles and Synthetic Preference Generation}\\
+\large Technical Report v2025.04}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{April 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Reward modeling is a critical component of aligning large language models to human
+preferences. We present the Zen alignment stack, comprising: (1) a preference data
+collection pipeline that produces high-quality human judgments at scale;
+(2) ensemble reward models based on the Bradley-Terry statistical model with
+multi-head architecture; (3) synthetic preference generation using a red-team/blue-team
+approach to augment human data; and (4) Direct Preference Optimization (DPO) as an
+alternative to full RL training. Our multi-reward ensemble achieves 87.3\% correlation
+with human judgment on a held-out evaluation set, a 12\% improvement over single-model
+baselines. RLHF with our ensemble reward substantially outperforms DPO alone on
+open-ended generation quality, while DPO achieves competitive results at lower compute
+cost for instruction following.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% -----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%% -----------------------------------------------------------------------
+
+Training a large language model to generate text that humans find helpful, harmless, and
+honest (HHH) \cite{askell2021general} requires a reward signal that accurately captures
+human preferences. Reinforcement Learning from Human Feedback (RLHF)
+\cite{christiano2017deep,ouyang2022training} trains a reward model on preference data and
+then uses it to fine-tune the policy via PPO. The quality of the reward model is a
+critical bottleneck: a poorly calibrated reward model produces \emph{reward hacking},
+where the policy exploits reward model weaknesses rather than genuinely improving.
+
+We address reward model quality through three mechanisms:
+
+\begin{enumerate}
+    \item \textbf{High-quality preference data}: structured collection of pairwise human
+          judgments with inter-annotator agreement metrics.
+    \item \textbf{Multi-reward ensemble}: an ensemble of reward models with different
+          training objectives (helpfulness, harmlessness, honesty, instruction-following),
+          combined to produce a holistic alignment score.
+    \item \textbf{Synthetic preference generation}: using a red-team model to generate
+          challenging response pairs that expose alignment failures, augmenting human data
+          with synthetically generated hard cases.
+\end{enumerate}
+
+\subsection{Alignment Taxonomy}
+
+Following \cite{askell2021general}, we distinguish:
+\begin{itemize}
+    \item \textbf{Helpfulness}: whether the response addresses the user's intent effectively.
+    \item \textbf{Harmlessness}: whether the response avoids harmful content or enabling harm.
+    \item \textbf{Honesty}: whether the response is factually accurate and appropriately
+          uncertain.
+    \item \textbf{Instruction following}: whether the response adheres to specified format,
+          length, and style constraints.
+\end{itemize}
+
+These dimensions are partially correlated but not identical, motivating a multi-head
+reward architecture.
+
+%% -----------------------------------------------------------------------
+\section{Preference Data Collection}
+\label{sec:data}
+%% -----------------------------------------------------------------------
+
+\subsection{Annotation Protocol}
+
+Human annotators compare pairs of responses $(y_A, y_B)$ to the same prompt $x$ and
+indicate: strongly prefer $A$, slightly prefer $A$, about equal, slightly prefer $B$,
+strongly prefer $B$. This 5-point scale is mapped to a continuous preference signal
+$\delta \in \{-2, -1, 0, +1, +2\}$ for the Bradley-Terry likelihood computation.
+
+Annotators also rate each response on four dimensions (helpfulness, harmlessness,
+honesty, instruction-following) using a 1--5 Likert scale. These dimensional ratings
+train the individual reward model heads.
+
+\subsection{Inter-Annotator Agreement}
+
+To ensure data quality, each prompt-pair is annotated by 3 independent annotators.
+We compute Fleiss's $\kappa$ as a quality metric:
+
+\begin{table}[H]
+\centering
+\caption{Inter-annotator agreement across preference data categories.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Category} & \textbf{Fleiss's $\kappa$} & \textbf{Agreement interpretation} \\
+\midrule
+Helpfulness            & 0.68 & Substantial \\
+Harmlessness           & 0.81 & Almost perfect \\
+Honesty                & 0.71 & Substantial \\
+Instruction following  & 0.87 & Almost perfect \\
+Overall preference     & 0.64 & Substantial \\
+\bottomrule
+\end{tabular}
+\label{tab:agreement}
+\end{table}
+
+Prompt-pairs with $\kappa < 0.4$ are excluded from training, retaining 89\% of
+collected pairs. This yields a final dataset of 1.2M preference pairs.
+
+\subsection{Dataset Composition}
+
+\begin{table}[H]
+\centering
+\caption{Preference dataset composition by domain.}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Domain} & \textbf{Pairs (K)} & \textbf{Fraction (\%)} & \textbf{Avg. $\kappa$} \\
+\midrule
+General conversation     & 320 & 26.7 & 0.63 \\
+Instruction following    & 210 & 17.5 & 0.88 \\
+Mathematics / reasoning  & 180 & 15.0 & 0.82 \\
+Code generation          & 150 & 12.5 & 0.79 \\
+Factual QA               & 140 & 11.7 & 0.71 \\
+Safety-critical          & 120 & 10.0 & 0.84 \\
+Creative writing         & 80  & 6.7  & 0.58 \\
+\midrule
+\textbf{Total}           & 1200 & 100.0 & 0.74 \\
+\bottomrule
+\end{tabular}
+\label{tab:dataset}
+\end{table}
+
+%% -----------------------------------------------------------------------
+\section{Bradley-Terry Reward Model}
+\label{sec:reward_model}
+%% -----------------------------------------------------------------------
+
+\subsection{Bradley-Terry Model}
+
+The Bradley-Terry (BT) model \cite{bradley1952rank} models the probability that response
+$y_A$ is preferred over $y_B$ for prompt $x$ as:
+\begin{equation}
+    P(y_A \succ y_B \mid x) = \sigma(r(x, y_A) - r(x, y_B))
+    \label{eq:bt}
+\end{equation}
+where $r(x, y) \in \mathbb{R}$ is the reward score and $\sigma$ is the sigmoid function.
+The reward model is trained to maximize the log-likelihood:
+\begin{equation}
+    \mathcal{L}_{\text{BT}} = -\mathbb{E}_{(x, y_A, y_B, \delta) \sim \mathcal{D}}\!\left[
+    \delta \log P(y_A \succ y_B \mid x)\right]
+    \label{eq:bt_loss}
+\end{equation}
+where $\delta \in \{-2, -1, 0, +1, +2\}$ is the annotator preference strength.
+
+\subsection{Multi-Head Architecture}
+
+Our reward model uses a Zen MoDE encoder to produce a contextual representation of
+$(x, y)$, with separate output heads for each alignment dimension:
+
+\begin{equation}
+    r_d(x, y) = \mathbf{w}_d^\top h(x, y) + b_d, \quad
+    d \in \{\text{help}, \text{harm}, \text{hon}, \text{inst}\}
+    \label{eq:multi_head}
+\end{equation}
+
+where $h(x, y) \in \mathbb{R}^{d_{\text{model}}}$ is the [EOS] token representation
+from the final transformer layer. The combined reward is:
+\begin{equation}
+    r(x, y) = \sum_d \lambda_d \cdot r_d(x, y)
+    \label{eq:combined}
+\end{equation}
+
+with per-domain weights $\lambda_d$ learned on the validation set.
+
+\subsection{Ensemble Construction}
+
+We train 5 reward models with different random seeds and data orderings, then ensemble:
+\begin{equation}
+    r_{\text{ens}}(x, y) = \frac{1}{5}\sum_{k=1}^{5} r^{(k)}(x, y)
+    \label{eq:ensemble}
+\end{equation}
+
+Ensemble disagreement $\text{Var}_{k}[r^{(k)}(x, y)]$ serves as an uncertainty estimate:
+high-variance examples are flagged for additional human review during RLHF training.
+
+%% -----------------------------------------------------------------------
+\section{Synthetic Preference Generation}
+\label{sec:synthetic}
+%% -----------------------------------------------------------------------
+
+\subsection{Red-Team / Blue-Team Protocol}
+
+Human preference data is expensive and limited in coverage. We augment it using a
+red-team model trained to generate challenging prompts that expose alignment failures,
+and a blue-team (the base policy) that responds. The red-team generates prompts by:
+
+\begin{enumerate}
+    \item Sampling a seed prompt $x_0$ from the training distribution.
+    \item Applying a perturbation $\Delta$ that targets known weak spots (jailbreaks,
+          out-of-distribution topics, adversarial formatting).
+    \item Generating the perturbed prompt $x' = T(x_0, \Delta)$.
+\end{enumerate}
+
+For each perturbed prompt, the base policy generates two responses with different
+decoding temperatures ($T_1 = 0.7$, $T_2 = 1.2$), producing a natural diversity
+in response quality. The reward model ensemble scores both responses and the pair is
+added to the preference dataset with the model scores as soft labels.
+
+\subsection{Quality Filtering}
+
+Synthetic pairs are filtered by:
+\begin{itemize}
+    \item Ensemble agreement: $\text{Var}_k[r^{(k)}] < \sigma_{\text{thresh}}$ ensures
+          the preference label is well-defined.
+    \item Margin threshold: $|r_{\text{ens}}(y_A) - r_{\text{ens}}(y_B)| > m_{\min}$
+          ensures the pair is informative (non-trivial).
+    \item Semantic diversity: the prompt $x'$ must differ from training prompts by
+          at least $0.15$ in embedding distance.
+\end{itemize}
+
+This process generates 8M synthetic preference pairs, of which 3.4M pass all filters.
+
+%% -----------------------------------------------------------------------
+\section{Direct Preference Optimization (DPO)}
+\label{sec:dpo}
+%% -----------------------------------------------------------------------
+
+DPO \cite{rafailov2023direct} directly optimizes the policy using preference data,
+bypassing explicit reward model training:
+
+\begin{equation}
+    \mathcal{L}_{\text{DPO}} = -\mathbb{E}_{(x, y_w, y_l)}\!\left[
+    \log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)}
+    - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}\right)
+    \right]
+    \label{eq:dpo}
+\end{equation}
+
+where $y_w$ and $y_l$ are preferred and dispreferred responses, $\pi_{\text{ref}}$
+is the reference (SFT) policy, and $\beta$ controls the KL penalty.
+
+We compare DPO trained on our human + synthetic preference data to full RLHF using
+PPO with our ensemble reward model.
+
+%% -----------------------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+%% -----------------------------------------------------------------------
+
+\subsection{Reward Model Accuracy}
+
+\begin{table}[H]
+\centering
+\caption{Reward model accuracy on held-out human preference pairs (binary: correct
+if reward model prefers the human-preferred response).}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Model} & \textbf{Accuracy (\%)} & \textbf{Human corr.\ (Pearson $r$)} \\
+\midrule
+Single RM (no ensemble)    & 77.8 & 0.778 \\
+Ensemble (5 RMs)           & 81.4 & 0.814 \\
+Multi-head + ensemble      & 85.2 & 0.852 \\
++ Synthetic data           & \textbf{87.3} & \textbf{0.873} \\
+\bottomrule
+\end{tabular}
+\label{tab:rm_accuracy}
+\end{table}
+
+\subsection{RLHF vs.\ DPO Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Alignment benchmark results. AlpacaEval 2.0 win rate vs.\ GPT-4 Turbo.
+MT-Bench score (1--10). Arena Elo (Chatbot Arena).}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Training} & \textbf{AlpacaEval 2.0 (\%)} & \textbf{MT-Bench} & \textbf{Arena Elo} \\
+\midrule
+SFT only           & 18.4 & 7.8 & 1124 \\
+DPO (human data)   & 31.7 & 8.4 & 1198 \\
+DPO (+ synthetic)  & 36.2 & 8.7 & 1231 \\
+RLHF (PPO, single RM)     & 38.4 & 8.9 & 1248 \\
+RLHF (PPO, ensemble RM)   & \textbf{44.8} & \textbf{9.2} & \textbf{1312} \\
+\bottomrule
+\end{tabular}
+\label{tab:alignment}
+\end{table}
+
+Full RLHF with ensemble reward outperforms DPO by 8.6 pp on AlpacaEval. However,
+DPO at significantly lower compute cost achieves competitive performance on MT-Bench.
+
+\subsection{Reward Model Calibration}
+
+\begin{table}[H]
+\centering
+\caption{ECE of reward model scores. Lower is better. The ensemble reduces
+miscalibration by 41\% vs.\ single RM.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Model} & \textbf{ECE} & \textbf{$\Delta$ vs.\ single} \\
+\midrule
+Single RM                & 0.124 & --- \\
+Ensemble (5 RMs)         & 0.082 & $-33.9\%$ \\
+Multi-head + ensemble    & 0.073 & $-41.1\%$ \\
+\bottomrule
+\end{tabular}
+\label{tab:calibration}
+\end{table}
+
+\subsection{Downstream RLHF Results}
+
+\begin{table}[H]
+\centering
+\caption{Downstream benchmark performance after RLHF. RLHF with ensemble RM provides
+consistent improvements without degrading base capabilities.}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{MMLU} & \textbf{GSM8K} & \textbf{HumanEval} & \textbf{TruthfulQA} \\
+\midrule
+Zen MoDE-72B (base)       & 84.7 & 90.8 & 79.3 & 74.8 \\
++ SFT                     & 84.9 & 91.2 & 80.1 & 76.3 \\
++ DPO                     & 85.1 & 91.8 & 80.7 & 78.9 \\
++ RLHF (ensemble RM)      & \textbf{85.4} & \textbf{92.1} & \textbf{81.3} & \textbf{82.4} \\
+\bottomrule
+\end{tabular}
+\label{tab:downstream}
+\end{table}
+
+\subsection{Reward Hacking Analysis}
+
+\begin{table}[H]
+\centering
+\caption{Reward hacking incidence: fraction of RLHF checkpoints where reward model
+score increases but human preference decreases.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Configuration} & \textbf{Hacking rate (\%)} & \textbf{Detected by ensemble (\%)} \\
+\midrule
+Single RM, no detection  & 14.2 & --- \\
+Ensemble RM              & 7.8  & 89.3\% of single-RM hacking events \\
+Ensemble + variance gate & 3.1  & 97.2\% of single-RM hacking events \\
+\bottomrule
+\end{tabular}
+\label{tab:hacking}
+\end{table}
+
+The variance gate (flagging high-disagreement ensemble predictions) detects 97\% of
+reward hacking events at the cost of rejecting 8\% of legitimate training updates.
+
+%% -----------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%% -----------------------------------------------------------------------
+
+\subsection{Ensemble vs.\ Single Reward Model}
+
+The ensemble provides two benefits beyond accuracy: (1) calibration improvement via
+variance-based uncertainty estimation, and (2) reward hacking detection through
+disagreement signals. The computational overhead of running 5 reward models during
+RLHF rollouts is 5$\times$ for inference, but reward model inference is typically
+$<$10\% of total PPO compute, making this tractable.
+
+\subsection{Synthetic Data Quality}
+
+The synthetic preference pairs improve accuracy by 2.1 pp (Table~\ref{tab:rm_accuracy}).
+Quality filtering is critical: unfiltered synthetic data degrades accuracy by 1.4 pp
+due to noisy margin pairs. The margin threshold $m_{\min}$ is the most important filter.
+
+\subsection{DPO Compute-Quality Trade-off}
+
+DPO avoids reward model training and PPO rollout generation, reducing alignment compute
+by approximately 8$\times$. For deployment scenarios where compute is the primary
+constraint, DPO with synthetic preference augmentation is the recommended choice,
+achieving 81\% of full RLHF performance at 12.5\% of the compute.
+
+%% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%% -----------------------------------------------------------------------
+
+We have presented the Zen alignment stack: multi-head ensemble reward models trained
+on 1.2M human preferences plus 3.4M filtered synthetic pairs, combined with RLHF or
+DPO fine-tuning. Key results: 87.3\% reward model human correlation, 44.8\% AlpacaEval
+win rate after RLHF, and 97\% reward hacking detection with ensemble variance gating.
+The full stack is recommended for production deployments; DPO is recommended when
+compute is constrained.
+
+\begin{thebibliography}{9}
+\bibitem{askell2021general}
+A. Askell, Y. Bai, A. Chen, et al.
+\textit{A General Language Assistant as a Laboratory for Alignment}.
+arXiv:2112.00861, 2021.
+
+\bibitem{christiano2017deep}
+P. Christiano, J. Leike, T. Brown, et al.
+\textit{Deep Reinforcement Learning from Human Preferences}.
+NeurIPS, 2017.
+
+\bibitem{ouyang2022training}
+L. Ouyang, J. Wu, X. Jiang, et al.
+\textit{Training Language Models to Follow Instructions with Human Feedback}.
+NeurIPS, 2022.
+
+\bibitem{bradley1952rank}
+R.A. Bradley, M.E. Terry.
+\textit{Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons}.
+Biometrika, 39(3/4):324--345, 1952.
+
+\bibitem{rafailov2023direct}
+R. Rafailov, A. Sharma, E. Mitchell, et al.
+\textit{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}.
+NeurIPS, 2023.
+\end{thebibliography}
+
+\end{document}

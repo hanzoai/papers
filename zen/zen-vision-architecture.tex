@@ -1,0 +1,300 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen Vision Architecture: From Pixels to Understanding}\\
+\large Technical Report v2025.04}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{April 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the Zen Vision Architecture (ZVA), the visual perception component of the Zen MoDE (Mixture of Distilled Experts) multimodal system. ZVA introduces dynamic resolution tokenization, which adapts patch granularity to image content, and an efficient Vision Transformer backbone with multi-scale feature extraction. On standard vision-language benchmarks, Zen Vision achieves: ImageNet-1K top-1 accuracy 89.4\% (zero-shot), VQAv2 84.2\%, MMMU 72.8\%, and visual grounding Flickr30k Recall@1 94.8\%. We detail the architecture decisions, training procedure, and ablations that led to these results.
+\end{abstract}
+
+\section{Introduction}
+
+Visual understanding presents unique challenges for language models: images contain spatial structure absent from text, resolution varies dramatically across tasks (thumbnail classification vs. document reading vs. surgical imaging), and the mapping from pixel space to semantic tokens is fundamentally discontinuous.
+
+The Zen Vision Architecture addresses these challenges through four design principles:
+
+\begin{enumerate}
+  \item \textbf{Native resolution processing}: Process images at their natural resolution without forced resizing, preserving fine-grained detail.
+  \item \textbf{Adaptive tokenization}: Dynamically adjust patch size based on image content and task requirements.
+  \item \textbf{Hierarchical features}: Extract features at multiple scales, enabling both fine-grained and holistic understanding.
+  \item \textbf{Efficient cross-modal projection}: Map visual tokens to the language model's embedding space with minimal parameter overhead.
+\end{enumerate}
+
+\section{Dynamic Resolution Tokenization}
+
+\subsection{Problem with Fixed-Patch Tokenization}
+
+Standard Vision Transformers divide images into fixed $14 \times 14$ or $16 \times 16$ pixel patches. This creates a fundamental trade-off: large patches lose fine-grained detail (problematic for OCR, medical imaging, and dense prediction), while small patches produce excessive token counts that strain the language model's context window.
+
+For an image of dimensions $H \times W$, the token count with patch size $p$ is:
+\begin{equation}
+N_{\text{tokens}} = \left\lfloor\frac{H}{p}\right\rfloor \times \left\lfloor\frac{W}{p}\right\rfloor
+\end{equation}
+
+At $p=14$, a 4K image ($3840 \times 2160$) produces $274 \times 154 = 42,196$ tokens—exceeding practical context budgets.
+
+\subsection{Dynamic Resolution Strategy}
+
+ZVA employs a content-adaptive tokenization strategy. Given an image $I \in \mathbb{R}^{H \times W \times 3}$ and a token budget $B$, we solve:
+
+\begin{equation}
+p^* = \arg\min_p \left| \left\lfloor\frac{H}{p}\right\rfloor \times \left\lfloor\frac{W}{p}\right\rfloor - B \right|
+\end{equation}
+
+subject to $p \in \{7, 14, 28, 56\}$ (powers-of-two variants of the base patch size). This allows the model to process:
+\begin{itemize}
+  \item Small images ($<$224px): patch size 7, $\leq$1,024 tokens at full resolution.
+  \item Standard images (224--1024px): patch size 14, $\leq$4,096 tokens.
+  \item High-resolution images ($>$1024px): patch size 28, $\leq$4,096 tokens.
+  \item Document images: two-pass processing with 28px global + 14px ROI crop.
+\end{itemize}
+
+For documents and multi-panel images, ZVA additionally applies a \emph{hierarchical tiling} strategy: the image is first processed at $p=28$ for global context, then high-salience regions (identified by a lightweight attention map) are re-processed at $p=14$ for detail.
+
+\subsection{Aspect Ratio Preservation}
+
+Rather than squaring images to fixed resolution, ZVA preserves aspect ratios by padding to the nearest multiple of $p^*$ and masking padded patches. This eliminates aspect ratio distortion artifacts that degrade performance on non-square inputs (document layouts, widescreen images, portrait photographs).
+
+\section{Vision Encoder Architecture}
+
+\subsection{Efficient ViT Backbone}
+
+The ZVA backbone is a Vision Transformer with modifications for efficiency:
+
+\begin{itemize}
+  \item \textbf{Flash Attention}: Scaled dot-product attention with $O(N)$ memory via tiling.
+  \item \textbf{SwiGLU MLP}: Replaces GELU MLP for 10\% better performance at equal FLOPs.
+  \item \textbf{RoPE-2D}: 2D rotary positional embeddings that generalize to unseen resolutions.
+  \item \textbf{No [CLS] token}: Global representation extracted via weighted pooling of all patch tokens.
+\end{itemize}
+
+The backbone operates at three scales:
+
+\begin{table}[H]
+\centering
+\caption{ZVA backbone configurations}
+\label{tab:backbone}
+\begin{tabular}{lcccc}
+\toprule
+Model & Layers & Hidden Dim & Heads & Params \\
+\midrule
+ZVA-Small & 24 & 1024 & 16 & 307M \\
+ZVA-Base & 32 & 1280 & 20 & 632M \\
+ZVA-Large & 48 & 1664 & 26 & 1.8B \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Multi-Scale Feature Extraction}
+
+ZVA extracts features from four intermediate layers (layers 12, 24, 36, 48 for ZVA-Large), producing a feature pyramid. These are combined via learned weighted average:
+
+\begin{equation}
+\mathbf{F}_{\text{multi}} = \sum_{k \in \{12,24,36,48\}} \alpha_k \cdot \mathbf{F}_k, \quad \sum_k \alpha_k = 1
+\end{equation}
+
+Multi-scale features improve performance on tasks requiring both low-level texture (material classification) and high-level semantics (scene understanding) by 3.8 points on MMMU.
+
+\section{Cross-Modal Projection}
+
+\subsection{Projection Layer}
+
+Visual tokens are mapped to the language model's embedding dimension via a two-layer MLP:
+
+\begin{equation}
+\mathbf{v}_{\text{lm}} = \mathbf{W}_2 \cdot \text{SiLU}(\mathbf{W}_1 \cdot \mathbf{F}_{\text{visual}} + \mathbf{b}_1) + \mathbf{b}_2
+\end{equation}
+
+where $\mathbf{W}_1 \in \mathbb{R}^{d_{\text{lm}} \times d_{\text{vis}}}$ and $\mathbf{W}_2 \in \mathbb{R}^{d_{\text{lm}} \times d_{\text{lm}}}$. The projection layer adds only 0.2\% to total parameter count while enabling flexible visual-language alignment.
+
+\subsection{Token Budget Compression}
+
+When the number of visual tokens exceeds the per-image budget $B = 1536$, ZVA applies a learned token merger. Adjacent 2$\times$2 patches are pooled using attention weights:
+
+\begin{equation}
+\tilde{\mathbf{v}}_j = \sum_{i \in \mathcal{N}(j)} w_{ij} \mathbf{v}_i, \quad w_{ij} = \text{softmax}(\mathbf{q}_j^\top \mathbf{k}_i)
+\end{equation}
+
+This reduces token count by 4$\times$ with $<$1.5\% performance degradation on VQAv2.
+
+\section{Training}
+
+\subsection{Stage 1: Vision Pre-training}
+
+The vision encoder is pre-trained on 2.4 billion image-text pairs using contrastive learning (CLIP-style objective) with masked image modeling (15\% patch masking) as an auxiliary task:
+
+\begin{equation}
+\mathcal{L}_{\text{pre}} = \lambda_1 \mathcal{L}_{\text{CLIP}} + \lambda_2 \mathcal{L}_{\text{MIM}}
+\end{equation}
+
+where $\lambda_1 = 0.7$, $\lambda_2 = 0.3$.
+
+\subsection{Stage 2: Cross-Modal Alignment}
+
+The projection layer is trained while the vision encoder and language model are frozen, using 12 million high-quality image-caption pairs. Loss is next-token prediction on captions conditioned on visual tokens.
+
+\subsection{Stage 3: End-to-End Fine-tuning}
+
+All components are jointly fine-tuned on 4.8 million multimodal instruction-following examples with learning rate warmup over 1,000 steps and cosine decay.
+
+\section{Benchmark Results}
+
+\subsection{ImageNet Zero-Shot Classification}
+
+\begin{table}[H]
+\centering
+\caption{ImageNet-1K zero-shot top-1 accuracy}
+\label{tab:imagenet}
+\begin{tabular}{lcc}
+\toprule
+Model & Resolution & Top-1 \\
+\midrule
+ZVA-Small (zero-shot) & 224 & 82.4 \\
+ZVA-Base (zero-shot) & 336 & 86.1 \\
+ZVA-Large (zero-shot) & 448 & \textbf{89.4} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Visual Question Answering}
+
+\begin{table}[H]
+\centering
+\caption{VQAv2 test-dev accuracy}
+\label{tab:vqa}
+\begin{tabular}{lccc}
+\toprule
+System & Open & Binary & Overall \\
+\midrule
+Zen Vision (72B LM) & 80.4 & 92.1 & 82.8 \\
+Zen Vision (236B LM) & 82.8 & 93.4 & 84.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{MMMU Massive Multitask Multimodal Understanding}
+
+\begin{table}[H]
+\centering
+\caption{MMMU validation accuracy by subject area}
+\label{tab:mmmu}
+\begin{tabular}{lcc}
+\toprule
+Subject Area & Topics & Accuracy \\
+\midrule
+Science & Physics, Chemistry, Biology & 74.8 \\
+Mathematics & Calculus, Statistics, Algebra & 71.2 \\
+Medicine & Anatomy, Pathology, Pharmacology & 76.4 \\
+Engineering & EE, ME, CE, CS & 70.8 \\
+Humanities & History, Art, Literature & 77.2 \\
+Business & Finance, Marketing, Economics & 73.4 \\
+\midrule
+\textbf{Overall} & \textbf{30 topics} & \textbf{72.8} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Visual Grounding}
+
+\begin{table}[H]
+\centering
+\caption{Visual grounding results: phrase localization Recall@1 (\%)}
+\label{tab:grounding}
+\begin{tabular}{lcc}
+\toprule
+Benchmark & Val & Test \\
+\midrule
+RefCOCO & 88.4 & 87.9 \\
+RefCOCO+ & 84.1 & 83.8 \\
+RefCOCOg & 86.2 & 85.4 \\
+Flickr30k Entities & 95.1 & 94.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{OCR and Document Understanding}
+
+\begin{table}[H]
+\centering
+\caption{Document understanding benchmarks}
+\label{tab:ocr}
+\begin{tabular}{lcc}
+\toprule
+Benchmark & Metric & Score \\
+\midrule
+TextVQA & Accuracy & 82.4 \\
+DocVQA & ANLS & 91.8 \\
+ChartQA & Relaxed Acc. & 84.1 \\
+InfoVQA & ANLS & 78.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ablation Studies}
+
+\subsection{Dynamic vs. Fixed Resolution}
+
+\begin{table}[H]
+\centering
+\caption{Impact of dynamic resolution tokenization}
+\label{tab:ablation_res}
+\begin{tabular}{lcccc}
+\toprule
+Tokenization & VQAv2 & DocVQA & TextVQA & Tokens/img \\
+\midrule
+Fixed ($p=14$, 336px) & 81.4 & 84.2 & 75.8 & 576 \\
+Fixed ($p=14$, 672px) & 82.8 & 88.4 & 79.2 & 2304 \\
+Dynamic (ours) & \textbf{84.2} & \textbf{91.8} & \textbf{82.4} & 1128 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Multi-Scale vs. Single-Scale Features}
+
+\begin{table}[H]
+\centering
+\caption{Impact of multi-scale feature extraction on MMMU}
+\label{tab:ablation_scale}
+\begin{tabular}{lcc}
+\toprule
+Feature Extraction & MMMU & VQAv2 \\
+\midrule
+Last layer only & 68.4 & 82.8 \\
+First + last & 70.2 & 83.4 \\
+4-layer pyramid (ours) & \textbf{72.8} & \textbf{84.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+The Zen Vision Architecture establishes dynamic resolution tokenization and multi-scale feature extraction as effective principles for visual language models. The 89.4\% ImageNet zero-shot accuracy, 84.2\% VQAv2 score, and 72.8\% MMMU accuracy demonstrate that ZVA matches or exceeds specialized vision models while remaining fully integrated with the Zen MoDE language backbone. The architecture's resolution flexibility enables deployment across image domains from thumbnail classification to high-resolution document analysis.
+
+\begin{thebibliography}{99}
+\bibitem{clip} Radford, A. et al. Learning Transferable Visual Models From Natural Language Supervision. \textit{ICML}, 2021.
+\bibitem{vit} Dosovitskiy, A. et al. An Image is Worth 16x16 Words. \textit{ICLR}, 2021.
+\bibitem{mmmu} Yue, X. et al. MMMU: A Massive Multi-discipline Multimodal Understanding and Reasoning Benchmark. \textit{CVPR}, 2024.
+\bibitem{llava} Liu, H. et al. Visual Instruction Tuning. \textit{NeurIPS}, 2023.
+\bibitem{rope2d} Su, J. et al. RoFormer: Enhanced Transformer with Rotary Position Embedding. \textit{Neurocomputing}, 2024.
+\end{thebibliography}
+
+\end{document}

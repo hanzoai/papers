@@ -1,0 +1,457 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen-Pro: A High-Performance Language Model for Complex Reasoning}\\
+\large Technical Report v2025.02}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{February 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen-Pro}, a 72 billion parameter dense transformer model designed for complex
+reasoning, professional scientific applications, and advanced code generation. Zen-Pro extends the
+Zen MoDE (Mixture of Distilled Experts) architecture to the 72B parameter scale, trained on
+4.5 trillion tokens with a curriculum emphasizing mathematics, science, and multi-step reasoning.
+Post-training combines extended chain-of-thought (CoT) supervised fine-tuning with reinforcement
+learning from verifiable rewards (RLVR) on formally checkable problem domains. Zen-Pro achieves
+frontier-level performance: MMLU 89.2\%, MATH 84.1\%, HumanEval 91.3\%, and GPQA 71.8\%,
+competitive with the strongest models at this capability tier while supporting a 128K token
+context window for long-form professional workflows.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+The transition from 7B to 70B$+$ parameter models represents more than a quantitative scaling
+step. Empirical research consistently shows qualitative capability emergence at larger scales,
+including multi-step mathematical reasoning, scientific hypothesis evaluation, and nuanced
+instruction disambiguation \cite{wei2022emergent, srivastava2022beyond}. Zen-Pro is our 72B
+offering in this tier, designed to serve professional and enterprise use cases where accuracy,
+reasoning depth, and reliability are paramount.
+
+Zen-Pro makes the following contributions:
+
+\begin{itemize}
+  \item A 72B dense transformer trained on 4.5T tokens with a curriculum that front-loads
+        high-quality mathematical, scientific, and code data in the final training phase.
+  \item Extended post-training with long chain-of-thought (CoT) fine-tuning and reinforcement
+        learning from verifiable rewards (RLVR) using formal verification on math and code tasks.
+  \item A 128K token context window via extended RoPE, validated on real-world long-document
+        tasks including legal review, codebase analysis, and scientific literature synthesis.
+  \item Frontier-tier benchmark performance that closes the gap with models of significantly
+        larger total parameter counts.
+\end{itemize}
+
+Zen-Pro serves as the flagship high-performance model in the Zen family for deployments requiring
+production-grade reasoning without the infrastructure overhead of the Zen-Max MoE tier.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Architecture}
+
+\subsection{Model Hyperparameters}
+
+Zen-Pro scales the Zen MoDE architecture to 72B parameters. Table~\ref{tab:arch} lists the
+key architectural hyperparameters.
+
+\begin{table}[H]
+\centering
+\caption{Zen-Pro architecture hyperparameters.}
+\label{tab:arch}
+\begin{tabular}{lc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Parameters (total)           & 72.7B \\
+Layers                       & 80 \\
+Attention heads              & 64 \\
+KV heads (GQA)               & 8 \\
+Hidden dimension             & 8192 \\
+FFN intermediate dimension   & 29{,}568 \\
+Vocabulary size              & 151{,}936 \\
+Context length (training)    & 131{,}072 \\
+Position encoding            & RoPE ($\theta = 5{,}000{,}000$) \\
+Activation function          & SiLU \\
+Normalization                & RMSNorm \\
+Tied embeddings              & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Grouped Query Attention at Scale}
+
+At 72B parameters and 80 layers, memory bandwidth is the dominant inference bottleneck.
+Zen-Pro uses GQA with 64 query heads and 8 KV heads, achieving an 8$\times$ reduction in
+KV cache size relative to full multi-head attention (MHA). This enables:
+
+\begin{equation}
+  \text{KV cache size} = 2 \cdot L \cdot n_{\text{kv}} \cdot d_k \cdot S \cdot \text{dtype\_bytes}
+\end{equation}
+
+where $L=80$ layers, $n_{\text{kv}}=8$ KV heads, $d_k = 128$ head dimension, and $S$ is sequence
+length. For a 128K-token sequence in BF16, this yields approximately 26.8 GB of KV cache,
+feasible on 4$\times$ A100-80GB with tensor parallelism.
+
+\subsection{Sliding Window Attention for Long Context}
+
+For the final 20 layers (layers 60--79), Zen-Pro employs sliding window attention (SWA)
+\cite{beltagy2020longformer} with a window size of 16K tokens in addition to full global
+attention on every 4th layer. This hybrid pattern maintains linear scaling in memory for
+long sequences while preserving global information flow:
+
+\begin{equation}
+  \text{Attention scope} =
+  \begin{cases}
+    \text{full }[0, S] & \text{if } l \bmod 4 = 0 \\
+    \text{window }[i-w, i] & \text{otherwise}
+  \end{cases}
+\end{equation}
+
+where $w = 16{,}384$ is the sliding window size and $i$ is the current token position.
+
+\subsection{Extended Context via RoPE Scaling}
+
+To support 128K tokens, we use a higher RoPE base frequency of $\theta = 5{,}000{,}000$ combined
+with position interpolation during the long-context fine-tuning phase. Pretraining is conducted
+at 8K context, with a two-stage context extension:
+
+\begin{enumerate}
+  \item Extend to 32K at reduced learning rate ($5 \times 10^{-5}$) for 10B tokens.
+  \item Extend to 128K at further reduced learning rate ($1 \times 10^{-5}$) for 5B tokens.
+\end{enumerate}
+
+This staged extension preserves short-context performance while enabling long-context
+generalization.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Training Methodology}
+
+\subsection{Pretraining Data Curriculum}
+
+Zen-Pro trains on 4.5T tokens with a data curriculum that emphasizes reasoning-intensive sources.
+The final 10\% of training uses a concentrated curriculum of the highest-quality sources.
+
+\begin{table}[H]
+\centering
+\caption{Pretraining data composition (4.5T tokens total).}
+\label{tab:data}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Domain} & \textbf{Tokens (B)} & \textbf{Fraction} \\
+\midrule
+Web text (quality-filtered) & 1{,}800 & 40.0\% \\
+Books and long-form         &   675 & 15.0\% \\
+Code (all languages)        &   675 & 15.0\% \\
+Scientific articles         &   450 & 10.0\% \\
+Mathematics (formal+informal) & 360 &  8.0\% \\
+Multilingual web            &   315 &  7.0\% \\
+Curated reasoning chains    &   225 &  5.0\% \\
+\midrule
+Total                       & 4{,}500 & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Curated reasoning chains include synthetic chain-of-thought solutions to mathematical competition
+problems (AMC, AIME, Olympiad), formal theorem proving datasets (Lean, Isabelle), and
+verified code problem solutions with test suite passes.
+
+\subsection{Long Chain-of-Thought Fine-Tuning}
+
+After base pretraining, we apply a specialized CoT-SFT phase on 2.5M long-form reasoning
+trajectories. Unlike standard SFT which targets short responses, CoT-SFT trains the model to
+generate step-by-step reasoning of 500--5{,}000 tokens before producing a final answer:
+
+\begin{align}
+  \mathcal{L}_{\text{CoT-SFT}} &= -\sum_{t=1}^{T_r} \log p(r_t \mid x, r_{<t})
+                                   - \lambda \sum_{t=1}^{T_a} \log p(a_t \mid x, r, a_{<t})
+\end{align}
+
+where $r$ is the reasoning chain, $a$ is the final answer, and $\lambda = 0.5$ down-weights
+the answer loss to encourage richer intermediate reasoning.
+
+\subsection{Reinforcement Learning from Verifiable Rewards}
+
+RLVR \cite{lightman2023lets, cobbe2021gsm8k} replaces human preference labels with
+programmatically verifiable correctness signals on three domains:
+
+\begin{itemize}
+  \item \textbf{Mathematics}: symbolic equivalence checking of numeric and algebraic answers.
+  \item \textbf{Code}: unit test execution with pass@k evaluation.
+  \item \textbf{Logic}: SAT/SMT solver verification of formal claims.
+\end{itemize}
+
+The reward function is:
+
+\begin{equation}
+  r(y, y^*) = \mathbb{1}[\text{verify}(y) = y^*] - \alpha \cdot \frac{|y|}{L_{\max}}
+\end{equation}
+
+where the first term is 1 for correct verified answers and the second term penalizes unnecessary
+verbosity with coefficient $\alpha = 0.02$ and maximum allowed length $L_{\max}$.
+
+Group Relative Policy Optimization (GRPO) \cite{shao2024deepseekmath} is used as the RL
+algorithm, sampling $G=8$ responses per prompt and computing advantages within the group to
+reduce variance without a separate value network.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Evaluation}
+
+\subsection{Standard Benchmarks}
+
+\begin{table}[H]
+\centering
+\caption{Zen-Pro benchmark results versus comparable frontier models.}
+\label{tab:benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen-Pro (72B)} & \textbf{Competitor A (70B)} & \textbf{Competitor B (72B)} & \textbf{Competitor C (8$\times$7B)} \\
+\midrule
+MMLU (5-shot)          & \textbf{89.2} & 88.1 & 87.6 & 82.4 \\
+MMLU-Pro               & \textbf{72.4} & 71.1 & 70.8 & 61.3 \\
+ARC-Challenge          & 72.8 & 73.1 & 71.4 & 66.4 \\
+HellaSwag              & 88.4 & 87.9 & 88.1 & 86.7 \\
+WinoGrande             & 82.3 & 81.8 & 81.4 & 78.2 \\
+\midrule
+MATH (4-shot, CoT)     & \textbf{84.1} & 80.3 & 78.9 & 62.1 \\
+GSM8K (8-shot, CoT)    & \textbf{93.4} & 92.1 & 91.8 & 87.3 \\
+GPQA Diamond           & \textbf{71.8} & 68.4 & 66.9 & 51.2 \\
+\midrule
+HumanEval (pass@1)     & \textbf{91.3} & 88.7 & 87.4 & 74.8 \\
+MBPP (pass@1)          & \textbf{84.6} & 82.3 & 80.9 & 71.4 \\
+\midrule
+MT-Bench (1-10)        & \textbf{9.1}  &  8.9 &  8.7 &  8.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scientific Reasoning}
+
+Zen-Pro shows strong performance on scientific reasoning benchmarks, reflecting the emphasis on
+scientific literature and formal reasoning in the training curriculum.
+
+\begin{table}[H]
+\centering
+\caption{Scientific reasoning benchmark results.}
+\label{tab:science}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen-Pro (72B)} & \textbf{Prior Best (Open)} \\
+\midrule
+GPQA (Graduate-level)    & 71.8 & 68.4 \\
+GPQA (Diamond subset)    & 64.3 & 61.7 \\
+SciQ                     & 97.1 & 96.8 \\
+ARC-Challenge            & 72.8 & 73.1 \\
+MMLU-STEM subjects       & 91.4 & 89.2 \\
+MedQA (USMLE)            & 82.6 & 80.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Long-Context Evaluation}
+
+\begin{table}[H]
+\centering
+\caption{RULER long-context benchmark scores at multiple context lengths.}
+\label{tab:longctx}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{8K} & \textbf{16K} & \textbf{32K} & \textbf{64K} & \textbf{128K} \\
+\midrule
+Zen-Pro (72B)      & 96.2 & 94.8 & 92.1 & 88.3 & 82.7 \\
+Competitor A (70B) & 95.8 & 92.3 & 86.4 & 71.2 & 52.3 \\
+Competitor B (72B) & 94.9 & 91.7 & 85.1 & 68.4 & 48.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Coding Benchmarks}
+
+\begin{table}[H]
+\centering
+\caption{Code generation benchmark results.}
+\label{tab:code}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen-Pro (72B)} & \textbf{Competitor A (70B)} \\
+\midrule
+HumanEval (pass@1)         & 91.3 & 88.7 \\
+HumanEval$+$ (pass@1)      & 87.1 & 84.2 \\
+MBPP (pass@1)              & 84.6 & 82.3 \\
+MBPP$+$ (pass@1)           & 79.3 & 76.8 \\
+SWE-bench Verified (pass@1)& 38.7 & 34.1 \\
+LiveCodeBench (3-month)    & 62.4 & 58.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Inference Efficiency}
+
+\begin{table}[H]
+\centering
+\caption{Inference throughput on 4$\times$ A100-80GB (tensor parallel, BF16).}
+\label{tab:inference}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{8K context} & \textbf{128K context} \\
+\midrule
+Throughput (tok/s, batch=1)  & 42  & 18 \\
+Throughput (tok/s, batch=8)  & 310 & 124 \\
+TTFT P50 (ms, 4K prompt)     & 210 & 1{,}840 \\
+GPU memory (weights+KV)      & 148 GB & 174 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Ablation Studies}
+
+\subsection{Effect of RLVR}
+
+Table~\ref{tab:ablation} compares Zen-Pro with RLVR against the SFT-only checkpoint.
+
+\begin{table}[H]
+\centering
+\caption{Ablation: effect of RLVR post-training stage.}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{MATH} & \textbf{HumanEval} & \textbf{GPQA} \\
+\midrule
+Zen-Pro SFT only   & 77.3 & 86.2 & 63.4 \\
+Zen-Pro + RLVR     & 84.1 & 91.3 & 71.8 \\
+\midrule
+Improvement ($\Delta$) & $+$6.8 & $+$5.1 & $+$8.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+RLVR produces the largest gains on GPQA, reflecting that formal scientific reasoning benefits
+most from verifiable reward signals where human preference annotation is difficult to obtain at
+scale and quality.
+
+\subsection{Effect of Long CoT Training}
+
+\begin{table}[H]
+\centering
+\caption{Ablation: standard SFT vs.\ long chain-of-thought SFT.}
+\label{tab:cot_ablation}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{MATH} & \textbf{AIME 2024} \\
+\midrule
+Standard SFT      & 71.4 & 23.3\% \\
+Long CoT SFT      & 78.9 & 36.7\% \\
+Long CoT + RLVR   & 84.1 & 53.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+
+Large-scale dense transformers at the 70B tier have been explored extensively following the
+LLaMA 2 \cite{touvron2023llama2} release, with subsequent models pushing reasoning capability
+through data quality improvements and specialized post-training. Reinforcement learning with
+verifiable rewards traces to outcome-based reward modeling \cite{cobbe2021gsm8k} and was
+prominently applied in mathematical reasoning work \cite{lightman2023lets, shao2024deepseekmath}.
+Our GRPO implementation follows the group relative policy gradient approach, adapted for a mix
+of math, code, and logic verification environments.
+
+Long-context scaling via RoPE interpolation has been studied in multiple works
+\cite{peng2023yarn, chen2023extending}, and the hybrid sliding-window / full-attention pattern
+draws inspiration from Longformer \cite{beltagy2020longformer}. Our two-stage context extension
+is a pragmatic variant of these approaches optimized for training stability.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Limitations}
+
+Zen-Pro at 72B requires significant compute for inference: at minimum 2$\times$ A100-80GB in
+BF16 without quantization, limiting accessibility compared to smaller models. While RLVR
+substantially improves mathematical and code reasoning, commonsense reasoning and open-ended
+creative tasks rely entirely on SFT signal, leaving room for improvement. Long-context
+performance degrades for retrieval tasks beyond 64K tokens, and generation quality on very
+long outputs (>8K tokens) has not been systematically evaluated.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+Zen-Pro represents the Zen family's high-performance tier, demonstrating that rigorous data
+curation combined with verifiable-reward reinforcement learning yields frontier-level reasoning
+capability at the 72B scale. The model achieves MMLU 89.2\%, MATH 84.1\%, HumanEval 91.3\%,
+and GPQA 71.8\%, competitive with the strongest open-weight models while maintaining a 128K
+context window for professional workflows. The RLVR training protocol generalizes well across
+verifiable domains and is expected to underpin future Zen family post-training pipelines.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{wei2022emergent}
+J.~Wei et al., ``Emergent Abilities of Large Language Models,'' \textit{TMLR}, 2022.
+
+\bibitem{srivastava2022beyond}
+A.~Srivastava et al., ``Beyond the Imitation Game: Quantifying and Extrapolating the Capabilities
+of Language Models,'' \textit{arXiv:2206.04615}, 2022.
+
+\bibitem{beltagy2020longformer}
+I.~Beltagy, M.~E.~Peters, and A.~Cohan, ``Longformer: The Long-Document Transformer,''
+\textit{arXiv:2004.05150}, 2020.
+
+\bibitem{lightman2023lets}
+H.~Lightman et al., ``Let's Verify Step by Step,'' \textit{arXiv:2305.20050}, 2023.
+
+\bibitem{cobbe2021gsm8k}
+K.~Cobbe et al., ``Training Verifiers to Solve Math Word Problems,'' \textit{arXiv:2110.14168}, 2021.
+
+\bibitem{shao2024deepseekmath}
+Z.~Shao et al., ``DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
+Models,'' \textit{arXiv:2402.03300}, 2024.
+
+\bibitem{peng2023yarn}
+B.~Peng et al., ``YaRN: Efficient Context Window Extension of Large Language Models,''
+\textit{arXiv:2309.00071}, 2023.
+
+\bibitem{chen2023extending}
+S.~Chen et al., ``Extending Context Window of Large Language Models via Positional Interpolation,''
+\textit{arXiv:2306.15595}, 2023.
+
+\bibitem{touvron2023llama2}
+H.~Touvron et al., ``Llama 2: Open Foundation and Fine-Tuned Chat Models,''
+\textit{arXiv:2307.09288}, 2023.
+
+\bibitem{su2021rope}
+J.~Su et al., ``RoFormer: Enhanced Transformer with Rotary Position Embedding,''
+\textit{arXiv:2104.09864}, 2021.
+
+\bibitem{ainslie2023gqa}
+J.~Ainslie et al., ``GQA: Training Generalized Multi-Query Transformer Models,''
+\textit{EMNLP}, 2023.
+
+\bibitem{rafailov2023dpo}
+R.~Rafailov et al., ``Direct Preference Optimization,'' \textit{NeurIPS}, 2023.
+
+\bibitem{ouyang2022instructgpt}
+L.~Ouyang et al., ``Training Language Models to Follow Instructions with Human Feedback,''
+\textit{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+\end{document}

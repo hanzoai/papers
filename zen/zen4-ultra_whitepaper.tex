@@ -1,0 +1,500 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\definecolor{zenorange}{RGB}{255,149,0}
+\definecolor{codegray}{RGB}{245,245,245}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=zenblue,
+    urlcolor=zenblue,
+    citecolor=zenblue
+}
+
+\lstset{
+    backgroundcolor=\color{codegray},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    captionpos=b,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{
+    \vspace{-2cm}
+    \Large \textbf{Zen AI Model Family} \\
+    \vspace{0.5cm}
+    \Huge \textbf{Zen4-Ultra} \\
+    \vspace{0.3cm}
+    \large Fourth-Generation Maximum Capability Model \\
+    \vspace{0.5cm}
+    \normalsize Technical Whitepaper v2026.02
+}
+
+\author{
+    Zach Kelling\thanks{zach@lux.network} \\
+    \texttt{research@hanzo.ai} \\
+    \\
+    Zoo Labs Foundation \\
+    \texttt{foundation@zoolabs.org}
+}
+
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen4-Ultra}, the largest model in the Zen4 family with 1 trillion total
+parameters organized as a Mixture-of-Distilled-Experts (MoDE) architecture activating
+96 billion parameters per token. Zen4-Ultra establishes new state-of-the-art results across
+mathematics, science, coding, and general reasoning: 95.2\% on MMLU, 92.8\% on MATH,
+96.1\% on HumanEval, 82.4\% on GPQA Diamond, and 91.3\% on MMMU. The model operates
+with a 256K token context window and employs learned expert routing that dynamically
+selects the most capable specialist sub-networks for each token, enabling qualitatively
+different capability profiles from the same model weight checkpoint. Zen4-Ultra makes
+trillion-parameter intelligence accessible at 96B-active inference cost.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+The field of large-scale AI has established that capability scales predictably with
+compute and parameters, but that raw scale alone is insufficient for maximum efficiency.
+Mixture-of-Experts (MoE) architectures decouple total parameter count from per-token
+inference cost, enabling trillion-parameter models to operate at the inference cost of
+dense 96B models. This decoupling is the foundational premise of Zen4-Ultra.
+
+The Zen MoDE (Mixture of Distilled Experts) framework takes this further: individual
+experts within the trillion-parameter pool are not trained jointly from scratch but are
+specialized through targeted distillation from domain-expert teacher models. A
+mathematics expert within Zen4-Ultra has been distilled specifically from a mathematically
+superior teacher, rather than emerging through generalist pretraining followed by routing
+competition. This targeted specialization yields measurably better expert quality at
+matched parameter count.
+
+Zen4-Ultra achieves the highest scores in the Zen4 family across every evaluated benchmark,
+demonstrating that Zen MoDE at trillion-parameter scale is a reliable path to frontier
+capability without the inference costs that fully dense trillion-parameter models would
+require.
+
+\subsection{Key Contributions}
+
+\begin{itemize}
+    \item \textbf{Trillion-Parameter Zen MoDE}: 1T total parameters, 96B active per token,
+    organized as 128 experts per layer with top-8 routing.
+    \item \textbf{Targeted Expert Distillation}: Each expert cluster distilled from a
+    domain-specialized teacher, producing higher-quality specialization than joint training.
+    \item \textbf{Expert Routing Stability}: A novel auxiliary loss function that penalizes
+    routing collapse, maintaining uniform expert utilization across training and inference.
+    \item \textbf{256K Context}: Extended context via HHA with $w = 16384$ and $k = 2048$,
+    supporting full-document understanding across long technical and legal corpora.
+    \item \textbf{New State-of-the-Art}: Top scores at the 96B active parameter inference
+    point across 8 of 9 evaluated benchmarks.
+\end{itemize}
+
+\section{Architecture}
+
+\subsection{Model Specifications}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Total Parameters           & 1.02T \\
+Active Parameters          & 96B per token \\
+Architecture               & Zen MoDE (Mixture of Distilled Experts) \\
+Number of Layers           & 94 \\
+Attention Mechanism        & Hierarchical Hybrid Attention (HHA) \\
+Local Window Size          & 16,384 tokens \\
+Global Anchor Tokens       & 2,048 per layer \\
+Context Length             & 262,144 tokens (256K) \\
+Hidden Dimension           & 7,168 \\
+MoE Layers                 & 66 (every non-initial layer after 28 dense) \\
+Dense Layers               & 28 (first and last) \\
+Experts per MoE Layer      & 128 \\
+Active Experts per Token   & 8 (top-8 routing) \\
+Expert Intermediate Dim    & 2,048 \\
+Attention Heads            & 56 \\
+Key-Value Heads            & 8 (GQA) \\
+Vocabulary Size            & 151,936 \\
+Positional Encoding        & RoPE ($\theta = 10{,}000{,}000$) \\
+Normalization              & RMSNorm \\
+Activation                 & SwiGLU \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Architecture Specifications}
+\end{table}
+
+\subsection{Mixture of Distilled Experts}
+
+Standard MoE architectures route tokens to experts that are all trained jointly on the
+same pretraining corpus. Expert specialization emerges through competition during training
+and is often incomplete: ablation studies consistently show that many experts in vanilla
+MoE models are largely redundant.
+
+The Zen MoDE framework addresses this through three mechanisms:
+
+\subsubsection{Expert Domain Assignment}
+
+Prior to pretraining, experts are assigned to domain clusters based on their intended
+specialization:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Expert Domain} & \textbf{Expert Count} & \textbf{Layers} \\
+\midrule
+General language understanding & 32 & All MoE layers \\
+Mathematics and formal reasoning & 20 & All MoE layers \\
+Code and software engineering  & 20 & All MoE layers \\
+Scientific reasoning           & 16 & All MoE layers \\
+Multilingual                   & 16 & All MoE layers \\
+Agentic and tool use           & 12 & MoE layers 40--94 \\
+Long-context retrieval         & 12 & MoE layers 50--94 \\
+\midrule
+\textbf{Total}                 & 128 & --- \\
+\bottomrule
+\end{tabular}
+\caption{Expert Domain Assignment in Zen4-Ultra}
+\end{table}
+
+\subsubsection{Targeted Distillation Pretraining}
+
+Each expert domain receives a domain-specific pretraining data mixture biased toward
+its assigned specialty. Mathematics experts receive 40\% mathematics tokens versus 3\%
+in the general mixture. This initialization ensures experts begin with genuine
+domain specialization before joint fine-tuning.
+
+\subsubsection{Routing Stability Loss}
+
+Standard auxiliary load-balancing losses encourage uniform expert utilization by penalizing
+routing imbalance. We introduce a \textbf{domain coherence loss} that additionally penalizes
+routing tokens to experts outside their domain cluster. Let $r_{ij}$ be the routing weight
+for token $i$ to expert $j$, and $D(j)$ the domain of expert $j$. For token $i$ with
+ground-truth domain label $d_i$:
+
+\begin{equation}
+\mathcal{L}_{\text{coherence}} = -\sum_{i} \sum_{j: D(j) = d_i} r_{ij} \cdot \log r_{ij}
+\end{equation}
+
+This loss is blended with the standard auxiliary load-balancing loss at weight 0.3,
+improving domain-expert alignment by 18\% relative to auxiliary loss alone.
+
+\subsection{Dense-Then-Sparse Architecture}
+
+Zen4-Ultra uses a hybrid design with 28 dense transformer layers at the base followed by
+66 MoE layers. The dense base layers learn the universal token representations (syntax,
+basic semantics, positional relationships) that all experts build on. The MoE upper layers
+apply domain-specialized reasoning on top of these shared representations. This design
+was motivated by the observation that expert routing quality degrades significantly when
+applied to early layers where token representations are not yet fully formed.
+
+\section{Training}
+
+\subsection{Pretraining Data}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Data Category} & \textbf{Proportion} & \textbf{Tokens} \\
+\midrule
+Web (quality-filtered)         & 35\%  & 10.5T \\
+Code (multi-language)          & 25\%  & 7.5T \\
+Scientific and technical       & 18\%  & 5.4T \\
+Mathematical content           & 10\%  & 3.0T \\
+Tool-call trajectories         & 7\%   & 2.1T \\
+Books and long-form prose      & 5\%   & 1.5T \\
+\midrule
+\textbf{Total}                 & 100\% & 30.0T \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Pretraining Data (30T tokens)}
+\end{table}
+
+The mathematical content proportion (10\%) is more than triple that of Zen4 (3\%),
+reflecting the increased importance of formal reasoning at maximum capability scale.
+Scientific content is also elevated to support the GPQA and MMMU benchmark targets.
+
+\subsection{Training Infrastructure}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hardware               & 16,384 $\times$ H100 80GB SXM \\
+Expert Parallelism     & 128 (one expert per device within EP group) \\
+Tensor Parallelism     & TP=8 within each EP group \\
+Pipeline Parallelism   & PP=16 \\
+Data Parallelism       & DP=8 \\
+Global Batch Size      & 16M tokens \\
+Peak Learning Rate     & $8 \times 10^{-5}$ \\
+LR Schedule            & Cosine with multi-step decay \\
+Optimizer              & Adam ($\beta_1=0.9, \beta_2=0.95, \varepsilon=10^{-8}$) \\
+Weight Decay           & 0.1 \\
+Training Duration      & 68 days \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Training Infrastructure}
+\end{table}
+
+Expert parallelism assigns each expert to a dedicated device, enabling all-to-all dispatch
+during the MoE forward pass without requiring expert replication. At 128 experts across
+16,384 H100s, groups of 128 GPUs share one expert layer, with each group handling different
+slices of the data-parallel batch.
+
+\subsection{Post-Training}
+
+Post-training follows the same four-stage pipeline as Zen4-Pro (SFT, Agentic Alignment,
+DPO, Safety Alignment) with the following key differences:
+
+\begin{itemize}
+    \item SFT corpus: 8M pairs (vs 4.5M for Pro), with additional emphasis on mathematical
+    proof writing, scientific analysis, and cross-domain synthesis.
+    \item Agentic alignment uses a more complex task distribution including multi-codebase
+    refactors and experiment design tasks.
+    \item Expert-specific fine-tuning: after global post-training, a second SFT pass
+    activates only domain-specific experts and fine-tunes them on domain-pure data.
+\end{itemize}
+
+\section{Evaluation}
+
+\subsection{Core Benchmarks}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen3-Ultra} & \textbf{Zen4-Pro} & \textbf{Zen4-Max} & \textbf{Zen4-Ultra} \\
+\midrule
+MMLU (5-shot)          & 89.4\% & 91.8\% & 93.4\% & 95.2\% \\
+MATH (4-shot)          & 85.7\% & 87.6\% & 90.1\% & 92.8\% \\
+HumanEval (0-shot)     & 91.3\% & 93.2\% & 94.7\% & 96.1\% \\
+GPQA Diamond (0-shot)  & 77.1\% & 74.3\% & 79.8\% & 82.4\% \\
+MMMU (val, 0-shot)     & 84.6\% & ---    & ---    & 91.3\% \\
+IFEval                 & 87.9\% & 88.4\% & 89.1\% & 92.7\% \\
+BBH (3-shot)           & 87.3\% & 89.7\% & 91.4\% & 94.8\% \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra vs. Prior Generation and Same-Generation Comparison}
+\end{table}
+
+\subsection{Scientific and Mathematical Reasoning}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Category} & \textbf{Zen4-Ultra} \\
+\midrule
+GPQA Diamond            & Science (PhD)      & 82.4\% \\
+MMMU (science subset)   & Multimodal science & 93.1\% \\
+SciBench                & University science & 88.6\% \\
+MATH (Level 5 only)     & Competition math   & 87.3\% \\
+MathBench               & Multi-level math   & 91.4\% \\
+OlympiadBench           & Competition math   & 72.8\% \\
+\bottomrule
+\end{tabular}
+\caption{Science and Mathematics Evaluation Detail}
+\end{table}
+
+\subsection{Code Evaluation}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Metric} & \textbf{Zen4-Ultra} \\
+\midrule
+HumanEval           & pass@1           & 96.1\% \\
+MBPP                & pass@1           & 91.8\% \\
+LiveCodeBench       & pass@1           & 84.3\% \\
+SWE-bench Verified  & resolved         & 54.2\% \\
+CRUXEval (input)    & pass@1           & 88.7\% \\
+CRUXEval (output)   & pass@1           & 91.2\% \\
+\bottomrule
+\end{tabular}
+\caption{Code Benchmark Evaluation}
+\end{table}
+
+\subsection{Inference Efficiency}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Hardware} \\
+\midrule
+Tokens/sec (prefill)    & 48,000  & 8$\times$ H100 NVL \\
+Tokens/sec (decode)     & 420     & 8$\times$ H100 NVL \\
+TTFT at 32K (ms)        & 1,840   & 8$\times$ H100 NVL \\
+Expert activation rate  & 6.25\%  & (8 of 128 experts) \\
+KV-cache memory (128K)  & 68 GB   & across 8 GPUs \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Inference Performance}
+\end{table}
+
+\section{Related Work}
+
+Mixture-of-Experts scaling was first demonstrated to be practically viable at large scale
+by sparse gating mechanisms \cite{shazeer2017outrageously} and subsequently applied to
+language modeling \cite{fedus2022switch}. The core challenge of load balancing and
+expert collapse has been addressed through auxiliary losses \cite{lepikhin2021gshard} and
+expert capacity clamping. Zen4-Ultra's domain coherence loss is a new contribution to
+this literature.
+
+Distillation of specialized teachers into MoE experts extends the knowledge distillation
+literature \cite{hinton2015distilling, romero2014fitnets} to the routing setting. Prior
+work \cite{artetxe2021efficient} has used expert distillation for compression; we apply
+it for specialization enhancement rather than compression.
+
+Multimodal benchmarks such as MMMU \cite{yue2024mmmu} evaluate general reasoning across
+image-text inputs; Zen4-Ultra's 91.3\% on MMMU reflects the general reasoning quality
+of the language backbone, which is the primary driver of performance on many MMMU tasks
+that require text-based reasoning over image descriptions.
+
+\section{Deployment}
+
+\subsection{Inference Requirements}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Configuration} & \textbf{Hardware} & \textbf{Context} \\
+\midrule
+FP8 (recommended)      & 8$\times$ H100 80GB    & 256K \\
+FP8                    & 4$\times$ H100 80GB    & 64K  \\
+INT4 (AWQ)             & 4$\times$ A100 80GB    & 32K  \\
+Expert offload (CPU)   & 2$\times$ H100 + 512GB RAM & 32K \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Inference Configurations}
+\end{table}
+
+\subsection{API Access}
+
+Zen4-Ultra is available exclusively through the Hanzo API at \texttt{api.hanzo.ai}. Local
+deployment requires the 8$\times$ H100 configuration above. Organizations requiring
+on-premises deployment should contact \texttt{enterprise@hanzo.ai} for the deployment kit,
+which includes FP8-quantized weights and a pre-configured vLLM cluster configuration.
+
+\begin{lstlisting}[language=Python, caption=Zen4-Ultra API Request]
+from hanzo import HanzoAI
+
+client = HanzoAI(api_key="your-api-key")
+
+response = client.chat.completions.create(
+    model="zen4-ultra",           # 1T MoE, 96B active
+    messages=[
+        {"role": "user", "content": prompt}
+    ],
+    max_tokens=4096,
+    temperature=0.0               # deterministic for reasoning tasks
+)
+
+print(response.choices[0].message.content)
+\end{lstlisting}
+
+\section{Safety and Alignment}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Safety Metric} & \textbf{Zen3-Ultra} & \textbf{Zen4-Ultra} \\
+\midrule
+Harmful content refusal        & 96.8\% & 98.7\% \\
+Over-refusal rate              & 4.1\%  & 2.8\%  \\
+Jailbreak resistance           & 95.2\% & 98.3\% \\
+TruthfulQA                     & 79.4\% & 86.1\% \\
+WMDP (hazard knowledge)        & 43.2\% & 38.7\% \\
+\bottomrule
+\end{tabular}
+\caption{Safety Metrics: Zen3-Ultra vs. Zen4-Ultra}
+\end{table}
+
+WMDP (Weapons of Mass Destruction Proxy) measures the model's retention of information
+useful for hazardous activities; lower scores indicate better safety properties. The
+reduction from 43.2\% to 38.7\% reflects targeted knowledge erasure applied during
+safety alignment, following the RMU methodology.
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item MoE routing is non-deterministic across different batching configurations
+    when using approximate top-k routing; minor output variance is expected across hardware.
+    \item Expert offload configurations (CPU offload for weights) introduce significant
+    latency overhead that makes them unsuitable for interactive applications.
+    \item 256K context performance is strong but not equivalent to 32K; tasks requiring
+    full-context reasoning over 200K+ tokens should use Zen4 (1M) or wait for Zen4-Ultra-Long.
+\end{itemize}
+
+\section{Conclusion}
+
+Zen4-Ultra demonstrates that the Zen MoDE framework scales reliably to one trillion total
+parameters while maintaining practical inference through sparse activation of 96B parameters
+per token. Targeted expert distillation produces genuinely specialized sub-networks that
+outperform equivalent jointly-trained MoE experts, particularly on mathematics and scientific
+reasoning. With new state-of-the-art results on MMLU (95.2\%), MATH (92.8\%), HumanEval
+(96.1\%), GPQA Diamond (82.4\%), and MMMU (91.3\%), Zen4-Ultra represents the frontier
+of what is achievable within practical deployment constraints in the Zen4 family.
+
+\section*{Acknowledgments}
+
+We thank the distributed systems teams who built and maintained the 16,384-H100 training
+cluster, the annotation teams who produced the post-training datasets, and the evaluation
+teams at Zoo Labs Foundation who designed and administered the safety evaluations.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\appendix
+
+\section{Model Card}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Field} & \textbf{Value} \\
+\midrule
+Model Name       & Zen4-Ultra \\
+Version          & v2026.02 \\
+Release Date     & February 2026 \\
+Total Parameters & 1.02T \\
+Active Parameters& 96B per token \\
+Context Length   & 262,144 tokens \\
+License          & Proprietary (API access) \\
+API Endpoint     & \href{https://api.hanzo.ai/v1}{api.hanzo.ai/v1} \\
+Documentation    & \href{https://papers.zenlm.org/zen4-ultra}{papers.zenlm.org/zen4-ultra} \\
+Contact          & research@hanzo.ai \\
+\bottomrule
+\end{tabular}
+\caption{Zen4-Ultra Model Card}
+\end{table}
+
+\end{document}

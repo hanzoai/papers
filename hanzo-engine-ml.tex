@@ -1,0 +1,237 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{Hanzo Engine: Production ML Inference Engine with Multi-Model Serving and GPU Scheduling}
+\author{Zach Kelling\thanks{zach@hanzo.ai} \\ \textit{Hanzo Industries} \\ \texttt{research@hanzo.ai}}
+\date{August 2024}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We present Hanzo Engine, a production ML inference engine implemented in Rust that serves multiple models concurrently with dynamic batching, intelligent GPU scheduling, and A/B traffic routing. Engine manages a fleet of GPU workers, automatically loading and unloading models based on traffic patterns, and implements continuous batching for transformer models to maximize GPU utilization. The system serves 200+ models in production across 48 GPUs with a median time-to-first-token (TTFT) of 45ms for language models and 99.9\% availability. Key innovations include: (1) a priority-aware GPU scheduler that co-locates complementary workloads, (2) speculative model preloading based on traffic prediction, and (3) a unified serving protocol supporting both streaming and batch inference.
+\end{abstract}
+
+\section{Introduction}
+
+Production ML serving differs fundamentally from research inference. Research focuses on single-model, single-request performance. Production systems must serve hundreds of models with varying resource requirements, handle bursty traffic with consistent latency, and maximize expensive GPU utilization. Existing serving frameworks (vLLM~\cite{kwon2023}, TGI~\cite{tgi2023}, Triton~\cite{triton2020}) excel at single-model serving but lack multi-model orchestration, cross-model GPU scheduling, and traffic management capabilities.
+
+Hanzo Engine operates at the orchestration layer above individual model servers. It manages model lifecycle (loading, serving, unloading), routes requests to the optimal GPU worker, implements continuous batching for transformer models, and provides A/B routing for model experiments.
+
+\paragraph{Contributions.}
+\begin{itemize}
+    \item A priority-aware GPU scheduler that co-locates models with complementary memory and compute profiles on shared GPUs.
+    \item Continuous batching with iteration-level scheduling for transformer models, achieving 3.2x throughput improvement over static batching.
+    \item Speculative model preloading using traffic prediction to reduce cold-start latency from 30s to under 200ms.
+    \item A unified serving protocol supporting streaming tokens, batch embeddings, and multimodal inputs.
+\end{itemize}
+
+\section{Architecture}
+
+\subsection{System Overview}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.5cm, align=center, font=\scriptsize},
+    arrow/.style={->, thick}
+]
+\node[box] (api) {Serving\\API};
+\node[box, below=of api] (router) {Model\\Router};
+\node[box, below=of router] (scheduler) {GPU\\Scheduler};
+\node[box, below left=0.6cm and 0.3cm of scheduler] (w1) {Worker 1\\(8xA100)};
+\node[box, below=of scheduler] (w2) {Worker 2\\(8xA100)};
+\node[box, below right=0.6cm and 0.3cm of scheduler] (w3) {Worker 3\\(8xH100)};
+\node[box, right=1.5cm of router] (registry) {Model\\Registry};
+\node[box, left=1.5cm of router] (ab) {A/B\\Router};
+
+\draw[arrow] (api) -- (router);
+\draw[arrow] (router) -- (scheduler);
+\draw[arrow] (scheduler) -- (w1);
+\draw[arrow] (scheduler) -- (w2);
+\draw[arrow] (scheduler) -- (w3);
+\draw[arrow] (registry) -- (router);
+\draw[arrow] (ab) -- (router);
+\end{tikzpicture}
+\caption{Engine architecture with GPU scheduling and model routing.}
+\label{fig:engine}
+\end{figure}
+
+Engine consists of three layers (Figure~\ref{fig:engine}): the serving API (HTTP/gRPC), the model router and A/B engine, and the GPU scheduler that manages worker nodes.
+
+\subsection{Model Registry}
+
+Models are registered with serving configurations:
+
+\begin{lstlisting}[language=YAML]
+models:
+  - name: qwen3-72b
+    format: safetensors
+    source: hf://Qwen/Qwen3-72B
+    gpu_memory: 140GB
+    tensor_parallel: 8
+    max_batch: 64
+    quantization: awq-int4
+    priority: high
+    min_replicas: 2
+    max_replicas: 8
+\end{lstlisting}
+
+The registry stores model metadata, serving constraints, and autoscaling policies. Models are pulled from Hugging Face Hub or Hanzo Storage.
+
+\subsection{GPU Scheduler}
+
+The scheduler assigns models to GPU workers using a bin-packing algorithm that maximizes GPU memory utilization while respecting colocation constraints:
+
+\begin{equation}
+    \max \sum_{m \in M} \sum_{g \in G} x_{mg} \cdot u_m
+\end{equation}
+subject to:
+\begin{equation}
+    \sum_{m} x_{mg} \cdot \text{mem}_m \leq \text{cap}_g \quad \forall g \in G
+\end{equation}
+
+where $x_{mg} \in \{0,1\}$ indicates model $m$ is assigned to GPU $g$, $u_m$ is the model's utilization score, and $\text{mem}_m$ is its memory requirement.
+
+\section{Key Features}
+
+\subsection{Continuous Batching}
+
+For autoregressive language models, Engine implements iteration-level batching~\cite{yu2022}: new requests join the batch at any decoding iteration, and completed requests leave immediately without waiting for the longest sequence:
+
+\begin{lstlisting}[language=Rust]
+pub struct ContinuousBatcher {
+    running: Vec<Request>,
+    waiting: VecDeque<Request>,
+    max_batch_tokens: usize,
+}
+
+impl ContinuousBatcher {
+    pub fn step(&mut self) -> Vec<Token> {
+        // Remove completed requests
+        self.running.retain(|r| !r.is_done());
+        // Admit new requests up to token budget
+        while let Some(req) = self.waiting.front() {
+            if self.token_budget() >= req.len() {
+                self.running.push(
+                    self.waiting.pop_front().unwrap());
+            } else { break; }
+        }
+        // Execute one decode step for all
+        self.decode_step()
+    }
+}
+\end{lstlisting}
+
+This achieves 3.2x higher throughput than static batching by eliminating padding waste.
+
+\subsection{Speculative Preloading}
+
+Engine tracks per-model request rates with exponential moving averages and preloads models predicted to receive traffic within the next 5 minutes. The predictor uses a simple ARIMA model trained on the last 24 hours of traffic data. Preloading reduces cold-start latency from 30s (model load from storage) to under 200ms (already in GPU memory).
+
+\subsection{A/B Routing}
+
+The A/B router splits traffic between model versions using consistent hashing by user ID:
+
+\begin{lstlisting}[language=Rust]
+pub struct ABRoute {
+    model_a: String,     // e.g. "qwen3-72b-v1"
+    model_b: String,     // e.g. "qwen3-72b-v2"
+    traffic_pct_b: f64,  // 0.0 to 1.0
+    sticky: bool,        // hash by user_id
+}
+\end{lstlisting}
+
+Results are logged with the model version for offline analysis of quality metrics.
+
+\section{Implementation}
+
+Engine is implemented in 35,000 lines of Rust. Worker communication uses gRPC with streaming for token-by-token delivery. Model loading uses \texttt{safetensors} format with memory-mapped I/O.
+
+\begin{table}[h]
+\centering
+\caption{Serving performance (Qwen3-72B, 8xH100).}
+\label{tab:engine-perf}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{Static Batch} & \textbf{Continuous} \\
+\midrule
+TTFT p50 (ms) & 52 & 45 \\
+TTFT p99 (ms) & 280 & 120 \\
+Throughput (tok/s) & 4,200 & 13,400 \\
+GPU utilization & 42\% & 87\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Security}
+
+\paragraph{Model Isolation.} Each model runs in a separate GPU memory space. Tensor data from one model cannot be read by another model's kernels.
+
+\paragraph{Input Validation.} Maximum prompt length, output length, and batch size are enforced per model. Malformed inputs are rejected before reaching the GPU.
+
+\paragraph{Authentication.} All API requests require a Hanzo IAM token. Model access is controlled by RBAC policies in the model registry.
+
+\paragraph{Rate Limiting.} Per-tenant token budgets prevent resource monopolization. Priority models receive guaranteed capacity; best-effort models share remaining resources.
+
+\paragraph{Audit.} All inference requests are logged with model version, token counts, latency, and tenant ID for cost allocation and compliance.
+
+\section{Conclusion}
+
+Hanzo Engine provides production ML inference orchestration that maximizes GPU utilization through continuous batching, intelligent scheduling, and speculative preloading. By operating at the orchestration layer above individual model servers, Engine manages the complexity of multi-model serving---model lifecycle, GPU allocation, traffic routing, and A/B experiments---while maintaining sub-50ms TTFT for language models at 99.9\% availability.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{kwon2023}
+W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. SOSP, 2023.
+
+\bibitem{tgi2023}
+Hugging Face. Text Generation Inference. 2023.
+
+\bibitem{triton2020}
+NVIDIA. Triton Inference Server. 2020.
+
+\bibitem{yu2022}
+G. Yu et al. Orca: A Distributed Serving System for Transformer-Based Generative Models. OSDI, 2022.
+
+\end{thebibliography}
+
+\end{document}

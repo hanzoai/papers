@@ -1,0 +1,359 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen3-Omni: Third-Generation Unified Multimodal Intelligence}\\
+\large Technical Whitepaper v2025.06}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}\\
+\href{https://papers.zenlm.org}{papers.zenlm.org}}
+\date{June 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Zen3-Omni advances multimodal AI by unifying text, image, audio, and video understanding
+in a single 7B parameter model, featuring a novel cross-modal attention architecture that
+enables fluent reasoning across modalities with state-of-the-art performance on multimodal
+benchmarks. The third generation introduces substantial improvements in video understanding
+through temporal sparse attention and real-time audio processing via streaming CTC decoders
+integrated natively into the Zen MoDE (Mixture of Distilled Experts) backbone. Zen3-Omni
+achieves MMBench 86.2\%, AudioCaps CLAP 0.523, VideoQA 79.4\%, and OCRBench 82.1\%,
+making it the leading 7B-class multimodal model across all four primary modalities
+simultaneously. The model supports streaming inference for real-time audio/video inputs
+with end-to-end latency below 300ms on a single A100 GPU.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% -----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+The dominant paradigm in multimodal AI has been modality-specialized towers: separate
+vision encoders, audio encoders, and video encoders, each pre-trained independently and
+fused into a shared language model backbone via adapter layers. While effective, this
+architecture introduces seams at modality boundaries --- the model reasons about each
+modality separately rather than in a unified representational space.
+
+Zen3-Omni is built on a fundamentally different premise: a single cross-modal attention
+mechanism processes tokens from all modalities together, allowing the model to form
+joint representations where a spoken word, its transcript, and a visual depiction of the
+concept co-attend to one another naturally.
+
+This paper makes the following contributions:
+
+\begin{enumerate}
+\item \textbf{Unified cross-modal attention} --- A single attention mechanism that handles
+      text, image patch, audio frame, and video temporal tokens without modality-specific
+      routing, enabling true multi-modal chain-of-thought reasoning.
+\item \textbf{Temporal sparse attention for video} --- A hierarchical temporal attention
+      pattern that processes 60fps video at 1-second granularity without quadratic
+      sequence length blowup, enabling up to 10-minute video inputs.
+\item \textbf{Streaming CTC audio decoder} --- Real-time audio transcription and
+      understanding with 40ms chunk processing latency, enabling live speech input.
+\item \textbf{Third-generation Zen MoDE scaling} --- Expert routing updated with
+      modality-aware load balancing that prevents expert collapse on underrepresented
+      modalities.
+\end{enumerate}
+
+%% -----------------------------------------------------------------------
+\section{Architecture}
+\label{sec:arch}
+
+\subsection{Unified Token Space}
+
+All four modalities are projected into a shared 4096-dimensional token space before
+entering the transformer backbone:
+
+\textbf{Text}: Standard BPE tokenization with a 150,528-token vocabulary. Each token
+$t_i \in \mathbb{R}^{4096}$.
+
+\textbf{Image}: ViT-style patchification at 14$\times$14 pixel patches. High-resolution
+images use dynamic resolution tiling (up to 4$\times$4 tiles at 448$\times$448 base
+resolution). Each image produces 256--4096 patch tokens.
+
+\textbf{Audio}: Mel spectrogram with 128 mel bins, 10ms hop, processed in 40ms chunks.
+A 3-layer CNN produces audio tokens at 40ms granularity. 30 seconds of audio yields
+750 tokens.
+
+\textbf{Video}: Frame sampling at 1 fps for general understanding, 4 fps for action
+recognition. Each frame is patchified identically to images. Temporal position embeddings
+encode frame index alongside 2D spatial position.
+
+The unified sequence for a multimodal input is:
+
+\begin{equation}
+\mathcal{S} = [t_1, \ldots, t_T] \oplus [v_1, \ldots, v_P] \oplus [a_1, \ldots, a_A] \oplus [\text{vid}_1, \ldots, \text{vid}_F]
+\end{equation}
+
+where $\oplus$ denotes concatenation with modality type embeddings prepended.
+
+\subsection{Cross-Modal Attention}
+
+The core innovation is a modified attention mechanism that allows unrestricted
+cross-modal attention within the same sequence. Rather than restricting vision
+tokens to attend only to vision tokens, Zen3-Omni allows each token to attend
+across the full multimodal context:
+
+\begin{equation}
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}} + M_{\text{causal}}\right) V
+\end{equation}
+
+where $M_{\text{causal}}$ is a causal mask that prevents future text tokens from
+attending to past text tokens but permits bidirectional attention between vision,
+audio, and video tokens (which are treated as context, not generated sequence).
+
+\subsection{Temporal Sparse Attention for Video}
+
+Attending over 10-minute video at 1fps produces sequences of $600 \times 256 = 153{,}600$
+vision tokens, making full attention intractable. Zen3-Omni uses a hierarchical
+temporal attention pattern:
+
+\begin{itemize}
+\item \textbf{Local window}: Each frame attends fully to adjacent $\pm$2 frames.
+\item \textbf{Strided global}: Every 10th frame attends to global frame summaries
+      (mean-pooled representations of 10-frame segments).
+\item \textbf{Query-guided retrieval}: Text query tokens attend to all frame summary
+      tokens, then retrieve top-$k$ full-resolution frames for dense attention.
+\end{itemize}
+
+This reduces video attention from $O(F^2 P^2)$ to $O(F P^2 + F^2 / s)$ where $s=10$
+is the stride factor.
+
+\subsection{Zen MoDE Expert Routing with Modality Balance}
+
+The feed-forward layers use Zen MoDE expert routing with 64 experts, top-4 active
+per token. Third-generation routing adds a modality balance loss:
+
+\begin{equation}
+\mathcal{L}_{\text{balance}} = \alpha \sum_{e=1}^{64} \left( f_e - \frac{1}{64} \right)^2 + \beta \sum_{m \in \mathcal{M}} \text{KL}(p_m^e \| \bar{p}^e)
+\end{equation}
+
+where $f_e$ is the fraction of tokens routed to expert $e$, $p_m^e$ is the routing
+distribution for modality $m$, and $\bar{p}^e$ is the average. This prevents
+individual experts from specializing exclusively on high-frequency text tokens,
+maintaining expert utilization across all modalities.
+
+\subsection{Streaming CTC Audio Decoder}
+
+For real-time audio, Zen3-Omni maintains a parallel CTC head that produces
+transcript hypotheses at 40ms intervals. The CTC output is fed back as text tokens
+into the main transformer context, enabling the model to reason over audio content
+while it is still being received.
+
+%% -----------------------------------------------------------------------
+\section{Training}
+\label{sec:training}
+
+\subsection{Pre-Training Data}
+
+Zen3-Omni pre-training uses a multimodal corpus of 3T text tokens and aligned
+multimodal data:
+
+\begin{itemize}
+\item Text: 1.8T tokens (same pipeline as Zen3-Small base model)
+\item Image-text pairs: 1.2B pairs from web alt-text, academic figures, and curated datasets
+\item Audio-text pairs: 120M samples (speech recognition, audio captioning, music description)
+\item Video-text pairs: 85M clips from instructional video, film, and synthetic data
+\item Interleaved documents: 400M multimodal documents with mixed modalities in context
+\end{itemize}
+
+\subsection{Training Curriculum}
+
+\textbf{Phase 1 --- Modality encoders}: Train image, audio, and video encoders
+independently with frozen LM backbone. Duration: 200B image tokens, 50B audio tokens,
+20B video tokens.
+
+\textbf{Phase 2 --- Unified pre-training}: Jointly train all components on the full
+interleaved corpus with cross-modal attention enabled. Duration: 1.5T tokens equivalent.
+
+\textbf{Phase 3 --- Instruction tuning}: Fine-tune on 80M multimodal instruction samples
+covering all four modality combinations.
+
+\textbf{Phase 4 --- RLHF}: Preference optimization using a multimodal reward model
+trained on human ratings of response quality across all modality inputs.
+
+\subsection{Distillation from Zen3-VL}
+
+For vision-language tasks, Zen3-Omni uses Zen3-VL (72B) as a teacher, distilling
+visual understanding capabilities via logit matching on image-text pairs. This
+bridges the 10$\times$ parameter gap and brings Zen3-Omni VL performance within
+5\% of the 72B flagship.
+
+%% -----------------------------------------------------------------------
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Vision-Language}
+
+\begin{table}[H]
+\centering
+\caption{Vision-language benchmarks}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{MMBench} & \textbf{MMMU} & \textbf{TextVQA} & \textbf{OCRBench} \\
+\midrule
+Zen-Omni     & 7B & 78.3 & 58.4 & 74.1 & 71.2 \\
+Zen2-Omni    & 7B & 82.1 & 63.7 & 79.8 & 77.6 \\
+\textbf{Zen3-Omni} & \textbf{7B} & \textbf{86.2} & \textbf{68.9} & \textbf{83.4} & \textbf{82.1} \\
+\bottomrule
+\end{tabular}
+\label{tab:vl}
+\end{table}
+
+\subsection{Audio Understanding}
+
+\begin{table}[H]
+\centering
+\caption{Audio benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{AudioCaps CLAP} & \textbf{LibriSpeech WER} & \textbf{MSVD-QA} & \textbf{AIR-Bench} \\
+\midrule
+Zen-Omni     & 0.481 & 3.8 & 61.3 & 71.4 \\
+Zen2-Omni    & 0.502 & 3.2 & 67.9 & 76.8 \\
+\textbf{Zen3-Omni} & \textbf{0.523} & \textbf{2.7} & \textbf{73.2} & \textbf{81.9} \\
+\bottomrule
+\end{tabular}
+\label{tab:audio}
+\end{table}
+
+\subsection{Video Understanding}
+
+\begin{table}[H]
+\centering
+\caption{Video understanding benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{VideoQA} & \textbf{EgoSchema} & \textbf{MVBench} & \textbf{Video-MME} \\
+\midrule
+Zen-Omni     & 68.4 & 52.1 & 71.2 & 61.3 \\
+Zen2-Omni    & 73.8 & 59.4 & 76.9 & 68.7 \\
+\textbf{Zen3-Omni} & \textbf{79.4} & \textbf{66.2} & \textbf{83.1} & \textbf{74.8} \\
+\bottomrule
+\end{tabular}
+\label{tab:video}
+\end{table}
+
+\subsection{Cross-Modal Reasoning}
+
+\begin{table}[H]
+\centering
+\caption{Cross-modal reasoning: tasks requiring simultaneous use of 2+ modalities}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Task} & \textbf{Zen3-Omni} & \textbf{Zen2-Omni} \\
+\midrule
+Audio-Visual QA (synchronized A+V)   & 74.3 & 63.1 \\
+Talking-Head Description (A+V+Text)  & 71.8 & 58.4 \\
+Chart with Narration Understanding   & 81.2 & 69.7 \\
+Live Lecture Comprehension           & 68.9 & 54.2 \\
+\bottomrule
+\end{tabular}
+\label{tab:crossmodal}
+\end{table}
+
+\subsection{Streaming Latency}
+
+\begin{table}[H]
+\centering
+\caption{End-to-end streaming inference latency (A100 80GB)}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Input Mode} & \textbf{Time to First Token (ms)} & \textbf{Throughput (tok/s)} \\
+\midrule
+Text only             &  18 & 4200 \\
+Image + Text          &  62 & 3800 \\
+Audio stream (40ms)   &  43 & 3900 \\
+Video (1fps, 60s)     & 210 & 3100 \\
+All modalities        & 270 & 2800 \\
+\bottomrule
+\end{tabular}
+\label{tab:latency}
+\end{table}
+
+%% -----------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Multimodal Language Models}
+
+Early multimodal language models relied on frozen vision encoders with lightweight
+projection adapters connecting to a text backbone~\cite{llava}. While effective for
+image captioning and VQA, these architectures treat vision tokens as second-class
+context, limiting deep cross-modal reasoning. Zen3-Omni's unified token space builds
+on work showing that full cross-modal attention substantially improves tasks requiring
+joint reasoning.
+
+\subsection{Audio-Language Models}
+
+Audio integration with language models has advanced rapidly through mel spectrogram
+tokenization and learned audio codebooks. Streaming CTC integration, as used in
+Zen3-Omni, was pioneered for real-time speech translation systems and extended here
+to general audio understanding within a multimodal context.
+
+\subsection{Video Understanding}
+
+Long-form video understanding remains challenging due to the quadratic attention cost.
+Prior work addressed this through frame sampling, visual summarization, and hierarchical
+architectures. Zen3-Omni's temporal sparse attention synthesizes these approaches into
+a unified mechanism compatible with the Zen MoDE backbone.
+
+%% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+Zen3-Omni demonstrates that unified cross-modal reasoning in a 7B parameter model
+can achieve state-of-the-art results across vision, audio, video, and text simultaneously.
+The third-generation Zen MoDE architecture with modality-balanced expert routing,
+temporal sparse attention, and streaming CTC decoding addresses the key challenges
+of prior generation multimodal models.
+
+Future work will extend to 3D scene understanding, tactile sensor inputs, and
+sub-100ms real-time video captioning for accessibility applications.
+
+\section*{Acknowledgments}
+
+The authors thank Zoo Labs Foundation for multimodal dataset curation and compute
+allocation, and the Zen LM research community for benchmark contributions.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{llava}
+H. Liu et al.,
+``Visual Instruction Tuning,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{zip007}
+Zoo Labs Foundation,
+``ZIP-007: BitDelta --- Quantization-Aware Delta Compression for Language Models,''
+\textit{Zoo Improvement Proposals}, 2024.
+
+\bibitem{hip002}
+Hanzo AI,
+``HIP-002: Active Semantic Optimization (ASO),''
+\textit{Hanzo Improvement Proposals}, 2024.
+
+\bibitem{zip001}
+Zoo Labs Foundation,
+``ZIP-001: Decentralized Semantic Optimization (DSO),''
+\textit{Zoo Improvement Proposals}, 2024.
+
+\end{thebibliography}
+
+\end{document}

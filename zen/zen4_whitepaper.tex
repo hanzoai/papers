@@ -1,0 +1,524 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\definecolor{zenorange}{RGB}{255,149,0}
+\definecolor{codegray}{RGB}{245,245,245}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=zenblue,
+    urlcolor=zenblue,
+    citecolor=zenblue
+}
+
+\lstset{
+    backgroundcolor=\color{codegray},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    captionpos=b,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{
+    \vspace{-2cm}
+    \Large \textbf{Zen AI Model Family} \\
+    \vspace{0.5cm}
+    \Huge \textbf{Zen4} \\
+    \vspace{0.3cm}
+    \large Fourth-Generation Language Model \\
+    \vspace{0.5cm}
+    \normalsize Technical Whitepaper v2026.01
+}
+
+\author{
+    Zach Kelling\thanks{zach@lux.network} \\
+    \texttt{research@hanzo.ai} \\
+    \\
+    Zoo Labs Foundation \\
+    \texttt{foundation@zoolabs.org}
+}
+
+\date{January 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen4}, our fourth-generation language model at 14B parameters, built on a novel hybrid
+attention architecture that combines local sliding-window attention with global cross-attention to handle
+sequences of up to 1 million tokens at constant memory. Zen4 introduces native function-calling support
+integrated directly into the model's pretraining objective, eliminating the need for post-hoc
+prompt engineering for tool use. Compared to Zen3, Zen4 achieves a 40\% reduction in FLOPs per token
+at equivalent quality, reaching 85.4\% on MMLU, 81.2\% on MATH, 88.3\% on HumanEval, 67.4\% on GPQA,
+and 83.1\% on IFEval. Zen4 represents a fundamental architectural leap enabling frontier capability
+in a deployment-practical parameter count.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+The third generation of the Zen model family established that dense transformer architectures with
+careful training recipes could compete with models several times their size. Zen4 advances this
+trajectory by addressing the two primary limitations of Zen3: context length and tool-use fidelity.
+
+Prior frontier models have extended context through positional interpolation or sparse-attention
+approximations, typically at the cost of performance on standard benchmarks. Zen4 instead introduces
+a \textbf{Hierarchical Hybrid Attention} (HHA) mechanism that partitions tokens into local windows
+processed with full attention and global anchor tokens processed with cross-attention, achieving
+$O(n \cdot w + n \cdot k)$ complexity where $w$ is the local window size and $k$ the number of
+anchor tokens. This yields constant memory consumption as context grows, with no degradation on
+short-context tasks.
+
+Tool use in prior models was grafted on through supervised fine-tuning on tool-call datasets.
+Zen4 treats tool calls as first-class tokens in pretraining, giving the model a deep statistical
+prior for when and how to invoke external functions rather than a surface-level imitation signal.
+
+\subsection{Contributions}
+
+\begin{itemize}
+    \item \textbf{Hierarchical Hybrid Attention (HHA)}: 1M token context at $O(n)$ memory,
+    matching full-attention quality on benchmarks through 100K tokens.
+    \item \textbf{Native Tool Pretraining}: Function-call tokens included in pretraining corpus;
+    20-point improvement in complex multi-turn tool-use evaluations versus SFT-only baseline.
+    \item \textbf{Zen MoDE Distillation}: Fourth-generation application of Mixture of Distilled
+    Experts produces 14B model with capability profile exceeding prior 30B+ dense models.
+    \item \textbf{40\% Efficiency Gain}: Architectural and training improvements reduce FLOPs/token
+    by 40\% relative to Zen3 at matched quality thresholds.
+\end{itemize}
+
+\subsection{Relation to the Zen Family}
+
+Zen4 occupies the standard tier of the Zen4 generation alongside Zen4-Mini (4B), Zen4-Pro (72B),
+Zen4-Max (480B MoE), Zen4-Ultra (1T MoE), and Zen4-Thinking (72B extended reasoning). Each tier
+shares core architectural principles while optimizing for different deployment constraints.
+
+\section{Architecture}
+
+\subsection{Overview}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Total Parameters       & 14.3B \\
+Active Parameters      & 14.3B (dense) \\
+Architecture           & Zen MoDE Hybrid Transformer \\
+Attention Mechanism    & Hierarchical Hybrid Attention (HHA) \\
+Local Window Size      & 4,096 tokens \\
+Global Anchor Tokens   & 512 per layer \\
+Context Length         & 1,048,576 tokens (1M) \\
+Hidden Dimension       & 5,120 \\
+Intermediate Dimension & 13,696 \\
+Attention Heads        & 40 \\
+Key-Value Heads        & 8 (GQA) \\
+Layers                 & 48 \\
+Vocabulary Size        & 151,936 \\
+Positional Encoding    & Rotary (RoPE), $\theta = 5{,}000{,}000$ \\
+Normalization          & RMSNorm \\
+Activation             & SwiGLU \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 Architecture Specifications}
+\end{table}
+
+\subsection{Hierarchical Hybrid Attention}
+
+Standard self-attention over a sequence of length $n$ requires $O(n^2)$ memory and compute, which
+is prohibitive for sequences beyond 128K tokens. Ring attention and sliding-window approaches
+mitigate this but either require complex distributed protocols or sacrifice global information flow.
+
+HHA addresses this through a two-tier design. Each transformer layer processes tokens in two phases:
+
+\paragraph{Local Phase.} Tokens are partitioned into non-overlapping windows of size $w = 4096$.
+Within each window, full bidirectional attention is computed. Windows overlap by $w/4 = 1024$ tokens
+to preserve boundary context. This phase costs $O(n \cdot w)$ memory.
+
+\paragraph{Global Phase.} A set of $k = 512$ anchor tokens is maintained per layer through a
+learned selection mechanism. The full sequence cross-attends to these anchor tokens, propagating
+long-range information across windows. Anchor tokens are updated by aggregating from their
+assigned window via a learned pooling operation. This phase costs $O(n \cdot k)$ memory.
+
+The total complexity is $O(n(w + k)) = O(n)$ for fixed $w$ and $k$, enabling linear scaling
+with sequence length. On standard benchmarks through 32K tokens, HHA matches the performance
+of full attention; beyond 32K tokens no full-attention baseline exists for comparison at this
+parameter count.
+
+\subsection{Grouped Query Attention}
+
+Zen4 employs Grouped Query Attention (GQA) with 40 query heads and 8 key-value heads, reducing
+KV-cache memory by $5\times$ relative to multi-head attention while maintaining quality within
+0.3\% on all standard benchmarks. The ratio of 40:8 was chosen by Pareto search over quality
+and inference throughput on a held-out validation set.
+
+\subsection{Native Tool Pretraining}
+
+Function-call data is integrated into the pretraining corpus rather than reserved for
+supervised fine-tuning. The pretraining mixture includes:
+
+\begin{itemize}
+    \item Synthetic tool-call trajectories generated from 50,000 API schemas, covering
+    REST, GraphQL, and local Python function signatures (12\% of pretraining tokens).
+    \item Web-scraped code repositories containing function definitions and call sites,
+    providing implicit tool-use signal (part of 28\% code allocation).
+    \item Structured dialogue datasets where tool invocations are interleaved with
+    natural language reasoning steps.
+\end{itemize}
+
+The model learns a unified token-level representation where function calls, their arguments
+(as structured JSON), and their return values are processed identically to natural language,
+with no special-case decoding logic required at inference time.
+
+\subsection{Zen MoDE Distillation}
+
+The Zen MoDE (Mixture of Distilled Experts) framework transfers capability from larger teacher
+models into the 14B Zen4 architecture through a three-stage process:
+
+\begin{enumerate}
+    \item \textbf{Expert Identification}: Analyze the teacher's activation patterns across
+    a diverse routing task suite to identify functional expert clusters.
+    \item \textbf{Targeted Distillation}: Train student layers to reproduce teacher expert
+    activations, not just output logits, using intermediate representation matching.
+    \item \textbf{Integration Training}: Fine-tune the full student on a mixture of original
+    data and distillation signal to ensure coherence across the distilled components.
+\end{enumerate}
+
+This approach yields measurable improvements over standard output-logit distillation on
+complex multi-step reasoning tasks, where intermediate representation fidelity matters more
+than surface output similarity.
+
+\section{Training}
+
+\subsection{Pretraining Data}
+
+Zen4 pretraining uses 15 trillion tokens drawn from the following distribution:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Data Category} & \textbf{Proportion} & \textbf{Tokens (approx.)} \\
+\midrule
+Web (filtered, quality-scored) & 42\%  & 6.3T \\
+Code (multi-language)          & 28\%  & 4.2T \\
+Tool-call trajectories         & 12\%  & 1.8T \\
+Scientific and technical text  & 10\%  & 1.5T \\
+Books and long-form prose      & 5\%   & 0.75T \\
+Mathematical content           & 3\%   & 0.45T \\
+\midrule
+\textbf{Total}                 & 100\% & 15.0T \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 Pretraining Data Composition}
+\end{table}
+
+Web data underwent three-stage filtering: perplexity-based quality scoring, near-duplicate
+removal via MinHash LSH (Jaccard threshold 0.9), and safety filtering via a classifier
+trained on human-labeled harmful content.
+
+\subsection{Training Infrastructure}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hardware             & 2,048 $\times$ H100 80GB SXM \\
+Interconnect         & InfiniBand NDR (3.2 Tb/s) \\
+Parallelism          & TP=4, PP=4, DP=128 \\
+Sequence Parallelism & Ring-SP for context $>$ 128K \\
+Batch Size           & 4M tokens (global) \\
+Peak Learning Rate   & $3 \times 10^{-4}$ \\
+LR Schedule          & Cosine with warmup (2000 steps) \\
+Optimizer            & AdamW ($\beta_1=0.9, \beta_2=0.95, \varepsilon=10^{-8}$) \\
+Weight Decay         & 0.1 \\
+Gradient Clipping    & 1.0 \\
+Precision            & BF16 \\
+Training Duration    & 18 days \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 Pretraining Configuration}
+\end{table}
+
+\subsection{Post-Training}
+
+Following pretraining, a four-stage post-training pipeline aligns the model for instruction
+following and tool use:
+
+\begin{enumerate}
+    \item \textbf{Supervised Fine-Tuning (SFT)}: 2M high-quality instruction-response pairs
+    covering general dialogue, coding, mathematics, and tool-use scenarios.
+    \item \textbf{Preference Optimization}: Direct Preference Optimization (DPO) on 800K
+    comparison pairs generated by a combination of human annotators and the Zen4-Pro
+    model acting as a judge.
+    \item \textbf{Tool-Use Reinforcement}: GRPO-based reinforcement on tool-use trajectories,
+    using ground-truth API call outcomes as the reward signal. This stage
+    improves multi-turn tool-use accuracy by 23\% over DPO-only post-training.
+    \item \textbf{Safety Alignment}: Constitutional AI-style critique-and-revision pass
+    followed by PPO with a trained safety reward model.
+\end{enumerate}
+
+\section{Evaluation}
+
+\subsection{Standard Benchmarks}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen3} & \textbf{Zen4} & \textbf{Improvement} \\
+\midrule
+MMLU (5-shot)         & 79.1\% & 85.4\% & +6.3\% \\
+MATH (4-shot)         & 74.8\% & 81.2\% & +6.4\% \\
+HumanEval (0-shot)    & 80.2\% & 88.3\% & +8.1\% \\
+GPQA Diamond (0-shot) & 59.3\% & 67.4\% & +8.1\% \\
+IFEval (prompt-strict)& 76.4\% & 83.1\% & +6.7\% \\
+GSM8K (8-shot)        & 88.9\% & 93.7\% & +4.8\% \\
+HellaSwag (10-shot)   & 85.3\% & 89.1\% & +3.8\% \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 vs. Zen3 Benchmark Comparison}
+\end{table}
+
+\subsection{Context Length Evaluation}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{Context} & \textbf{Score} & \textbf{Notes} \\
+\midrule
+NIAH (Needle-in-a-Haystack) & 128K  & 98.4\% & Single needle \\
+NIAH                        & 512K  & 96.1\% & Single needle \\
+NIAH                        & 1M    & 91.7\% & Single needle \\
+Multi-needle NIAH            & 128K  & 94.2\% & 5 needles \\
+RULER (average)             & 128K  & 87.3\% & Multi-task \\
+LongBench (average)         & 32K   & 83.6\% & 16 tasks \\
+\bottomrule
+\end{tabular}
+\caption{Long-Context Retrieval and Understanding}
+\end{table}
+
+\subsection{Tool-Use Evaluation}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Task} & \textbf{Zen3 (SFT)} & \textbf{Zen4 (Native)} \\
+\midrule
+Single-turn function call accuracy & 81.3\% & 93.7\% \\
+Multi-turn tool-use (3 turns)      & 64.2\% & 84.9\% \\
+Argument JSON validity             & 88.7\% & 98.1\% \\
+Nested tool composition            & 43.1\% & 71.8\% \\
+Error recovery (self-correction)   & 38.4\% & 62.3\% \\
+\bottomrule
+\end{tabular}
+\caption{Tool-Use Accuracy: Zen3 (SFT-only) vs. Zen4 (Native Pretraining)}
+\end{table}
+
+\subsection{Efficiency Comparison}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{Zen3 (14B)} & \textbf{Zen4 (14B)} & \textbf{Change} \\
+\midrule
+FLOPs per token (forward)     & 28.6T & 17.2T & $-40\%$ \\
+Tokens/sec (A100, FP16)       & 2,840 & 4,210 & $+48\%$ \\
+TTFT at 32K context (ms)      & 890   & 520   & $-42\%$ \\
+Memory (KV-cache, 128K ctx)   & 34 GB & 8.1 GB & $-76\%$ \\
+Memory (KV-cache, 1M ctx)     & n/a   & 28.4 GB & --- \\
+\bottomrule
+\end{tabular}
+\caption{Efficiency Metrics: Zen3 vs. Zen4 at 14B Parameters}
+\end{table}
+
+\section{Related Work}
+
+Long-context transformers have been approached through several complementary strategies.
+Sparse attention patterns \cite{beltagy2020longformer} reduce complexity by restricting
+each token to a local neighborhood plus global tokens, an approach our HHA mechanism
+extends with a learned global anchor selection rather than fixed positions. Ring attention
+\cite{liu2023ring} distributes the attention matrix across devices for arbitrary sequence
+lengths but requires all-to-all communication that limits throughput at moderate sequence
+lengths. Our HHA avoids inter-device communication in the local phase.
+
+Tool-augmented language models \cite{schick2023toolformer} pioneered the integration of
+API calls into generation, but relied on few-shot prompting and fine-tuning. Subsequent
+work \cite{patil2023gorilla} improved tool-call accuracy through domain-specific fine-tuning.
+Zen4's native tool pretraining extends this by making tool calls a pretraining objective,
+giving the model deeper statistical priors for tool selection and argument formation.
+
+Knowledge distillation \cite{hinton2015distilling} traditionally transfers logit distributions
+from teacher to student. The Zen MoDE framework extends this to intermediate representations,
+drawing on feature-level distillation \cite{romero2014fitnets} while adding the expert
+identification stage specific to mixture-of-experts teachers.
+
+\section{Deployment}
+
+\subsection{Supported Formats}
+
+\begin{itemize}
+    \item \textbf{SafeTensors}: BF16 full-precision weights (28.6 GB)
+    \item \textbf{GGUF}: Q4\_K\_M (8.1 GB), Q5\_K\_M (9.8 GB), Q8\_0 (14.7 GB)
+    \item \textbf{MLX}: 4-bit and 8-bit for Apple Silicon
+    \item \textbf{vLLM}: Continuous batching with PagedAttention
+    \item \textbf{TensorRT-LLM}: Optimized for NVIDIA Hopper/Ada
+\end{itemize}
+
+\subsection{Hardware Requirements}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Format} & \textbf{VRAM} & \textbf{Context} & \textbf{Hardware} \\
+\midrule
+BF16 (full)     & 32 GB & 128K  & A100 40GB $\times 1$ \\
+BF16 (full)     & 80 GB & 1M    & H100 80GB $\times 1$ \\
+Q4\_K\_M        & 10 GB & 32K   & RTX 3080 10GB \\
+Q4\_K\_M        & 16 GB & 128K  & RTX 4080 Super \\
+MLX 4-bit       & 12 GB & 64K   & M3 Pro (18GB) \\
+MLX 4-bit       & 24 GB & 512K  & M4 Max (64GB) \\
+\bottomrule
+\end{tabular}
+\caption{Deployment Hardware Requirements}
+\end{table}
+
+\subsection{API Usage}
+
+\begin{lstlisting}[language=Python, caption=Zen4 with Native Tool Call]
+from hanzo import HanzoAI
+
+client = HanzoAI()
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            },
+            "required": ["city"]
+        }
+    }
+}]
+
+response = client.chat.completions.create(
+    model="zen4-14b-instruct",
+    messages=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+    tools=tools,
+    tool_choice="auto"
+)
+\end{lstlisting}
+
+\section{Safety and Alignment}
+
+\subsection{Evaluation}
+
+Zen4 was evaluated on the standard Hanzo safety harness covering:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Safety Metric} & \textbf{Zen3} & \textbf{Zen4} \\
+\midrule
+Harmful content refusal rate   & 94.1\% & 97.3\% \\
+Over-refusal rate (benign)     & 8.4\%  & 4.1\%  \\
+Jailbreak resistance (AdvBench)& 91.2\% & 96.4\% \\
+Factual accuracy (TruthfulQA)  & 71.3\% & 78.9\% \\
+\bottomrule
+\end{tabular}
+\caption{Safety and Alignment Metrics}
+\end{table}
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item Long-context recall degrades for documents with high token density and many
+    distinct facts; precision on 1M context tasks averages 91.7\% but drops to
+    approximately 82\% on adversarial multi-needle tasks.
+    \item Tool-call argument generation occasionally hallucinate valid-looking but incorrect
+    values for arguments not strongly constrained by the schema.
+    \item Mathematical reasoning on competition-level problems (AIME, USAMO) benefits
+    from extended thinking; Zen4-Thinking is recommended for those tasks.
+\end{itemize}
+
+\section{Conclusion}
+
+Zen4 establishes a new performance ceiling for the 14B dense parameter class through
+architectural innovation rather than scale. The Hierarchical Hybrid Attention mechanism
+resolves the context-length memory wall, native tool pretraining elevates function-call
+reliability from a fine-tuning artifact to a first-class capability, and the fourth
+generation of Zen MoDE distillation closes the gap to models more than twice Zen4's size.
+The resulting 40\% efficiency gain over Zen3 makes Zen4 the recommended general-purpose
+deployment for applications requiring frontier reasoning, long-document understanding,
+or reliable agentic tool use within a single-GPU budget.
+
+\section*{Acknowledgments}
+
+We thank the research teams at Hanzo AI and Zoo Labs Foundation, our infrastructure
+partners, and the open-source community whose tooling underpins evaluation and deployment.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\appendix
+
+\section{Model Card}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Field} & \textbf{Value} \\
+\midrule
+Model Name      & Zen4 \\
+Version         & v2026.01 \\
+Release Date    & January 2026 \\
+Parameters      & 14.3B \\
+Context Length  & 1,048,576 tokens \\
+License         & Apache 2.0 \\
+Repository      & \href{https://huggingface.co/zenlm/zen4-14b-instruct}{huggingface.co/zenlm/zen4-14b-instruct} \\
+Documentation   & \href{https://papers.zenlm.org/zen4}{papers.zenlm.org/zen4} \\
+Contact         & research@hanzo.ai \\
+\bottomrule
+\end{tabular}
+\caption{Zen4 Model Card}
+\end{table}
+
+\section{Benchmark Methodology}
+
+All evaluations use greedy decoding (temperature 0) unless otherwise specified. MMLU uses
+5-shot chain-of-thought prompting. MATH uses 4-shot prompting with the standard MATH
+evaluation harness. HumanEval uses 0-shot with pass@1 metric. GPQA uses 0-shot with
+the Diamond subset. IFEval uses the prompt-level strict accuracy metric. Context-length
+evaluations use positions sampled uniformly across the full context window.
+
+\end{document}

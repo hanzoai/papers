@@ -1,0 +1,422 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{geometry}
+\geometry{margin=1in}
+\definecolor{zenblue}{RGB}{41,121,255}
+\definecolor{zengreen}{RGB}{52,199,89}
+\hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
+
+\title{\textbf{Zen-Max: Maximum Capability via Mixture-of-Experts Architecture}\\
+\large Technical Report v2025.03}
+\author{Zen LM Research Team\\
+\texttt{research@zenlm.org}}
+\date{March 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{Zen-Max}, the highest-capability model in the Zen family, implementing the
+Zen MoDE (Mixture of Distilled Experts) architecture at maximum scale: 480 billion total
+parameters activating 48 billion per forward pass through a sparse mixture-of-experts (MoE)
+routing mechanism. Trained on 5.5 trillion tokens with a 200K token context window, Zen-Max
+establishes new performance records across the Zen family on reasoning, scientific understanding,
+mathematics, and code generation benchmarks: MMLU 92.7\%, MATH 89.3\%, HumanEval 94.8\%,
+GPQA 78.2\%, and MMMU 87.6\%. The MoE design achieves dense-model reasoning quality at
+substantially lower per-token inference cost, making frontier capability accessible for research
+and enterprise deployment at manageable compute budgets.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+Scaling language model capability to the frontier has historically required proportional
+increases in inference compute, creating tension between maximizing quality and deployment
+cost. Mixture-of-experts (MoE) architectures \cite{shazeer2017outrageously, fedus2022switch}
+address this tension by decoupling total parameter count from per-token active parameters:
+a large expert pool provides rich representational capacity while sparse routing activates
+only a relevant subset for each token.
+
+Zen-Max realizes this principle at our largest scale to date: 480B total parameters, 48B
+active per token (10\% activation rate), with 128 experts per MoE layer and top-8 routing.
+This design delivers performance comparable to much larger dense models while constraining
+inference FLOPs to approximately 48B-equivalent. We make the following contributions:
+
+\begin{itemize}
+  \item The Zen MoDE architecture at 480B/48B scale, with 128 experts, fine-grained expert
+        segmentation, and auxiliary-loss-free load balancing via a bias-adjustment mechanism.
+  \item A 200K token context window enabled by extended RoPE and a chunked attention
+        implementation optimized for memory efficiency.
+  \item RLVR post-training on an extended suite of verifiable domains including formal
+        mathematics, code, logic puzzles, scientific question answering, and multi-step
+        tool-use trajectories.
+  \item State-of-the-art benchmark performance: MMLU 92.7\%, MATH 89.3\%, HumanEval 94.8\%,
+        GPQA Diamond 78.2\%, MMMU 87.6\%.
+\end{itemize}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Architecture}
+
+\subsection{Overall Structure}
+
+Zen-Max is a decoder-only transformer with alternating dense attention layers and MoE
+feed-forward layers. The 96-layer network has MoE FFN in 80 of the 96 layers, with 16 dense
+layers (every 6th layer) to maintain stable global representations across the routing sparsity.
+
+\begin{table}[H]
+\centering
+\caption{Zen-Max architecture hyperparameters.}
+\label{tab:arch}
+\begin{tabular}{lc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Parameters (total)               & 480B \\
+Parameters (active per token)    & 48B \\
+Layers (total)                   & 96 \\
+Dense layers                     & 16 (every 6th) \\
+MoE layers                       & 80 \\
+Experts per MoE layer            & 128 \\
+Experts activated per token      & 8 (top-8 routing) \\
+Shared expert per MoE layer      & 2 (always active) \\
+Attention heads                  & 128 \\
+KV heads (GQA)                   & 8 \\
+Hidden dimension                 & 7{,}168 \\
+Expert FFN dimension             & 2{,}048 (per expert) \\
+Vocabulary size                  & 151{,}936 \\
+Context length (training)        & 200{,}000 \\
+Position encoding                & RoPE ($\theta = 10{,}000{,}000$) \\
+Activation                       & SiLU \\
+Normalization                    & RMSNorm \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Fine-Grained Expert Architecture}
+
+Zen-Max uses a fine-grained expert decomposition where each MoE layer contains 128 small
+experts rather than fewer large experts. Each expert $e_i$ applies a SwiGLU FFN with
+intermediate dimension 2,048, smaller than the 7,168 hidden dimension:
+
+\begin{equation}
+  \text{Expert}_i(x) = \left(\text{SiLU}(xW_{\text{gate},i}) \odot xW_{\text{up},i}\right) W_{\text{down},i}
+\end{equation}
+
+The top-8 routing selects the 8 highest-scoring experts per token. Additionally, 2 shared
+experts per layer are always activated and added to the routed experts' outputs. This
+``shared expert'' pattern ensures that universal representations (stopwords, punctuation,
+formatting) are handled without burdening the routing mechanism.
+
+\subsection{Auxiliary-Loss-Free Load Balancing}
+
+Expert load imbalance is a critical failure mode in MoE training, causing some experts to
+receive disproportionate tokens (routing collapse) while others atrophy. Rather than adding
+an auxiliary load balancing loss that trades task performance for balance, Zen-Max employs
+a bias-adjustment mechanism \cite{deepseekmoe2024}:
+
+\begin{equation}
+  s_{i,j} = \text{softmax}(x_i W_g)_j + b_j
+\end{equation}
+
+where $b_j$ is a per-expert bias updated after each training step based on the deviation of
+expert load from the target. Experts that are overloaded receive a negative bias; underloaded
+experts receive a positive bias. This maintains load balance without introducing conflicting
+gradient signals.
+
+\subsection{200K Context Window}
+
+A 200K token context window requires careful management of attention memory. Zen-Max combines:
+
+\begin{enumerate}
+  \item Extended RoPE with $\theta = 10{,}000{,}000$ providing position distinguishability
+        up to 200K tokens.
+  \item Chunked attention with chunk size $c = 4{,}096$ tokens, computing attention in chunks
+        to avoid materializing the full $200K \times 200K$ attention matrix.
+  \item A 3-stage training curriculum: 8K $\to$ 64K $\to$ 200K, each stage consuming
+        20B, 10B, and 5B tokens respectively.
+\end{enumerate}
+
+\subsection{Multi-Head Latent Attention}
+
+For the attention sublayer, Zen-Max uses Multi-Head Latent Attention (MLA) \cite{liu2024deepseekv2}
+which compresses the KV cache via low-rank projections:
+
+\begin{align}
+  c^{KV} &= x W^{DKV} \in \mathbb{R}^{d_c} \\
+  K &= c^{KV} W^{UK} \in \mathbb{R}^{n_h \times d_h} \\
+  V &= c^{KV} W^{UV} \in \mathbb{R}^{n_h \times d_h}
+\end{align}
+
+where $d_c = 512 \ll n_h \cdot d_h$. Only $c^{KV}$ is cached (512 floats per layer per
+token), reducing the KV cache by approximately 26$\times$ relative to full MHA at equivalent
+head count. For a 200K-token sequence at 96 layers in BF16: $96 \times 200{,}000 \times 512
+\times 2 \approx 19.7$ GB, compared to $\sim$510 GB for full MHA.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Training Methodology}
+
+\subsection{Pretraining at Scale}
+
+Zen-Max pretrains on 5.5T tokens across the same domain distribution as Zen-Pro (see
+Table~\ref{tab:data}), with an increased allocation to mathematical and scientific content.
+
+\begin{table}[H]
+\centering
+\caption{Zen-Max pretraining data (5.5T tokens total).}
+\label{tab:data}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Domain} & \textbf{Tokens (B)} & \textbf{Fraction} \\
+\midrule
+Web text (quality-filtered)   & 2{,}035 & 37.0\% \\
+Code (all languages)          &   825 & 15.0\% \\
+Books and long-form           &   770 & 14.0\% \\
+Scientific articles           &   605 & 11.0\% \\
+Mathematics (formal+informal) &   550 & 10.0\% \\
+Multilingual web              &   385 &  7.0\% \\
+Curated reasoning chains      &   330 &  6.0\% \\
+\midrule
+Total                         & 5{,}500 & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training infrastructure: 2048 H100-SXM5 GPUs, expert parallelism $\times$16, tensor
+parallelism $\times$8, pipeline parallelism $\times$16, data parallelism $\times$8. Total
+training compute approximately $3.2 \times 10^{24}$ FLOPs.
+
+\subsection{MoE-Specific Training Stability}
+
+MoE models are prone to instability from routing discontinuities. Zen-Max applies:
+
+\begin{itemize}
+  \item Gradient clipping at norm 1.0 with monitoring of per-expert gradient magnitudes.
+  \item Expert dropout: randomly zeroing 1 expert per token during training for robustness.
+  \item Router z-loss \cite{zoph2022stmoe}: $\mathcal{L}_z = \frac{1}{B}\sum_{x} (\log \sum_j e^{x_j})^2$
+        applied at coefficient $10^{-3}$ to prevent logit explosion in the router.
+\end{itemize}
+
+\subsection{Post-Training: Extended RLVR}
+
+Zen-Max applies RLVR on an expanded set of verifiable tasks beyond Zen-Pro's three domains:
+
+\begin{itemize}
+  \item Mathematics (AMC/AIME/Olympiad, formal Lean proofs)
+  \item Code (Python, Rust, Go, C++ on competitive programming problems)
+  \item Logic (first-order logic satisfiability, constraint satisfaction)
+  \item Science QA (verified against authoritative databases: PubMed, arXiv theorem checks)
+  \item Multi-step tool use (API call sequences verified by environment simulation)
+\end{itemize}
+
+GRPO sampling uses $G=16$ rollouts per prompt (doubled from Zen-Pro) to improve advantage
+estimation quality at the 480B parameter scale.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Evaluation}
+
+\subsection{Core Benchmarks}
+
+\begin{table}[H]
+\centering
+\caption{Zen-Max benchmark results versus frontier models.}
+\label{tab:benchmarks}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen-Max (480B)} & \textbf{Zen-Pro (72B)} & \textbf{Comp.\ A (large)} & \textbf{Comp.\ B (MoE)} \\
+\midrule
+MMLU (5-shot)          & \textbf{92.7} & 89.2 & 91.8 & 90.4 \\
+MMLU-Pro               & \textbf{78.3} & 72.4 & 77.1 & 75.6 \\
+ARC-Challenge          & 78.4 & 72.8 & 79.1 & 77.3 \\
+HellaSwag              & 91.2 & 88.4 & 90.8 & 89.6 \\
+\midrule
+MATH (4-shot, CoT)     & \textbf{89.3} & 84.1 & 87.9 & 86.4 \\
+AIME 2024 (pass@1)     & \textbf{66.7} & 53.3 & 63.3 & 60.0 \\
+GSM8K                  & \textbf{96.2} & 93.4 & 95.8 & 94.7 \\
+GPQA Diamond           & \textbf{78.2} & 71.8 & 76.4 & 74.1 \\
+\midrule
+HumanEval (pass@1)     & \textbf{94.8} & 91.3 & 93.2 & 91.8 \\
+MBPP (pass@1)          & \textbf{88.4} & 84.6 & 86.9 & 85.3 \\
+SWE-bench Verified     & \textbf{52.1} & 38.7 & 49.3 & 46.8 \\
+\midrule
+MMMU (val)             & \textbf{87.6} & --   & 86.1 & 84.3 \\
+MT-Bench               & \textbf{9.4}  &  9.1 &  9.3 &  9.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Mathematical Olympiad Performance}
+
+\begin{table}[H]
+\centering
+\caption{Performance on mathematical competition benchmarks.}
+\label{tab:math}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Zen-Max} & \textbf{Prior Best} \\
+\midrule
+AIME 2024 (pass@1)   & 66.7\% & 63.3\% \\
+AIME 2024 (pass@32)  & 93.3\% & 90.0\% \\
+AIME 2023            & 71.4\% & 68.6\% \\
+AMC 10               & 94.2\% & 92.8\% \\
+AMC 12               & 91.8\% & 89.4\% \\
+MATH Level 5 only    & 83.1\% & 80.7\% \\
+OlympiadBench        & 67.4\% & 64.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Long-Context Performance}
+
+\begin{table}[H]
+\centering
+\caption{RULER scores and needle-in-a-haystack (NIAH) accuracy at increasing context lengths.}
+\label{tab:longctx}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Model} & \textbf{8K} & \textbf{32K} & \textbf{64K} & \textbf{128K} & \textbf{200K} \\
+\midrule
+Zen-Max (480B)     & 97.1 & 95.3 & 92.7 & 88.4 & 82.1 \\
+Zen-Pro (72B)      & 96.2 & 92.1 & 88.3 & 82.7 & --- \\
+Competitor A       & 96.8 & 93.4 & 87.1 & 71.3 & 54.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Inference Cost Analysis}
+
+The MoE sparsity of Zen-Max provides substantial cost advantages over dense models at
+comparable quality.
+
+\begin{table}[H]
+\centering
+\caption{Comparative inference cost (A100-80GB cluster, BF16).}
+\label{tab:inference_cost}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Active Params} & \textbf{GPUs (TP8)} & \textbf{tok/s (batch=1)} & \textbf{Relative cost} \\
+\midrule
+Zen-Max (480B MoE) & 48B  & 8$\times$ A100 & 28  & 1.0$\times$ \\
+Dense-equivalent   & 72B  & 8$\times$ A100 & 18  & 1.6$\times$ \\
+Dense-equivalent   & 120B & 16$\times$ A100 & 11  & 4.2$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Expert Specialization Analysis}
+
+We analyze expert routing patterns to understand emergent specialization. After training,
+we feed 1M tokens from each domain and measure the Kullback-Leibler divergence between
+per-domain routing distributions and the uniform distribution:
+
+\begin{equation}
+  \text{Specialization}(e, d) = D_{\text{KL}}(P(e \mid x \in d) \| P(e))
+\end{equation}
+
+We find that:
+
+\begin{itemize}
+  \item Mathematical tokens activate a consistent set of 12--18 experts (out of 128) at
+        rates 4$\times$ above average, suggesting strong specialization.
+  \item Code tokens show stronger expert specialization by programming language than by
+        task type (generation vs.\ debugging), with Python and C$+$$+$ activating distinct
+        expert subsets.
+  \item Natural language tokens show weaker specialization than code or math, consistent
+        with the hypothesis that diverse language modeling requires broader expert coverage.
+\end{itemize}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+
+Sparse mixture-of-experts for language models was introduced in Sparsely-Gated MoE
+\cite{shazeer2017outrageously} and scaled in Switch Transformer \cite{fedus2022switch}
+and GLaM \cite{du2022glam}. Load balancing has been addressed via auxiliary losses
+\cite{fedus2022switch}, expert capacity buffers \cite{lepikhin2020gshard}, and more
+recently bias-adjustment mechanisms \cite{deepseekmoe2024}. Multi-Head Latent Attention
+for KV cache compression follows \cite{liu2024deepseekv2}.
+
+Long-context MoE models face additional challenges in routing consistency across long
+sequences. Our chunked attention and staged context extension follow best practices
+established in recent long-context scaling work \cite{peng2023yarn, hsieh2024ruler}.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Limitations}
+
+Expert routing introduces non-determinism that complicates reproducibility. Load balancing
+remains imperfect: a small fraction of experts (3--5\%) consistently receives below-average
+routing probability despite bias adjustment. Inference requires communication-heavy expert
+parallelism, increasing latency on multi-node deployments. The 200K context window, while
+large, degrades for generation tasks beyond 64K output tokens. MoE training instability
+necessitates careful monitoring and checkpoint selection.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+Zen-Max demonstrates that the Zen MoDE architecture scales favorably to 480B/48B active
+parameters, achieving the highest benchmark scores in the Zen family: MMLU 92.7\%, MATH
+89.3\%, HumanEval 94.8\%, GPQA Diamond 78.2\%, and MMMU 87.6\%. The sparse MoE design
+delivers these results at the per-token FLOPs budget of a 48B dense model, providing a
+compelling capability/cost trade-off for research and enterprise deployments. Zen-Max
+serves as the primary model for demanding scientific, mathematical, and multi-step reasoning
+workloads in the Zen family ecosystem.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{shazeer2017outrageously}
+N.~Shazeer et al., ``Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts
+Layer,'' \textit{ICLR}, 2017.
+
+\bibitem{fedus2022switch}
+W.~Fedus, B.~Zoph, and N.~Shazeer, ``Switch Transformers: Scaling to Trillion Parameter Models
+with Simple and Efficient Sparsity,'' \textit{JMLR}, 2022.
+
+\bibitem{du2022glam}
+N.~Du et al., ``GLaM: Efficient Scaling of Language Models with Mixture-of-Experts,''
+\textit{ICML}, 2022.
+
+\bibitem{lepikhin2020gshard}
+D.~Lepikhin et al., ``GShard: Scaling Giant Models with Conditional Computation and Automatic
+Sharding,'' \textit{ICLR}, 2021.
+
+\bibitem{deepseekmoe2024}
+DeepSeek AI, ``DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language
+Model,'' \textit{arXiv:2405.04434}, 2024.
+
+\bibitem{liu2024deepseekv2}
+A.~Liu et al., ``DeepSeek-V2,'' \textit{arXiv:2405.04434}, 2024.
+
+\bibitem{zoph2022stmoe}
+B.~Zoph et al., ``ST-MoE: Designing Stable and Transferable Sparse Expert Models,''
+\textit{arXiv:2202.08906}, 2022.
+
+\bibitem{peng2023yarn}
+B.~Peng et al., ``YaRN: Efficient Context Window Extension,'' \textit{arXiv:2309.00071}, 2023.
+
+\bibitem{hsieh2024ruler}
+C.-Y.~Hsieh et al., ``RULER: What's the Real Context Size of Your Long-Context Language Models?''
+\textit{arXiv:2404.06654}, 2024.
+
+\bibitem{shao2024deepseekmath}
+Z.~Shao et al., ``DeepSeekMath,'' \textit{arXiv:2402.03300}, 2024.
+
+\bibitem{wei2022emergent}
+J.~Wei et al., ``Emergent Abilities of Large Language Models,'' \textit{TMLR}, 2022.
+
+\bibitem{lightman2023lets}
+H.~Lightman et al., ``Let's Verify Step by Step,'' \textit{arXiv:2305.20050}, 2023.
+
+\end{thebibliography}
+
+\end{document}

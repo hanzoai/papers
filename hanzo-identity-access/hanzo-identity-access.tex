@@ -1,0 +1,288 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{../shared/lstlang}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{Hanzo IAM: Identity, Access Management, and\\API Gateway for Multi-Tenant Cloud Applications}
+\author{Zach Kelling\thanks{zach@hanzo.ai} \\ \textit{CTO, Hanzo Industries (Techstars '17)}}
+\date{February 2019}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We describe the Hanzo identity, access management (IAM), and API gateway architecture, developed between 2016 and 2019. The system comprises an API gateway built on KrakenD (\texttt{hanzo/gateway}, forked December 2017), an OAuth~2.0/OIDC identity provider with multi-tenant organization support, an OpenAPI-first contract layer (2016), and a role-based access control (RBAC) system with per-organization data isolation. The IAM layer authenticates and authorizes every request entering the Hanzo platform, extracts the organization from the JWT \texttt{owner} claim, and scopes all downstream data queries to that organization. This architecture now serves as the unified identity layer for all Hanzo, Lux, and Zoo deployments, as well as white-label deployments under custom domains.
+\end{abstract}
+
+\section{Introduction}
+
+Multi-tenant cloud platforms require a centralized identity layer that provides authentication, authorization, and tenant isolation across all services. Without such a layer, each service must independently implement credential validation, permission checking, and data scoping---leading to inconsistent security posture and duplicated effort.
+
+The Hanzo IAM system was developed to serve as this centralized layer. Its evolution proceeded through three phases:
+
+\begin{enumerate}
+    \item \textbf{OpenAPI-first design} (2016): API contracts defined before implementation, with schema-derived validation and client generation.
+    \item \textbf{API Gateway} (December 2017): A KrakenD-based gateway providing JWT validation, rate limiting, and request routing at the edge.
+    \item \textbf{Identity provider} (February 2019): An OAuth~2.0/OIDC-compliant identity provider with multi-tenant organizations and RBAC.
+\end{enumerate}
+
+\section{API Gateway}
+
+\subsection{Architecture}
+
+The Hanzo API Gateway (\texttt{hanzo/gateway}) is built on KrakenD~\cite{krakend2017}, forked in December 2017. The gateway operates as a stateless reverse proxy at the edge of the platform, handling JWT validation, rate limiting, request aggregation, and protocol translation.
+
+\subsection{Request Pipeline}
+
+Every request traverses the following pipeline:
+
+\begin{enumerate}
+    \item \textbf{TLS termination}: Handled by the upstream ingress layer.
+    \item \textbf{Identity header stripping}: The gateway removes all client-supplied identity headers (\texttt{X-Org-Id}, \texttt{X-User-Id}, \texttt{X-User-Email}) before processing. Only the JWT-validated path may set these headers.
+    \item \textbf{JWT validation}: The gateway verifies the JWT signature against the IAM provider's JWKS endpoint, checks expiration, audience, and issuer claims.
+    \item \textbf{Claim extraction}: The \texttt{sub} (user ID), \texttt{email}, and \texttt{owner} (organization) claims are extracted and injected as internal headers.
+    \item \textbf{Rate limiting}: Per-organization and per-user rate limits are enforced.
+    \item \textbf{Routing}: The request is forwarded to the appropriate backend service.
+\end{enumerate}
+
+\subsection{Configuration}
+
+The gateway is configured declaratively via a JSON specification:
+
+\begin{lstlisting}[caption=Gateway endpoint configuration.]
+{
+  "endpoint": "/v1/products",
+  "method": "GET",
+  "backend": [
+    {
+      "host": ["http://commerce:8080"],
+      "url_pattern": "/v1/products"
+    }
+  ],
+  "extra_config": {
+    "auth/validator": {
+      "alg": "RS256",
+      "jwk_url": "https://hanzo.id/.well-known/jwks.json",
+      "audience": ["hanzo-platform"],
+      "issuer": "https://hanzo.id"
+    }
+  }
+}
+\end{lstlisting}
+
+\section{Identity Provider}
+
+\subsection{OAuth 2.0 and OIDC}
+
+The Hanzo identity provider implements the OAuth~2.0 Authorization Framework~\cite{rfc6749} and OpenID Connect Core~\cite{oidc2014}. Supported grant types:
+
+\begin{itemize}
+    \item \textbf{Authorization Code}: Standard web application flow with PKCE.
+    \item \textbf{Client Credentials}: Service-to-service authentication.
+    \item \textbf{Device Authorization}: CLI and device-based flows.
+    \item \textbf{Refresh Token}: Long-lived session maintenance.
+\end{itemize}
+
+\subsection{OIDC Endpoints}
+
+All endpoints follow RFC~6749 and OIDC discovery:
+
+\begin{table}[h]
+\centering
+\caption{OIDC endpoint paths.}
+\begin{tabular}{ll}
+\toprule
+\textbf{Function} & \textbf{Path} \\
+\midrule
+Discovery   & \texttt{/.well-known/openid-configuration} \\
+Authorize   & \texttt{/oauth/authorize} \\
+Token       & \texttt{/oauth/token} \\
+UserInfo    & \texttt{/oauth/userinfo} \\
+Introspect  & \texttt{/oauth/introspect} \\
+Revoke      & \texttt{/oauth/revoke} \\
+Device      & \texttt{/oauth/device} \\
+Logout      & \texttt{/oauth/logout} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{JWT Structure}
+
+Access tokens are signed JWTs containing identity and authorization claims:
+
+\begin{lstlisting}[caption=JWT payload structure.]
+{
+  "sub": "user_abc123",
+  "email": "user@example.com",
+  "owner": "org-acme",
+  "aud": ["hanzo-platform"],
+  "iss": "https://hanzo.id",
+  "iat": 1550000000,
+  "exp": 1550003600,
+  "roles": ["admin"],
+  "permissions": ["products:read", "products:write"]
+}
+\end{lstlisting}
+
+The \texttt{owner} claim identifies the organization. All downstream services scope data queries to this organization.
+
+\section{Multi-Tenant Organizations}
+
+\subsection{Organization Model}
+
+Each organization is an isolated tenant with its own users, roles, applications, and data:
+
+\begin{equation}
+    \text{Org} = (\text{id}, \text{name}, \text{domain}, \text{members}, \text{roles}, \text{applications})
+\end{equation}
+
+Users may belong to multiple organizations. A user's effective permissions are the union of their role assignments within the active organization.
+
+\subsection{Data Isolation}
+
+The \texttt{owner} claim from the JWT is injected into every database query as a mandatory filter:
+
+\begin{lstlisting}[language=Go,caption=Org-scoped query pattern.]
+func ListProducts(ctx context.Context) ([]Product, error) {
+    orgID := ctx.Value("orgID").(string)
+    return db.Query(
+        "SELECT * FROM products WHERE org_id = $1",
+        orgID,
+    )
+}
+\end{lstlisting}
+
+Services never expose data from one organization to another. The gateway is the sole source of the organization identifier; backend services do not trust client-supplied values.
+
+\section{Role-Based Access Control}
+
+\subsection{Permission Model}
+
+Permissions are defined as triples of (resource, action, scope):
+
+\begin{equation}
+    P = \{(r, a, s) \mid r \in \mathcal{R}, a \in \mathcal{A}, s \in \{\text{own}, \text{all}\}\}
+\end{equation}
+
+where $\mathcal{R}$ is the set of resource types and $\mathcal{A} = \{\text{read}, \text{write}, \text{delete}\}$.
+
+\subsection{Role Hierarchy}
+
+Standard roles are provided:
+
+\begin{table}[h]
+\centering
+\caption{Default role hierarchy.}
+\begin{tabular}{ll}
+\toprule
+\textbf{Role} & \textbf{Capabilities} \\
+\midrule
+\texttt{owner}   & Full control, manage members and billing \\
+\texttt{admin}   & All resource operations, manage members \\
+\texttt{editor}  & Read and write all resources \\
+\texttt{viewer}  & Read-only access to all resources \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Custom roles can be defined per organization with arbitrary permission sets.
+
+\subsection{Authorization Check}
+
+\begin{equation}
+    \text{authorized}(u, r, a) = \exists\, \rho \in \text{roles}(u, o) : (r, a, *) \in \text{permissions}(\rho)
+\end{equation}
+
+where $u$ is the user, $r$ the resource type, $a$ the action, and $o$ the active organization.
+
+\section{White-Label Deployments}
+
+The IAM system supports white-label deployments where the identity provider serves multiple brands from a single instance. Brand detection is hostname-based: the login page, logo, colors, and email templates are determined by the domain the user accesses.
+
+\begin{table}[h]
+\centering
+\caption{White-label brand mapping.}
+\begin{tabular}{ll}
+\toprule
+\textbf{Domain} & \textbf{Brand} \\
+\midrule
+\texttt{hanzo.id}   & Hanzo \\
+\texttt{lux.id}     & Lux \\
+\texttt{zoo.id}     & Zoo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The underlying identity data is shared: a user authenticated at \texttt{lux.id} with an organization membership on the Hanzo platform can access Hanzo services with their Lux-issued JWT, provided the audience claim matches.
+
+\section{Service-to-Service Authentication}
+
+Internal services authenticate using the Client Credentials grant. Each service is registered as an application with a \texttt{clientId} and \texttt{clientSecret}:
+
+\begin{lstlisting}[caption=Service authentication.]
+POST /oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials
+&client_id=svc-commerce
+&client_secret=SECRET
+&audience=hanzo-platform
+\end{lstlisting}
+
+The resulting access token contains a \texttt{sub} identifying the service and scoped permissions appropriate for inter-service communication.
+
+\section{Security Considerations}
+
+\begin{itemize}
+    \item \textbf{Password storage}: All passwords are hashed with bcrypt (cost factor 12). Plaintext passwords are never stored.
+    \item \textbf{Token signing}: RS256 with 2048-bit RSA keys, rotated quarterly. JWKS endpoint serves the current and previous public keys to allow graceful rotation.
+    \item \textbf{Brute force protection}: Account lockout after 5 failed attempts with exponential backoff.
+    \item \textbf{Secret management}: Client secrets and signing keys are stored in the Hanzo KMS, not in configuration files or environment variables.
+\end{itemize}
+
+\section{Conclusion}
+
+The Hanzo IAM system provides a centralized identity, access management, and API gateway layer for the entire Hanzo platform. By extracting the organization from JWT claims and enforcing data isolation at the query level, the system ensures strict multi-tenant separation. The gateway strips client-supplied identity headers and relies solely on JWT-validated claims, preventing privilege escalation. OAuth~2.0/OIDC compliance enables integration with standard tooling, while white-label support allows the same identity infrastructure to serve multiple brands. This architecture now provides authentication and authorization for all Hanzo, Lux, and Zoo services in production.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{rfc6749}
+D.~Hardt. The OAuth 2.0 Authorization Framework. RFC 6749, IETF, 2012.
+
+\bibitem{oidc2014}
+N.~Sakimura et al. OpenID Connect Core 1.0. OpenID Foundation, 2014.
+
+\bibitem{krakend2017}
+KrakenD. KrakenD: Ultra-High Performance API Gateway. \url{https://krakend.io}, 2017.
+
+\bibitem{rfc7519}
+M.~Jones, J.~Bradley, and N.~Sakimura. JSON Web Token (JWT). RFC 7519, IETF, 2015.
+
+\bibitem{rfc7517}
+M.~Jones. JSON Web Key (JWK). RFC 7517, IETF, 2015.
+
+\end{thebibliography}
+
+\end{document}

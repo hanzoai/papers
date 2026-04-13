@@ -1,0 +1,283 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{../shared/lstlang}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{End-to-End Encryption and Security Architecture\\for Cloud-Native Applications}
+\author{Zach Kelling\thanks{zach@hanzo.ai} \\ \textit{CTO, Hanzo Industries (Techstars '17)}}
+\date{2019}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We describe the encryption and security architecture developed at Hanzo Industries between 2018 and 2019, comprising four components: Age-based file encryption using X25519 key agreement (\texttt{hanzo/age}, May 2019), an encrypted message queue (\texttt{hanzo/mq}, December 2018, 4{,}900 commits), per-tenant storage encryption for the S3-compatible object store, and a key management architecture that serves as the precursor to the Hanzo KMS. Together, these components provide end-to-end encryption for data at rest, data in transit within the message queue, and data in storage. The security primitives described here subsequently evolved into the post-quantum encryption stack deployed on the Lux network.
+\end{abstract}
+
+\section{Introduction}
+
+Cloud-native applications handle sensitive data across multiple services, storage backends, and communication channels. Encryption must be applied consistently at every layer: files at rest, messages in transit between services, objects in storage, and secrets in configuration. Relying on transport-layer encryption (TLS) alone is insufficient---data is decrypted at each service boundary, creating exposure windows.
+
+The Hanzo security architecture addresses this through defense-in-depth encryption:
+
+\begin{enumerate}
+    \item \textbf{File encryption} (May 2019): Age-based encryption for configuration files, backups, and secrets at rest.
+    \item \textbf{Message encryption} (December 2018): Per-message encryption within the message queue.
+    \item \textbf{Storage encryption}: Per-tenant encryption of objects in the S3-compatible store.
+    \item \textbf{Key management}: Centralized key lifecycle management.
+\end{enumerate}
+
+\section{Age Encryption}
+
+\subsection{Design}
+
+The \texttt{hanzo/age} module (May 2019) implements file encryption using the Age format~\cite{age2019}. Age uses X25519 key agreement with ChaCha20-Poly1305 symmetric encryption:
+
+\begin{equation}
+    K_{\text{shared}} = \text{X25519}(sk_{\text{sender}}, pk_{\text{recipient}})
+\end{equation}
+
+\begin{equation}
+    K_{\text{file}} \xleftarrow{\$} \{0, 1\}^{256}
+\end{equation}
+
+\begin{equation}
+    C_{\text{header}} = \text{ChaCha20-Poly1305}_{K_{\text{shared}}}(K_{\text{file}})
+\end{equation}
+
+\begin{equation}
+    C_{\text{body}} = \text{ChaCha20-Poly1305}_{K_{\text{file}}}(P)
+\end{equation}
+
+where $sk_{\text{sender}}$ is the sender's private key, $pk_{\text{recipient}}$ is the recipient's public key, $K_{\text{file}}$ is a per-file symmetric key, $P$ is the plaintext, and $C_{\text{body}}$ is the ciphertext.
+
+\subsection{Key Format}
+
+Public keys are encoded as Bech32 strings with a human-readable prefix:
+
+\begin{lstlisting}[caption=Age key pair format.]
+# Public key
+age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+
+# Private key (stored in KMS, never on disk)
+AGE-SECRET-KEY-1QFWET6A35FH2XNNWCJLZ5VQCGY3P46S...
+\end{lstlisting}
+
+\subsection{Use Cases}
+
+Age encryption is used for:
+\begin{itemize}
+    \item \textbf{Secret files}: Encrypting configuration files containing credentials before storing them in version control or backup storage.
+    \item \textbf{Database backups}: Encrypting PostgreSQL and KV store backups before uploading to object storage.
+    \item \textbf{Compliance exports}: Encrypting data exports for regulatory compliance.
+\end{itemize}
+
+\section{Encrypted Message Queue}
+
+\subsection{Architecture}
+
+The Hanzo message queue (\texttt{hanzo/mq}, December 2018, 4{,}900 commits) extends the PubSub layer with per-message encryption. Messages containing sensitive data are encrypted before publication and decrypted by authorized subscribers.
+
+\subsection{Envelope Encryption}
+
+Messages use envelope encryption: each message is encrypted with a unique data encryption key (DEK), and the DEK is encrypted with the recipient's key encryption key (KEK):
+
+\begin{equation}
+    DEK_m \xleftarrow{\$} \{0, 1\}^{256}
+\end{equation}
+
+\begin{equation}
+    C_m = \text{AES-256-GCM}_{DEK_m}(M)
+\end{equation}
+
+\begin{equation}
+    E_m = \text{AES-256-GCM}_{KEK_r}(DEK_m)
+\end{equation}
+
+where $M$ is the plaintext message, $C_m$ the ciphertext, $DEK_m$ the per-message data encryption key, and $KEK_r$ the recipient's key encryption key.
+
+The published message contains $(E_m, \text{nonce}, C_m, \text{tag})$. Only subscribers with access to $KEK_r$ can decrypt $DEK_m$ and subsequently $M$.
+
+\subsection{Key Rotation}
+
+KEKs are rotated on a configurable schedule (default: 90 days). During rotation:
+\begin{enumerate}
+    \item A new KEK is generated and distributed to authorized subscribers.
+    \item New messages are encrypted with the new KEK.
+    \item The old KEK is retained for a grace period to allow in-flight message decryption.
+    \item After the grace period, the old KEK is archived to the key management layer.
+\end{enumerate}
+
+\subsection{Message Queue Performance}
+
+\begin{table}[h]
+\centering
+\caption{Encryption overhead on message throughput.}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Mode} & \textbf{Messages/s} & \textbf{Overhead} \\
+\midrule
+Plaintext PubSub   & 3{,}500{,}000 & --- \\
+Encrypted MQ (256B) & 2{,}800{,}000 & 20\% \\
+Encrypted MQ (4KB)  & 1{,}900{,}000 & 46\% \\
+Encrypted MQ (64KB) &   420{,}000 & 88\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The overhead is dominated by the symmetric encryption of the message body. The envelope key operation adds negligible latency (sub-microsecond).
+
+\section{Per-Tenant Storage Encryption}
+
+\subsection{Architecture}
+
+The S3-compatible object storage layer encrypts all objects at rest using per-tenant keys. The encryption is transparent to clients: objects are encrypted on write and decrypted on read by the storage service.
+
+\subsection{Key Hierarchy}
+
+A three-tier key hierarchy provides isolation and rotation:
+
+\begin{enumerate}
+    \item \textbf{Master Key (MK)}: A single master key stored in a hardware security module (HSM) or software KMS. Never leaves the key management boundary.
+    \item \textbf{Tenant Key (TK)}: One per tenant, encrypted by the MK. Stored alongside the tenant metadata.
+    \item \textbf{Object Key (OK)}: One per object, encrypted by the TK. Stored in the object metadata.
+\end{enumerate}
+
+\begin{equation}
+    OK_o \xleftarrow{\$} \{0, 1\}^{256}, \quad C_o = \text{AES-256-GCM}_{OK_o}(O)
+\end{equation}
+
+\begin{equation}
+    E_{OK} = \text{AES-256-GCM}_{TK_t}(OK_o), \quad E_{TK} = \text{AES-256-GCM}_{MK}(TK_t)
+\end{equation}
+
+\subsection{Tenant Isolation Guarantee}
+
+Compromising a single tenant key $TK_t$ exposes only that tenant's objects. The master key and all other tenant keys remain unaffected. Tenant key rotation re-encrypts only the tenant key itself (not the underlying objects), making rotation a constant-time operation:
+
+\begin{equation}
+    E_{TK}' = \text{AES-256-GCM}_{MK}(TK_t'), \quad \forall\, o : E_{OK_o}' = \text{AES-256-GCM}_{TK_t'}(OK_o)
+\end{equation}
+
+In practice, lazy re-encryption of object keys is performed during object access, amortizing the cost over normal read/write operations.
+
+\section{Key Management Architecture}
+
+\subsection{Design Principles}
+
+The key management layer follows three principles:
+
+\begin{enumerate}
+    \item \textbf{Separation of duties}: The system that encrypts data does not have direct access to the master key. Encryption operations go through the KMS API.
+    \item \textbf{Audit trail}: Every key operation (creation, rotation, access, deletion) is logged immutably.
+    \item \textbf{Least privilege}: Services are granted access only to the specific keys required for their function.
+\end{enumerate}
+
+\subsection{KMS API}
+
+The key management API provides four operations:
+
+\begin{lstlisting}[language=Go,caption=Key management interface.]
+type KMS interface {
+    // Create a new encryption key
+    CreateKey(ctx context.Context,
+        name string) (*Key, error)
+
+    // Encrypt data with a named key
+    Encrypt(ctx context.Context,
+        keyName string,
+        plaintext []byte) ([]byte, error)
+
+    // Decrypt data with a named key
+    Decrypt(ctx context.Context,
+        keyName string,
+        ciphertext []byte) ([]byte, error)
+
+    // Rotate a key (creates new version)
+    RotateKey(ctx context.Context,
+        keyName string) (*Key, error)
+}
+\end{lstlisting}
+
+\subsection{Access Control}
+
+Access to keys is controlled by IAM policies. Each key has an access control list specifying which service identities may encrypt, decrypt, or administer the key:
+
+\begin{table}[h]
+\centering
+\caption{Key access policy example.}
+\begin{tabular}{lll}
+\toprule
+\textbf{Service} & \textbf{Key} & \textbf{Permissions} \\
+\midrule
+storage-service & tenant-keys/* & encrypt, decrypt \\
+backup-service  & backup-key    & encrypt only \\
+restore-service & backup-key    & decrypt only \\
+kms-admin       & *             & admin \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Threat Model}
+
+The encryption architecture defends against the following threats:
+
+\begin{itemize}
+    \item \textbf{Storage breach}: An attacker gaining read access to the storage backend obtains only ciphertext. Without the tenant key, objects cannot be decrypted.
+    \item \textbf{Message interception}: An attacker capturing messages from the queue obtains only encrypted payloads. Without the recipient KEK, messages cannot be decrypted.
+    \item \textbf{Insider threat}: A compromised service can only access keys granted to its identity. Separation of encrypt/decrypt permissions limits blast radius.
+    \item \textbf{Key compromise}: Per-tenant and per-object key hierarchy limits the scope of any single key compromise.
+\end{itemize}
+
+\section{Evolution Toward Post-Quantum Security}
+
+The X25519 key agreement and AES-256-GCM symmetric encryption provide strong security against classical adversaries. However, the emergence of large-scale quantum computing threatens the security of elliptic curve key agreement. The key management architecture was designed with algorithm agility: the KMS abstraction allows replacement of the underlying cryptographic primitives without changing the API surface.
+
+This design decision enabled the subsequent adoption of post-quantum key encapsulation mechanisms (KEMs) on the Lux network, where Kyber/ML-KEM replaced X25519 for key agreement while maintaining the same envelope encryption pattern and key hierarchy.
+
+\section{Conclusion}
+
+The Hanzo encryption and security architecture provides defense-in-depth protection for data at rest, in transit within the message queue, and in object storage. Age encryption handles file-level encryption with X25519 key agreement. The encrypted message queue extends PubSub with per-message envelope encryption. Per-tenant storage encryption with a three-tier key hierarchy ensures tenant isolation. The key management API centralizes key lifecycle operations with IAM-controlled access policies. These primitives, developed between 2018 and 2019, formed the security foundation that subsequently evolved into the post-quantum encryption stack deployed on the Lux network.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{age2019}
+F.~Valsorda. age: A Simple, Modern, and Secure Encryption Tool. \url{https://age-encryption.org}, 2019.
+
+\bibitem{rfc7748}
+A.~Langley, M.~Hamburg, and S.~Turner. Elliptic Curves for Security. RFC 7748, IETF, 2016.
+
+\bibitem{rfc5116}
+D.~McGrew. An Interface and Algorithms for Authenticated Encryption. RFC 5116, IETF, 2008.
+
+\bibitem{nist2016}
+NIST. Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM). SP 800-38D, 2007.
+
+\bibitem{bernstein2012}
+D.~J.~Bernstein. Curve25519: New Diffie-Hellman speed records. \textit{Lecture Notes in Computer Science}, 3958:207--228, 2006.
+
+\end{thebibliography}
+
+\end{document}

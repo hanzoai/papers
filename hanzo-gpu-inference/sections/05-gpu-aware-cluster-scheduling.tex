@@ -1,0 +1,55 @@
+\section{GPU-Aware Cluster Scheduling}
+
+\label{sec:scheduling}
+% ============================================================================
+
+The cluster scheduler operates at the request level, assigning incoming requests
+to GPU nodes. Unlike traditional load balancers, it must account for
+GPU-specific constraints.
+
+\subsection{Node Health Scoring}
+
+Each GPU node reports a health score $h_g$ computed as:
+\begin{equation}
+h_g = \omega_1 (1 - U_g) + \omega_2 \frac{M_{\text{free}}^g}{M_{\text{total}}^g}
++ \omega_3 \left(1 - \frac{T_g}{T_{\max}}\right)
++ \omega_4 \frac{1}{1 + Q_g},
+\end{equation}
+where $\omega_1 + \omega_2 + \omega_3 + \omega_4 = 1$ are configurable weights.
+In production, we use $\omega = (0.3, 0.3, 0.1, 0.3)$.
+
+\subsection{Model Affinity}
+
+Loading a model onto a GPU that does not already have it incurs a cold-start
+penalty. The scheduler maintains an affinity matrix $A \in \{0,1\}^{|\mathcal{M}|
+\times |\mathcal{G}|}$ where $A_{m,g} = 1$ if model $m$ is loaded on GPU $g$.
+The routing cost (Equation~\ref{eq:routing}) penalizes routing to nodes without
+model affinity.
+
+\subsection{Thermal Throttling Avoidance}
+
+GPU thermal throttling reduces clock speed by up to 30\% when junction
+temperature exceeds 83\textdegree C (H100). The scheduler proactively avoids
+hot nodes:
+\begin{equation}
+\text{throttle}(g) = \begin{cases}
+    1.0 & \text{if } T_g < 75\text{\textdegree C}, \\
+    1 - 0.3 \cdot \frac{T_g - 75}{T_{\max} - 75} & \text{if } T_g \geq 75\text{\textdegree C}.
+\end{cases}
+\end{equation}
+
+\subsection{Multi-GPU Tensor Parallelism}
+
+For models exceeding single-GPU memory (70B+ parameters), the scheduler
+co-locates tensor-parallel shards on GPUs connected via NVLink:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Intra-node}: NVLink at 900 GB/s (H100 SXM). Shards on the
+    same physical node.
+    \item \textbf{Inter-node}: InfiniBand at 400 Gb/s. Used only when intra-node
+    GPUs are exhausted.
+\end{itemize}
+
+The scheduler ensures that all shards for a tensor-parallel group are placed on
+GPUs with symmetric interconnect bandwidth to avoid stragglers.
+
+% ============================================================================

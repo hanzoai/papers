@@ -1,0 +1,91 @@
+\section{Key Management}
+
+
+\subsection{Key Hierarchy}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    box/.style={rectangle, draw, minimum width=3cm, minimum height=0.7cm,
+                align=center, font=\footnotesize},
+    arrow/.style={->, thick}
+]
+\node[box] (master) {Master Key\\(Hanzo KMS)};
+\node[box, below left=1.2cm and 0.5cm of master] (iam-key) {IAM Identity\\(age)};
+\node[box, below=1.2cm of master] (ats-key) {ATS Identity\\(age)};
+\node[box, below right=1.2cm and 0.5cm of master] (kms-key) {KMS Identity\\(age)};
+\node[box, below=1.2cm of iam-key] (iam-recip) {IAM Recipients};
+\node[box, below=1.2cm of ats-key] (ats-recip) {ATS Recipients};
+\node[box, below=1.2cm of kms-key] (kms-recip) {KMS Recipients};
+
+\draw[arrow] (master) -- (iam-key) node[midway,left,font=\scriptsize] {HKDF};
+\draw[arrow] (master) -- (ats-key) node[midway,left,font=\scriptsize] {HKDF};
+\draw[arrow] (master) -- (kms-key) node[midway,right,font=\scriptsize] {HKDF};
+\draw[arrow] (iam-key) -- (iam-recip);
+\draw[arrow] (ats-key) -- (ats-recip);
+\draw[arrow] (kms-key) -- (kms-recip);
+\end{tikzpicture}
+\caption{Key derivation hierarchy. Per-service age identities are derived
+from the master key via HKDF.}
+\label{fig:keys}
+\end{figure}
+
+\begin{enumerate}[nosep]
+    \item \textbf{Master encryption key.} Stored in Hanzo KMS (HIP-0027).
+    This is the root of trust for all replicate encryption. It is a 256-bit
+    symmetric key used as HKDF input keying material.
+
+    \item \textbf{Per-service age keypairs.} Derived from the master key via
+    HKDF with the service name as the info parameter:
+    \texttt{HKDF-SHA256(master, salt="hanzo-replicate", info=service\_name)}.
+    The derived 32 bytes are used as the X25519 private key (age identity).
+    The corresponding public key is the age recipient.
+
+    \item \textbf{Recipients file.} Contains the public keys (recipients) of
+    all parties authorized to decrypt the replica. For normal operation, this
+    is the service's own recipient. For disaster recovery, this includes a
+    recovery recipient held offline.
+\end{enumerate}
+
+\subsection{Key Rotation}
+
+Key rotation proceeds without downtime:
+
+\begin{enumerate}[nosep]
+    \item Generate a new age keypair (derived from a new HKDF info or a
+    rotated master key).
+    \item Add the new recipient to the recipients file. The old recipient
+    remains.
+    \item Restart the \texttt{replicate} sidecar. New WAL segments and
+    snapshots are encrypted to both old and new recipients.
+    \item After the retention period expires (72 hours for WAL, 30 days for
+    snapshots), all surviving replicas are encrypted to the new recipient.
+    \item Remove the old recipient from the recipients file.
+    \item The old identity is retained in KMS for historical reads. It is
+    marked as \texttt{rotated} but never deleted.
+\end{enumerate}
+
+\subsection{Emergency Recovery}
+
+Full restore requires two keys: the master key from Hanzo KMS and the
+per-service age identity derived from it. The recovery procedure:
+
+\begin{enumerate}[nosep]
+    \item Retrieve the master key from KMS (requires KMS admin
+    authentication).
+    \item Derive the service identity:
+    \texttt{age-keygen -o identity.txt} from the HKDF output.
+    \item Run \texttt{replicate restore -config replicate.yml
+    /data/base/data.db}.
+    \item The restored database is encrypted with sqlcipher. The sqlcipher key
+    is also in KMS.
+\end{enumerate}
+
+If KMS itself is unavailable (catastrophic failure), the KMS database is
+restored first using the offline recovery identity (stored in a physical
+safe or HSM).
+
+% ============================================================================
+% 6. DEPLOYMENT
+% ============================================================================

@@ -1,0 +1,73 @@
+\section{Grounded Generation}
+
+\label{sec:generation}
+
+\subsection{Constrained Decoding}
+
+To ensure factual grounding, we employ a constrained decoding scheme that requires every factual claim in the generated response to be supported by at least one retrieved passage.
+
+\begin{definition}[Grounded Response]
+A response $a = [s_1, \ldots, s_n]$ (sequence of sentences) is \emph{grounded} with respect to passages $\mathcal{P}$ if for every factual sentence $s_i$, there exists a passage $p_j \in \mathcal{P}$ such that $\text{NLI}(p_j, s_i) = \text{entailment}$, where NLI is a natural language inference model.
+\end{definition}
+
+\subsection{Citation Injection}
+
+We inject citation markers during generation using a modified prompt that instructs the model to include inline references:
+
+\begin{algorithm}[H]
+\caption{Grounded Generation with Citation Injection}
+\label{alg:grounded}
+\begin{algorithmic}[1]
+\Require Query $q$, passages $\mathcal{P} = [p_1, \ldots, p_k]$, model $M$
+\State Format context: $C \gets \text{FormatPassages}(\mathcal{P})$
+\State $\text{prompt} \gets \text{SystemPrompt}(\text{``cite sources inline''})$
+\State $a \gets M(\text{prompt}, C, q)$ \Comment{Generate with citations}
+\State Parse citations: $\mathcal{C} \gets \text{ExtractCitations}(a)$
+\State \Comment{Verify each citation}
+\For{each $(s_i, c_i) \in \mathcal{C}$}
+    \State $\text{score} \gets \text{NLI}(\mathcal{P}[c_i], s_i)$
+    \If{$\text{score} < \tau_{\text{nli}}$}
+        \State Flag $s_i$ as potentially ungrounded
+    \EndIf
+\EndFor
+\State \Return $(a, \mathcal{C}, \text{flags})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Hallucination Detection}
+
+We employ a three-layer hallucination detection system:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{NLI-based}: DeBERTa-v3-large fine-tuned on MNLI + FactCC + custom data checks entailment between each claim and its cited passage.
+    \item \textbf{Consistency-based}: Generate the answer twice with different temperatures; claims that disagree between runs are flagged.
+    \item \textbf{Knowledge-based}: Cross-reference numerical claims, dates, and named entities against a structured knowledge base.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+NLI only & 87.2\% & 79.1\% & 82.9\% \\
+Consistency only & 81.4\% & 72.3\% & 76.6\% \\
+Knowledge only & 92.1\% & 54.8\% & 68.7\% \\
+\textbf{Combined} & \textbf{91.8\%} & \textbf{85.4\%} & \textbf{88.5\%} \\
+\bottomrule
+\end{tabular}
+\caption{Hallucination detection accuracy on our FactCheck-1K dataset.}
+\label{tab:hallucination}
+\end{table}
+
+\subsection{Source Attribution Accuracy}
+
+On our SourceVerify benchmark (1,000 generated answers with manually verified citations), Hanzo Search achieves:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Citation precision}: 94.3\% (fraction of citations that correctly support the claim).
+    \item \textbf{Citation recall}: 89.7\% (fraction of factual claims that have a citation).
+    \item \textbf{Source diversity}: 3.2 unique sources per answer (median), preventing over-reliance on single sources.
+\end{itemize}
+

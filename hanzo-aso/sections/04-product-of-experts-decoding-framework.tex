@@ -1,0 +1,153 @@
+\section{Product-of-Experts Decoding Framework}
+
+\label{sec:poe}
+
+\subsection{Token-Level PoE Formulation}
+
+At each decoding step $t$, the adapted distribution is a PoE of the base model
+and $M$ experiential priors:
+\begin{equation}
+    \pi_{\text{ASO}}(y_t \mid x, y_{<t})
+    = \frac{1}{Z_t} \; \pi_\theta(y_t \mid x, y_{<t})
+    \prod_{m=1}^{M} \phi_m(y_t \mid x, y_{<t})^{\eta_m},
+    \label{eq:poe-main}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em]
+    \item $\pi_\theta$ is the frozen base model (expert 0),
+    \item $\phi_m$ is the $m$-th experiential prior factor,
+    \item $\eta_m \geq 0$ is the weight for prior $m$,
+    \item $Z_t = \sum_{v \in \mathcal{V}} \pi_\theta(v \mid x, y_{<t})
+          \prod_m \phi_m(v \mid x, y_{<t})^{\eta_m}$ is the normalizing constant.
+\end{itemize}
+
+In log-space, the PoE decoding reduces to a simple addition of logits:
+\begin{equation}
+    \log \pi_{\text{ASO}}(y_t = v \mid x, y_{<t})
+    = \ell_{t,v} + \sum_{m=1}^{M} \eta_m \log \phi_m(v \mid x, y_{<t}) - \log Z_t,
+    \label{eq:poe-logspace}
+\end{equation}
+where $\ell_{t,v}$ are the base model logits. This is computationally
+inexpensive: the overhead is $O(MV)$ additions per decoding step, negligible
+compared to the $O(d^2)$ cost of the transformer forward pass.
+
+\subsection{Expert Factor Construction}
+
+Each experiential prior $\phi_m$ is constructed from the semantic advantage
+$S_m$ extracted during TF-GRPO. The construction proceeds in three steps:
+
+\paragraph{Step 1: Token Set Identification.}
+Given pattern $s_k = (\text{pattern}_k, c_k, \mathcal{V}_k)$, identify the set
+of vocabulary tokens $\mathcal{V}_k$ that are promoted or demoted by this
+pattern. For code generation, this typically involves:
+\begin{itemize}[leftmargin=1.5em]
+    \item Function/method names (e.g., \texttt{get} vs.\ \texttt{\_\_getitem\_\_}),
+    \item Control flow tokens (e.g., \texttt{try}/\texttt{except} vs.\ \texttt{if}/\texttt{else}),
+    \item Library-specific tokens (e.g., \texttt{pandas} operations).
+\end{itemize}
+
+\paragraph{Step 2: Delta Computation.}
+For each token $v \in \mathcal{V}_k$, compute the log-probability adjustment:
+\begin{equation}
+    \Delta_m(v) = c_m \cdot \begin{cases}
+        +\delta_+ & \text{if } v \text{ is promoted by pattern } m, \\
+        -\delta_- & \text{if } v \text{ is demoted by pattern } m, \\
+        0 & \text{otherwise},
+    \end{cases}
+\end{equation}
+where $\delta_+, \delta_- > 0$ are the promotion/demotion magnitudes (default
+$\delta_+ = \delta_- = 1.0$). The confidence $c_m$ scales the adjustment.
+
+\paragraph{Step 3: Factor Assembly.}
+The expert factor is:
+\begin{equation}
+    \log \phi_m(v \mid x, y_{<t}) = \begin{cases}
+        \Delta_m(v) & \text{if context matches pattern } m \text{ and } v \in \mathcal{V}_m, \\
+        0 & \text{otherwise}.
+    \end{cases}
+\end{equation}
+The context matching condition ensures that priors are applied only when
+relevant. For example, a pattern about error handling is applied only when the
+model is generating code within a function body that performs I/O operations.
+
+\subsection{Expert Weight Derivation}
+
+The weight $\eta_m$ for prior $m$ is derived from its quality score $q_m \in (0, 1)$
+via a Bayesian argument.
+
+\begin{theorem}[Optimal Expert Weights]
+\label{thm:weights}
+Under the assumption that each prior $m$ is an independent binary classifier of
+``good'' vs.\ ``bad'' token choices with accuracy $q_m$, the Bayes-optimal
+log-weight is:
+\begin{equation}
+    \eta_m = \log \frac{q_m}{1 - q_m}.
+    \label{eq:eta-bayes}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Consider token $v$ at position $t$. Let $H_+$ denote the event that $v$ is a
+good choice and $H_-$ that it is bad. Prior $m$ provides a binary
+recommendation: $\phi_m(v) = q_m$ if recommending $v$ (event $R_+$) and
+$\phi_m(v) = 1 - q_m$ otherwise. By independence:
+\begin{align}
+    \frac{P(H_+ \mid R_+^1, \ldots, R_+^M)}{P(H_- \mid R_+^1, \ldots, R_+^M)}
+    &= \frac{P(H_+)}{P(H_-)} \prod_{m=1}^M \frac{P(R_+^m \mid H_+)}{P(R_+^m \mid H_-)} \\
+    &= \frac{P(H_+)}{P(H_-)} \prod_{m=1}^M \frac{q_m}{1 - q_m}.
+\end{align}
+Taking logarithms and identifying the base model logit ratio with
+$\log(P(H_+)/P(H_-))$, each prior contributes an additive
+$\log(q_m / (1 - q_m))$ to the log-odds, which is exactly the PoE with
+$\eta_m$ as given.
+\end{proof}
+
+\begin{corollary}
+Priors with $q_m = 0.5$ (random) receive weight $\eta_m = 0$ and are
+automatically ignored. Priors with $q_m > 0.5$ receive positive weight
+(contribute constructively), while $q_m < 0.5$ would receive negative weight
+(inverted signal). In practice, we clamp $\eta_m \geq 0$ and discard priors
+with $q_m < 0.5$.
+\end{corollary}
+
+\subsection{Sparse Expert Factors}
+
+In practice, most expert factors are extremely sparse: only a small subset
+$\mathcal{V}_m \subset \mathcal{V}$ of tokens are affected by any given pattern.
+Let $s_m = |\mathcal{V}_m| / V$ denote the sparsity ratio. Typical values:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Pattern Type & $|\mathcal{V}_m|$ & Sparsity $s_m$ \\
+\midrule
+API preference & 5--20 & $10^{-4}$ \\
+Control flow & 10--50 & $10^{-3}$ \\
+Style convention & 20--100 & $10^{-3}$ \\
+Library selection & 50--200 & $10^{-2}$ \\
+\bottomrule
+\end{tabular}
+\caption{Typical sparsity of expert factors for code generation tasks.}
+\label{tab:sparsity}
+\end{table}
+
+The sparse representation enables efficient storage and retrieval. Only non-zero
+entries need to be stored, reducing memory from $O(V)$ to $O(|\mathcal{V}_m|)$
+per factor.
+
+\subsection{Temperature and Sharpness Control}
+
+The PoE can be sharpened or softened via a global temperature $\tau$:
+\begin{equation}
+    \pi_{\text{ASO}}^\tau(y_t = v \mid x, y_{<t})
+    = \frac{1}{Z_t^\tau} \left[\pi_\theta(v \mid x, y_{<t})
+    \prod_{m=1}^{M} \phi_m(v \mid x, y_{<t})^{\eta_m}\right]^{1/\tau}.
+\end{equation}
+Low $\tau$ sharpens the distribution (more deterministic), while high $\tau$
+flattens it (more exploratory). We use $\tau = 0.7$ for final generation and
+$\tau = 1.2$ during TF-GRPO exploration phases.
+
+% ============================================================================
+% 5. 1-BIT PRIOR COMPRESSION
+% ============================================================================

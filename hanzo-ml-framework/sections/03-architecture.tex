@@ -1,0 +1,180 @@
+\section{Architecture}
+
+
+\subsection{Tensor Core}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.7cm, align=center, font=\small},
+    arrow/.style={->, thick}
+]
+\node[box, fill=blue!10] (tensor) {Tensor};
+\node[box, below=of tensor] (storage) {Storage};
+\node[box, below left=0.5cm and 0cm of storage] (cpu) {CpuStorage};
+\node[box, below=of storage] (cuda) {CudaStorage};
+\node[box, below right=0.5cm and 0cm of storage] (metal) {MetalStorage};
+\node[box, right=2cm of tensor, fill=green!10] (op) {BackpropOp};
+\node[box, below=of op] (layout) {Layout};
+
+\draw[arrow] (tensor) -- (storage);
+\draw[arrow] (storage) -- (cpu);
+\draw[arrow] (storage) -- (cuda);
+\draw[arrow] (storage) -- (metal);
+\draw[arrow] (tensor) -- (op);
+\draw[arrow] (tensor) -- (layout);
+\end{tikzpicture}
+\caption{Tensor architecture with pluggable storage backends.}
+\label{fig:tensor}
+\end{figure}
+
+The core \texttt{Tensor} type (Figure~\ref{fig:tensor}) wraps:
+
+\begin{lstlisting}[language=Rust]
+pub struct Tensor_(Arc<Tensor_>);
+
+struct Tensor_ {
+    id: TensorId,
+    storage: Arc<RwLock<Storage>>,
+    layout: Layout,
+    op: BackpropOp,
+    is_variable: bool,
+    dtype: DType,
+    device: Device,
+}
+\end{lstlisting}
+
+\paragraph{Reference Counting.} Tensors use \texttt{Arc} for cheap cloning during graph construction. Storage is independently reference-counted to enable view operations without copying data.
+
+\paragraph{Layout.} The \texttt{Layout} struct tracks shape, strides, and offset, enabling non-contiguous views:
+
+\begin{lstlisting}[language=Rust]
+pub struct Layout {
+    shape: Shape,
+    stride: Vec<usize>,
+    start_offset: usize,
+}
+\end{lstlisting}
+
+\paragraph{Backpropagation.} The \texttt{BackpropOp} enum records the operation graph for automatic differentiation:
+
+\begin{lstlisting}[language=Rust]
+pub enum Op {
+    Binary(Tensor, Tensor, BinaryOp),
+    Unary(Tensor, UnaryOp),
+    Matmul(Tensor, Tensor),
+    Reduce(Tensor, ReduceOp, Vec<usize>),
+    Conv2D { arg, kernel, padding, stride, dilation },
+    // ... 30+ operations
+}
+\end{lstlisting}
+
+\subsection{Data Types}
+
+The \texttt{DType} enum supports:
+
+\begin{lstlisting}[language=Rust]
+pub enum DType {
+    // Standard floats
+    F16, BF16, F32, F64,
+    // Integers
+    U8, U32, I32, I64,
+    // Experimental FHE-friendly types
+    F8E4M3,  // 8-bit float
+    F4,      // 4-bit float
+    F6E2M3, F6E3M2,  // 6-bit floats
+}
+\end{lstlisting}
+
+The \texttt{WithDType} trait provides type-level operations:
+
+\begin{lstlisting}[language=Rust]
+pub trait WithDType: Sized + Copy {
+    const DTYPE: DType;
+    fn to_cpu_storage(data: &[Self]) -> CpuStorage;
+    fn from_cpu_storage(s: &CpuStorage) -> Vec<Self>;
+}
+\end{lstlisting}
+
+\subsection{Backend System}
+
+Three backends implement the \texttt{BackendStorage} trait:
+
+\paragraph{CPU Backend.} Pure Rust implementation with SIMD optimizations:
+
+\begin{lstlisting}[language=Rust]
+#[cfg(target_arch = "x86_64")]
+mod avx {
+    use std::arch::x86_64::*;
+
+    pub fn vec_add_f32(a: &[f32], b: &[f32],
+                       c: &mut [f32]) {
+        for i in (0..a.len()).step_by(8) {
+            unsafe {
+                let va = _mm256_loadu_ps(&a[i]);
+                let vb = _mm256_loadu_ps(&b[i]);
+                let vc = _mm256_add_ps(va, vb);
+                _mm256_storeu_ps(&mut c[i], vc);
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+Runtime dispatch selects optimal kernels based on CPU features.
+
+\paragraph{CUDA Backend.} Uses cuBLAS for matrix operations and custom kernels for element-wise ops. Optional cuDNN integration for convolutions.
+
+\paragraph{Metal Backend.} Apple Silicon support via Metal Performance Shaders and custom compute kernels for M1/M2/M3 optimization.
+
+\subsection{Operations}
+
+\subsubsection{Unary Operations}
+
+Defined via macro for consistency:
+
+\begin{lstlisting}[language=Rust]
+macro_rules! unary_op {
+    ($fn_name:ident, $op_name:ident) => {
+        pub fn $fn_name(&self) -> Result<Self> {
+            let storage = self.storage()
+                .unary_impl::<op::$op_name>(
+                    self.layout())?;
+            let op = BackpropOp::new1(self,
+                |s| Op::Unary(s, UnaryOp::$op_name));
+            Ok(from_storage(storage, shape, op, false))
+        }
+    };
+}
+
+unary_op!(exp, Exp);
+unary_op!(log, Log);
+unary_op!(sin, Sin);
+unary_op!(gelu, Gelu);
+unary_op!(silu, Silu);
+\end{lstlisting}
+
+\subsubsection{Binary Operations}
+
+Support broadcasting with shape validation:
+
+\begin{lstlisting}[language=Rust]
+pub fn broadcast_add(&self, rhs: &Self) -> Result<Self> {
+    let shape = self.shape()
+        .broadcast_shape_binary_op(rhs.shape(), "add")?;
+    // ... broadcast and compute
+}
+\end{lstlisting}
+
+\subsubsection{Reductions}
+
+Sum, mean, max, min, argmax, argmin with axis specification:
+
+\begin{lstlisting}[language=Rust]
+let x = Tensor::randn((2, 3, 4), DType::F32, &device)?;
+let sum_all = x.sum_all()?;           // Scalar
+let sum_axis = x.sum(1)?;             // Shape: (2, 4)
+let max_keepdim = x.max_keepdim(2)?;  // Shape: (2, 3, 1)
+\end{lstlisting}
+

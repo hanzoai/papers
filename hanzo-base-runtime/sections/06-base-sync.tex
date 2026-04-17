@@ -1,0 +1,80 @@
+\section{Base Sync}
+
+\label{sec:sync}
+% ============================================================================
+
+Base Sync is the replication protocol. It enables multiple Base instances to
+share data without a central coordinator. Sync is built on CRDTs
+(Conflict-free Replicated Data Types), guaranteeing that concurrent
+modifications converge to the same state without manual conflict resolution.
+
+\subsection{CRDT Log}
+
+Every mutation in Base produces a log entry:
+
+\begin{equation}
+e = (\text{id}, \text{collection}, \text{op}, \text{fields}, \text{hlc}, \text{node\_id})
+\end{equation}
+
+where $\text{hlc}$ is a hybrid logical clock~\cite{kulkarni2014hlc} and
+$\text{node\_id}$ is the originating Base instance. The log is append-only.
+Deletions are tombstones, not physical removals.
+
+\subsection{Conflict-Free Merge}
+
+Sync uses a last-writer-wins register (LWW) at the field level. Given two
+concurrent writes to the same field:
+
+\begin{equation}
+\text{resolve}(e_1, e_2) =
+\begin{cases}
+e_1 & \text{if } \text{hlc}(e_1) > \text{hlc}(e_2) \\
+e_2 & \text{if } \text{hlc}(e_2) > \text{hlc}(e_1) \\
+e_{\max(\text{node\_id})} & \text{if } \text{hlc}(e_1) = \text{hlc}(e_2)
+\end{cases}
+\end{equation}
+
+Field-level LWW means that two users editing different fields of the same
+record will both see their changes preserved. Only truly conflicting writes
+(same field, same record, same logical time) fall back to node ID ordering.
+
+\subsection{Sync Topologies}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lp{6cm}}
+\toprule
+\textbf{Topology} & \textbf{Description} \\
+\midrule
+Offline-first & Single device. Sync log accumulates locally. Replayed on
+next connection. \\
+Peer-to-peer & Two or more Base instances sync directly over WebSocket or
+WebRTC. No server. \\
+Server-relay & Base instances sync through a central relay. The relay is a
+Base instance with no special privileges. \\
+Hub-and-spoke & One Base instance acts as the persistent hub. Edge instances
+sync through it. The hub can be a cloud VM or a NAS on the local network. \\
+\bottomrule
+\end{tabular}
+\caption{Supported sync topologies. All use the same CRDT merge protocol.}
+\label{tab:topologies}
+\end{table}
+
+\subsection{Selective Sync}
+
+Not all data needs to sync everywhere. Base supports collection-level and
+rule-based sync filters:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Collection filter}: Sync only specified collections to a
+    target. A mobile device might sync \texttt{notes} but not
+    \texttt{analytics}.
+    \item \textbf{Record filter}: Sync only records matching a predicate.
+    A shared workspace might sync only records where
+    \texttt{org\_id = \$current\_org}.
+    \item \textbf{Field filter}: Exclude specific fields from sync. Encrypted
+    fields can be excluded from remote targets to keep sensitive data local.
+\end{itemize}
+
+% ============================================================================

@@ -1,0 +1,67 @@
+\section{Load Balancing}
+
+\label{sec:loadbalancing}
+
+\subsection{Adaptive Weight Computation}
+
+The load balancer assigns weights to provider endpoints based on observed performance. Let $w_i(t)$ be the weight of provider $i$ at time $t$:
+
+\begin{equation}
+w_i(t) = \frac{H_i(t) \cdot C_i(t)}{\sum_j H_j(t) \cdot C_j(t)}
+\end{equation}
+
+where $H_i(t)$ is the health score and $C_i(t)$ is the remaining rate limit capacity estimated from provider-returned headers:
+
+\begin{equation}
+C_i(t) = \min\left(\frac{r_{\text{remaining},i}}{r_{\text{limit},i}}, \frac{t_{\text{remaining},i}}{t_{\text{limit},i}}\right)
+\end{equation}
+
+This formulation naturally routes traffic away from degraded or rate-limited providers without requiring explicit configuration.
+
+\subsection{Fallback Chains}
+
+Fallback chains define ordered sequences of provider endpoints to attempt for a given request. When the primary provider fails or is unavailable, the gateway transparently retries with the next provider in the chain:
+
+\begin{algorithm}[t]
+\caption{Fallback Chain Execution}
+\label{alg:fallback}
+\begin{algorithmic}[1]
+\REQUIRE Request $q$, chain $[p_1, \ldots, p_n]$, retries $R$
+\STATE $\text{errors} \gets []$
+\FOR{$i = 1$ \TO $n$}
+    \FOR{$r = 1$ \TO $R$}
+        \STATE $\text{resp} \gets \text{dispatch}(q, p_i)$
+        \IF{$\text{resp.success}$}
+            \RETURN $\text{resp}$
+        \ELSIF{$\text{resp.retryable}$}
+            \STATE $\text{sleep}(\text{backoff}(r))$
+            \STATE $\text{errors.append}(\text{resp.error})$
+        \ELSE
+            \STATE $\text{errors.append}(\text{resp.error})$
+            \STATE \textbf{break} \COMMENT{Non-retryable, try next provider}
+        \ENDIF
+    \ENDFOR
+\ENDFOR
+\RETURN $\text{AggregateError}(\text{errors})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Streaming Failover}
+
+Streaming failover presents unique challenges. When a provider fails mid-stream, the gateway must decide whether to: (a) return the partial response, (b) retry from scratch with a different provider, or (c) attempt to continue from the partial output.
+
+We implement strategy (b) with optimization: the gateway buffers streamed tokens and, upon failure, prepends them as an assistant prefix in the retry request. This approach works for providers supporting assistant prefilling (Anthropic, most open-weight model servers) and falls back to full retry otherwise.
+
+\subsection{Priority Queues}
+
+The gateway implements priority-based request scheduling with four levels:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Critical}: Health checks, auth validation---bypass rate limits.
+    \item \textbf{High}: Interactive user requests---minimize latency.
+    \item \textbf{Normal}: API calls from applications---balance cost and latency.
+    \item \textbf{Low}: Batch processing, embeddings---optimize for cost.
+\end{enumerate}
+
+Low-priority requests are eligible for delayed dispatch to exploit off-peak pricing windows where available.
+

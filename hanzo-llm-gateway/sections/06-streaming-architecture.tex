@@ -1,0 +1,32 @@
+\section{Streaming Architecture}
+
+\label{sec:streaming}
+
+\subsection{Server-Sent Events Normalization}
+
+The gateway normalizes all streaming protocols to OpenAI-compatible SSE format. This requires handling three distinct upstream protocols:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{OpenAI SSE}: \texttt{data: \{json\}} lines with \texttt{data: [DONE]} termination.
+    \item \textbf{Anthropic SSE}: Typed events (\texttt{event: content\_block\_delta}) with structured delta payloads.
+    \item \textbf{Google/Vertex}: JSON array streaming or line-delimited JSON.
+\end{enumerate}
+
+Each provider adapter implements a streaming transformer that converts provider-specific chunks to normalized \texttt{ChatCompletionChunk} objects. The transformer maintains per-stream state to track accumulated content, tool call assembly, and usage statistics.
+
+\subsection{Backpressure Management}
+
+When downstream clients consume slowly, the gateway must manage backpressure to avoid unbounded memory growth. We implement a bounded buffer with configurable capacity (default 256 chunks). When the buffer fills, the gateway applies backpressure to the upstream provider connection through TCP flow control, pausing reads on the upstream socket.
+
+For providers that do not respect TCP backpressure (those that aggressively push SSE events), the gateway implements an overflow spill-to-disk mechanism with asynchronous replay.
+
+\subsection{Multi-Stream Aggregation}
+
+For advanced use cases such as parallel model evaluation or ensemble generation, the gateway supports multi-stream aggregation. Multiple provider streams are consumed concurrently, and chunks are interleaved or merged according to a configurable aggregation strategy:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{First-complete}: Stream the first response to complete, cancel others.
+    \item \textbf{Fastest-token}: Forward tokens from whichever stream produces them first.
+    \item \textbf{Consensus}: Buffer both streams and return the response with higher self-consistency.
+\end{itemize}
+

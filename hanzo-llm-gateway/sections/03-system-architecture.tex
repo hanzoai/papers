@@ -1,0 +1,205 @@
+\section{System Architecture}
+
+\label{sec:architecture}
+
+The Hanzo LLM Gateway is structured as a layered proxy with five principal components (Figure~\ref{fig:architecture}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=3.2cm, minimum height=0.6cm, font=\small},
+    layer/.style={rectangle, draw, dashed, rounded corners, minimum width=7cm, minimum height=0.8cm, font=\small\bfseries, fill=gray!10}
+]
+    \node[layer] (ingress) {Ingress Layer};
+    \node[layer, below=0.3cm of ingress] (routing) {Routing Engine};
+    \node[layer, below=0.3cm of routing] (cache) {Semantic Cache};
+    \node[layer, below=0.3cm of cache] (transform) {Provider Transform};
+    \node[layer, below=0.3cm of transform] (egress) {Egress \& Health};
+
+    \draw[->, thick] (ingress) -- (routing);
+    \draw[->, thick] (routing) -- (cache);
+    \draw[->, thick] (cache) -- (transform);
+    \draw[->, thick] (transform) -- (egress);
+\end{tikzpicture}
+\caption{Gateway architecture showing the five processing layers. Requests flow top-to-bottom; cache hits short-circuit at the cache layer.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Ingress Layer}
+
+The ingress layer accepts requests in OpenAI-compatible format and performs authentication, rate limiting, and request validation. Authentication supports API keys, JWT tokens, and OAuth2 bearer tokens with configurable scopes mapped to provider access permissions.
+
+Rate limiting operates at three granularities: per-key, per-organization, and global. Each level implements a token bucket algorithm with configurable burst capacity:
+
+\begin{definition}[Token Bucket]
+A token bucket $B(r, c)$ with rate $r$ tokens/second and capacity $c$ tokens admits request $q$ with cost $w(q)$ if and only if the current token count $t \geq w(q)$, where tokens accumulate at rate $r$ up to maximum $c$.
+\end{definition}
+
+Request validation ensures well-formed messages, validates tool schemas against JSON Schema Draft 2020-12, and enforces configurable context length limits per model.
+
+\subsection{Routing Engine}
+\label{sec:routing}
+
+The routing engine selects the optimal provider endpoint for each request. We formalize routing as a multi-objective optimization problem.
+
+\begin{definition}[Routing Problem]
+Given a request $q$ with model requirement $m$, let $P_m = \{p_1, \ldots, p_k\}$ be the set of available provider endpoints serving model $m$. The routing problem is to select $p^* \in P_m$ that minimizes the weighted objective:
+\begin{equation}
+p^* = \arg\min_{p \in P_m} \sum_{i} w_i \cdot f_i(p, q)
+\end{equation}
+where $f_i$ are objective functions for latency, cost, and quality, and $w_i$ are user-configurable weights summing to 1.
+\end{definition}
+
+The individual objectives are:
+
+\begin{align}
+f_{\text{latency}}(p, q) &= \hat{L}(p) + \beta \cdot \text{tokens}(q) \label{eq:latency} \\
+f_{\text{cost}}(p, q) &= c_{\text{input}}(p) \cdot \text{in}(q) + c_{\text{output}}(p) \cdot \hat{o}(q) \label{eq:cost} \\
+f_{\text{quality}}(p, q) &= 1 - s(m_p, \text{task}(q)) \label{eq:quality}
+\end{align}
+
+where $\hat{L}(p)$ is the estimated latency based on exponentially weighted moving average (EWMA) of recent requests, $\beta$ is the per-token generation latency, $c_{\text{input}}$ and $c_{\text{output}}$ are per-token costs, $\hat{o}(q)$ is the estimated output token count, and $s(m_p, \text{task}(q))$ is the model's benchmark score on the detected task category.
+
+\subsubsection{Routing Strategies}
+
+The gateway supports five routing strategies:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Weighted Round-Robin}: Distributes requests proportionally across providers based on static weights. Suitable for even load distribution with known capacity ratios.
+    \item \textbf{Least-Latency}: Routes to the provider with the lowest EWMA latency. Uses exponential smoothing with $\alpha = 0.3$ for recent-biased estimation.
+    \item \textbf{Cost-Optimized}: Selects the cheapest provider meeting quality and latency constraints. Formulated as a constrained optimization with user-specified thresholds.
+    \item \textbf{Quality-First}: Prioritizes model benchmark scores with cost as a tiebreaker. Uses an internal leaderboard refreshed weekly from standardized evaluations.
+    \item \textbf{Custom Policy}: Executes user-defined routing logic expressed as a policy DSL supporting conditional routing, A/B testing, and canary deployments.
+\end{enumerate}
+
+\subsubsection{Model Mapping}
+
+A critical routing function is mapping abstract model identifiers to concrete provider endpoints. The gateway maintains a model registry that maps logical names (e.g., \texttt{gpt-4o}) to multiple physical endpoints:
+
+\begin{lstlisting}[language=Python, caption=Model mapping configuration]
+models:
+  gpt-4o:
+    endpoints:
+      - provider: openai
+        model: gpt-4o-2024-11-20
+        priority: 1
+      - provider: azure
+        region: eastus
+        deployment: gpt-4o-prod
+        priority: 2
+  claude-sonnet:
+    endpoints:
+      - provider: anthropic
+        model: claude-sonnet-4-20250514
+        priority: 1
+      - provider: bedrock
+        model: anthropic.claude-sonnet-4
+        priority: 2
+\end{lstlisting}
+
+The model registry supports version pinning, gradual rollout of new model versions, and automatic fallback to equivalent models across providers.
+
+\subsection{Semantic Cache}
+\label{sec:caching}
+
+The semantic cache intercepts requests before provider dispatch and returns cached responses for semantically equivalent prompts. Unlike exact-match caching, semantic caching recognizes that prompts with minor variations (whitespace, punctuation, synonym substitution) often produce functionally identical responses.
+
+\subsubsection{Cache Key Generation}
+
+We generate cache keys using a two-stage process. First, we normalize the prompt by lowercasing, removing excess whitespace, and sorting tool definitions. Second, we compute a locality-sensitive hash (LSH)~\cite{indyk1998approximate} using SimHash~\cite{charikar2002similarity} over character n-grams:
+
+\begin{equation}
+\text{key}(q) = \text{SimHash}_{b}(\text{normalize}(q))
+\end{equation}
+
+where $b = 128$ bits provides collision probability proportional to cosine similarity. Two prompts collide (cache hit) when their Hamming distance is below threshold $\tau$:
+
+\begin{equation}
+\text{hit}(q_1, q_2) = \mathbb{1}[d_H(\text{key}(q_1), \text{key}(q_2)) \leq \tau]
+\end{equation}
+
+We set $\tau = 3$ based on empirical calibration on a held-out dataset of 50,000 prompt pairs, achieving 97.2\% precision (fraction of cache hits that are truly equivalent) and 41.8\% recall (fraction of equivalent pairs detected).
+
+\subsubsection{Cache Storage}
+
+The cache uses a two-tier storage architecture:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{L1 (In-memory)}: LRU cache with 10,000 entries, sub-millisecond lookup. Stores hot entries using a frequency-based promotion policy.
+    \item \textbf{L2 (Redis)}: Persistent cache with configurable TTL. Supports cluster mode for horizontal scaling. Entries include response body, token counts, and provider metadata.
+\end{itemize}
+
+Cache entries are keyed by the tuple $(\text{model}, \text{SimHash}, \text{temperature}, \text{max\_tokens}, \text{tools\_hash})$. Temperature $> 0$ requests are cached only when temperature is exactly 0 (deterministic), unless the user explicitly enables stochastic caching.
+
+\subsubsection{Streaming Cache}
+
+A unique challenge is caching streaming responses. The gateway buffers streaming chunks and writes the complete response to cache upon stream completion. For cache hits on streaming requests, the gateway replays cached chunks with synthetic timing that preserves the original inter-chunk delay distribution, providing a natural streaming experience to clients.
+
+\subsection{Provider Transform Layer}
+
+The transform layer converts normalized requests into provider-specific formats and reverses the transformation for responses. Each provider has a dedicated adapter implementing the \texttt{ProviderAdapter} interface:
+
+\begin{lstlisting}[language=Python, caption=Provider adapter interface]
+class ProviderAdapter:
+    def transform_request(
+        self, request: ChatRequest
+    ) -> ProviderRequest:
+        """Convert normalized request to
+           provider-specific format."""
+
+    def transform_response(
+        self, response: ProviderResponse
+    ) -> ChatResponse:
+        """Convert provider response to
+           normalized format."""
+
+    def transform_stream_chunk(
+        self, chunk: ProviderChunk
+    ) -> StreamChunk:
+        """Transform individual stream
+           chunks."""
+
+    def extract_usage(
+        self, response: ProviderResponse
+    ) -> TokenUsage:
+        """Extract token usage for cost
+           tracking."""
+\end{lstlisting}
+
+The gateway ships with 47 provider adapters covering all major providers and their regional variants. The adapter architecture supports rapid integration of new providers, typically requiring 200-400 lines of code per adapter.
+
+\subsubsection{Message Format Translation}
+
+Message translation handles structural differences across providers. For Anthropic, system messages are extracted from the message array and placed in the dedicated \texttt{system} field. For Google Gemini, the \texttt{messages} array is converted to \texttt{contents} with role remapping (\texttt{assistant} $\rightarrow$ \texttt{model}). Multi-modal content (images, audio) is translated between Base64 inline encoding and URL-referenced formats as required by each provider.
+
+\subsubsection{Tool/Function Calling Translation}
+
+Tool calling presents the most complex translation challenge. The gateway normalizes all tool interactions to OpenAI's function calling format and translates bidirectionally:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Schema translation}: JSON Schema parameters are mapped between OpenAI's \texttt{parameters} format, Anthropic's \texttt{input\_schema}, and Google's \texttt{functionDeclarations}.
+    \item \textbf{Invocation semantics}: Parallel tool calls (OpenAI) are serialized for providers that only support sequential invocation.
+    \item \textbf{Result format}: Tool results are wrapped in provider-specific structures (\texttt{tool\_result} for Anthropic, \texttt{functionResponse} for Google).
+\end{itemize}
+
+\subsection{Egress and Health Monitoring}
+
+The egress layer manages outbound connections, retry logic, and provider health tracking.
+
+\subsubsection{Connection Management}
+
+Each provider endpoint maintains a connection pool with configurable maximum connections, keep-alive duration, and TLS session caching. The pool implements HTTP/2 multiplexing where supported, reducing connection overhead for high-throughput providers.
+
+\subsubsection{Health Tracking}
+
+Provider health is tracked using an exponentially weighted health score $H(p, t)$:
+
+\begin{equation}
+H(p, t) = \alpha \cdot h(p, t) + (1 - \alpha) \cdot H(p, t-1)
+\end{equation}
+
+where $h(p, t) \in [0, 1]$ is the outcome of the most recent request (1 for success, 0 for failure, fractional for degraded performance such as elevated latency), and $\alpha = 0.1$ provides smoothing.
+
+When $H(p, t) < \theta_{\text{open}} = 0.3$, the circuit breaker opens and the provider is temporarily removed from the routing pool. After a configurable cooldown period (default 30 seconds), the circuit enters half-open state, allowing a single probe request. If the probe succeeds, the circuit closes and the provider is restored; otherwise, the cooldown period doubles (exponential backoff up to 5 minutes).
+

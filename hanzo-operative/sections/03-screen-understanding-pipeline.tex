@@ -1,0 +1,130 @@
+\section{Screen Understanding Pipeline}
+
+\label{sec:perception}
+
+The perception system converts raw screen content into a structured \texttt{ScreenState} representation that captures all interactive elements, their properties, and spatial relationships.
+
+\subsection{Multi-Source Element Detection}
+
+Element detection fuses three sources:
+
+\subsubsection{Visual Detection}
+
+A lightweight object detection model (YOLOv8-nano fine-tuned on 180,000 annotated GUI screenshots) identifies common UI elements: buttons, text fields, checkboxes, dropdowns, links, icons, and images. The model runs at 23ms per 1920$\times$1080 screenshot on an M2 MacBook Pro.
+
+For each detected element, the model produces a bounding box $(x_1, y_1, x_2, y_2)$, element type classification, and confidence score. We apply non-maximum suppression with IoU threshold 0.5 to remove duplicates.
+
+\subsubsection{OCR Layer}
+
+Optical character recognition extracts text content from the screenshot. We use a two-stage pipeline:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Text detection}: A CRAFT-based~\cite{baek2019craft} text detector identifies text regions with character-level granularity.
+    \item \textbf{Text recognition}: A transformer-based recognizer processes each detected region, supporting 47 languages including CJK scripts.
+\end{enumerate}
+
+OCR results are associated with visually detected elements by spatial overlap (IoU $> 0.3$) to populate element text content.
+
+\subsubsection{Accessibility Tree}
+
+On supported platforms (macOS via Accessibility API, Windows via UI Automation, Linux via AT-SPI, browsers via DOM), the framework queries the accessibility tree to obtain:
+
+\begin{itemize}[leftmargin=*]
+    \item Element roles (button, textbox, link, etc.)
+    \item Labels and descriptions
+    \item State information (enabled, focused, checked, expanded)
+    \item Hierarchical relationships (parent, children, siblings)
+    \item Bounding rectangles (when available)
+\end{itemize}
+
+\subsection{Element Fusion}
+
+The three detection sources are fused using a matching algorithm that associates elements across sources:
+
+\begin{algorithm}[t]
+\caption{Multi-Source Element Fusion}
+\label{alg:fusion}
+\begin{algorithmic}[1]
+\REQUIRE Visual elements $V$, OCR elements $O$, A11y elements $A$
+\STATE $M \gets \emptyset$ \COMMENT{Matched element set}
+\FOR{$v \in V$}
+    \STATE $a^* \gets \arg\max_{a \in A} \text{IoU}(v.\text{bbox}, a.\text{bbox})$
+    \IF{$\text{IoU}(v.\text{bbox}, a^*.\text{bbox}) > 0.4$}
+        \STATE $e \gets \text{merge}(v, a^*)$
+        \STATE $A \gets A \setminus \{a^*\}$
+    \ELSE
+        \STATE $e \gets \text{fromVisual}(v)$
+    \ENDIF
+    \STATE $o^* \gets \{o \in O \mid \text{IoU}(o.\text{bbox}, e.\text{bbox}) > 0.3\}$
+    \STATE $e.\text{text} \gets \text{bestText}(e.\text{text}, o^*.\text{text})$
+    \STATE $M \gets M \cup \{e\}$
+\ENDFOR
+\FOR{$a \in A$} \COMMENT{Unmatched a11y elements}
+    \STATE $M \gets M \cup \{\text{fromA11y}(a)\}$
+\ENDFOR
+\RETURN $M$
+\end{algorithmic}
+\end{algorithm}
+
+The fusion algorithm prioritizes accessibility tree data for element roles and state (higher reliability) while using visual detection for spatial accuracy and OCR for text content when accessibility labels are absent.
+
+\subsection{ScreenState Representation}
+
+The fused elements are organized into a \texttt{ScreenState} object:
+
+\begin{lstlisting}[language=Python, caption=ScreenState data structure]
+@dataclass
+class Element:
+    id: str           # Unique identifier
+    type: ElementType # button, input, link...
+    bbox: BBox        # Bounding rectangle
+    text: str         # Visible text content
+    role: str         # Accessibility role
+    state: dict       # enabled, focused, etc
+    children: list    # Child elements
+
+@dataclass
+class ScreenState:
+    elements: list[Element]
+    focused: Element | None
+    screenshot: bytes  # PNG screenshot
+    timestamp: float
+    app_name: str      # Active application
+    window_title: str  # Active window
+    url: str | None    # Browser URL if any
+
+    def to_text(self) -> str:
+        """Serialize to numbered element list
+           for LLM consumption."""
+
+    def find(self, query: str) -> list:
+        """Fuzzy search elements by text
+           or role."""
+\end{lstlisting}
+
+The \texttt{to\_text()} method produces a numbered element list that serves as the primary input to the LLM planner:
+
+\begin{lstlisting}[caption=Example ScreenState text representation]
+Active: Chrome - GitHub Dashboard
+URL: https://github.com
+
+[1] button "Sign in" (423,12)-(492,36)
+[2] input "Search" (210,12)-(380,36) focused
+[3] link "Explore" (132,12)-(178,36)
+[4] heading "Dashboard" (24,72)-(180,96)
+[5] link "hanzoai/gateway" (24,120)-(186,138)
+...
+[47] button "New repository" (890,12)-(1004,36)
+\end{lstlisting}
+
+\subsection{Performance Optimization}
+
+To achieve real-time perception (target: $<$250ms per frame), we implement several optimizations:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Incremental updates}: Only re-process screen regions that changed since the last frame (detected via pixel-level differencing with 2\% change threshold).
+    \item \textbf{Parallel pipelines}: Visual detection, OCR, and accessibility tree queries run concurrently using a thread pool.
+    \item \textbf{Caching}: Accessibility tree queries are cached with 500ms TTL, as tree structure changes infrequently between user actions.
+    \item \textbf{Resolution scaling}: Screenshots are downscaled to 1280$\times$720 for visual detection (sufficient for element localization) while full resolution is preserved for OCR.
+\end{itemize}
+

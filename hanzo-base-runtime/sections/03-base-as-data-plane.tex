@@ -1,0 +1,60 @@
+\section{Base as Data Plane}
+
+\label{sec:dataplane}
+% ============================================================================
+
+Base treats local storage as the primary data plane. This is the opposite of
+every cloud-native system, where the network database is primary and the client
+is a cache. In Base, the local SQLite database is the source of truth. Remote
+storage is a replica.
+
+\subsection{Local Vault}
+
+Every Base instance maintains a local encrypted database using SQLite compiled
+with the sqlcipher extension. The encryption key is derived from the user's
+master key via Argon2id:
+
+\begin{equation}
+k_{\text{db}} = \text{Argon2id}(k_{\text{master}}, \text{salt}, t=3, m=64\text{MB}, p=4)
+\end{equation}
+
+The database file is AES-256-CBC encrypted at the page level. An attacker who
+obtains the file without the key sees random bytes. The key never leaves the
+device unless the user explicitly exports it (for backup or device migration).
+
+\subsection{Provider-Optional Replication}
+
+Replication in Base is a directed graph of sync targets. Each target is a
+remote Base instance, an S3-compatible bucket, or a Lux chain endpoint. The
+user configures zero or more targets:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Zero targets}: Fully offline. Data exists only on the local
+    device. Backup is the user's responsibility.
+    \item \textbf{One target}: Simple backup. Changes replicate to a single
+    remote. Recovery is possible from the remote.
+    \item \textbf{Multiple targets}: Redundant replication. Changes fan out to
+    multiple remotes. Availability survives any single target failure.
+\end{itemize}
+
+No target is privileged. There is no ``primary'' remote. The local database
+is always authoritative. If a remote diverges, the CRDT merge
+(\S\ref{sec:sync}) resolves the conflict deterministically.
+
+\subsection{Chain Anchoring}
+
+Base optionally anchors data integrity proofs to the Lux Network. Anchoring
+does not store data on-chain---it stores a Merkle root of the local database
+state, creating an immutable timestamp proof.
+
+\begin{equation}
+\text{anchor}(t) = \text{SHA3-256}\bigl(\text{root}(\text{MerkleTree}(D_t))\bigr)
+\end{equation}
+
+where $D_t$ is the set of all records at time $t$. The anchor transaction is
+submitted to the Lux T-Chain (transaction chain), providing sub-second
+finality and costing less than 0.001 LUX per anchor. Applications that require
+tamper-evidence (medical records, legal documents, audit logs) enable anchoring.
+Applications that do not need it pay nothing.
+
+% ============================================================================

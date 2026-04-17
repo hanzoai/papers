@@ -1,0 +1,81 @@
+\section{ML-DSA for Digital Signatures}
+
+\label{sec:mldsa}
+% ============================================================================
+
+ML-DSA (FIPS 204) replaces Ed25519 and ECDSA for digital signatures. It is
+based on the Module Learning with Errors and Module Short Integer Solution
+(MLWE/MSIS) problems.
+
+\begin{definition}[ML-DSA]
+ML-DSA consists of three algorithms:
+\begin{itemize}[leftmargin=1.1em]
+    \item $\texttt{KeyGen}() \to (vk, sk)$: Generate verification and
+    signing keys.
+    \item $\texttt{Sign}(sk, m) \to \sigma$: Produce signature $\sigma$ on
+    message $m$.
+    \item $\texttt{Verify}(vk, m, \sigma) \to \{0, 1\}$: Verify signature
+    validity.
+\end{itemize}
+\end{definition}
+
+We deploy ML-DSA-65 (NIST Security Level 3):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Parameter} & \textbf{ML-DSA-65} & \textbf{Ed25519} & \textbf{Ratio} \\
+\midrule
+Public key (bytes) & 1,952 & 32 & 61$\times$ \\
+Signature (bytes) & 3,309 & 64 & 52$\times$ \\
+Sign ($\mu$s) & 120 & 22 & 5.5$\times$ \\
+Verify ($\mu$s) & 45 & 18 & 2.5$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{ML-DSA-65 vs Ed25519 parameter comparison.}
+\label{tab:mldsa}
+\end{table}
+
+\subsection{IAM JWT Migration}
+
+Hanzo IAM~\cite{hanzoiam} JWT tokens currently use Ed25519 signatures.
+The migration proceeds in three phases:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Phase 1 (current)}: IAM signs with both Ed25519 and ML-DSA-65.
+    Tokens carry dual signatures. Verifiers accept either.
+    \item \textbf{Phase 2 (Q3 2026)}: New tokens are signed with ML-DSA-65 only.
+    Verifiers accept both algorithms (backward compatibility for tokens issued
+    in Phase 1).
+    \item \textbf{Phase 3 (Q4 2026)}: Ed25519 verification is removed. All
+    tokens are ML-DSA-65.
+\end{enumerate}
+
+\begin{remark}
+The larger ML-DSA-65 signature (3,309 bytes vs.\ 64 bytes) increases JWT size
+from $\sim$500 bytes to $\sim$3,800 bytes. This remains well within HTTP header
+limits and does not impact API performance measurably.
+\end{remark}
+
+\subsection{API Request Signing}
+
+External API requests to Hanzo Gateway use HMAC-SHA256 for authentication
+(quantum-safe at 128-bit security). Internal service-to-service requests use
+mTLS with ML-DSA-65 certificates.
+
+\subsection{Agent Credential Chains}
+
+Agent credentials~\cite{hanzoagentsdk} use certificate chains signed with
+Ed25519. Migration replaces the signature algorithm while preserving the chain
+structure:
+\begin{equation}
+\text{Root}_{ML\text{-}DSA} \to \text{Org}_{ML\text{-}DSA} \to
+\text{Agent}_{ML\text{-}DSA}.
+\end{equation}
+
+During the hybrid period, cross-signed certificates bridge old and new root
+keys.
+
+% ============================================================================

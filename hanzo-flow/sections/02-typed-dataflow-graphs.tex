@@ -1,0 +1,130 @@
+\section{Typed Dataflow Graphs}
+
+\label{sec:formalism}
+
+\subsection{Formal Definition}
+
+\begin{definition}[Flow Graph]
+A Hanzo Flow graph is a tuple $G = (V, E, \Sigma, \tau)$ where:
+\begin{itemize}[leftmargin=1.1em]
+    \item $V = \{v_1, \ldots, v_n\}$ is a set of nodes (operations).
+    \item $E \subseteq V \times V \times \text{Port}$ is a set of directed edges with port annotations.
+    \item $\Sigma$ is a type system with base types $\mathcal{B} = \{\texttt{string}, \texttt{number}, \texttt{boolean}, \texttt{json}, \texttt{image}, \texttt{embedding}, \texttt{message[]}\}$ and constructors $\texttt{List}[\cdot]$, $\texttt{Optional}[\cdot]$, $\texttt{Union}[\cdot, \cdot]$.
+    \item $\tau : \text{Port} \to \Sigma$ assigns types to input and output ports.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Well-Typed Flow]
+A flow graph $G$ is well-typed if for every edge $(u, v, (p_u, p_v)) \in E$:
+\begin{equation}
+\tau(p_u^{\text{out}}) \preceq \tau(p_v^{\text{in}}),
+\end{equation}
+where $\preceq$ denotes subtype compatibility (e.g., $\texttt{string} \preceq \texttt{Optional[string]}$).
+\end{definition}
+
+\subsection{Node Types}
+
+Hanzo Flow provides 14 built-in node types organized into four categories:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llc}
+\toprule
+\textbf{Category} & \textbf{Node Type} & \textbf{Ports} \\
+\midrule
+\multirow{4}{*}{AI} & LLM Call & 3 in, 2 out \\
+& Embedding & 1 in, 1 out \\
+& Classifier & 1 in, 2 out \\
+& Structured Output & 2 in, 1 out \\
+\midrule
+\multirow{3}{*}{Control} & Conditional Branch & 1 in, $n$ out \\
+& Parallel Split & 1 in, $n$ out \\
+& Merge/Join & $n$ in, 1 out \\
+\midrule
+\multirow{4}{*}{Data} & Transform (code) & $n$ in, $m$ out \\
+& API Call & 2 in, 2 out \\
+& Database Query & 2 in, 1 out \\
+& File I/O & 1 in, 1 out \\
+\midrule
+\multirow{3}{*}{Human} & Approval Gate & 1 in, 2 out \\
+& Input Request & 0 in, 1 out \\
+& Feedback Loop & 2 in, 2 out \\
+\bottomrule
+\end{tabular}
+\caption{Built-in node types in Hanzo Flow.}
+\label{tab:nodes}
+\end{table}
+
+\subsection{LLM Call Node}
+
+The LLM Call node is the fundamental AI operation. It accepts three inputs:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{System prompt} (\texttt{string}): The system-level instruction.
+    \item \textbf{Messages} (\texttt{message[]}): Conversation history.
+    \item \textbf{Tools} (\texttt{json[]}): Available tool definitions.
+\end{enumerate}
+
+And produces two outputs:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Response} (\texttt{string | json}): The model's text or structured output.
+    \item \textbf{Tool calls} (\texttt{json[]}): Any tool invocations requested by the model.
+\end{enumerate}
+
+Configuration includes model selection (or ``auto'' for routing), temperature, max tokens, response format (text, JSON, or schema-constrained), and retry policy.
+
+\subsection{Conditional Branch Node}
+
+The Conditional Branch node evaluates a predicate on its input and routes data to one of $n$ output ports:
+
+\begin{definition}[Branch Semantics]
+Given input $x$ and predicates $\{P_1, \ldots, P_n\}$ with a default branch $d$:
+\begin{equation}
+\text{output}(x) = \begin{cases}
+\text{port}_i & \text{if } P_i(x) \text{ is first true predicate}, \\
+\text{port}_d & \text{if no predicate is true}.
+\end{cases}
+\end{equation}
+\end{definition}
+
+Predicates can be:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Expression-based}: JavaScript expressions (e.g., \texttt{x.score > 0.8}).
+    \item \textbf{LLM-based}: Natural language conditions evaluated by a classifier (e.g., ``Is this response about code?'').
+    \item \textbf{Schema-based}: JSON Schema validation (e.g., ``Does the output contain a \texttt{name} field?'').
+\end{itemize}
+
+\subsection{Static Verification}
+
+Before execution, Hanzo Flow performs four verification passes:
+
+\begin{algorithm}[H]
+\caption{Static Flow Verification}
+\label{alg:verify}
+\begin{algorithmic}[1]
+\Require Flow graph $G = (V, E, \Sigma, \tau)$
+\State \Comment{Pass 1: Type checking}
+\For{each edge $(u, v, (p_u, p_v)) \in E$}
+    \State Verify $\tau(p_u^{\text{out}}) \preceq \tau(p_v^{\text{in}})$
+\EndFor
+\State \Comment{Pass 2: Connectivity}
+\State Verify all non-optional input ports have exactly one incoming edge
+\State Verify graph has exactly one start node and at least one end node
+\State \Comment{Pass 3: Acyclicity (for non-loop subgraphs)}
+\State Verify topological sort exists for non-feedback edges
+\State \Comment{Pass 4: Resource bounds}
+\State Verify no unbounded parallel expansion
+\State Estimate max token consumption and cost
+\State \Return verification result with warnings/errors
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Type Safety]
+If a flow graph passes static verification, then at runtime, no type mismatch error will occur at any edge, assuming node implementations respect their declared types.
+\end{theorem}
+
+\begin{proof}
+By induction on topological order. The start node produces outputs of declared type. Each subsequent node receives inputs of compatible type (by verification), and by the contract of node implementations, produces outputs of declared type. The inductive step preserves type safety at every edge.
+\end{proof}
+

@@ -1,0 +1,91 @@
+\section{AI-Aware Build System}
+
+\label{sec:build}
+
+\subsection{Model Dependency Detection}
+
+The build system automatically scans application code for model dependencies:
+
+\begin{algorithm}[H]
+\caption{Model Dependency Detection}
+\label{alg:detect}
+\begin{algorithmic}[1]
+\Require Source code $S$, known model registries $\mathcal{R}$
+\State $\text{deps} \gets \text{ParseRequirements}(S)$ \Comment{pip, npm, cargo}
+\State $\text{models} \gets \emptyset$
+\State \Comment{Pattern 1: HuggingFace model references}
+\State $\text{models} \gets \text{models} \cup \text{FindHFModels}(S)$
+\State \Comment{Pattern 2: Model download URLs}
+\State $\text{models} \gets \text{models} \cup \text{FindModelURLs}(S)$
+\State \Comment{Pattern 3: Framework-specific configs}
+\State $\text{models} \gets \text{models} \cup \text{FindFrameworkModels}(S)$
+\State \Comment{Pattern 4: API client configurations}
+\State $\text{apis} \gets \text{FindLLMAPIs}(S)$
+\State \Comment{Determine GPU requirements}
+\State $\text{gpu} \gets \text{EstimateGPU}(\text{models})$
+\State \Return $(\text{models}, \text{apis}, \text{gpu})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{GPU-Optimized Container Images}
+
+For applications requiring local model inference, the build system generates optimized container images:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Base image selection}: Choose from pre-built base images with CUDA, cuDNN, and framework-specific optimizations (PyTorch, TensorFlow, ONNX Runtime, vLLM).
+    \item \textbf{Model caching}: Models are stored in a shared cache layer, avoiding redundant downloads across deployments. Cache hit rate: 87\%.
+    \item \textbf{Quantization}: Automatically apply GPTQ or AWQ quantization for models that exceed available GPU memory, with quality verification.
+    \item \textbf{Multi-stage builds}: Separate build dependencies from runtime, reducing final image size by 40--60\%.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{App Type} & \textbf{Traditional} & \textbf{Hanzo} & \textbf{Speedup} \\
+\midrule
+API-only (LLM gateway) & 3.2 min & 1.1 min & 2.9x \\
+RAG application & 8.7 min & 2.3 min & 3.8x \\
+Local model serving & 42.1 min & 6.8 min & 6.2x \\
+Full-stack AI app & 15.4 min & 3.2 min & 4.8x \\
+Fine-tuning pipeline & 67.3 min & 12.1 min & 5.6x \\
+\bottomrule
+\end{tabular}
+\caption{Build and deploy times: traditional PaaS vs. Hanzo Platform.}
+\label{tab:build_times}
+\end{table}
+
+\subsection{Incremental Deployment}
+
+Hanzo Platform supports zero-downtime deployments with AI-specific optimizations:
+
+\begin{algorithm}[H]
+\caption{AI-Aware Rolling Deployment}
+\label{alg:deploy}
+\begin{algorithmic}[1]
+\Require New image $I'$, current pods $\mathcal{P}$, model warmup time $T_w$
+\State \Comment{Phase 1: Pre-warm new pods}
+\State $\mathcal{P}' \gets \text{StartPods}(I', |\mathcal{P}|)$
+\For{each $p \in \mathcal{P}'$}
+    \State Wait for model loading
+    \State Run warmup inference requests
+    \State Verify latency $\le$ SLA threshold
+\EndFor
+\State \Comment{Phase 2: Gradual traffic shift}
+\For{$w = 0.1, 0.25, 0.5, 0.75, 1.0$}
+    \State Route $w$ fraction of traffic to $\mathcal{P}'$
+    \State Monitor error rate and latency for 60s
+    \If{error rate $> 1\%$ or P99 latency $> 2\times$ baseline}
+        \State Rollback: route all traffic to $\mathcal{P}$
+        \State \Return failure
+    \EndIf
+\EndFor
+\State \Comment{Phase 3: Cleanup}
+\State Terminate old pods $\mathcal{P}$
+\State \Return success
+\end{algorithmic}
+\end{algorithm}
+
+The model pre-warming phase is critical: without it, cold starts for GPU inference can take 30--120 seconds, causing unacceptable latency spikes during deployment.
+

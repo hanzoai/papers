@@ -1,0 +1,106 @@
+\section{Gossip Protocol}
+
+\label{sec:gossip}
+
+\subsection{Protocol Design}
+
+DSO uses an epidemic gossip protocol~\cite{demers1987epidemic} for propagating
+high-quality priors across the network. The protocol is designed to be:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Pull-based:} Nodes request priors they lack, avoiding
+          unsolicited data transfer.
+    \item \textbf{Quality-filtered:} Only priors with $q_i \geq q_{\text{fetch}}$
+          (default: 0.5) are propagated.
+    \item \textbf{Stake-weighted:} Propagation priority is proportional to
+          quality score times stake.
+\end{itemize}
+
+\begin{algorithm}[H]
+\caption{DSO Gossip Protocol (per node)}
+\label{alg:gossip}
+\begin{algorithmic}[1]
+\Require Local replica $L$, registry connection, peer set $\mathcal{P}$
+\State Subscribe to registry events: $\texttt{NewSubmission}$, $\texttt{QualityUpdate}$
+\Loop
+    \State $\texttt{events} \gets \text{Registry.PollEvents}()$
+    \For{each $\texttt{NewSubmission}(\texttt{id}, q, \texttt{cid})$ in events}
+        \If{$q \geq q_{\text{fetch}}$ \textbf{and} $\texttt{id} \notin L$}
+            \State $E \gets \text{FetchFromPeersOrIPFS}(\texttt{cid}, \mathcal{P})$
+            \State Verify: $\text{MerkleRoot}(E) = \text{Registry.GetMerkleRoot}(\texttt{id})$
+            \If{verification passes}
+                \State $L.\text{Insert}(E, \texttt{id})$
+                \State Announce availability to peers
+            \EndIf
+        \EndIf
+    \EndFor
+    \For{each $\texttt{QualityUpdate}(\texttt{id}, q_{\text{new}})$ in events}
+        \If{$q_{\text{new}} < q_{\min}$ \textbf{and} $\texttt{id} \in L$}
+            \State $L.\text{Remove}(\texttt{id})$
+            \Comment{Garbage collect low-quality}
+        \EndIf
+    \EndFor
+    \State Sleep($\Delta t_{\text{gossip}}$)
+    \Comment{Default: 30s}
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Propagation Analysis}
+
+\begin{proposition}[Propagation Time]
+\label{prop:propagation}
+In a network of $n$ nodes with random peer connections (average degree $d$),
+a new prior with quality $q \geq q_{\text{fetch}}$ reaches all honest nodes
+in expected time:
+\begin{equation}
+    T_{\text{prop}} = O\left(\frac{\log n}{d} \cdot \Delta t_{\text{gossip}}\right).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Standard epidemic gossip analysis~\cite{demers1987epidemic}. Each gossip round,
+each informed node tells $d$ peers. The number of informed nodes doubles each
+round until saturation, giving $O(\log n)$ rounds. With gossip interval
+$\Delta t_{\text{gossip}}$ and average degree $d$, the effective round time is
+$\Delta t_{\text{gossip}} / d$.
+\end{proof}
+
+For typical parameters ($n = 1000$, $d = 10$, $\Delta t = 30$s), propagation
+time is approximately $O(\log(1000) / 10 \times 30) \approx 21$s.
+
+\subsection{Bandwidth Efficiency}
+
+The 1-bit compression from ASO is critical for gossip efficiency:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Representation & Size per Prior & Bandwidth (100 priors) \\
+\midrule
+Full precision (FP32) & 128 KB & 12.5 MB \\
+16-bit quantized & 64 KB & 6.25 MB \\
+1-bit compressed & 4.3 KB & 430 KB \\
+1-bit + schema sparse & 1.2 KB & 120 KB \\
+\bottomrule
+\end{tabular}
+\caption{Prior data sizes under different representations. 1-bit compression
+with schema-sparse encoding reduces bandwidth by $100\times$ compared to
+full precision.}
+\label{tab:bandwidth}
+\end{table}
+
+\subsection{Incentive-Compatible Propagation}
+
+Nodes that propagate high-quality priors earn fee rebates:
+\begin{equation}
+    \text{rebate}_i = \gamma_{\text{prop}} \sum_{j: \text{fetched from } i} q_j \cdot \text{size}_j,
+    \label{eq:rebate}
+\end{equation}
+where $\gamma_{\text{prop}}$ is the propagation reward rate (default: 0.001 \$AI
+per quality-byte). This incentivizes nodes to maintain high availability and
+serve popular priors.
+
+% ============================================================================
+% 8. CONVERGENCE ANALYSIS
+% ============================================================================

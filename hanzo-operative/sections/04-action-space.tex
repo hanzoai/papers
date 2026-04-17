@@ -1,0 +1,97 @@
+\section{Action Space}
+
+\label{sec:actions}
+
+Operative defines a typed action space with 47 primitive operations organized into five categories.
+
+\subsection{Action Type System}
+
+Each action is defined with a formal signature:
+
+\begin{definition}[Action Signature]
+An action $a$ has signature $(T, P, \text{pre}, \text{post}, R)$ where $T$ is the action type, $P$ is the parameter type, $\text{pre}: S \times P \rightarrow \{0,1\}$ is the pre-condition predicate over screen state $S$ and parameters $P$, $\text{post}: S \times S' \rightarrow \{0,1\}$ is the post-condition predicate over pre- and post-states, and $R \in \{\text{reversible}, \text{irreversible}, \text{idempotent}\}$ is the reversibility classification.
+\end{definition}
+
+\subsection{Action Categories}
+
+\subsubsection{Mouse Actions (12 operations)}
+
+\begin{table}[t]
+\centering
+\caption{Mouse action primitives}
+\label{tab:mouse}
+\begin{tabular}{@{}llp{2.8cm}@{}}
+\toprule
+\textbf{Action} & \textbf{Params} & \textbf{Pre-condition} \\
+\midrule
+\texttt{click} & $x, y$, btn & Target visible \\
+\texttt{double\_click} & $x, y$ & Target visible \\
+\texttt{right\_click} & $x, y$ & Target visible \\
+\texttt{drag} & $x_1, y_1, x_2, y_2$ & Source visible \\
+\texttt{scroll} & $x, y$, $\delta$ & Target scrollable \\
+\texttt{hover} & $x, y$ & Target visible \\
+\texttt{click\_element} & \texttt{id} & Element exists \\
+\texttt{drag\_element} & \texttt{id}, $x, y$ & Element draggable \\
+\texttt{select\_text} & $x_1, y_1, x_2, y_2$ & Text region \\
+\texttt{triple\_click} & $x, y$ & Text element \\
+\texttt{mouse\_down} & $x, y$, btn & --- \\
+\texttt{mouse\_up} & $x, y$, btn & Mouse pressed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mouse actions support both coordinate-based and element-based targeting. When using element-based targeting (\texttt{click\_element}), the framework automatically computes the click point as the center of the element's bounding box, adjusted for any scroll offset.
+
+\subsubsection{Keyboard Actions (10 operations)}
+
+Keyboard actions include \texttt{type\_text}, \texttt{press\_key}, \texttt{hotkey}, \texttt{key\_down}, \texttt{key\_up}, and text manipulation operations (\texttt{select\_all}, \texttt{copy}, \texttt{paste}, \texttt{cut}, \texttt{undo}). The \texttt{type\_text} action supports configurable inter-keystroke delay for applications that process keystrokes individually.
+
+\subsubsection{Browser Actions (12 operations)}
+
+When operating in browser mode, Operative provides higher-level browser-specific actions built on Playwright~\cite{playwright2024}:
+
+\begin{itemize}[leftmargin=*]
+    \item \texttt{navigate(url)}: Navigate to URL with wait-for-load semantics.
+    \item \texttt{fill(selector, text)}: Fill form fields with automatic clearing.
+    \item \texttt{select\_option(selector, value)}: Select dropdown options.
+    \item \texttt{wait\_for(selector, state)}: Wait for element state changes.
+    \item \texttt{execute\_js(code)}: Execute JavaScript in page context.
+    \item \texttt{screenshot\_element(selector)}: Capture specific element.
+    \item \texttt{get\_text(selector)}: Extract text content.
+    \item \texttt{get\_attribute(selector, name)}: Read element attributes.
+    \item \texttt{new\_tab()}, \texttt{close\_tab()}, \texttt{switch\_tab(idx)}: Tab management.
+    \item \texttt{go\_back()}: Navigate backward.
+\end{itemize}
+
+Browser actions provide higher reliability than coordinate-based mouse actions for web tasks, as they are resilient to layout shifts and viewport changes.
+
+\subsubsection{System Actions (8 operations)}
+
+System actions interact with the operating system: \texttt{open\_app}, \texttt{close\_app}, \texttt{switch\_app}, \texttt{take\_screenshot}, \texttt{read\_clipboard}, \texttt{write\_clipboard}, \texttt{run\_command}, and \texttt{file\_dialog}. System actions are subject to safety boundary restrictions (Section~\ref{sec:safety}).
+
+\subsubsection{Composite Actions (5 operations)}
+
+Composite actions encode common multi-step patterns: \texttt{search\_and\_click} (type in search field, wait for results, click match), \texttt{fill\_form} (iterate over form fields and fill values), \texttt{login} (detect login form, enter credentials, submit), \texttt{download\_file} (click download, wait for completion, verify file), and \texttt{scroll\_to\_find} (repeatedly scroll and search for target element).
+
+\subsection{Action Validation}
+
+Before execution, each action is validated against its pre-conditions:
+
+\begin{lstlisting}[language=Python, caption=Pre-condition validation]
+def validate_click(state: ScreenState,
+                   x: int, y: int) -> bool:
+    # Check coordinates in viewport
+    if not state.viewport.contains(x, y):
+        return False
+    # Check no modal dialog blocking
+    if state.has_modal_at(x, y):
+        return False
+    # Check element is interactive
+    elem = state.element_at(x, y)
+    if elem and not elem.state.get("enabled"):
+        return False
+    return True
+\end{lstlisting}
+
+Post-condition verification runs after action execution to confirm expected state changes. For example, \texttt{click} on a button verifies that the screen state changed (detected via screenshot differencing), \texttt{type\_text} verifies that the text appears in the focused field, and \texttt{navigate} verifies that the URL changed to the expected target.
+

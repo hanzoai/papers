@@ -1,0 +1,109 @@
+\section{Rate Limiting}
+
+
+\subsection{Token Bucket Algorithm}
+
+We implement rate limiting using a distributed token bucket:
+
+\begin{definition}[Token Bucket]
+A token bucket $B$ is characterized by:
+\begin{itemize}
+    \item $r$: token replenishment rate (tokens/second)
+    \item $b$: bucket capacity (max tokens)
+    \item $tokens(t)$: current token count at time $t$
+\end{itemize}
+\end{definition}
+
+Token count evolution:
+\begin{equation}
+tokens(t) = \min(b, tokens(t_0) + r \cdot (t - t_0))
+\end{equation}
+
+\begin{algorithm}
+\caption{Distributed Token Bucket}
+\begin{algorithmic}[1]
+\Function{CheckRateLimit}{$key$, $cost$}
+    \State $bucket \gets$ \Call{GetBucket}{$key$}
+    \State $now \gets$ \Call{CurrentTime}{}
+    \State \Comment{Replenish tokens}
+    \State $elapsed \gets now - bucket.lastUpdate$
+    \State $bucket.tokens \gets \min(bucket.capacity,$
+    \State \hspace{4em} $bucket.tokens + bucket.rate \times elapsed)$
+    \State $bucket.lastUpdate \gets now$
+    \If{$bucket.tokens \geq cost$}
+        \State $bucket.tokens \gets bucket.tokens - cost$
+        \State \Call{SaveBucket}{$key$, $bucket$}
+        \State \Return \textsc{Allowed}
+    \Else
+        \State $retryAfter \gets (cost - bucket.tokens) / bucket.rate$
+        \State \Return \textsc{RateLimited}($retryAfter$)
+    \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Rate Limit Tiers}
+
+\begin{table}[h]
+\centering
+\caption{Rate Limit Tiers}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Tier} & \textbf{Rate (req/s)} & \textbf{Burst} & \textbf{Daily Limit} \\
+\midrule
+Free & 10 & 20 & 10,000 \\
+Starter & 50 & 100 & 100,000 \\
+Growth & 200 & 500 & 1,000,000 \\
+Enterprise & 1,000 & 2,000 & Unlimited \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Distributed State}
+
+Rate limit state is stored in Redis with the following structure:
+
+\begin{lstlisting}[caption=Redis Rate Limit State]
+HSET ratelimit:{key} tokens {count} lastUpdate {timestamp}
+EXPIRE ratelimit:{key} 3600
+\end{lstlisting}
+
+Atomic update using Lua script:
+
+\begin{lstlisting}[language=Lua, caption=Atomic Rate Limit Check]
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'lastUpdate')
+local tokens = tonumber(bucket[1]) or capacity
+local lastUpdate = tonumber(bucket[2]) or now
+
+-- Replenish
+local elapsed = now - lastUpdate
+tokens = math.min(capacity, tokens + rate * elapsed)
+
+if tokens >= cost then
+    tokens = tokens - cost
+    redis.call('HMSET', key, 'tokens', tokens, 'lastUpdate', now)
+    redis.call('EXPIRE', key, 3600)
+    return {1, tokens}
+else
+    local retryAfter = (cost - tokens) / rate
+    return {0, retryAfter}
+end
+\end{lstlisting}
+
+\subsection{Rate Limit Headers}
+
+Responses include rate limit information:
+
+\begin{lstlisting}[caption=Rate Limit Headers]
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 742
+X-RateLimit-Reset: 1548892800
+Retry-After: 30  # Only on 429 responses
+\end{lstlisting}
+

@@ -1,0 +1,178 @@
+\section{The Self-Modification Taxonomy}
+
+\label{sec:taxonomy}
+
+We organize agent self-modification into four tiers based on scope, persistence,
+and trust level. Each tier has characteristic modification objects, lifecycle
+policies, and validation requirements.
+
+\begin{definition}[Modification Tier]
+A \emph{modification tier} $T_k$ for $k \in \{1, 2, 3, 4\}$ is a tuple
+$T_k = (O_k, L_k, V_k, D_k)$ where $O_k$ is the set of modification objects,
+$L_k$ is the lifecycle policy (TTL, test-gated, review-gated), $V_k$ is the
+validation predicate, and $D_k$ is the deployment mechanism.
+\end{definition}
+
+Table~\ref{tab:tiers} summarizes the four tiers.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{l X X X X}
+\toprule
+Tier & Object & Lifecycle & Validation & Deployment \\
+\midrule
+1 & Runtime tools & 7-day TTL & Trigger cases & Hot-reload \\
+2 & Extensions & Persistent & \texttt{pnpm test} & npm package \\
+3 & Skills & Persistent & Peer review & SKILL.md merge \\
+4 & Components & Persistent & CI + human PR & Git merge \\
+\bottomrule
+\end{tabularx}
+\caption{The four modification tiers of HHP, ordered by scope and trust level.}
+\label{tab:tiers}
+\end{table}
+
+\subsection{Tier 1: Runtime Tool Creation}
+\label{sec:tier1}
+
+Runtime tool creation is the lightest-weight form of self-modification. When an
+agent observes a friction point---a task it cannot perform efficiently with
+existing tools---it can generate a new tool on the spot and hot-load it into the
+active session.
+
+\begin{definition}[Friction Event]
+A \emph{friction event} $\mathcal{F}$ is a tuple $(\tau, e, n)$ where $\tau$ is
+the task type, $e$ is the error or inefficiency observed, and $n$ is the number
+of times this pattern has recurred in the current session.
+\end{definition}
+
+\begin{definition}[Runtime Tool]
+A \emph{runtime tool} $\rho$ is a tuple $(\sigma, \pi, \mathcal{C}, t_0, T)$
+where $\sigma$ is the tool specification (JSON Schema), $\pi$ is the
+implementation (TypeScript function), $\mathcal{C}$ is the set of triggering
+failure cases, $t_0$ is the creation timestamp, and $T = 7\text{ days}$ is the
+TTL.
+\end{definition}
+
+The validation predicate for Tier 1 is:
+\begin{equation}
+    V_1(\rho) = \bigwedge_{c \in \mathcal{C}} \text{Pass}(\rho.\pi, c),
+\end{equation}
+where $\text{Pass}(\pi, c)$ is true if and only if running implementation $\pi$
+on test case $c$ produces the expected output without error. A generated tool
+is only hot-loaded if $V_1(\rho) = \text{true}$.
+
+Hot-loading proceeds via the agent's plugin API:
+\begin{verbatim}
+// Tool is registered without restarting the session
+await agent.tools.register({
+  name:        rho.spec.name,
+  description: rho.spec.description,
+  schema:      rho.spec.inputSchema,
+  handler:     rho.implementation,
+  ttl:         7 * 24 * 60 * 60 * 1000,   // 7 days in ms
+  triggerCases: rho.triggerCases,
+});
+\end{verbatim}
+
+After the TTL expires, the tool is automatically unregistered. If the tool was
+used successfully, a summary is appended to the agent's experience bank for
+potential Tier 2 promotion.
+
+\subsection{Tier 2: Extension Development}
+\label{sec:tier2}
+
+Extensions are persistent, versioned packages that add durable capability to the
+agent harness. An extension consists of a package manifest, an index module
+exporting a plugin conforming to the \texttt{BotPlugin} interface, and a test
+suite.
+
+\begin{definition}[Extension]
+An \emph{extension} $\xi$ is a tuple $(\rho_{\text{pkg}}, \Pi, \Theta, \mathcal{S})$
+where $\rho_{\text{pkg}}$ is the package manifest (\texttt{package.json}),
+$\Pi$ is the plugin implementation, $\Theta$ is the set of registered tools and
+services, and $\mathcal{S}$ is the test suite.
+\end{definition}
+
+The plugin API supports four registration types:
+
+\begin{verbatim}
+interface BotPlugin {
+  name:    string;
+  version: string;
+  setup(api: PluginAPI): Promise<void>;
+}
+
+interface PluginAPI {
+  registerTool(spec: ToolSpec, handler: ToolHandler): void;
+  registerService(name: string, service: Service): void;
+  on(event: AgentEvent, handler: EventHandler): void;
+  registerSkill(name: string, skillMd: string): void;
+}
+\end{verbatim}
+
+The validation predicate for Tier 2 is:
+\begin{equation}
+    V_2(\xi) = \text{BuildSuccess}(\xi) \wedge \left(\frac{|\mathcal{S}_{\text{pass}}|}{|\mathcal{S}|} = 1\right),
+\end{equation}
+where $\mathcal{S}_{\text{pass}}$ is the set of passing tests. Extensions must
+achieve $100\%$ test passage before registration. Because extensions persist
+beyond session TTL, they are deployed via the standard package management
+workflow: \texttt{pnpm build}, \texttt{pnpm test}, followed by registration in
+the agent's extension registry.
+
+\subsection{Tier 3: Skill Development}
+\label{sec:tier3}
+
+Skills encode declarative procedural knowledge---patterns and heuristics that
+help agents perform better on recurring task types. Unlike extensions (which
+provide executable capabilities), skills provide interpretable, transferable
+knowledge that any agent can apply via prompting.
+
+\begin{definition}[Skill]
+A \emph{skill} $\varsigma$ is a SKILL.md document with YAML frontmatter and
+Markdown body:
+\begin{equation}
+    \varsigma = \left(\texttt{name}, \texttt{trigger}, \texttt{scope},
+    \texttt{tags}, \texttt{body}\right),
+\end{equation}
+where \texttt{trigger} is a natural language description of when the skill
+applies, \texttt{scope} specifies the applicable agent roles, \texttt{tags}
+enable retrieval, and \texttt{body} contains the procedural knowledge.
+\end{definition}
+
+Skills are stored as Markdown files in the agent's skill library and loaded
+into the system prompt for applicable tasks. The validation predicate for Tier 3
+is lightweight---skills are reviewed by a coordinating agent before merge, not
+executed against test cases. This reflects the fact that skills encode knowledge
+rather than functionality, and erroneous skills produce suboptimal behavior
+rather than system failures.
+
+\subsection{Tier 4: Cross-Component Hacking}
+\label{sec:tier4}
+
+The most powerful and most carefully governed tier covers modifications to the
+agent's ecosystem components: MCP tool server, Agent SDK, LLM Gateway, Operative
+computer-use system, GRPO training pipelines, and model configuration. These
+modifications affect all agents sharing the infrastructure and therefore require
+the highest trust level.
+
+\begin{definition}[Cross-Component Modification]
+A \emph{cross-component modification} $\mu$ is a tuple
+$(\mathcal{R}, \Delta, B, \texttt{pr})$ where $\mathcal{R}$ is the target
+repository, $\Delta$ is the git diff representing the proposed change, $B$ is
+the isolated git worktree in which $\Delta$ was developed and tested, and
+$\texttt{pr}$ is the pull request submitted for human review.
+\end{definition}
+
+The worktree isolation mechanism is central to Tier 4 safety and is analyzed
+formally in Section~\ref{sec:safety}. The validation predicate is:
+\begin{equation}
+    V_4(\mu) = \text{CI}(\mu) \wedge \text{HumanApproval}(\mu.\texttt{pr}),
+\end{equation}
+where $\text{CI}(\mu)$ is the outcome of automated continuous integration and
+$\text{HumanApproval}$ is the result of human pull request review. Neither
+condition alone is sufficient.
+
+% ============================================================================
+% 4. SAFETY FRAMEWORK
+% ============================================================================

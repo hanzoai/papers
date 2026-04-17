@@ -1,0 +1,122 @@
+\section{Specification}
+
+
+\subsection{Components}
+
+The replication system consists of three components:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Image} & \textbf{Purpose} \\
+\midrule
+\texttt{hanzoai/replicate} & \texttt{ghcr.io/hanzoai/replicate} & WAL replication + age encryption \\
+\texttt{hanzoai/age}       & \texttt{ghcr.io/hanzoai/age}       & X25519 key generation \\
+\texttt{hanzoai/s3}        & \texttt{ghcr.io/hanzoai/s3}        & S3-compatible object storage \\
+\bottomrule
+\end{tabular}
+\caption{System components.}
+\label{tab:components}
+\end{table}
+
+\texttt{hanzoai/replicate} is a fork of Litestream incorporating Beeper's
+age encryption patches, rebased onto mainline Litestream, and maintained as
+part of the Hanzo ecosystem. The binary is called \texttt{replicate}. It
+accepts the same configuration format as Litestream with one addition: an
+\texttt{age} block specifying identities and recipients.
+
+\texttt{hanzoai/age} is a container image packaging the \texttt{age-keygen}
+binary for key generation in init containers and CI pipelines.
+
+\texttt{hanzoai/s3} (HIP-0032) provides the S3-compatible storage backend.
+
+\subsection{Replication Protocol}
+
+The replication lifecycle for a single SQLite database:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Startup.} \texttt{replicate} reads the configuration file,
+    connects to the S3 endpoint, and checks for an existing replica.
+
+    \item \textbf{Restore (if needed).} If the local database does not exist
+    and a replica exists in S3, \texttt{replicate} downloads the most recent
+    snapshot, decrypts it with the age identity, replays all subsequent WAL
+    segments (each decrypted individually), and writes the restored database
+    to the configured path.
+
+    \item \textbf{Monitor.} \texttt{replicate} monitors the SQLite WAL file
+    using \texttt{inotify} (Linux) or \texttt{kqueue} (macOS). When new
+    frames are written, it reads them from the WAL.
+
+    \item \textbf{Encrypt.} Each WAL segment is encrypted with the
+    configured age recipients before upload. Encryption happens in memory.
+    Plaintext WAL data never touches S3.
+
+    \item \textbf{Upload.} The encrypted WAL segment is uploaded to S3 at the
+    configured path. The upload is atomic (multipart with commit).
+
+    \item \textbf{Snapshot.} Periodically (default: every 24 hours),
+    \texttt{replicate} takes a full snapshot of the database, encrypts it,
+    and uploads it to S3. Old snapshots are retained according to the
+    configured retention policy.
+
+    \item \textbf{Shutdown.} On SIGTERM, \texttt{replicate} flushes any
+    pending WAL frames, uploads them, and exits cleanly. Kubernetes sends
+    SIGTERM before SIGKILL, so graceful shutdown is the normal path.
+\end{enumerate}
+
+\subsection{Encryption Layers}
+
+Data is protected by three independent encryption layers:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Layer} & \textbf{Mechanism} & \textbf{Scope} & \textbf{Protects Against} \\
+\midrule
+1. Disk   & sqlcipher (AES-256-CBC)      & Database at rest     & Local filesystem access \\
+2. S3     & age (X25519 + ChaCha20)      & Replicas in storage  & S3 operator, bucket leak \\
+3. Wire   & TLS 1.3                       & In transit           & Network interception \\
+\bottomrule
+\end{tabular}
+\caption{Encryption layers. Each layer is independent---compromise of one
+does not compromise the others.}
+\label{tab:encryption}
+\end{table}
+
+Layer 1 (sqlcipher) is managed by Hanzo Base. Layer 2 (age) is managed by
+\texttt{replicate}. Layer 3 (TLS) is managed by the S3 endpoint. This HIP
+specifies Layer 2.
+
+\subsection{Recovery Objectives}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{Target} & \textbf{Mechanism} \\
+\midrule
+RPO (Recovery Point Objective) & $\leq$ 1 second & Continuous WAL streaming \\
+RTO (Recovery Time Objective)  & $\leq$ 30 seconds & Snapshot restore + WAL replay \\
+Retention                      & 72 hours WAL, 30 days snapshots & S3 lifecycle policy \\
+\bottomrule
+\end{tabular}
+\caption{Recovery objectives.}
+\label{tab:recovery}
+\end{table}
+
+The 1-second RPO is achieved by the default \texttt{sync-interval} of 1
+second. WAL frames generated within the last sync interval may be lost on
+unclean shutdown (SIGKILL without preceding SIGTERM). In practice,
+Kubernetes provides a 30-second grace period between SIGTERM and SIGKILL, so
+data loss on clean shutdown is zero.
+
+The 30-second RTO accounts for S3 download latency for the most recent
+snapshot (typically 1--5 seconds for databases under 1~GiB) plus WAL replay
+time (linear in the number of frames since the last snapshot).
+
+% ============================================================================
+% 4. CONFIGURATION
+% ============================================================================

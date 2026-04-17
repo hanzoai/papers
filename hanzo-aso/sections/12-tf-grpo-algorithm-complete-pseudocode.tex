@@ -1,0 +1,53 @@
+\section{TF-GRPO Algorithm (Complete Pseudocode)}
+
+\label{app:algorithm}
+
+\begin{algorithm}[H]
+\caption{Training-Free GRPO with PoE Decoding}
+\label{alg:tfgrpo}
+\begin{algorithmic}[1]
+\Require Task $x$, base model $\pi_\theta$, prior bank $\mathcal{E}$,
+         group size $G$, max iterations $K$, reward weights $\alpha, \beta$
+\Ensure Updated prior bank $\mathcal{E}'$, best solution $y^*$
+\State $\mathcal{E}' \gets \mathcal{E}$
+\State $r^* \gets -\infty$
+\For{$k = 1$ to $K$}
+    \State \texttt{// Phase 1: Generate rollouts with current priors}
+    \For{$i = 1$ to $G$}
+        \State $y^{(i)}_k \sim \pi_{\text{ASO}}(\cdot \mid x; \mathcal{E}')$
+        \Comment{PoE decoding (Eq.~\ref{eq:poe-main})}
+        \State $r_{\text{ext}}^{(i)} \gets \text{ExecuteAndTest}(y^{(i)}_k, x)$
+        \State $r_{\text{epi}}^{(i)} \gets \text{EpistemicReward}(y^{(i)}_k, \mathcal{E}')$
+        \State $r^{(i)} \gets \alpha \cdot r_{\text{ext}}^{(i)} + \beta \cdot r_{\text{epi}}^{(i)}$
+    \EndFor
+    \State \texttt{// Phase 2: Compute group-relative advantages}
+    \State $\mu_G \gets \frac{1}{G}\sum_i r^{(i)}$, \quad
+           $\sigma_G \gets \sqrt{\frac{1}{G-1}\sum_i (r^{(i)} - \mu_G)^2}$
+    \For{$i = 1$ to $G$}
+        \State $A^{(i)} \gets (r^{(i)} - \mu_G) / (\sigma_G + \epsilon)$
+    \EndFor
+    \State \texttt{// Phase 3: Extract and compress semantic advantages}
+    \State $S \gets \text{LLMIntrospect}(\{(y^{(i)}_k, A^{(i)})\}_{i=1}^G, x)$
+    \For{each pattern $s_j \in S$}
+        \State $\Delta_j \gets \text{DistillToTokenFactors}(s_j)$
+        \State $\widehat{\Delta}_j \gets \alpha_j \cdot \sign(\Delta_j)$
+        \Comment{1-bit compression (Eq.~\ref{eq:1bit})}
+        \State $q_j \gets \text{EstimateQuality}(s_j, \{r^{(i)}\})$
+        \State $\eta_j \gets \log(q_j / (1 - q_j))$
+        \Comment{Optimal weight (Eq.~\ref{eq:eta-bayes})}
+        \State $\mathcal{E}' \gets \mathcal{E}' \cup \{(\widehat{\Delta}_j, \eta_j, q_j)\}$
+    \EndFor
+    \State \texttt{// Phase 4: Update best solution}
+    \State $i^* \gets \argmax_i r^{(i)}$
+    \If{$r^{(i^*)} > r^*$}
+        \State $r^* \gets r^{(i^*)}$, \quad $y^* \gets y^{(i^*)}_k$
+    \EndIf
+    \State \texttt{// Early termination}
+    \If{$r_{\text{ext}}^{(i^*)} = 1.0$}
+        \State \textbf{break} \Comment{All tests pass}
+    \EndIf
+\EndFor
+\State \Return $\mathcal{E}', y^*$
+\end{algorithmic}
+\end{algorithm}
+

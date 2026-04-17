@@ -1,0 +1,81 @@
+\section{Confidential Inference}
+
+\label{sec:fhe}
+% ============================================================================
+
+Hanzo implements confidential inference using the CKKS (Cheon--Kim--Kim--Song)
+FHE scheme~\cite{ckks2017}, which supports approximate fixed-point arithmetic
+on encrypted vectors---the operation profile that neural network inference
+requires.
+
+\subsection{CKKS Overview}
+
+CKKS operates on the ring $R_Q = \mathbb{Z}_Q[X]/(X^N + 1)$ where $N$ is a
+power of 2 (typically $N = 2^{16}$) and $Q$ is a product of coprime moduli.
+A plaintext vector $\bm{z} \in \mathbb{C}^{N/2}$ is encoded as a ring
+element $m \in R_Q$ via the canonical embedding, then encrypted as:
+
+\begin{equation}
+\text{ct} = (\bm{a} \cdot s + e + m, \; \bm{a})
+\end{equation}
+
+where $s$ is the secret key, $\bm{a}$ is uniform random, and $e$ is a small
+error. Homomorphic addition and multiplication on ciphertexts correspond to
+addition and multiplication on plaintexts, with the error growing after each
+operation.
+
+\subsection{Inference Pipeline}
+
+The confidential inference pipeline operates in four phases:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Client-side encryption}: The client encodes the input (token
+    embeddings for text, pixel values for images) into CKKS plaintext vectors
+    and encrypts them with their public key. The ciphertexts are transmitted
+    to the Hanzo Cloud.
+    \item \textbf{Homomorphic evaluation}: The cloud evaluates the model on
+    the ciphertexts. Linear layers (matrix multiplication, convolution) map
+    directly to CKKS operations. Non-linear activations (GELU, softmax) are
+    approximated by low-degree polynomials fitted via Remez
+    algorithm~\cite{hanzocandle, hanzofhe}.
+    \item \textbf{Encrypted output}: The cloud returns the encrypted result.
+    It cannot decrypt it---only the client (or threshold decryption
+    participants) hold the secret key.
+    \item \textbf{Client-side decryption}: The client decrypts the result
+    locally. For threshold configurations, $k$-of-$n$ key holders cooperate
+    to produce the decryption.
+\end{enumerate}
+
+\subsection{Polynomial Activation Approximation}
+
+The GELU activation $\text{GELU}(x) = x \cdot \Phi(x)$ where $\Phi$ is the
+Gaussian CDF is approximated by a degree-7 polynomial on $[-8, 8]$:
+
+\begin{equation}
+\widetilde{\text{GELU}}(x) = \sum_{k=0}^{7} a_k x^k
+\end{equation}
+
+with coefficients fitted to minimize $L_\infty$ error. The maximum
+approximation error is $|\text{GELU}(x) - \widetilde{\text{GELU}}(x)| <
+2 \times 10^{-4}$ on the domain, which is within the noise floor of CKKS
+arithmetic. Softmax is decomposed into exponentiation (degree-6 polynomial
+approximation) and reciprocal (Goldschmidt iteration on ciphertexts).
+
+\subsection{Threshold Decryption}
+
+For multi-party scenarios, the secret key $s$ is split into $n$ shares
+$s_1, \ldots, s_n$ via Shamir's secret sharing. Decryption requires $k$
+shares:
+
+\begin{equation}
+m = \text{ct}_0 + \text{ct}_1 \cdot s = \text{ct}_0 +
+\text{ct}_1 \cdot \sum_{i \in S} \lambda_i s_i
+\end{equation}
+
+where $S \subset [n]$ with $|S| = k$ and $\lambda_i$ are Lagrange
+interpolation coefficients. Each participant computes a partial decryption
+$d_i = \text{ct}_1 \cdot \lambda_i s_i + e_i$ (with a smudging noise $e_i$
+to prevent key leakage), and the combiner sums the partial decryptions. No
+single party learns the plaintext unless they hold $k$ shares.
+
+% ============================================================================

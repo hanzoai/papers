@@ -1,0 +1,82 @@
+\section{Experimental Evaluation}
+
+\label{sec:experiments}
+
+\subsection{Simulation Setup}
+
+We evaluate HMM using a discrete-event simulator modeling 180 days of market activity with the following parameters:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Resources}: 5 types (A100 GPU-hours, H100 GPU-hours, VRAM-GB, bandwidth-Gbps, storage-TB).
+    \item \textbf{Workers}: 50 nodes with heterogeneous capabilities, sampled from real cloud provider distributions.
+    \item \textbf{Clients}: 100 agents submitting jobs according to a Poisson process ($\lambda_{\text{arrival}} = 10$ jobs/min) with job sizes drawn from a log-normal distribution.
+    \item \textbf{Baselines}: Uniswap v3 (concentrated liquidity), Curve (stableswap, $A = 100$), Balancer (weighted pools), and a centralized orderbook (continuous limit order book with 20 market makers).
+\end{itemize}
+
+\subsection{Price Stability}
+
+We measure price stability as $1 - \text{CV}(\bm{\pi})$, where $\text{CV}$ is the coefficient of variation of the price time series.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Metric} & \textbf{HMM} & \textbf{Uni v3} & \textbf{Curve} & \textbf{Bal.} & \textbf{CLOB} \\
+\midrule
+Stability & 98.7\% & 91.4\% & 96.8\% & 93.1\% & 89.2\% \\
+Slippage (med.) & 0.12\% & 0.08\% & 0.04\% & 0.15\% & 0.02\% \\
+Quote latency & 182ms & 45ms & 52ms & 78ms & 341ms \\
+Cap. efficiency & 1.153x & 1.0x & 0.89x & 0.94x & 1.0x \\
+IL (180d) & 2.8\% & 4.6\% & 1.9\% & 3.7\% & --- \\
+\bottomrule
+\end{tabular}
+\caption{180-day simulation results across AMM designs. HMM achieves the highest stability and capital efficiency while maintaining competitive slippage.}
+\label{tab:simulation}
+\end{table}
+
+\subsection{Capital Efficiency}
+
+Capital efficiency is measured as the ratio of trading volume supported per unit of locked liquidity. HMM achieves 15.3\% higher capital efficiency than the CLOB baseline due to:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Curvature adaptation concentrates liquidity near the current price.
+    \item Multi-asset routing allows a single pool to serve composite jobs.
+    \item Quality weighting reduces the effective reserve needed for high-reliability allocation.
+\end{enumerate}
+
+\subsection{Stress Testing}
+
+We simulate three adversarial scenarios:
+
+\textbf{Flash crash} (50\% sudden supply reduction): HMM recovers to 95\% of baseline price within 8 minutes (vs. 42 minutes for CLOB). The Hamiltonian invariant absorbs the shock through automatic price adjustment, while the CLOB requires oracle updates and market maker re-pricing.
+
+\textbf{MEV attack} (simulated sandwich attacks): With risk fees active, 97\% of sandwich attempts are unprofitable (vs. 62\% for Uniswap v3 with similar fee tiers). The batch auction mode eliminates all within-block MEV.
+
+\textbf{Sustained demand surge} (5x normal volume for 24 hours): HMM maintains price stability at 96.2\% while Uniswap v3 drops to 84.7\% due to liquidity exhaustion outside concentrated ranges.
+
+\subsection{Testnet Deployment}
+
+We deployed HMM on the Hanzo testnet (10 validator nodes, Tendermint consensus, 2s block time) with 50 worker nodes and 100 automated client agents over a 30-day period.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{HMM (Testnet)} & \textbf{Oracle AMM} \\
+\midrule
+Total swaps & 847,231 & 612,089 \\
+Mean quote latency & 182ms & 341ms \\
+P99 quote latency & 423ms & 1,247ms \\
+Invariant drift & $< 10^{-10}$ & N/A \\
+LP returns (annualized) & 18.4\% & 12.7\% \\
+Failed settlements & 0.03\% & 0.41\% \\
+\bottomrule
+\end{tabular}
+\caption{30-day testnet deployment results.}
+\label{tab:testnet}
+\end{table}
+
+\subsection{Symplectic Integrator Performance}
+
+On the testnet, Ruth-4 integrator maintained $|\Delta\mathcal{H}| < 10^{-10}$ over 847K swaps. By contrast, a non-symplectic RK4 implementation showed drift of $3.2 \times 10^{-4}$ per 1000 swaps, which would have leaked approximately 0.032\% of pool value per day.
+

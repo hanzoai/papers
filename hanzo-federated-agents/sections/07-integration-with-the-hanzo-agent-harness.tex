@@ -1,0 +1,104 @@
+\section{Integration with the Hanzo Agent Harness}
+
+\label{sec:harness}
+
+\subsection{The Continuous Learning Extension}
+
+FAI is implemented as a \emph{plugin} for the Hanzo agent harness,
+augmenting the base agent with four capabilities:
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Session telemetry collection}: Intercept and log all tool
+          calls and outcomes without modifying agent behavior.
+    \item \textbf{Background GRPO}: Run experience extraction asynchronously
+          between sessions, not blocking agent execution.
+    \item \textbf{DSO network tools}: Expose DSO operations as callable tools
+          so the agent can query its own fleet status.
+    \item \textbf{Periodic synchronization}: Background service that runs
+          library consolidation and DSO broadcast on a configurable schedule.
+\end{enumerate}
+
+\subsection{DSO Network Tools}
+
+The plugin exposes four tools to the agent:
+
+\begin{verbatim}
+dso_network(action="status")
+  -> { peers: N, library_size: M, last_sync: timestamp,
+       bytes_sent: X, bytes_received: Y }
+
+dso_network(action="broadcast", domain="coding")
+  -> { experiences_sent: K, peers_reached: P, batch_id: str }
+
+dso_network(action="receive", domain="coding", limit=50)
+  -> { experiences_received: K, library_delta: D }
+
+dso_network(action="peers")
+  -> { peers: [{ node_id, latency_ms, reputation, last_seen }] }
+\end{verbatim}
+
+These tools allow the agent to actively manage its DSO participation---for
+example, by broadcasting immediately after completing a difficult task, or
+by requesting experiences from a specific domain before starting a new
+project.
+
+\subsection{Experience Lifecycle}
+
+The complete lifecycle of an experience from agent session to fleet benefit
+is illustrated in Figure~\ref{fig:lifecycle} and described below:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Session}: Agent executes tools, producing telemetry
+          $\{(\text{tool}_t, \text{input}_t, \text{output}_t, r_t)\}$.
+    \item \textbf{Trajectory construction}: Telemetry is grouped into
+          trajectories $\tau = (\tau_1, \ldots, \tau_T)$ by task.
+    \item \textbf{GRPO extraction}: Group relative advantages are computed
+          and semantic patterns are extracted via LLM introspection.
+    \item \textbf{Local library update}: Patterns are embedded and stored
+          in $\mathcal{L}_i$, indexed by task embedding.
+    \item \textbf{BitDelta compression}: Library is compressed using
+          Algorithm~\ref{alg:compress} with the current baseline.
+    \item \textbf{DSO broadcast}: Compressed batch is broadcast to $k$
+          peers via the gossip protocol.
+    \item \textbf{Peer receive}: Peers receive the batch, verify integrity,
+          and add to their incoming queue.
+    \item \textbf{DeltaSoup merge}: Algorithm~\ref{alg:deltasoup} merges
+          all received batches into the peer's local library.
+    \item \textbf{Better next session}: The updated library is used for
+          PoE decoding (Eq.~\ref{eq:poe}) in the peer's next session.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ccccccccc}
+\textbf{Session} & $\to$ & \textbf{Telemetry} & $\to$ & \textbf{GRPO} & $\to$ & \textbf{Local} & $\to$ & \textbf{Compress} \\
+& & & & & & $\mathcal{L}_i$ & & BitDelta \\[4pt]
+\multicolumn{3}{c}{\textbf{Better Session}} & $\leftarrow$ & \textbf{DeltaSoup} & $\leftarrow$ & \textbf{Receive} & $\leftarrow$ & \textbf{Broadcast} \\
+\multicolumn{3}{c}{(PoE decoding)} & & merge & & peers & & DSO gossip \\
+\end{tabular}
+\caption{Experience lifecycle: from agent session to fleet benefit and back.}
+\label{fig:lifecycle}
+\end{figure}
+
+\subsection{Interaction with Self-Improvement}
+
+The Hanzo agent harness includes a self-improvement loop that periodically
+audits agent behavior and proposes policy changes. FAI integrates with this
+loop at two points:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Library statistics inform sharing policy}: The self-improvement
+          loop's maintenance phase (Loop 4) examines experience library statistics
+          (domain coverage, quality distribution, staleness) and can increase
+          broadcast frequency for under-represented domains or reduce it for
+          saturated ones.
+    \item \textbf{Fleet quality informs individual improvement}: Low fleet-wide
+          quality in a domain signals that new local GRPO runs may be productive.
+          The self-improvement loop uses $Q^{(T)}$ as a signal for when to
+          invest in fresh rollouts.
+\end{enumerate}
+
+% ============================================================================
+% 8. PRIVACY AND SECURITY
+% ============================================================================

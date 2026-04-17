@@ -1,0 +1,106 @@
+\section{Loop 0: Telemetry Pipeline}
+
+\label{sec:loop0}
+
+\subsection{Formal Definition}
+
+The telemetry pipeline is the foundation on which all other loops depend. Its
+design must satisfy three requirements: (1) zero latency overhead on the
+critical path, (2) append-only storage for tamper-evidence and crash safety,
+and (3) sufficient structural richness to support all downstream analyses.
+
+\begin{definition}[ToolInvocation Record]
+\label{def:tool_invocation}
+A \textsc{ToolInvocation} record $\tau$ is a tuple:
+\begin{equation}
+\tau = \bigl( \text{id},\; \text{session\_id},\; \text{ts},\; \text{tool},\;
+              \text{args},\; \text{outcome},\; \text{duration\_ms},\; \text{failure\_mode} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{id} \in \{0,1\}^{256}$: Globally unique record identifier (SHA-256 of content).
+    \item $\text{session\_id} \in \mathbb{N}$: Monotonically increasing session counter.
+    \item $\text{ts} \in \mathbb{R}_{>0}$: Unix timestamp with millisecond precision.
+    \item $\text{tool} \in \mathcal{V}_T$: Tool identifier from the tool vocabulary.
+    \item $\text{args} \in \mathcal{A}$: Serialized argument record (JSON, size-bounded).
+    \item $\text{outcome} \in \{\textsc{success}, \textsc{failure}, \textsc{timeout}, \textsc{cancelled}\}$: Categorical outcome.
+    \item $\text{duration\_ms} \in \mathbb{N}$: Wall-clock execution time.
+    \item $\text{failure\_mode} \in \mathcal{V}_F \cup \{\bot\}$: Categorical failure mode or null on success.
+\end{itemize}
+\end{definition}
+
+\begin{remark}
+The content-addressed identifier $\text{id}$ enables deduplication and serves
+as an integrity check: any modification to a record is detectable by recomputing
+the hash. This property is important for Loop~4's cross-session aggregation,
+which must be robust to storage corruption.
+\end{remark}
+
+\subsection{Storage Architecture}
+
+Records are appended to a JSONL (JSON Lines) file, one record per line. JSONL
+is preferred over binary formats for three reasons:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Crash safety:} A partial write affects only the last line.
+          All preceding lines remain valid and parseable.
+    \item \textbf{Tier portability:} The same file format works identically
+          on a local laptop, a remote container, and an EC2 instance. NATS
+          JetStream can replay from JSONL without schema migration.
+    \item \textbf{Zero write amplification:} Append-only writes never
+          trigger compaction, B-tree rebalancing, or WAL flushing. The
+          telemetry path adds at most one \texttt{write(2)} syscall per
+          tool invocation.
+\end{enumerate}
+
+Records are simultaneously published to a NATS JetStream subject
+\texttt{telemetry.{session\_id}.{tool}} for real-time consumption by Loops~1
+and~2. The NATS layer provides durability (disk-backed JetStream), replay
+capability (for recovering Loop~1 analysis after agent restart), and
+subject-based filtering (Loop~2 subscribes only to its trigger subjects).
+
+\begin{definition}[Telemetry Log]
+\label{def:telemetry_log}
+The telemetry log $\mathcal{T}^{(s)}$ at session $s$ is the ordered sequence:
+\begin{equation}
+\mathcal{T}^{(s)} = \bigl( \tau_1, \tau_2, \ldots, \tau_{|\mathcal{T}^{(s)}|} \bigr),
+\quad \tau_i.\text{ts} \leq \tau_{i+1}.\text{ts},
+\end{equation}
+stored as an append-only JSONL file. The \emph{session slice}
+$\mathcal{T}^{(s)}_{\text{cur}}$ is the subsequence of records with
+$\text{session\_id} = s$.
+\end{definition}
+
+\subsection{Failure Mode Taxonomy}
+
+The failure mode vocabulary $\mathcal{V}_F$ is a hierarchical taxonomy with
+three levels:
+
+\begin{table}[H]
+\centering
+\caption{Failure Mode Taxonomy (Level-1 categories with examples).}
+\label{tab:failure_modes}
+\begin{tabular}{llp{6cm}}
+\toprule
+Code & Category & Example Instances \\
+\midrule
+\texttt{PERM} & Permission error & File not writable, socket permission denied \\
+\texttt{NOTFOUND} & Resource not found & File missing, URL 404, package not installed \\
+\texttt{TIMEOUT} & Execution timeout & Command exceeded wall-clock limit \\
+\texttt{SYNTAX} & Syntax/parse error & Malformed JSON argument, invalid regex \\
+\texttt{RUNTIME} & Runtime exception & Uncaught exception, segfault, OOM \\
+\texttt{TOOL\_GAP} & Missing capability & No tool for requested operation \\
+\texttt{ARGS} & Argument error & Wrong type, out of range, missing required field \\
+\texttt{CONFLICT} & State conflict & Git merge conflict, lock contention \\
+\texttt{NETWORK} & Network failure & DNS failure, connection refused, TLS error \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Level-2 and Level-3 sub-codes refine each category. The full taxonomy is
+defined in the SDK and is extensible: new failure modes can be registered by
+tool authors without modifying the core taxonomy.
+
+% ============================================================================
+% 5. LOOP 1: BUILD IT NOW
+% ============================================================================

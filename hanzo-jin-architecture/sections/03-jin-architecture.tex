@@ -1,0 +1,261 @@
+\section{Jin Architecture}
+
+
+\subsection{Overview}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    encoder/.style={rectangle, draw, minimum width=1.8cm, minimum height=1cm, align=center, fill=blue!10},
+    joint/.style={rectangle, draw, minimum width=10cm, minimum height=1.2cm, align=center, fill=green!10},
+    transformer/.style={rectangle, draw, minimum width=10cm, minimum height=1.5cm, align=center, fill=yellow!10},
+    decoder/.style={rectangle, draw, minimum width=1.8cm, minimum height=1cm, align=center, fill=red!10},
+    arrow/.style={->, thick}
+]
+% Inputs
+\node[encoder] (text_enc) {Text\\Encoder};
+\node[encoder, right=0.3cm of text_enc] (vision_enc) {Vision\\Encoder};
+\node[encoder, right=0.3cm of vision_enc] (audio_enc) {Audio\\Encoder};
+\node[encoder, right=0.3cm of audio_enc] (custom_enc) {Custom\\Encoder};
+
+% Joint space
+\node[joint, below=1cm of vision_enc] (joint) {Joint Embedding Space + Modality Tokens};
+
+% Transformer
+\node[transformer, below=0.8cm of joint] (transformer) {Diffusion Transformer with MoE};
+
+% Decoders
+\node[decoder, below=1cm of text_enc] (text_dec) at (text_enc |- transformer.south) {Text\\Output};
+\node[decoder, below=1cm of vision_enc] (vision_dec) at (vision_enc |- transformer.south) {Vision\\Output};
+\node[decoder, below=1cm of audio_enc] (audio_dec) at (audio_enc |- transformer.south) {Audio\\Output};
+\node[decoder, below=1cm of custom_enc] (custom_dec) at (custom_enc |- transformer.south) {Custom\\Output};
+
+% Arrows
+\draw[arrow] (text_enc) -- (joint);
+\draw[arrow] (vision_enc) -- (joint);
+\draw[arrow] (audio_enc) -- (joint);
+\draw[arrow] (custom_enc) -- (joint);
+\draw[arrow] (joint) -- (transformer);
+\draw[arrow] (transformer.south -| text_dec) -- (text_dec);
+\draw[arrow] (transformer.south -| vision_dec) -- (vision_dec);
+\draw[arrow] (transformer.south -| audio_dec) -- (audio_dec);
+\draw[arrow] (transformer.south -| custom_dec) -- (custom_dec);
+
+% Labels
+\node[above=0.2cm of text_enc] {\small Tokens};
+\node[above=0.2cm of vision_enc] {\small Patches};
+\node[above=0.2cm of audio_enc] {\small Mel-Spec};
+\node[above=0.2cm of custom_enc] {\small Features};
+\end{tikzpicture}
+\caption{Jin architecture: modality-specific encoders project into a joint embedding space, processed by a diffusion transformer with MoE, and decoded to target modalities.}
+\label{fig:architecture}
+\end{figure*}
+
+Figure~\ref{fig:architecture} shows the Jin architecture. The system processes inputs through three stages:
+
+\begin{enumerate}
+    \item \textbf{Encoding}: Modality-specific encoders project inputs to the joint embedding space.
+    \item \textbf{Processing}: A diffusion transformer with MoE processes the joint representation.
+    \item \textbf{Decoding}: Modality-specific decoders generate outputs in target modalities.
+\end{enumerate}
+
+\subsection{Joint Embedding Space}
+
+\begin{lstlisting}[language=Python]
+class JointEmbeddingSpace(nn.Module):
+    def __init__(self, config: JinConfig):
+        self.encoders = nn.ModuleDict({
+            "text": TextEncoder(config),
+            "vision": VisionEncoder(config),
+            "audio": AudioEncoder(config)
+        })
+        self.modality_embed = nn.Embedding(
+            len(config.modalities), config.embedding_dim)
+        self.fusion = nn.MultiheadAttention(
+            config.embedding_dim, config.num_heads)
+
+    def encode(self, inputs: Dict[str, Tensor]) -> Tensor:
+        encoded = []
+        for i, (mod, data) in enumerate(inputs.items()):
+            embeds = self.encoders[mod].encode(data)
+            mod_emb = self.modality_embed(
+                torch.full((B, 1), i, device=device))
+            embeds = embeds + mod_emb
+            encoded.append(embeds)
+
+        joint = torch.cat(encoded, dim=1)
+        fused, _ = self.fusion(joint, joint, joint)
+        return fused
+\end{lstlisting}
+
+\paragraph{Modality Tokens.} Each modality receives a learnable embedding added to all its tokens, enabling the transformer to distinguish modality origins without explicit conditioning.
+
+\paragraph{Cross-Modal Fusion.} Self-attention over concatenated modality tokens enables cross-modal information flow from the first layer, unlike late-fusion approaches.
+
+\subsection{Modality Encoders}
+
+\paragraph{Text Encoder.} Standard token embedding with learned positional encodings:
+
+\begin{lstlisting}[language=Python]
+class TextEncoder(nn.Module):
+    def encode(self, x: Tensor) -> Tensor:
+        embeds = self.embed(x)  # (B, T, D)
+        positions = self.pos_embed[:, :x.shape[1]]
+        return embeds + positions
+\end{lstlisting}
+
+\paragraph{Vision Encoder.} Patch embedding following ViT~\cite{vit2020}:
+
+\begin{lstlisting}[language=Python]
+class VisionEncoder(nn.Module):
+    def __init__(self, config, patch_size=14):
+        self.proj = nn.Conv2d(3, config.embedding_dim,
+                              kernel_size=patch_size,
+                              stride=patch_size)
+
+    def encode(self, x: Tensor) -> Tensor:
+        patches = self.proj(x)  # (B, D, H/P, W/P)
+        patches = rearrange(patches, 'b d h w -> b (h w) d')
+        return patches + self.pos_embed[:, :patches.shape[1]]
+\end{lstlisting}
+
+\paragraph{Audio Encoder.} Projects mel-spectrogram frames:
+
+\begin{lstlisting}[language=Python]
+class AudioEncoder(nn.Module):
+    def encode(self, x: Tensor) -> Tensor:
+        # x: (B, T, 80) mel bins
+        return self.proj(x) + self.pos_embed[:, :x.shape[1]]
+\end{lstlisting}
+
+\subsection{Diffusion Transformer with MoE}
+
+\begin{lstlisting}[language=Python]
+class DiffusionTransformerBlock(nn.Module):
+    def __init__(self, config):
+        self.norm1 = nn.LayerNorm(config.hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            config.hidden_dim, config.num_heads)
+        self.norm2 = nn.LayerNorm(config.hidden_dim)
+        self.moe = UnifiedMoE(config)
+        if config.use_diffusion:
+            self.time_embed = nn.Sequential(
+                nn.Linear(1, config.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(config.hidden_dim,
+                          config.hidden_dim))
+
+    def forward(self, x, timestep=None):
+        x = x + self.attn(self.norm1(x))[0]
+        x = x + self.moe(self.norm2(x))
+        if timestep is not None:
+            x = x + self.time_embed(timestep).unsqueeze(1)
+        return x
+\end{lstlisting}
+
+\paragraph{MoE Routing.} Each token is routed to top-$k$ experts:
+
+\begin{lstlisting}[language=Python]
+class UnifiedMoE(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        scores = self.router(x)  # (B, N, num_experts)
+        weights, indices = torch.topk(
+            F.softmax(scores, dim=-1),
+            self.experts_per_token, dim=-1)
+
+        output = torch.zeros_like(x)
+        for i in range(self.experts_per_token):
+            expert_idx = indices[:, :, i]
+            expert_weight = weights[:, :, i].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (expert_idx == e)
+                if mask.any():
+                    expert_out = self.experts[e](x[mask])
+                    output[mask] += expert_weight[mask] * expert_out
+        return output
+\end{lstlisting}
+
+\subsection{z-JEPA: Hierarchical Zooming}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    level/.style={rectangle, draw, minimum width=2cm, minimum height=0.7cm, align=center},
+    arrow/.style={->, thick}
+]
+\node[level, fill=blue!30] (l0) {Level 0\\224x224};
+\node[level, below=of l0, fill=blue!25] (l1) {Level 1\\112x112};
+\node[level, below=of l1, fill=blue!20] (l2) {Level 2\\56x56};
+\node[level, below=of l2, fill=blue!15] (l3) {Level 3\\28x28};
+
+\node[right=1.5cm of l0] (d0) {\small Global context};
+\node[right=1.5cm of l1] (d1) {\small Object-level};
+\node[right=1.5cm of l2] (d2) {\small Part-level};
+\node[right=1.5cm of l3] (d3) {\small Fine detail};
+
+\draw[arrow, bend right=20] (l0) to node[left] {\tiny predict} (l1);
+\draw[arrow, bend right=20] (l1) to node[left] {\tiny predict} (l2);
+\draw[arrow, bend right=20] (l2) to node[left] {\tiny predict} (l3);
+\draw[arrow, bend left=20, dashed] (l3) to node[right] {\tiny feedback} (l2);
+\draw[arrow, bend left=20, dashed] (l2) to node[right] {\tiny feedback} (l1);
+\end{tikzpicture}
+\caption{z-JEPA hierarchical levels with bidirectional prediction.}
+\label{fig:zjepa}
+\end{figure}
+
+z-JEPA extends JEPA with hierarchical zoom levels (Figure~\ref{fig:zjepa}):
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class ZJEPAConfig:
+    num_z_levels: int = 4
+    zoom_factors: List[float] = [1.0, 0.5, 0.25, 0.125]
+    predict_fine_from_coarse: bool = True
+    predict_coarse_from_fine: bool = True
+    bidirectional_prediction: bool = True
+\end{lstlisting}
+
+\paragraph{Cross-Scale Prediction.} The model learns to predict fine-grained features from coarse-grained context and vice versa:
+
+\begin{equation}
+    \mathcal{L}_{\text{cross}} = \sum_{i=0}^{L-1} \left( \|g_i(z_i) - z_{i+1}\|^2 + \|h_{i+1}(z_{i+1}) - z_i\|^2 \right)
+\end{equation}
+
+\paragraph{Adaptive Zoom.} An attention network identifies regions of interest for detailed processing:
+
+\begin{lstlisting}[language=Python]
+class AdaptiveZoomModule(nn.Module):
+    def forward(self, x, global_features):
+        roi_coords = self.roi_network(global_features)
+        importance = self.importance_scorer(global_features)
+
+        crops = [x]  # Level 0: full image
+        for level in range(1, self.num_levels):
+            crop = extract_foveal_region(
+                x, roi_coords, level)
+            crops.append(crop)
+        return crops, importance
+\end{lstlisting}
+
+\subsection{Modality Extension}
+
+New modalities can be added without retraining:
+
+\begin{lstlisting}[language=Python]
+class CustomModalityEncoder(nn.Module, ModalityEncoder):
+    def __init__(self, input_dim, config):
+        self.proj = nn.Linear(input_dim,
+                              config.embedding_dim)
+
+    def encode(self, x: Tensor) -> Tensor:
+        return self.proj(x)
+
+# Add at runtime
+custom_encoder = CustomModalityEncoder(128, model.config)
+model.add_modality("proprioception", custom_encoder)
+\end{lstlisting}
+
+The modality embedding table expands dynamically, preserving existing embeddings.
+

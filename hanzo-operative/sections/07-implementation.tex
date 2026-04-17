@@ -1,0 +1,81 @@
+\section{Implementation}
+
+\label{sec:implementation}
+
+Operative is implemented in Python (12,400 lines) with platform-specific native extensions for screen capture and accessibility tree access.
+
+\subsection{Platform Support}
+
+\begin{table}[t]
+\centering
+\caption{Platform support matrix}
+\label{tab:platforms}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Feature} & \textbf{macOS} & \textbf{Linux} & \textbf{Win} & \textbf{Docker} \\
+\midrule
+Screen capture & \checkmark & \checkmark & \checkmark & \checkmark \\
+Mouse/keyboard & \checkmark & \checkmark & \checkmark & \checkmark \\
+A11y tree & \checkmark & \checkmark & \checkmark & --- \\
+Browser (PW) & \checkmark & \checkmark & \checkmark & \checkmark \\
+App launch & \checkmark & \checkmark & \checkmark & --- \\
+VM sandbox & --- & \checkmark & --- & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On macOS, screen capture uses the ScreenCaptureKit framework via PyObjC. Mouse and keyboard input uses Quartz Event Services. Accessibility tree access uses the AX API. On Linux, screen capture uses the X11 SHM extension or Wayland screencopy protocol. Input is generated via XTest or uinput. Docker support uses a headless X11 server (Xvfb) with VNC for remote observation.
+
+\subsection{Model Integration}
+
+Operative supports any model accessible via the Hanzo LLM Gateway~\cite{hanzo2026gateway}:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Vision models}: Claude Sonnet/Opus, GPT-4o, Gemini Pro Vision---receive screenshots as image inputs.
+    \item \textbf{Text models}: Any chat model---receive text-serialized \texttt{ScreenState} as input.
+    \item \textbf{Local models}: Models running via Ollama or vLLM with vision capabilities.
+\end{itemize}
+
+The model interface is abstracted behind a \texttt{Planner} protocol:
+
+\begin{lstlisting}[language=Python, caption=Planner protocol]
+class Planner(Protocol):
+    async def select_action(
+        self,
+        state: ScreenState,
+        task: Task,
+        history: list[Observation],
+    ) -> Action:
+        """Select next action given current
+           state and task context."""
+
+    async def decompose(
+        self, goal: str
+    ) -> Task:
+        """Decompose goal into task
+           hierarchy."""
+
+    async def handle_error(
+        self,
+        state: ScreenState,
+        action: Action,
+        error: ActionError,
+    ) -> TaskUpdate:
+        """Decide recovery strategy for
+           failed action."""
+\end{lstlisting}
+
+\subsection{Browser Automation Backend}
+
+For web-based tasks, Operative uses Playwright as the browser automation backend. This provides:
+
+\begin{itemize}[leftmargin=*]
+    \item Cross-browser support (Chromium, Firefox, WebKit).
+    \item DOM access for precise element targeting.
+    \item Network interception for monitoring requests.
+    \item Built-in waiting mechanisms for dynamic content.
+    \item Device emulation for mobile web testing.
+\end{itemize}
+
+The browser backend can operate in two modes: (1) \textbf{visual mode}, where the agent sees screenshots and uses coordinate-based actions, and (2) \textbf{structured mode}, where the agent receives DOM-based element descriptions and uses selector-based actions. Structured mode is more reliable but less generalizable to non-browser environments.
+

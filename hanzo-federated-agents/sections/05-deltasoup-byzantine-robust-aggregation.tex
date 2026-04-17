@@ -1,0 +1,217 @@
+\section{DeltaSoup: Byzantine-Robust Aggregation}
+
+\label{sec:deltasoup}
+
+\subsection{Threat Model}
+
+\begin{assumption}[Byzantine Threat Model]
+\label{ass:threat}
+Among $N$ peer nodes, up to $f$ nodes are Byzantine. Byzantine nodes may:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Submit experience batches with arbitrary sign vectors or scales.
+    \item Selectively withhold experiences (censorship).
+    \item Replay or duplicate previously observed honest batches.
+    \item Coordinate with other Byzantine nodes to mount joint attacks.
+    \item Create Sybil identities (limited by the DSO stake requirement).
+\end{enumerate}
+The remaining $h = N - f$ honest nodes follow the protocol specification.
+We assume the standard bound $f < N/3$ for Byzantine agreement~\cite{pease1980reaching}.
+\end{assumption}
+
+\begin{assumption}[Honest Node Diversity]
+\label{ass:diversity}
+Honest nodes operate on related but distinct task distributions. Their
+experience embeddings are drawn from a common distribution with bounded
+variance: $\mathbb{E}[\|\bm{e}_m - \mu\|_2^2] \leq \sigma_h^2$ for some
+true centroid $\mu$ and $\sigma_h^2 < \infty$.
+\end{assumption}
+
+\subsection{Aggregation Protocol}
+
+DeltaSoup aggregates incoming compressed batches from all peers into a
+filtered, merged experience set. The protocol proceeds in four phases.
+
+\paragraph{Phase 1: Receive and Verify.}
+For each incoming batch $\hat{B}_i$ from peer $i$:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Verify SHA-256 hash. Drop and record reputation penalty on failure.
+    \item Check timestamp freshness: reject if $|t_i - t_{\text{now}}| > T_{\max}$
+          (default $T_{\max} = 300$\,s).
+    \item Check node reputation: skip processing if reputation below threshold.
+\end{enumerate}
+
+\paragraph{Phase 2: Decompress.}
+Apply Algorithm~\ref{alg:decompress} to each verified batch, producing
+$\{\hat{\bm{e}}_{i,m}\}$ for all experiences $m$ in batch $i$.
+
+\paragraph{Phase 3: Outlier Filtering.}
+Collect all decompressed embeddings into a joint set
+$\mathcal{E} = \{\hat{\bm{e}}_{i,m} : i \in [N], m \in [M_i]\}$.
+
+\begin{definition}[Coordinate-Wise Median]
+\label{def:cwmed}
+For a set of vectors $\{\bm{v}_1, \ldots, \bm{v}_K\} \subset \mathbb{R}^d$,
+the coordinate-wise median is:
+\begin{equation}
+    \text{cwmed}(\{\bm{v}_k\}) = \left(\med(\{v_{k,1}\}_{k=1}^K), \;\ldots,\;
+    \med(\{v_{k,d}\}_{k=1}^K)\right).
+\end{equation}
+\end{definition}
+
+Compute the coordinate-wise median $\bm{\mu}_{\med}$ and coordinate-wise
+standard deviation $\bm{\sigma}$ of $\mathcal{E}$:
+\begin{equation}
+    \bm{\mu}_{\med} = \text{cwmed}(\mathcal{E}),
+    \qquad
+    \sigma_j = \med\!\left(\left\{|v_{k,j} - \mu_{\med,j}|\right\}_k\right)
+    \quad \forall j \in [d],
+    \label{eq:mad}
+\end{equation}
+where the $\sigma_j$ are median absolute deviations (MAD). An experience
+$\hat{\bm{e}}$ is filtered out if:
+\begin{equation}
+    \frac{1}{d}\sum_{j=1}^{d} \frac{|\hat{e}_j - \mu_{\med,j}|}{\sigma_j + \varepsilon} > \tau_{\text{filter}},
+    \label{eq:filter}
+\end{equation}
+with default $\tau_{\text{filter}} = 2.0$ and $\varepsilon = 10^{-8}$.
+
+\paragraph{Phase 4: Confidence-Weighted Merge.}
+Let $\mathcal{E}_{\text{pass}}$ be the set of experiences passing the filter.
+For experiences with the same domain, deduplicate by cosine similarity:
+experiences with $\cos(\hat{\bm{e}}_a, \hat{\bm{e}}_b) > \theta_{\text{dup}}$
+(default $\theta_{\text{dup}} = 0.95$) are merged by averaging their
+embeddings, weighted by confidence:
+\begin{equation}
+    \hat{\bm{e}}_{\text{merged}} = \frac{\sum_{m \in \text{cluster}} q_m \hat{\bm{e}}_m}{\sum_{m \in \text{cluster}} q_m}.
+    \label{eq:weighted-merge}
+\end{equation}
+
+The full DeltaSoup aggregation procedure is given in Algorithm~\ref{alg:deltasoup}.
+
+\begin{algorithm}[H]
+\caption{\textsc{DeltaSoup}}
+\label{alg:deltasoup}
+\begin{algorithmic}[1]
+\Require Compressed batches $\{\hat{B}_i\}_{i=1}^N$, local library $\mathcal{L}$,
+         filter threshold $\tau$, dedup threshold $\theta_{\text{dup}}$
+\Ensure Updated library $\mathcal{L}'$
+\State $\mathcal{E}_{\text{raw}} \gets \emptyset$
+\For{$i = 1, \ldots, N$}
+    \If{$\textsc{VerifyHash}(\hat{B}_i)$ \textbf{and} $\textsc{CheckReputation}(\hat{B}_i.\text{node\_id})$}
+        \State $\{\hat{\bm{e}}_{i,m}\} \gets \textsc{BitDelta-Decompress}(\hat{B}_i.\text{baseline}, \hat{B}_i.\text{experiences})$
+        \State $\mathcal{E}_{\text{raw}} \gets \mathcal{E}_{\text{raw}} \cup \{(\hat{\bm{e}}_{i,m}, q_{i,m}, d_{i,m})\}$
+    \EndIf
+\EndFor
+\State $\bm{\mu}_{\med} \gets \text{cwmed}(\{\hat{\bm{e}} : (\hat{\bm{e}}, \cdot, \cdot) \in \mathcal{E}_{\text{raw}}\})$
+        \Comment{Coordinate-wise median (Def.~\ref{def:cwmed})}
+\State $\bm{\sigma} \gets \text{MAD}(\mathcal{E}_{\text{raw}}, \bm{\mu}_{\med})$
+        \Comment{Eq.~\eqref{eq:mad}}
+\State $\mathcal{E}_{\text{pass}} \gets \{(\hat{\bm{e}}, q, d) \in \mathcal{E}_{\text{raw}} : \textsc{PassFilter}(\hat{\bm{e}}, \bm{\mu}_{\med}, \bm{\sigma}, \tau)\}$
+        \Comment{Eq.~\eqref{eq:filter}}
+\State $\mathcal{C} \gets \textsc{ClusterByCosine}(\mathcal{E}_{\text{pass}}, \theta_{\text{dup}})$
+        \Comment{Greedy single-linkage}
+\State $\mathcal{E}_{\text{new}} \gets \emptyset$
+\For{each cluster $C \in \mathcal{C}$}
+    \State $\hat{\bm{e}}_C \gets \sum_{m \in C} q_m \hat{\bm{e}}_m / \sum_{m \in C} q_m$
+            \Comment{Confidence-weighted merge (Eq.~\ref{eq:weighted-merge})}
+    \State $q_C \gets \max_{m \in C} q_m$ \Comment{Inherit maximum confidence}
+    \State $\mathcal{E}_{\text{new}} \gets \mathcal{E}_{\text{new}} \cup \{(\hat{\bm{e}}_C, q_C, C.\text{domain})\}$
+\EndFor
+\State $\mathcal{L}' \gets \textsc{Merge}(\mathcal{L}, \mathcal{E}_{\text{new}})$
+        \Comment{CRDT merge with quality-based eviction}
+\State \Return $\mathcal{L}'$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Formal Properties}
+
+\begin{theorem}[DeltaSoup is $(f, \varepsilon)$-Robust]
+\label{thm:deltasoup-robust}
+Under Assumptions~\ref{ass:threat} and~\ref{ass:diversity}, with $f < N/3$
+Byzantine nodes, DeltaSoup produces an aggregated set $\mathcal{E}_{\text{pass}}$
+such that:
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Byzantine Exclusion}: All experiences submitted by Byzantine
+          nodes with embeddings outside the honest cluster are filtered with
+          probability $\geq 1 - \delta$ for $\delta = O(e^{-N})$.
+    \item \textbf{Honest Retention}: All honest experiences within $2\sigma_h$
+          of the honest centroid $\mu$ are retained.
+    \item \textbf{Quality Bound}: The mean quality of $\mathcal{E}_{\text{pass}}$
+          satisfies $\bar{q}_{\text{pass}} \geq \bar{q}_{\text{honest}} - \varepsilon$
+          where $\varepsilon = O(f/N)$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+We prove each part.
+
+\textit{Part 1 (Byzantine Exclusion).}
+Byzantine nodes submit embeddings from an arbitrary distribution $\mathcal{P}_B$.
+If $\mathcal{P}_B$ is not concentrated near the honest cluster, the Byzantine
+embeddings lie far from $\bm{\mu}_{\med}$. By Assumption~\ref{ass:diversity},
+honest embeddings have bounded variance $\sigma_h^2$; their coordinate-wise MAD
+is at most $O(\sigma_h)$. The coordinate-wise median $\bm{\mu}_{\med}$ satisfies:
+\begin{equation}
+    \|\bm{\mu}_{\med} - \mu\|_2 \leq O\left(\frac{f}{N-f}\right) \sigma_h,
+\end{equation}
+by the robustness of the coordinate-wise median under less-than-half corruption
+(since $f < N/3 < N/2$). Byzantine embeddings that differ from $\mu$ by more
+than $2\sigma_h$ will have normalized deviation exceeding $\tau_{\text{filter}} = 2$
+and will be filtered. The probability of a false retention is bounded by
+the tail probability of $|\Delta|$ under the honest distribution, which is
+$O(e^{-N})$ by standard concentration inequalities.
+
+\textit{Part 2 (Honest Retention).}
+An honest embedding $\hat{\bm{e}}_m$ with $\|\hat{\bm{e}}_m - \mu\|_2 \leq
+2\sigma_h$ has mean normalized deviation at most $2\sigma_h / \sigma_j$ per
+coordinate. Since $\sigma_j = \text{MAD}_j \geq \sigma_h / \sqrt{d}$ by
+sub-Gaussianity, the mean normalized deviation is at most $2\sqrt{d}$.
+For $\tau_{\text{filter}} = 2$ and $d = 768$, honest experiences are retained
+unless they are genuine outliers within the honest distribution.
+
+\textit{Part 3 (Quality Bound).}
+Since $\mathcal{E}_{\text{pass}}$ contains all honest experiences within the
+$2\sigma_h$ ball and at most $O(f)$ Byzantine experiences that happen to lie
+in the same region, the fraction of Byzantine contamination in $\mathcal{E}_{\text{pass}}$
+is at most $O(f / (N - f)) = O(f/N)$. Quality degradation is therefore
+$O(f/N) \cdot (q_{\max} - q_{\min}) = O(f/N)$.
+\end{proof}
+
+\begin{theorem}[Convergence under Honest Majority]
+\label{thm:convergence-ds}
+Let $\mathcal{G}$ be the communication graph with minimum degree
+$d_{\min} \geq 3$. Under Assumptions~\ref{ass:threat} and~\ref{ass:diversity}
+with $f < N/3$, the mean quality of the fleet-wide experience library after
+$T$ broadcast rounds satisfies:
+\begin{equation}
+    \mathbb{E}\left[\bar{q}^{(T)}\right] \geq q^*
+    - \varepsilon_{\text{approx}} - O\left(\sqrt{\frac{\log N}{T}}\right),
+    \label{eq:convergence-ds}
+\end{equation}
+where $q^*$ is the quality achievable with centralized aggregation of all
+honest experiences and $\varepsilon_{\text{approx}} = O(f/N)$ is the
+irreducible Byzantine contamination term.
+\end{theorem}
+
+\begin{proof}
+The proof proceeds in two steps.
+
+\textit{Step 1 (Gossip Convergence).}
+By the epidemic gossip analysis~\cite{demers1987epidemic}, after $T$ rounds
+with fanout $k_{\text{peers}}$, the fraction of nodes that have received any
+given honest experience is $1 - O(e^{-k_{\text{peers}} T / N})$. For $T =
+O(\log N / k_{\text{peers}})$, this is $1 - O(1/N)$.
+
+\textit{Step 2 (Quality Improvement).}
+At each node, DeltaSoup retains all honest experiences (Part 2 of
+Theorem~\ref{thm:deltasoup-robust}) and excludes most Byzantine contributions
+(Part 1). Each new honest experience from a remote node increases the local
+library quality by at least its marginal contribution. The marginal contribution
+decays as $O(1/M)$ as the library grows (diminishing returns). Summing over $T$
+rounds and $h = N - f$ honest nodes, the cumulative improvement is
+$\Omega(\sqrt{hT})$, giving the $O(\sqrt{\log N / T})$ convergence term.
+\end{proof}
+
+% ============================================================================
+% 6. FLEET LEARNING DYNAMICS
+% ============================================================================

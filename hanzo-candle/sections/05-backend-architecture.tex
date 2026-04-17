@@ -1,0 +1,83 @@
+\section{Backend Architecture}
+
+\label{sec:backends}
+
+\subsection{Multi-Backend Support}
+
+Candle supports three compute backends:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Backend} & \textbf{Hardware} & \textbf{API} & \textbf{Precision} \\
+\midrule
+CUDA & NVIDIA GPU & cuBLAS, cuDNN & f32, f16, bf16 \\
+Metal & Apple GPU & MPS & f32, f16 \\
+CPU & x86, ARM & BLAS, NEON & f32, f16, bf16 \\
+\bottomrule
+\end{tabular}
+\caption{Candle backend support.}
+\label{tab:backends}
+\end{table}
+
+\subsection{Quantization Support}
+
+Candle supports multiple quantization formats for memory-efficient inference:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Format} & \textbf{Bits} & \textbf{Memory (7B)} & \textbf{Quality} \\
+\midrule
+FP32 & 32 & 28.0 GB & 100\% \\
+FP16 & 16 & 14.0 GB & 99.8\% \\
+BF16 & 16 & 14.0 GB & 99.7\% \\
+GPTQ-8 & 8 & 7.0 GB & 99.2\% \\
+GPTQ-4 & 4 & 3.5 GB & 97.1\% \\
+GGUF Q4\_K\_M & 4.5 & 4.0 GB & 97.8\% \\
+GGUF Q2\_K & 2.6 & 2.3 GB & 92.4\% \\
+AWQ-4 & 4 & 3.5 GB & 97.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Quantization formats and quality retention (perplexity-based) for a 7B parameter model.}
+\label{tab:quantization}
+\end{table}
+
+\subsection{GGUF Format Support}
+
+Candle natively reads the GGUF format~\cite{ggml2023}, providing access to the extensive library of community-quantized models. The GGUF reader:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item Parses metadata (model architecture, tokenizer, quantization scheme).
+    \item Memory-maps weight data for zero-copy loading.
+    \item Dispatches to quantized matmul kernels appropriate for the quantization type.
+\end{enumerate}
+
+\subsection{KV Cache Management}
+
+For autoregressive generation, Candle implements an efficient KV cache:
+
+\begin{algorithm}[H]
+\caption{Paged KV Cache}
+\label{alg:kvcache}
+\begin{algorithmic}[1]
+\Require Max sequence length $S_{\max}$, num layers $L$, num heads $H$, head dim $D$
+\State Allocate cache: $\mathcal{K}, \mathcal{V} \in \mathbb{R}^{L \times H \times S_{\max} \times D}$
+\State $\text{pos} \gets 0$
+\Function{Append}{layer $l$, new $k, v \in \mathbb{R}^{H \times 1 \times D}$}
+    \State $\mathcal{K}[l, :, \text{pos}, :] \gets k$
+    \State $\mathcal{V}[l, :, \text{pos}, :] \gets v$
+    \State $\text{pos} \gets \text{pos} + 1$
+\EndFunction
+\Function{Get}{layer $l$}
+    \State \Return $\mathcal{K}[l, :, 0:\text{pos}, :]$, $\mathcal{V}[l, :, 0:\text{pos}, :]$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+For serving multiple concurrent requests, we implement PagedAttention~\cite{kwon2023vllm} with block-level KV cache management, enabling efficient memory sharing across requests.
+

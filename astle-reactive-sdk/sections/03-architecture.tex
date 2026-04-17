@@ -1,0 +1,197 @@
+\section{Architecture}
+
+
+\subsection{Core Principles}
+
+Astle.js adheres to three architectural principles:
+
+\textbf{Principle 1: State as Derived Value.} Application state is computed from an ordered sequence of events. The current state is a pure function of the event history:
+
+\begin{equation}
+\text{state}_n = \text{reduce}(\text{state}_0, [\text{event}_1, \ldots, \text{event}_n])
+\end{equation}
+
+\textbf{Principle 2: Events are Immutable.} Once recorded, events cannot be modified. Corrections are represented as compensating events, preserving audit history.
+
+\textbf{Principle 3: Optimistic by Default.} User actions produce immediate local state changes. Server confirmation or rejection triggers reconciliation.
+
+\subsection{Event Model}
+
+Events in Astle.js follow a standard schema:
+
+\begin{lstlisting}[language=JavaScript,caption=Event schema]
+interface Event {
+  id: string;          // UUID
+  type: string;        // e.g., "cart/addItem"
+  payload: object;     // Event-specific data
+  timestamp: number;   // Unix milliseconds
+  origin: "local" | "remote";
+  status: "pending" | "confirmed" | "rejected";
+}
+\end{lstlisting}
+
+Events transition through states:
+\begin{enumerate}
+\item \texttt{pending}: Applied locally, awaiting server confirmation.
+\item \texttt{confirmed}: Server acknowledged; event is permanent.
+\item \texttt{rejected}: Server rejected; compensating event generated.
+\end{enumerate}
+
+\subsection{State Domains}
+
+Astle.js partitions state into domains with independent reducers:
+
+\subsubsection{Cart Domain}
+
+The cart domain manages shopping cart state:
+
+\begin{lstlisting}[language=JavaScript,caption=Cart state shape]
+interface CartState {
+  items: CartItem[];
+  subtotal: number;
+  discounts: Discount[];
+  total: number;
+  itemCount: number;
+}
+\end{lstlisting}
+
+Cart events include:
+\begin{itemize}
+\item \texttt{cart/addItem}: Add product to cart.
+\item \texttt{cart/updateQuantity}: Change item quantity.
+\item \texttt{cart/removeItem}: Remove item from cart.
+\item \texttt{cart/applyCoupon}: Apply promotional code.
+\item \texttt{cart/clear}: Empty cart contents.
+\end{itemize}
+
+\subsubsection{Checkout Domain}
+
+The checkout domain manages the checkout flow:
+
+\begin{lstlisting}[language=JavaScript,caption=Checkout state machine]
+type CheckoutStatus =
+  | "idle"
+  | "collecting_info"
+  | "processing_payment"
+  | "confirming"
+  | "complete"
+  | "failed";
+\end{lstlisting}
+
+State transitions are guarded by validation:
+
+\begin{equation}
+\text{transition}(s, e) = \begin{cases}
+s' & \text{if valid}(s, e) \\
+s & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\subsubsection{Customer Domain}
+
+The customer domain tracks authentication and profile state:
+
+\begin{lstlisting}[language=JavaScript,caption=Customer state]
+interface CustomerState {
+  authenticated: boolean;
+  profile: Profile | null;
+  addresses: Address[];
+  paymentMethods: PaymentMethod[];
+}
+\end{lstlisting}
+
+\subsection{Reducer Composition}
+
+Domain reducers compose into the root reducer:
+
+\begin{lstlisting}[language=JavaScript,caption=Root reducer composition]
+const rootReducer = combineReducers({
+  cart: cartReducer,
+  checkout: checkoutReducer,
+  customer: customerReducer,
+  ui: uiReducer,
+});
+
+function cartReducer(state = initialCart, event) {
+  switch (event.type) {
+    case "cart/addItem":
+      return addItemToCart(state, event.payload);
+    case "cart/updateQuantity":
+      return updateCartQuantity(state, event.payload);
+    // ...
+    default:
+      return state;
+  }
+}
+\end{lstlisting}
+
+\subsection{Optimistic Updates}
+
+Astle.js implements optimistic updates through a three-phase protocol:
+
+\textbf{Phase 1: Local Application.} User action generates event with \texttt{status: "pending"}. Reducer applies event to produce optimistic state. UI renders immediately.
+
+\textbf{Phase 2: Server Submission.} Event dispatched to server via WebSocket or HTTP. Client awaits confirmation.
+
+\textbf{Phase 3: Reconciliation.} Server responds with confirmation or rejection.
+\begin{itemize}
+\item \textbf{Confirmed}: Event status updates; state unchanged.
+\item \textbf{Rejected}: Compensating event generated; state rolls back.
+\end{itemize}
+
+\begin{lstlisting}[language=JavaScript,caption=Optimistic middleware]
+function optimisticMiddleware(store) {
+  return next => async event => {
+    // Phase 1: Apply locally
+    event.status = "pending";
+    next(event);
+
+    try {
+      // Phase 2: Submit to server
+      const response = await api.submit(event);
+
+      // Phase 3a: Confirm
+      next({ type: "event/confirm", payload: { id: event.id } });
+    } catch (error) {
+      // Phase 3b: Reject and compensate
+      next({ type: "event/reject", payload: { id: event.id, error } });
+      next(compensate(event));
+    }
+  };
+}
+\end{lstlisting}
+
+\subsection{Real-Time Synchronization}
+
+Astle.js maintains a persistent WebSocket connection for real-time updates:
+
+\begin{lstlisting}[language=JavaScript,caption=WebSocket synchronization]
+class SyncClient {
+  constructor(store, url) {
+    this.store = store;
+    this.socket = new WebSocket(url);
+    this.queue = [];
+
+    this.socket.onmessage = (msg) => {
+      const event = JSON.parse(msg.data);
+      event.origin = "remote";
+      this.store.dispatch(event);
+    };
+
+    this.socket.onclose = () => {
+      this.reconnect();
+    };
+  }
+
+  send(event) {
+    if (this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(event));
+    } else {
+      this.queue.push(event);
+    }
+  }
+}
+\end{lstlisting}
+
+Server-originated events (inventory updates, price changes) flow through the same reducer pipeline, ensuring consistent state regardless of event origin.
+

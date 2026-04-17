@@ -1,0 +1,71 @@
+\section{Base Functions}
+
+\label{sec:functions}
+% ============================================================================
+
+Base Functions are TypeScript functions that run inside the Base process. They
+are not Lambda functions. They are not containers. They are JavaScript closures
+executed in an embedded Goja VM, sharing the same process and the same database
+connection as the rest of Base.
+
+\subsection{Execution Model}
+
+The Goja VM implements ECMAScript 2023. TypeScript is transpiled to JavaScript
+at deploy time (via esbuild, also embedded in the binary). Functions execute
+in response to events:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Before hooks}: Run before a database operation (create, update,
+    delete). Can modify the record or reject the operation.
+    \item \textbf{After hooks}: Run after a database operation. Used for
+    side effects (notifications, audit logs, cache invalidation).
+    \item \textbf{Routes}: Custom HTTP endpoints registered in the Base router.
+    Full access to request/response, database, and auth context.
+    \item \textbf{Cron}: Scheduled functions executed at configurable intervals.
+    Uses the Base internal scheduler, not system cron.
+    \item \textbf{Realtime}: Functions triggered by WebSocket subscription
+    events. Used for live data transformation.
+\end{itemize}
+
+\subsection{Zero Cold Start}
+
+There is no cold start. The Goja VM is initialized once at Base startup and
+persists for the lifetime of the process. Function invocation is a direct
+Go function call into the VM---no process spawn, no container boot, no
+network hop. Measured overhead per invocation: 0.3~ms for a trivial function,
+1.2~ms for a function that reads 10 records and writes 1.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Operation} & \textbf{Cold Start} & \textbf{Warm} \\
+\midrule
+AWS Lambda (Node.js) & 200--800~ms & 5--15~ms \\
+Cloudflare Workers & 0~ms & 1--3~ms \\
+Supabase Edge Functions & 50--200~ms & 3--8~ms \\
+Base Functions (Goja) & 0~ms & 0.3--1.2~ms \\
+\bottomrule
+\end{tabular}
+\caption{Function invocation latency comparison. Base Functions have zero cold start because the VM is in-process.}
+\label{tab:coldstart}
+\end{table}
+
+\subsection{Capability Model}
+
+Functions execute with a capability set, not ambient authority. Each function
+declares what it can access:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Collections}: Which collections the function can read/write.
+    \item \textbf{Network}: Whether the function can make outbound HTTP requests.
+    \item \textbf{KMS}: Whether the function can access encrypted fields.
+    \item \textbf{Auth}: Whether the function can read/modify user sessions.
+\end{itemize}
+
+A function that declares no capabilities can only compute on its inputs and
+return a result. This is the default. Capabilities are additive, never
+implicit.
+
+% ============================================================================

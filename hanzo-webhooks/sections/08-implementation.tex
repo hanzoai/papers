@@ -1,0 +1,72 @@
+\section{Implementation}
+
+
+\subsection{Architecture Components}
+
+\begin{itemize}
+    \item \textbf{Event Ingestion}: Kafka for event buffering
+    \item \textbf{Router}: Go service matching events to subscriptions
+    \item \textbf{Delivery Workers}: Go worker pool with connection reuse
+    \item \textbf{Retry Queue}: Redis sorted set keyed by delivery time
+    \item \textbf{Dead Letter Queue}: PostgreSQL for failed deliveries
+    \item \textbf{Monitoring}: Prometheus metrics, PagerDuty alerts
+\end{itemize}
+
+\subsection{Worker Pool}
+
+\begin{lstlisting}[language=Go, caption=Delivery Worker]
+type Worker struct {
+    client    *http.Client
+    queue     *DeliveryQueue
+    signer    *Signer
+}
+
+func (w *Worker) Process(ctx context.Context) error {
+    for {
+        delivery, err := w.queue.Dequeue(ctx)
+        if err != nil {
+            return err
+        }
+
+        result := w.deliver(ctx, delivery)
+        if result.Success {
+            w.queue.Ack(delivery)
+        } else {
+            w.scheduleRetry(delivery, result)
+        }
+    }
+}
+
+func (w *Worker) deliver(ctx context.Context, d *Delivery) Result {
+    body, _ := json.Marshal(d.Event)
+    signature := w.signer.Sign(body, time.Now().Unix())
+
+    req, _ := http.NewRequestWithContext(ctx, "POST", d.URL, bytes.NewReader(body))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-Webhook-Signature", signature)
+
+    resp, err := w.client.Do(req)
+    if err != nil {
+        return Result{Success: false, Error: err}
+    }
+    defer resp.Body.Close()
+
+    return Result{Success: resp.StatusCode >= 200 && resp.StatusCode < 300}
+}
+\end{lstlisting}
+
+\subsection{Connection Management}
+
+HTTP connections are pooled and reused:
+
+\begin{lstlisting}[language=Go, caption=HTTP Client Configuration]
+client := &http.Client{
+    Transport: &http.Transport{
+        MaxIdleConns:        1000,
+        MaxIdleConnsPerHost: 100,
+        IdleConnTimeout:     90 * time.Second,
+    },
+    Timeout: 30 * time.Second,
+}
+\end{lstlisting}
+

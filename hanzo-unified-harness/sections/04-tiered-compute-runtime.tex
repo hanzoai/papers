@@ -1,0 +1,150 @@
+\section{Tiered Compute Runtime}
+
+\label{sec:tiers}
+
+\subsection{Motivation}
+
+A key insight of the UAH architecture is that different agent tasks require
+radically different compute environments. Answering a factual question requires
+only an LLM inference call (milliseconds, cents). Resolving a GitHub issue
+requires a sandboxed code execution environment (seconds, dollars). Automating
+a complex multi-application workflow requires a full virtual desktop with GUI
+access (minutes, tens of dollars). Building and deploying a production service
+requires persistent cloud compute (hours, hundreds of dollars).
+
+Traditional agent products hard-code a single compute tier. Devin always
+provisions a full VM. Claude Code always runs in the user's terminal. The UAH
+dynamically selects and upgrades compute tier based on task requirements,
+with automatic context migration on tier transitions.
+
+\subsection{The Five-Tier Hierarchy}
+
+We define the Compute Tier as an element of the ordered set:
+\begin{equation}
+    \mathcal{T} = \left\{T_0 \prec T_1 \prec T_2 \prec T_3 \prec T_4\right\},
+\end{equation}
+where $T_i \prec T_j$ means $T_i$ is strictly less capable and less costly
+than $T_j$.
+
+\paragraph{Tier 0: Shared Gateway (Message Routing).}
+No persistent execution environment. The agent receives a message, invokes
+the LLM, calls stateless tools (web search, document retrieval, computation),
+and returns a response. Latency: 1--5 seconds. Cost: $10^{-3}$--$10^{-2}$
+USD per interaction.
+
+\paragraph{Tier 1: Terminal Pod (Isolated Container).}
+A dedicated Docker container with a filesystem, shell, and standard
+Unix tools. Supports code execution, file I/O, and network requests within
+a sandboxed namespace. Lifetime: up to 4 hours. Cost: $\sim 0.02$ USD/hour.
+Used for: code generation and testing, data analysis scripts, automated
+report generation.
+
+\paragraph{Tier 2: Operative Desktop (VNC + GUI Environment).}
+A full Linux desktop environment (Ubuntu 22.04) with VNC access. Provides
+a graphical display server (Xvfb), browser automation (Playwright/Chromium),
+and GUI applications. The Hanzo Operative framework~\cite{hanzo2024operative}
+manages screen understanding and action execution. Cost: $\sim 0.10$ USD/hour.
+Used for: web automation, GUI testing, multi-application workflows.
+
+\paragraph{Tier 3: Cloud VM (Full Compute).}
+A dedicated cloud virtual machine (4--64 vCPUs, 8--256 GB RAM) with
+persistent storage, public IP, and full system access. Supports long-running
+processes, custom software installation, and external network services. Cost:
+$0.20$--$5.00$ USD/hour. Used for: ML training runs, system administration,
+multi-service deployments.
+
+\paragraph{Tier 4: Local Desktop (Hardware Access).}
+The user's physical desktop or laptop machine, registered with the gateway
+via a local agent daemon. Provides direct hardware access (GPU, USB devices,
+camera, microphone) with no virtualization overhead. Registered machines
+communicate with the cloud gateway via an encrypted tunnel, allowing cloud
+orchestration of local compute. Cost: user's own hardware (compute is free,
+tunnel bandwidth $\sim 0.01$ USD/GB).
+
+\subsection{Tier Transition State Machine}
+
+We model tier management as a state machine $(Q, \Sigma, \delta, q_0, F)$
+where:
+\begin{itemize}[leftmargin=1.5em]
+    \item $Q = \{q_0, q_1, q_2, q_3, q_4\}$ are the tier states.
+    \item $\Sigma = \{\texttt{upgrade}, \texttt{downgrade}, \texttt{migrate}\}$
+          are transitions.
+    \item $\delta : Q \times \Sigma \to Q$ is the transition function.
+    \item $q_0 = T_0$ is the initial state (all sessions start at Tier 0).
+    \item $F = Q$ (all tiers are accepting; the machine is reset on session end).
+\end{itemize}
+
+Each transition carries a \textbf{precondition} and \textbf{migration protocol}:
+
+\begin{definition}[Tier Upgrade]
+The transition $\delta(T_i, \texttt{upgrade}) = T_j$ ($j > i$) is valid iff:
+\begin{enumerate}[leftmargin=1.5em, label=(\roman*)]
+    \item $\text{UserConsentLevel}(T_j) \leq \text{UserGrantedConsent}()$
+    \item $\text{Budget}(\text{session}) \geq \text{EstimatedCost}(T_j, \text{task})$
+    \item $\text{TaskComplexityScore}(\text{task}) \geq \theta_j$
+\end{enumerate}
+where $\theta_j$ is the complexity threshold for tier $T_j$.
+\end{definition}
+
+\begin{definition}[Context Migration Protocol]
+On upgrade from $T_i$ to $T_j$, the context migration function
+$\mu_{i \to j} : \text{Context}_{T_i} \to \text{Context}_{T_j}$ performs:
+\begin{enumerate}[leftmargin=1.5em, label=(\roman*)]
+    \item Serialize current working state (files, variables, conversation).
+    \item Provision the target compute environment $T_j$.
+    \item Transfer state via the Hanzo context bundle format (CBOR-encoded,
+          AES-256-GCM encrypted).
+    \item Resume execution with injected system prompt summarizing the prior
+          tier context.
+    \item Verify environment readiness with a liveness probe before returning
+          control to the agent.
+\end{enumerate}
+\end{definition}
+
+The migration is atomic from the agent's perspective: the agent issues a
+single tool call (\texttt{upgrade\_tier}) and receives an updated
+\texttt{ExecutionEnvironment} handle. The migration latency is bounded:
+Tier 1 provisioning completes in $\leq 8$ seconds (pre-warmed pool),
+Tier 2 in $\leq 30$ seconds, Tier 3 in $\leq 90$ seconds.
+
+\begin{algorithm}[H]
+\caption{Adaptive Tier Selection}
+\label{alg:tier}
+\begin{algorithmic}[1]
+\Require Task description $\tau$, session context $\mathcal{C}$, policy $\pi$
+\Ensure Execution environment $e \in \{T_0, \ldots, T_4\}$
+\State $s_\tau \gets \text{ComplexityScore}(\tau, \mathcal{C})$
+\Comment{LLM-based scoring}
+\State $t \gets \min\{j : \theta_j \leq s_\tau\}$
+\Comment{Minimum sufficient tier}
+\State $b \gets \text{SessionBudget}(\mathcal{C})$
+\If{$\text{EstimatedCost}(T_t, \tau) > b$}
+    \State $t \gets \max\{j : \text{EstimatedCost}(T_j, \tau) \leq b\}$
+    \Comment{Budget-constrained fallback}
+\EndIf
+\State $\text{consent} \gets \text{VerifyConsent}(T_t, \mathcal{C}.\text{user})$
+\If{$\neg\,\text{consent}$}
+    \State $\textbf{return}\ \text{RequestConsentAndRetry}(T_t, \tau)$
+\EndIf
+\State $e \gets \text{ProvisionTier}(T_t, \mathcal{C})$
+\State $\text{Emit}(\text{TIER\_SELECTED}, \{t, s_\tau, b, \mathcal{C}.\text{session\_id}\})$
+\State \Return $e$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Downgrade and Session Cleanup}
+
+When task complexity decreases (a common occurrence in long sessions), the
+runtime can downgrade the tier to reduce cost. A downgrade $\delta(T_i,
+\texttt{downgrade}) = T_j$ ($j < i$) is triggered when:
+\begin{equation}
+    \text{IdleTime}(T_i) \geq \Delta_{\text{idle}} \quad \text{and} \quad
+    \text{PendingWork}(\text{session}) \subseteq \text{Capabilities}(T_j).
+\end{equation}
+The downgrade uses the same migration protocol, with the added step of
+flushing all persistent state to external storage (MinIO object store) before
+releasing the compute environment.
+
+% ============================================================================
+% 5. CROSS-LAYER OPTIMIZATION
+% ============================================================================

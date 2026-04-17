@@ -1,0 +1,54 @@
+\section{Multi-Model GPU Sharing}
+
+\label{sec:sharing}
+% ============================================================================
+
+Dedicating one GPU per model wastes capacity. A 7B-parameter model in FP16
+occupies 14GB; an 80GB H100 can host multiple models simultaneously.
+
+\subsection{Spatial Multiplexing}
+
+We partition GPU memory into fixed regions:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model weights region}: Pinned allocations for model parameters.
+    Multiple models co-reside if total weight size fits.
+    \item \textbf{KV-cache pool}: Shared pool of cache blocks, allocated
+    dynamically across models based on demand.
+    \item \textbf{Workspace}: Scratch memory for intermediate activations,
+    shared across all models (only one model computes at a time per SM group).
+\end{itemize}
+
+\begin{definition}[Memory Budget]
+For a GPU with total memory $M_{\text{total}}$, the allocation is:
+\begin{equation}
+M_{\text{total}} = \sum_{i=1}^{N} M_{\text{weights}}^{(i)} +
+M_{\text{kv}} + M_{\text{workspace}} + M_{\text{reserved}},
+\end{equation}
+where $N$ is the number of co-located models, $M_{\text{kv}}$ is the shared
+KV-cache pool, $M_{\text{workspace}}$ is the activation workspace, and
+$M_{\text{reserved}}$ is a safety margin (typically 2GB).
+\end{definition}
+
+\subsection{Temporal Multiplexing}
+
+When models cannot co-reside (e.g., two 70B models on one GPU), we use temporal
+multiplexing with fast model swapping:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Model weights are kept in host pinned memory (PCIe-accessible).
+    \item On model switch, weights are streamed via PCIe Gen5 at 64 GB/s.
+    \item A 14GB model swap completes in $\sim$220ms. KV-cache is preserved
+    across swaps for the active model's in-flight sequences.
+\end{enumerate}
+
+\begin{theorem}[Sharing Efficiency]
+Let $\lambda_i$ be the request rate for model $i$ and $\mu_i$ be its service
+rate on a dedicated GPU. Under spatial multiplexing with $N$ models, the
+effective service rate for model $i$ is:
+\begin{equation}
+\mu_i^{\text{shared}} = \mu_i \cdot \frac{M_{\text{kv}}^{(i)}}{M_{\text{kv}}},
+\end{equation}
+where $M_{\text{kv}}^{(i)}$ is the KV-cache allocation for model $i$.
+Sharing is efficient when $\sum_i \lambda_i / \mu_i^{\text{shared}} < 1$.
+\end{theorem}
+
+% ============================================================================

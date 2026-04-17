@@ -1,0 +1,81 @@
+\section{EVM Implementation}
+
+
+\subsection{Solidity Implementation Challenges}
+
+The EVM presents unique constraints for implementing NTT:
+
+\begin{enumerate}
+\item \textbf{Gas Model}: Every operation has an associated gas cost, with memory operations being particularly expensive
+\item \textbf{256-bit Word Size}: While providing ample precision, requires careful handling for smaller primes
+\item \textbf{Stack Limitations}: Maximum 16 stack slots limits local variable usage
+\item \textbf{No Native Modular Reduction}: Requires explicit \texttt{mod} operations
+\end{enumerate}
+
+\subsection{Memory Layout Optimization}
+
+EVM charges gas quadratically for memory expansion but linearly for access within allocated memory. We optimize by:
+
+\begin{enumerate}
+\item Pre-allocating all required memory upfront
+\item Using packed representations where possible
+\item Minimizing memory copies through in-place operations
+\end{enumerate}
+
+\subsection{Loop Unrolling Strategies}
+
+The EVM charges gas per instruction, making loop overhead significant. We employ partial unrolling:
+
+\begin{lstlisting}[caption={Unrolled Butterfly Operations}]
+assembly {
+    // Process 4 butterflies per iteration
+    let u0 := mload(add(a, mul(j, 0x20)))
+    let u1 := mload(add(a, mul(add(j, 1), 0x20)))
+    let u2 := mload(add(a, mul(add(j, 2), 0x20)))
+    let u3 := mload(add(a, mul(add(j, 3), 0x20)))
+
+    let v0 := mulmod(mload(add(a, mul(add(j, t), 0x20))), S, q)
+    let v1 := mulmod(mload(add(a, mul(add(j, add(t, 1)), 0x20))), S, q)
+    let v2 := mulmod(mload(add(a, mul(add(j, add(t, 2)), 0x20))), S, q)
+    let v3 := mulmod(mload(add(a, mul(add(j, add(t, 3)), 0x20))), S, q)
+
+    mstore(add(a, mul(j, 0x20)), addmod(u0, v0, q))
+    mstore(add(a, mul(add(j, 1), 0x20)), addmod(u1, v1, q))
+    mstore(add(a, mul(add(j, 2), 0x20)), addmod(u2, v2, q))
+    mstore(add(a, mul(add(j, 3), 0x20)), addmod(u3, v3, q))
+
+    mstore(add(a, mul(add(j, t), 0x20)), submod(u0, v0, q))
+    mstore(add(a, mul(add(j, add(t, 1)), 0x20)), submod(u1, v1, q))
+    mstore(add(a, mul(add(j, add(t, 2)), 0x20)), submod(u2, v2, q))
+    mstore(add(a, mul(add(j, add(t, 3)), 0x20)), submod(u3, v3, q))
+}
+\end{lstlisting}
+
+\subsection{Yul Optimization for Gas Efficiency}
+
+Yul, Solidity's intermediate language, provides fine-grained control over EVM operations. Key optimizations include:
+
+\begin{enumerate}
+\item \textbf{Direct Memory Access}: Bypassing Solidity's bounds checking
+\item \textbf{Inline Assembly}: Eliminating function call overhead
+\item \textbf{Stack Variable Management}: Optimal use of 16 available stack slots
+\item \textbf{CODECOPY Trick}: Loading precomputed tables from contract bytecode
+\end{enumerate}
+
+\begin{lstlisting}[caption={Yul-Optimized Modular Arithmetic}]
+assembly {
+    function submod(a, b, m) -> result {
+        result := addmod(a, sub(m, b), m)
+    }
+
+    function montgomeryReduce(a, m, minv) -> result {
+        let q := mul(a, minv)
+        let t := add(a, mul(q, m))
+        result := shr(256, t)
+        if gt(result, m) {
+            result := sub(result, m)
+        }
+    }
+}
+\end{lstlisting}
+

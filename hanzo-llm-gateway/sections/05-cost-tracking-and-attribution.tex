@@ -1,0 +1,76 @@
+\section{Cost Tracking and Attribution}
+
+\label{sec:cost}
+
+\subsection{Pricing Model Normalization}
+
+Provider pricing models exhibit significant heterogeneity:
+
+\begin{table}[t]
+\centering
+\caption{Provider pricing model categories}
+\label{tab:pricing}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Model} & \textbf{Providers} & \textbf{Unit} \\
+\midrule
+Per-token & OpenAI, Anthropic & \$/1M tokens \\
+Per-character & Google & \$/1M chars \\
+Per-second & Replicate & \$/GPU-sec \\
+Reserved & Azure, Bedrock & \$/hour \\
+Per-request & Some embeddings & \$/request \\
+Tiered & Together AI & Rate-dependent \\
+Free tier & Groq, Cerebras & Quota-limited \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The cost engine normalizes all pricing to a per-token basis using provider-specific conversion factors. For character-based pricing, we use the empirical ratio of 1 token $\approx$ 4 characters for English text, calibrated per-model using tokenizer analysis. For time-based pricing, we estimate cost as $c_{\text{time}} = \text{price\_per\_second} \times \text{generation\_time}$.
+
+\subsection{Real-Time Cost Computation}
+
+For each completed request, the cost engine computes:
+
+\begin{equation}
+\text{cost}(q) = c_{\text{in}}(p) \cdot n_{\text{in}} + c_{\text{out}}(p) \cdot n_{\text{out}} + c_{\text{fixed}}(p)
+\end{equation}
+
+where $n_{\text{in}}$ and $n_{\text{out}}$ are input and output token counts from the provider response's \texttt{usage} field, and $c_{\text{fixed}}$ captures any per-request fixed costs.
+
+For streaming requests where usage is reported only at stream completion, the gateway estimates running cost from token-counting the streamed content using a provider-matched tokenizer.
+
+\subsection{Budget Enforcement}
+
+Organizations can set budget limits at multiple granularities:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Per-key daily/monthly limits}: Hard caps on API key spend.
+    \item \textbf{Per-model limits}: Restrict spend on expensive models.
+    \item \textbf{Alerting thresholds}: Notifications at 50\%, 80\%, 90\%, 100\% of budget.
+    \item \textbf{Automatic downgrade}: When budget thresholds are crossed, automatically route to cheaper model alternatives.
+\end{itemize}
+
+\subsection{Cost Attribution}
+
+The gateway attributes costs to organizational units through a hierarchical tagging system. Each request can carry tags for organization, project, team, user, and feature. Costs are aggregated along each dimension and exposed through a reporting API:
+
+\begin{lstlisting}[language=Python, caption=Cost attribution query]
+GET /v1/costs?start=2026-02-01
+    &end=2026-02-28
+    &group_by=project,model
+    &filter=team:ml-platform
+
+{
+  "total_cost": 14823.47,
+  "by_project": {
+    "chat-prod": {
+      "gpt-4o": 8234.12,
+      "claude-sonnet": 3421.89
+    },
+    "embeddings": {
+      "text-embedding-3-large": 1167.46
+    }
+  }
+}
+\end{lstlisting}
+

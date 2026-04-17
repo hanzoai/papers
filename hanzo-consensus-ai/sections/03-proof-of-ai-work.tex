@@ -1,0 +1,94 @@
+\section{Proof of AI Work}
+
+\label{sec:poai}
+% ============================================================================
+
+Proof of AI Work (PoAI) is a probabilistic verification protocol. Rather than
+re-executing every inference request, verifiers sample a random subset and check
+for consistency.
+
+\subsection{Verification Protocol}
+
+\begin{algorithm}
+\caption{Proof of AI Work Verification}
+\label{alg:poai}
+\begin{algorithmic}[1]
+\Require Inference records $\{\mathcal{I}_1, \ldots, \mathcal{I}_N\}$ from
+    epoch $e$, sampling rate $p$
+\Ensure Verification result for each sampled record
+\State $S \leftarrow$ sample each $\mathcal{I}_i$ independently with
+    probability $p$
+\For{each $\mathcal{I}_i \in S$ in parallel}
+    \State Retrieve input $\mathbf{x}_i$ from request log
+    \State Re-execute: $\mathbf{y}_i' \leftarrow \texttt{Infer}(m_i,
+        \mathbf{x}_i, \theta_i^{\text{det}})$
+    \State Compare: $\delta_i = d(\mathbf{y}_i, \mathbf{y}_i')$
+    \If{$\delta_i > \epsilon$}
+        \State Flag worker $w_i$ for potential cheating
+    \EndIf
+\EndFor
+\State Submit verification results to on-chain consensus
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Handling Non-Determinism}
+
+GPU floating-point arithmetic is non-deterministic across different hardware,
+driver versions, and even consecutive runs on the same GPU. Two correct
+executions of the same model on the same input may produce slightly different
+outputs.
+
+\begin{definition}[Verification Distance]
+The verification distance $d(\mathbf{y}, \mathbf{y}')$ between two output
+sequences uses a composite metric:
+\begin{equation}
+d(\mathbf{y}, \mathbf{y}') = \alpha \cdot d_{\text{token}}(\mathbf{y},
+\mathbf{y}') + (1 - \alpha) \cdot d_{\text{logit}}(\mathbf{y}, \mathbf{y}'),
+\end{equation}
+where $d_{\text{token}}$ is normalized edit distance on generated tokens and
+$d_{\text{logit}}$ is KL divergence on output logit distributions.
+\end{definition}
+
+To ensure deterministic verification, we fix the random seed and use
+temperature $\tau = 0$ (greedy decoding) for verification re-execution:
+\begin{equation}
+\theta^{\text{det}} = (\tau = 0, \text{seed} = H(\mathcal{I}_i)),
+\end{equation}
+where the seed is derived from the inference record hash, making verification
+reproducible.
+
+\begin{theorem}[Detection Probability]
+For a worker that cheats on fraction $\chi$ of requests, the probability of
+detecting the cheating in a single epoch with sampling rate $p$ and $N$ total
+requests is:
+\begin{equation}
+P_{\text{detect}} = 1 - (1 - p)^{\chi N}.
+\end{equation}
+For $p = 0.05$ (5\% sampling), $\chi = 0.10$ (cheating on 10\% of requests),
+and $N = 10000$ (requests per epoch): $P_{\text{detect}} > 1 - 10^{-22}$.
+\end{theorem}
+
+\subsection{Economic Security}
+
+\begin{definition}[Cheating Profitability]
+A rational worker cheats if the expected profit from cheating exceeds the
+expected loss from detection:
+\begin{equation}
+\chi \cdot R_{\text{save}} > P_{\text{detect}} \cdot S_{\text{slash}},
+\end{equation}
+where $R_{\text{save}}$ is compute cost saved per cheated request and
+$S_{\text{slash}}$ is the slashing penalty.
+\end{definition}
+
+\begin{theorem}[Economic Security Bound]
+Under the HANZO staking parameters~\cite{hanzotokenomics} (25\% slashing for
+detected cheating, minimum stake proportional to GPU capacity), cheating is
+unprofitable for any cheating rate $\chi > 0$ when the sampling rate satisfies:
+\begin{equation}
+p > \frac{\ln(R_{\text{save}} / S_{\text{slash}})}{\chi \cdot N}.
+\end{equation}
+With production parameters ($R_{\text{save}} / S_{\text{slash}} \approx 0.001$,
+$N = 10000$): $p > 0.007$ suffices. We use $p = 0.05$ for a safety margin.
+\end{theorem}
+
+% ============================================================================

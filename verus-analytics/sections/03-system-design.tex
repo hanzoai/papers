@@ -1,0 +1,234 @@
+\section{System Design}
+
+
+\subsection{Architecture Overview}
+
+Verus comprises three layers:
+
+\begin{enumerate}
+\item \textbf{Ingestion layer}: Receives events, validates, and routes to processing.
+\item \textbf{Processing layer}: Maintains real-time aggregations and writes to storage.
+\item \textbf{Query layer}: Routes queries to optimal backend and merges results.
+\end{enumerate}
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.9\linewidth}{
+\centering
+\textit{[Architecture diagram]}\\[0.5em]
+Events $\rightarrow$ Kafka $\rightarrow$ Stream Processor $\rightarrow$ Redis (aggregates)\\
+\hspace{4em} $\searrow$ Columnar Store (raw events)\\[0.5em]
+Query Router $\rightarrow$ Redis / Columnar / Both
+}}
+\caption{Verus architecture overview}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Ingestion Layer}
+
+Events arrive via HTTP endpoints or Kafka consumers:
+
+\begin{lstlisting}[language=Python,caption=Event ingestion]
+class EventIngester:
+    def __init__(self, kafka_producer, validator):
+        self.producer = kafka_producer
+        self.validator = validator
+
+    async def ingest(self, event: CommerceEvent) -> None:
+        # Validate schema and business rules
+        self.validator.validate(event)
+
+        # Enrich with server-side data
+        event.server_timestamp = datetime.utcnow()
+        event.geo = geoip.lookup(event.ip_address)
+
+        # Partition by store for ordering guarantees
+        partition_key = event.store_id
+
+        await self.producer.send(
+            topic="commerce-events",
+            key=partition_key,
+            value=event.to_json()
+        )
+\end{lstlisting}
+
+Events partition by store ID, ensuring ordering within a store while enabling parallel processing across stores.
+
+\subsection{Stream Processing Layer}
+
+The stream processor maintains real-time aggregations:
+
+\subsubsection{Aggregation Windows}
+
+We maintain aggregations at multiple time granularities:
+
+\begin{itemize}
+\item \textbf{1-minute windows}: Operational dashboards.
+\item \textbf{1-hour windows}: Intraday trends.
+\item \textbf{1-day windows}: Daily summaries.
+\end{itemize}
+
+Windows use event time with allowed lateness of 5 minutes. Late events update existing windows; very late events are logged but excluded.
+
+\subsubsection{Materialized Views}
+
+Common query patterns are pre-computed as materialized views:
+
+\begin{lstlisting}[language=SQL,caption=Materialized view definition]
+CREATE MATERIALIZED VIEW revenue_by_source AS
+SELECT
+    store_id,
+    TUMBLE(event_time, INTERVAL '1' MINUTE) AS window,
+    utm_source,
+    COUNT(*) AS order_count,
+    SUM(revenue) AS total_revenue,
+    COUNT(DISTINCT user_id) AS unique_customers
+FROM events
+WHERE event_type = 'purchase'
+GROUP BY store_id, window, utm_source;
+\end{lstlisting}
+
+The stream processor maintains these views incrementally:
+
+\begin{lstlisting}[language=Python,caption=Incremental aggregation]
+class MaterializedViewProcessor:
+    def __init__(self, view_def, state_store):
+        self.view_def = view_def
+        self.state = state_store
+
+    def process(self, event):
+        if not self.view_def.filter(event):
+            return
+
+        # Compute aggregation key
+        key = self.view_def.group_key(event)
+
+        # Update state
+        current = self.state.get(key) or self.view_def.initial_state()
+        updated = self.view_def.aggregate(current, event)
+        self.state.put(key, updated)
+
+        # Emit to downstream
+        self.emit(key, updated)
+\end{lstlisting}
+
+\subsubsection{State Management}
+
+Aggregation state resides in Redis for fast access:
+
+\begin{lstlisting}[language=Python,caption=Redis state store]
+class RedisStateStore:
+    def __init__(self, redis_client, ttl_seconds):
+        self.redis = redis_client
+        self.ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[Dict]:
+        data = self.redis.get(key)
+        return json.loads(data) if data else None
+
+    def put(self, key: str, value: Dict) -> None:
+        self.redis.setex(key, self.ttl, json.dumps(value))
+
+    def increment(self, key: str, field: str, delta: float) -> float:
+        return self.redis.hincrbyfloat(key, field, delta)
+\end{lstlisting}
+
+State keys encode view name, dimensions, and time window:
+
+\begin{verbatim}
+verus:revenue_by_source:store_123:google:2015-06-15T14:30
+\end{verbatim}
+
+\subsection{Columnar Storage Layer}
+
+Raw events persist to columnar storage for ad-hoc queries:
+
+\subsubsection{Storage Format}
+
+We use Apache Parquet with the following optimizations:
+
+\begin{itemize}
+\item \textbf{Partitioning}: By store ID and date for partition pruning.
+\item \textbf{Sorting}: By timestamp within partitions for range queries.
+\item \textbf{Compression}: Snappy for balance of speed and size.
+\item \textbf{Statistics}: Min/max per column for predicate pushdown.
+\end{itemize}
+
+\begin{lstlisting}[language=Python,caption=Parquet writer]
+class ParquetWriter:
+    def __init__(self, base_path, partition_cols):
+        self.base_path = base_path
+        self.partition_cols = partition_cols
+        self.buffers = {}  # partition -> event buffer
+
+    def write(self, event):
+        partition = self.compute_partition(event)
+        self.buffers.setdefault(partition, []).append(event)
+
+        if len(self.buffers[partition]) >= BATCH_SIZE:
+            self.flush(partition)
+
+    def flush(self, partition):
+        events = self.buffers.pop(partition)
+        path = f"{self.base_path}/{partition}/data_{uuid4()}.parquet"
+
+        table = pa.Table.from_pylist(events, schema=EVENT_SCHEMA)
+        pq.write_table(table, path, compression='snappy')
+\end{lstlisting}
+
+\subsubsection{Query Engine}
+
+Ad-hoc queries execute on columnar storage via a distributed query engine (we use Presto):
+
+\begin{lstlisting}[language=SQL,caption=Ad-hoc query example]
+SELECT
+    product_category,
+    COUNT(*) AS views,
+    COUNT(DISTINCT session_id) AS sessions,
+    SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS purchases
+FROM events
+WHERE store_id = 'store_123'
+  AND event_date = '2015-06-15'
+  AND device_type = 'mobile'
+GROUP BY product_category
+ORDER BY views DESC
+LIMIT 20;
+\end{lstlisting}
+
+\subsection{Query Routing Layer}
+
+The query router examines incoming queries and routes to the optimal backend:
+
+\begin{lstlisting}[language=Python,caption=Query routing]
+class QueryRouter:
+    def __init__(self, redis_client, presto_client, view_catalog):
+        self.redis = redis_client
+        self.presto = presto_client
+        self.views = view_catalog
+
+    def execute(self, query: str) -> ResultSet:
+        parsed = parse_sql(query)
+
+        # Check if query matches a materialized view
+        view_match = self.views.match(parsed)
+
+        if view_match and self.is_recent_enough(parsed, view_match):
+            # Serve from Redis
+            return self.query_redis(view_match, parsed)
+        elif view_match:
+            # Merge Redis (recent) + Presto (historical)
+            return self.merge_results(
+                self.query_redis(view_match, parsed),
+                self.query_presto(parsed)
+            )
+        else:
+            # Full scan on Presto
+            return self.query_presto(parsed)
+
+    def is_recent_enough(self, parsed, view):
+        # Check if query time range fits in Redis TTL
+        query_start = parsed.get_time_range()[0]
+        redis_start = datetime.utcnow() - timedelta(seconds=view.ttl)
+        return query_start >= redis_start
+\end{lstlisting}
+

@@ -1,0 +1,108 @@
+\section{Adaptive Execution Engine}
+
+\label{sec:engine}
+
+\subsection{Execution Model}
+
+The execution engine processes flow graphs using a topological executor with support for parallelism, dynamic expansion, and error recovery.
+
+\begin{algorithm}[H]
+\caption{Adaptive Flow Execution}
+\label{alg:execute}
+\begin{algorithmic}[1]
+\Require Flow graph $G = (V, E, \Sigma, \tau)$, input $x_0$
+\State $\text{ready} \gets \{v \in V : \text{in-degree}(v) = 0\}$
+\State $\text{results} \gets \{\}$
+\While{$\text{ready} \neq \emptyset$}
+    \State $\text{batch} \gets$ independent nodes in $\text{ready}$
+    \State Execute $\text{batch}$ in parallel:
+    \For{each $v \in \text{batch}$ \textbf{in parallel}}
+        \State $x_v \gets \text{GatherInputs}(v, E, \text{results})$
+        \State $y_v \gets \text{ExecuteNode}(v, x_v)$
+        \If{$y_v$ is error and $v$ has retry policy}
+            \State $y_v \gets \text{RetryWithFallback}(v, x_v)$
+        \EndIf
+        \State $\text{results}[v] \gets y_v$
+    \EndFor
+    \State Update $\text{ready}$ with newly satisfiable nodes
+\EndWhile
+\State \Return $\text{results}[\text{end node}]$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Parallel Branch Execution}
+
+Parallel Split nodes create independent execution branches that run concurrently. The Merge node waits for all (or a configurable quorum of) branches to complete:
+
+\begin{definition}[Merge Strategies]
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{All}: Wait for all branches; output is a list of results.
+    \item \textbf{First}: Return the first completed branch; cancel others.
+    \item \textbf{Quorum($k$)}: Wait for $k$ of $n$ branches; return the $k$ results.
+    \item \textbf{Best}: Wait for all; return the result with the highest quality score.
+\end{itemize}
+\end{definition}
+
+The ``Best'' strategy is particularly useful for LLM calls: generate multiple responses in parallel with different models or temperatures, then select the best one using a quality evaluator.
+
+\subsection{Dynamic Subgraph Expansion}
+
+Certain patterns require dynamic workflow modification at runtime:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Map-Reduce}: When an LLM Call returns a list, the engine can dynamically spawn a subgraph instance per list item, process them in parallel, and reduce the results.
+    \item \textbf{Recursive decomposition}: A task decomposition node can generate subtasks, each of which is processed by a copy of a designated subgraph.
+    \item \textbf{Tool-triggered expansion}: When a tool call returns structured data requiring further processing, the engine instantiates a handler subgraph.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{Map-Reduce Expansion}
+\label{alg:mapreduce}
+\begin{algorithmic}[1]
+\Require Input list $[x_1, \ldots, x_n]$, map subgraph $G_m$, reduce node $R$
+\State \Comment{Expand: create $n$ instances of map subgraph}
+\For{$i = 1, \ldots, n$ \textbf{in parallel}}
+    \State $y_i \gets \text{Execute}(G_m, x_i)$
+\EndFor
+\State \Comment{Reduce: aggregate results}
+\State $y \gets R([y_1, \ldots, y_n])$
+\State \Return $y$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Retry and Fallback}
+
+Each node can be configured with a retry policy:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Strategy} & \textbf{Behavior} & \textbf{Use Case} \\
+\midrule
+Fixed retry & Same model, $k$ attempts & Transient errors \\
+Backoff retry & Exp. backoff, same model & Rate limits \\
+Model fallback & Try next model in list & Model outage \\
+Temperature retry & Increase temp each try & Format failures \\
+Prompt retry & Append error to prompt & Content errors \\
+\bottomrule
+\end{tabular}
+\caption{Retry strategies available per node.}
+\label{tab:retry}
+\end{table}
+
+\subsection{Cost and Latency Estimation}
+
+Before execution, the engine estimates total cost and latency:
+
+\begin{equation}
+\text{Cost}(G) = \sum_{v \in V} \text{Cost}(v) \cdot \mathbb{E}[\text{retries}(v)],
+\end{equation}
+
+\begin{equation}
+\text{Latency}(G) = \max_{\text{path } P \in G} \sum_{v \in P} \text{Latency}(v) \cdot \mathbb{E}[\text{retries}(v)],
+\end{equation}
+
+where the latency is determined by the critical path (longest sequential chain) due to parallel execution of independent branches.
+

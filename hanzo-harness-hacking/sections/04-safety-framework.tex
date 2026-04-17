@@ -1,0 +1,136 @@
+\section{Safety Framework}
+
+\label{sec:safety}
+
+\subsection{The Isolation Invariant}
+\label{sec:isolation}
+
+The core safety mechanism of HHP is worktree isolation. Git worktrees~\cite{git2015worktree}
+allow multiple working directories to share a single repository object store
+while maintaining independent working trees and HEAD pointers.
+
+\begin{definition}[System State]
+The \emph{system state} $\Sigma$ is the tuple $(\mathcal{F}, \mathcal{P}, \mathcal{M})$
+where $\mathcal{F}$ is the set of files comprising the running system,
+$\mathcal{P}$ is the set of running processes, and $\mathcal{M}$ is the in-memory
+state of all services.
+\end{definition}
+
+\begin{definition}[Worktree Isolation]
+\label{def:isolation}
+A modification $\Delta$ is \emph{worktree-isolated} with respect to system state
+$\Sigma$ if:
+\begin{enumerate}[leftmargin=1.5em]
+    \item $\Delta$ is applied to a directory $W$ such that $W \cap \mathcal{F} = \emptyset$.
+    \item No process in $\mathcal{P}$ has an open file descriptor into $W$.
+    \item The git object store is read-only from $W$ (writes to objects do not
+          affect the main working tree).
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Worktree Isolation Theorem]
+\label{thm:isolation}
+Let $\Sigma_0$ be the system state before a modification sequence
+$\Delta_1, \ldots, \Delta_k$, and let each $\Delta_i$ be worktree-isolated.
+Then for all $i$, the system state while $\Delta_i$ is being applied satisfies
+$\Sigma_i = \Sigma_0$. That is, worktree-isolated modifications cannot alter
+the running system state.
+\end{theorem}
+
+\begin{proof}
+By Definition 4.2, each $\Delta_i$ operates on directory $W_i$ disjoint from
+$\mathcal{F}$. Since the running system resolves all file references against
+$\mathcal{F}$, and $W_i \cap \mathcal{F} = \emptyset$, no file read by any
+process in $\mathcal{P}$ is affected by $\Delta_i$. By condition (2), no process
+holds file descriptors into $W_i$, so in-memory caches of system files are not
+affected. By condition (3), git object writes in $W_i$ do not alter any object
+reachable from the main \texttt{HEAD}, so the repository history visible to
+running services is unchanged. Therefore $\Sigma_i = \Sigma_0$ for all $i$.
+\end{proof}
+
+\begin{corollary}[Composition of Isolated Modifications]
+\label{cor:composition}
+If modifications $\Delta_1, \ldots, \Delta_k$ are each worktree-isolated and
+satisfy $V(\Delta_i) = \text{true}$ for all $i$, then sequentially deploying
+them via validated merge preserves the post-deployment system in the validated
+state.
+\end{corollary}
+
+\subsection{Validation Gates}
+\label{sec:gates}
+
+Each modification must pass a tier-appropriate validation gate before deployment.
+We define validation gates formally as predicates over modification and system state.
+
+\begin{definition}[Validation Gate]
+A \emph{validation gate} $\Gamma_k$ for tier $k$ is a predicate:
+\begin{equation}
+    \Gamma_k : (\text{Modification}_k \times \text{SystemState}) \to \{\text{pass}, \text{fail}\}
+\end{equation}
+A modification $\Delta$ may be deployed if and only if $\Gamma_k(\Delta, \Sigma) = \text{pass}$.
+\end{definition}
+
+The gates are ordered by strictness:
+
+\begin{align}
+    \Gamma_1(\rho, \Sigma) &= \bigwedge_{c \in \mathcal{C}} \text{Pass}(\rho.\pi, c), \label{eq:gate1} \\
+    \Gamma_2(\xi, \Sigma) &= \text{Build}(\xi) \wedge \text{AllTests}(\xi.\mathcal{S}), \label{eq:gate2} \\
+    \Gamma_3(\varsigma, \Sigma) &= \text{AgentReview}(\varsigma), \label{eq:gate3} \\
+    \Gamma_4(\mu, \Sigma) &= \text{CI}(\mu.\Delta) \wedge \text{HumanApproval}(\mu.\texttt{pr}). \label{eq:gate4}
+\end{align}
+
+\begin{proposition}[Gate Monotonicity]
+\label{prop:gate-mono}
+For all $k < k'$ and any modification $\Delta$ applicable to both tiers,
+$\Gamma_{k'}(\Delta, \Sigma) \Rightarrow \Gamma_k(\Delta, \Sigma)$.
+\end{proposition}
+
+\begin{proof}
+CI (\ref{eq:gate4}) runs all unit and integration tests including those in
+$\Gamma_2$ (\ref{eq:gate2}). Human approval (\ref{eq:gate4}) subsumes agent
+review (\ref{eq:gate3}). AllTests (\ref{eq:gate2}) subsumes the trigger-case
+tests (\ref{eq:gate1}). Thus each higher gate implies the lower ones. \qed
+\end{proof}
+
+\subsection{Rollback Guarantees}
+\label{sec:rollback}
+
+Every modification under HHP is a git commit in a version-controlled repository.
+This provides immediate rollback via \texttt{git revert}.
+
+\begin{invariant}[Rollback Invariant]
+For every modification $\Delta$ deployed under HHP, there exists a git commit
+$c_{\text{pre}}$ such that \texttt{git revert} $c_\Delta$ restores the system
+to state $\Sigma_{c_{\text{pre}}}$ in $O(1)$ git operations.
+\end{invariant}
+
+For Tier 1 runtime tools, the TTL provides an automatic rollback: if a tool is
+not explicitly promoted, it expires and is deregistered without any manual action.
+This creates an asymmetry: the cost of a bad Tier 1 tool is at most 7 days of
+suboptimal behavior on matching tasks, and the problem self-resolves.
+
+\subsection{Trust Escalation}
+\label{sec:trust}
+
+The trust escalation model governs how a modification moves up the tier hierarchy.
+
+\begin{definition}[Trust Score]
+The \emph{trust score} of a modification $\Delta$ at time $t$ is:
+\begin{equation}
+    \tau(\Delta, t) = \frac{\sum_{s \leq t} \mathbb{1}[\text{UseSuccess}(\Delta, s)]}
+                          {\sum_{s \leq t} \mathbb{1}[\text{Use}(\Delta, s)] + 1},
+\end{equation}
+where $\text{Use}(\Delta, s)$ indicates the modification was invoked in session
+$s$ and $\text{UseSuccess}(\Delta, s)$ indicates it contributed to task success.
+\end{definition}
+
+A Tier 1 tool with $\tau(\rho, t) > 0.8$ after at least 10 uses becomes a
+candidate for Tier 2 promotion. The agent may propose this promotion explicitly,
+or the promotion can be triggered automatically when the telemetry threshold is
+reached. Tier 2 extensions with broad applicability ($> 3$ distinct task types)
+and high trust scores become candidates for Tier 4 contribution to the shared
+ecosystem.
+
+% ============================================================================
+% 5. THE HARNESS-HACKER PROTOCOL
+% ============================================================================

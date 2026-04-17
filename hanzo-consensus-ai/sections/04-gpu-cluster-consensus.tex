@@ -1,0 +1,67 @@
+\section{GPU Cluster Consensus}
+
+\label{sec:cluster}
+% ============================================================================
+
+Distributed training and tensor-parallel inference require consensus among GPU
+nodes on intermediate computation results. Unlike blockchain consensus (agreeing
+on transaction order), GPU cluster consensus must agree on tensor values---high-dimensional floating-point data.
+
+\subsection{Tensor-Parallel Consensus}
+
+In tensor-parallel inference~\cite{megatron}, model layers are sharded across
+$P$ GPUs. Each GPU computes a partial result, and an all-reduce operation
+aggregates them:
+\begin{equation}
+\mathbf{h}^{(l)} = \sum_{p=1}^{P} \mathbf{h}_p^{(l)},
+\end{equation}
+where $\mathbf{h}_p^{(l)}$ is the partial activation from GPU $p$ at layer $l$.
+
+In a trusted cluster, all-reduce is a simple communication primitive. In an
+untrusted ACI network, a Byzantine GPU could submit incorrect partial results
+to corrupt the final output.
+
+\begin{definition}[Byzantine All-Reduce]
+A Byzantine-tolerant all-reduce protocol guarantees that the aggregated result
+equals the sum of honest contributions, even if up to $f < P/3$ participants
+submit arbitrary values.
+\end{definition}
+
+\begin{algorithm}
+\caption{Byzantine All-Reduce with Commitment}
+\label{alg:allreduce}
+\begin{algorithmic}[1]
+\Require Partial results $\{\mathbf{h}_p\}_{p=1}^{P}$, threshold $f < P/3$
+\Ensure Verified aggregate $\mathbf{h} = \sum_p \mathbf{h}_p$ (for honest $p$)
+\For{each GPU $p$}
+    \State Compute commitment: $c_p = \texttt{Hash}(\mathbf{h}_p)$
+    \State Broadcast $c_p$ to all peers
+\EndFor
+\For{each GPU $p$}
+    \State After receiving all commitments, broadcast $\mathbf{h}_p$
+    \State Verify: $\texttt{Hash}(\mathbf{h}_p) \stackrel{?}{=} c_p$ for all $p$
+    \State Discard contributions with invalid commitments
+\EndFor
+\State $\mathbf{h} = \sum_{p \in \text{valid}} \mathbf{h}_p$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Redundant Computation}
+
+For high-value inference (e.g., financial decisions, medical diagnoses), ACI
+supports redundant computation:
+\begin{itemize}[leftmargin=1.1em]
+    \item The request is sent to $k$ independent workers.
+    \item Results are compared using the verification distance metric
+    (\S\ref{sec:poai}).
+    \item The majority result (or median for continuous outputs) is returned.
+    \item Outlier workers are flagged for investigation.
+\end{itemize}
+
+\begin{proposition}[Redundancy Security]
+With $k = 2f + 1$ independent workers and at most $f$ Byzantine workers, the
+majority vote produces the correct output with probability 1 (assuming
+deterministic execution with fixed seeds).
+\end{proposition}
+
+% ============================================================================

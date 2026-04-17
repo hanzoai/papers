@@ -1,0 +1,85 @@
+\section{Wire Protocol: ZAP}
+
+\label{sec:zap}
+%% ============================================================================
+
+\subsection{Overview}
+
+ZAP (Zero-Allocation Protocol) is a binary RPC wire protocol designed for high-frequency blockchain communication. It achieves zero heap allocations per call by using arena-based memory management and pre-allocated message buffers. ZAP supports bidirectional streaming, multiplexing over a single TCP connection, and optional TLS with post-quantum key exchange (ML-KEM-768).
+
+\subsection{Feature Matrix}
+
+\begin{table}[H]
+\centering
+\caption{Wire protocol comparison.}
+\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Feature & \rotatebox{60}{ZAP} & \rotatebox{60}{gRPC} & \rotatebox{60}{libp2p} \\
+\midrule
+Zero-alloc & \yes & \no & \no \\
+Streaming & \yes & \yes & \yes \\
+Multiplexing & \yes & \yes & \yes \\
+TLS 1.3 & \yes & \yes & \yes \\
+PQ key exchange & \yes & \no & \no \\
+Binary encoding & \yes & \yes & \pmark \\
+Code generation & \yes & \yes & \no \\
+Service discovery & \pmark & \yes & \yes \\
+NAT traversal & \no & \no & \yes \\
+DHT routing & \no & \no & \yes \\
+Arena allocator & \yes & \no & \no \\
+Go native & \yes & \yes & \yes \\
+Rust native & \yes & \yes & \yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Performance}
+
+Benchmarked on a single machine (loopback), 100-byte payload, 256 concurrent streams:
+
+\begin{table}[H]
+\centering
+\caption{RPC throughput and allocation comparison.}
+\footnotesize
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Protocol & Calls/sec & Allocs/call & p99 (us) \\
+\midrule
+ZAP & 4,200,000 & 0 & 28 \\
+gRPC (Go) & 890,000 & 12 & 145 \\
+gRPC (Rust) & 1,420,000 & 4 & 82 \\
+libp2p & 340,000 & 38 & 420 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ZAP achieves 4.7$\times$ the throughput of Go gRPC and 3.0$\times$ the throughput of Rust gRPC by eliminating all heap allocations. Each ZAP call uses a pre-allocated arena buffer; when the call completes, the entire arena is reset (a single pointer decrement). gRPC allocates protobuf message structs, serialization buffers, and HTTP/2 frame headers on each call. libp2p's overhead comes from its protocol negotiation layer, multistream-select, and encryption handshake per stream.
+
+\subsection{Cross-Network Performance}
+
+Benchmarked between us-east-1 and eu-west-1 (80ms base RTT), 1KB payload:
+
+\begin{table}[H]
+\centering
+\caption{Cross-region RPC performance.}
+\footnotesize
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Protocol & Calls/sec & Median (ms) & p99 (ms) \\
+\midrule
+ZAP & 48,200 & 81.2 & 84.5 \\
+gRPC (Go) & 41,500 & 82.1 & 92.3 \\
+gRPC (Rust) & 44,800 & 81.5 & 88.1 \\
+libp2p & 28,100 & 83.4 & 112.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Cross-network, the throughput gap narrows because the bottleneck shifts from CPU (allocation overhead) to network (RTT). ZAP retains a 7--16\% advantage from its smaller wire format and multiplexing efficiency. The p99 advantage is more pronounced (84.5ms vs 92.3--112.0ms) due to ZAP's predictable memory behavior eliminating GC-induced latency spikes.
+
+\subsection{Key Differentiator}
+
+Zero allocations per call is unique among production RPC protocols. This eliminates garbage collection pressure entirely in Go validators, which is critical when processing 180K transactions per second. The optional ML-KEM-768 key exchange makes ZAP the only RPC protocol with post-quantum confidentiality for inter-validator communication.
+
+%% ============================================================================

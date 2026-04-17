@@ -1,0 +1,67 @@
+\section{Adaptive Continuous Batching}
+
+\label{sec:batching}
+% ============================================================================
+
+Static batching wastes GPU cycles: short sequences pad to the longest sequence
+in the batch, and completed sequences block new admissions until the entire
+batch finishes. Continuous batching~\cite{orca2022} solves this by admitting and
+evicting sequences at each decode step.
+
+\subsection{Iteration-Level Scheduling}
+
+At each decode iteration $t$, the scheduler decides which sequences to include
+in the batch $\mathcal{B}_t$:
+
+\begin{equation}
+\mathcal{B}_t = \arg\max_{\mathcal{B} \subseteq \mathcal{R}_t}
+\sum_{r \in \mathcal{B}} w(r) \quad \text{s.t.} \quad
+\sum_{r \in \mathcal{B}} k(r) \leq K_{\max},
+\label{eq:batch}
+\end{equation}
+where $\mathcal{R}_t$ is the set of runnable sequences, $w(r)$ is priority
+weight, and $k(r)$ is the KV-cache block count for sequence $r$.
+$K_{\max}$ is the total available cache blocks.
+
+\begin{proposition}[Throughput Bound]
+Under continuous batching with $K_{\max}$ cache blocks and average sequence
+length $\bar{n}$, the maximum sustainable throughput is:
+\begin{equation}
+\Theta_{\max} = \frac{K_{\max}}{\bar{n}} \cdot f_{\text{iter}},
+\end{equation}
+where $f_{\text{iter}}$ is the iteration frequency (decode steps per second).
+\end{proposition}
+
+\subsection{Priority-Aware Batching}
+
+Not all requests are equal. Realtime requests (chat) must preempt batch
+requests (document processing). We assign priority weights:
+\begin{equation}
+w(r) = \begin{cases}
+    10.0 & \text{if } \tau_r = \texttt{realtime}, \\
+    1.0 & \text{if } \tau_r = \texttt{standard}, \\
+    0.1 & \text{if } \tau_r = \texttt{batch}.
+\end{cases}
+\end{equation}
+
+When GPU memory is contiguous, realtime requests preempt batch sequences via
+KV-cache swapping to CPU memory. The preempted sequence resumes when GPU memory
+becomes available.
+
+\subsection{Prefill--Decode Disaggregation}
+
+Prefill (processing input tokens) and decode (generating output tokens) have
+fundamentally different compute profiles. Prefill is compute-bound; decode is
+memory-bandwidth-bound. We separate them:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Prefill phase}: Dedicated GPU SMs process the input sequence
+    in a single forward pass, populating the KV-cache.
+    \item \textbf{Decode phase}: The sequence joins the continuous batch for
+    autoregressive generation.
+\end{enumerate}
+
+On H100 GPUs with 80GB HBM3, this disaggregation improves prefill throughput by
+2.1$\times$ and reduces TTFT by 45\% compared to unified processing.
+
+% ============================================================================

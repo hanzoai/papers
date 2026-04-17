@@ -1,0 +1,67 @@
+\section{Safety Boundaries}
+
+\label{sec:safety}
+
+Operative implements a defense-in-depth safety system to prevent agents from causing unintended harm.
+
+\subsection{Permission Model}
+
+Safety boundaries are configured through a declarative policy:
+
+\begin{lstlisting}[language=Python, caption=Safety boundary configuration]
+safety:
+  filesystem:
+    allowed_paths:
+      - ~/Downloads
+      - ~/Documents/agent-workspace
+    denied_paths:
+      - ~/.ssh
+      - ~/.aws
+      - /etc
+    max_file_size: 100MB
+
+  network:
+    allowed_domains:
+      - "*.google.com"
+      - "*.github.com"
+    denied_domains:
+      - "*.darkweb.*"
+    block_downloads_from: ["*"]
+
+  system:
+    allow_app_launch: true
+    allow_app_close: false
+    allow_system_settings: false
+    allow_shell_commands: false
+    max_concurrent_windows: 5
+
+  interaction:
+    require_confirmation:
+      - purchase
+      - delete
+      - send_email
+      - form_submission
+    max_actions_per_minute: 60
+    idle_timeout: 300
+\end{lstlisting}
+
+\subsection{Sandboxing Layers}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Action-level filtering}: Each action is checked against the policy before execution. Denied actions return an error to the planner, which must select an alternative approach.
+    \item \textbf{Confirmation gates}: Actions matching \texttt{require\_confirmation} patterns trigger a human-in-the-loop approval step. The agent pauses and presents the proposed action with context to the user.
+    \item \textbf{VM isolation}: For maximum security, Operative supports execution within a Docker container or lightweight VM with restricted host access. The screen is shared via VNC or headless framebuffer.
+    \item \textbf{Rollback capability}: Reversible actions maintain undo state. If a sequence of actions produces unintended results, the planner can issue rollback commands to restore previous state.
+\end{enumerate}
+
+\subsection{Rate Limiting and Circuit Breaking}
+
+To prevent runaway agents, Operative enforces:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Action rate limit}: Maximum 60 actions per minute (configurable), preventing rapid uncontrolled clicking.
+    \item \textbf{Cost limit}: For actions that incur LLM costs, a per-task budget ceiling.
+    \item \textbf{Repetition detection}: If the agent repeats the same action sequence more than 3 times, execution pauses for human review.
+    \item \textbf{Error escalation}: After 5 consecutive failed actions, the agent enters supervised mode requiring human approval for each subsequent action.
+\end{itemize}
+

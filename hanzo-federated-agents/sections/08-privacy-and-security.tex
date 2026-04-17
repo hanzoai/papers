@@ -1,0 +1,76 @@
+\section{Privacy and Security}
+
+\label{sec:privacy}
+
+\subsection{What Is and Is Not Shared}
+
+\paragraph{Shared (non-sensitive):}
+\begin{itemize}[leftmargin=1.5em]
+    \item Natural language pattern descriptions ($\leq 32$ words each),
+          representing general strategies (e.g., ``validate inputs before
+          calling external APIs'').
+    \item 1-bit quantized embeddings of these patterns.
+    \item Quality scores and domain tags.
+\end{itemize}
+
+\paragraph{Never shared:}
+\begin{itemize}[leftmargin=1.5em]
+    \item Raw tool call inputs or outputs (may contain user data).
+    \item Agent trajectories or session logs.
+    \item Model weights or internal representations.
+    \item User identifiers, API keys, or credentials.
+    \item Task-specific content beyond the extracted pattern.
+\end{itemize}
+
+The pattern extraction step (GRPO introspection) is designed to produce
+generalizable principles, not task-specific solutions. A pattern like
+``always handle \texttt{None} inputs before processing'' does not reveal
+what specific \texttt{None} value was encountered.
+
+\subsection{Differential Privacy}
+
+For deployments requiring formal privacy guarantees, FAI supports optional
+Gaussian noise injection before broadcast:
+
+\begin{definition}[DP-Noisy Compression]
+\label{def:dp-noise}
+Given privacy budget $\varepsilon_{\text{DP}} > 0$ and sensitivity $\Delta_s$,
+add Gaussian noise to each scale factor before broadcast:
+\begin{equation}
+    \tilde{\alpha}_m^{(j)} = \alpha_m^{(j)} + \mathcal{N}\!\left(0, \, \sigma_{\text{DP}}^2\right),
+    \quad \sigma_{\text{DP}} = \frac{\Delta_s \sqrt{2 \ln(1.25/\delta)}}{\varepsilon_{\text{DP}}}.
+\end{equation}
+Sign vectors are not perturbed (binary data has a different privacy calculus).
+Each broadcast round consumes privacy budget $\varepsilon_{\text{DP}}$;
+over $R$ rounds, the total budget is $R \cdot \varepsilon_{\text{DP}}$ (basic
+composition) or $O(\varepsilon_{\text{DP}} \sqrt{R \ln(1/\delta)})$ (advanced
+composition~\cite{dwork2014algorithmic}).
+\end{definition}
+
+\subsection{Integrity and Reputation}
+
+\paragraph{Batch Integrity.}
+Each broadcast batch is signed by the sender's private key (using Ed25519)
+and includes a SHA-256 hash. Receiving nodes verify both before processing.
+
+\paragraph{Reputation Tracking.}
+Each node maintains a reputation score for each peer, initialized to $1.0$
+and updated as:
+\begin{align}
+    \text{rep}^{(T+1)}_i &= \gamma \cdot \text{rep}^{(T)}_i + (1 - \gamma) \cdot r_i^{(T)},
+    \label{eq:reputation}
+\end{align}
+where $\gamma = 0.9$ is the decay factor and $r_i^{(T)} \in \{0, 1\}$
+indicates whether peer $i$'s batch passed validation (hash, freshness, and
+filter). Peers with $\text{rep}_i < \rho_{\min}$ (default $\rho_{\min} = 0.3$)
+are deprioritized for future gossip connections.
+
+\paragraph{DSO Stake Requirement.}
+Integration with the DSO network requires staking a minimum bond $D_{\min}$
+(default: 10 \$AI) per node registration. Byzantine behavior that is
+provably detected triggers bond slashing, creating an economic deterrent
+against adversarial participation~\cite{hanzo2026dso}.
+
+% ============================================================================
+% 9. EVALUATION PLAN
+% ============================================================================

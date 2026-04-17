@@ -1,0 +1,242 @@
+\section{System Architecture}
+
+
+\subsection{Design Principles}
+
+Hanzo adheres to four architectural principles:
+
+\textbf{Principle 1: Events as First-Class Citizens.} Every user action, system event, and model prediction is an event in a unified stream. Events are immutable, ordered, and available for both real-time and batch processing.
+
+\textbf{Principle 2: Shared Feature Store.} All models draw features from a centralized store. This ensures consistency (the same feature computation serves training and inference) and enables feature reuse across models.
+
+\textbf{Principle 3: Online-Offline Parity.} Models train on historical data and serve in real-time. Infrastructure ensures the same feature transformations apply in both contexts, eliminating training-serving skew.
+
+\textbf{Principle 4: Continuous Learning.} Models update continuously as new data arrives. Feedback loops from predictions to outcomes enable rapid adaptation.
+
+\subsection{Core Components}
+
+\subsubsection{Event Stream}
+
+All platform activity flows through Apache Kafka:
+
+\begin{lstlisting}[language=Python,caption=Event schema]
+@dataclass
+class Event:
+    event_id: str
+    event_type: str
+    timestamp: datetime
+    user_id: Optional[str]
+    session_id: str
+    payload: Dict[str, Any]
+    context: Dict[str, Any]  # device, location, etc.
+\end{lstlisting}
+
+Event types include:
+\begin{itemize}
+\item \texttt{page\_view}: User views a page.
+\item \texttt{product\_view}: User views a product.
+\item \texttt{add\_to\_cart}: User adds item to cart.
+\item \texttt{purchase}: Transaction completed.
+\item \texttt{recommendation\_shown}: Model prediction served.
+\item \texttt{recommendation\_clicked}: User engaged with recommendation.
+\end{itemize}
+
+\subsubsection{Feature Store}
+
+The feature store provides:
+
+\textbf{Feature computation.} Declarative feature definitions:
+
+\begin{lstlisting}[language=Python,caption=Feature definition]
+@feature
+def user_purchase_count_7d(user_id: str) -> int:
+    """Count of purchases in last 7 days."""
+    return events.filter(
+        event_type="purchase",
+        user_id=user_id,
+        timestamp__gte=now() - days(7)
+    ).count()
+
+@feature
+def product_view_to_purchase_rate(product_id: str) -> float:
+    """Conversion rate from view to purchase."""
+    views = events.filter(event_type="product_view", product_id=product_id).count()
+    purchases = events.filter(event_type="purchase", product_id=product_id).count()
+    return purchases / max(views, 1)
+\end{lstlisting}
+
+\textbf{Online serving.} Low-latency feature retrieval (p99 < 5ms):
+
+\begin{lstlisting}[language=Python,caption=Feature retrieval]
+features = feature_store.get_features(
+    feature_names=["user_purchase_count_7d", "user_avg_order_value"],
+    entity_ids={"user_id": "user_123"}
+)
+\end{lstlisting}
+
+\textbf{Offline training.} Point-in-time correct feature joins for training data:
+
+\begin{lstlisting}[language=Python,caption=Training data generation]
+training_data = feature_store.get_historical_features(
+    feature_names=["user_purchase_count_7d", "product_popularity"],
+    entity_df=labels_df,  # Contains user_id, product_id, timestamp, label
+)
+\end{lstlisting}
+
+\subsubsection{Model Serving}
+
+Models deploy to a unified serving layer:
+
+\begin{lstlisting}[language=Python,caption=Model serving]
+class RecommendationModel:
+    def __init__(self, model_path: str):
+        self.model = tf.saved_model.load(model_path)
+        self.feature_spec = load_feature_spec(model_path)
+
+    def predict(self, user_id: str, candidate_ids: List[str]) -> List[float]:
+        features = feature_store.get_features(
+            feature_names=self.feature_spec,
+            entity_ids={"user_id": user_id, "product_ids": candidate_ids}
+        )
+        return self.model.predict(features)
+\end{lstlisting}
+
+\subsection{AI Capabilities}
+
+\subsubsection{Personalized Recommendations}
+
+Recommendations power multiple surfaces: homepage, product pages, cart, and email.
+
+\textbf{Model architecture.} We employ a two-tower neural network \cite{youtube2016}:
+
+\begin{align}
+u &= f_{\text{user}}(x_{\text{user}}) \\
+v &= f_{\text{item}}(x_{\text{item}}) \\
+\text{score} &= u \cdot v
+\end{align}
+
+The user tower $f_{\text{user}}$ encodes user features (browsing history, purchase history, demographics). The item tower $f_{\text{item}}$ encodes product features (category, price, description embeddings). Dot product scoring enables efficient retrieval via approximate nearest neighbors.
+
+\textbf{Features.} Key features include:
+\begin{itemize}
+\item User: Recent views (sequence), purchase history, session duration, device type.
+\item Item: Category hierarchy, price percentile, description embedding, popularity.
+\item Context: Time of day, day of week, referral source.
+\end{itemize}
+
+\textbf{Training.} The model trains on implicit feedback:
+\begin{itemize}
+\item Positive: Purchases, add-to-carts, extended views (> 30 seconds).
+\item Negative: Sampled non-interactions, quick bounces.
+\end{itemize}
+
+We use batch negatives with in-batch sampling for efficient training.
+
+\subsubsection{Intelligent Search}
+
+Search ranking combines text relevance with personalization.
+
+\textbf{Architecture.} A learning-to-rank model \cite{liu2009} re-ranks candidates from Elasticsearch:
+
+\begin{enumerate}
+\item \textbf{Retrieval}: Elasticsearch returns top 1000 candidates by BM25.
+\item \textbf{Scoring}: Neural ranker scores candidates using user context.
+\item \textbf{Re-ranking}: Final ordering by learned scores.
+\end{enumerate}
+
+\textbf{Model.} We use a cross-attention transformer:
+
+\begin{lstlisting}[language=Python,caption=Search ranking model]
+class SearchRanker(nn.Module):
+    def __init__(self, config):
+        self.query_encoder = TransformerEncoder(config)
+        self.product_encoder = TransformerEncoder(config)
+        self.cross_attention = CrossAttention(config)
+        self.scorer = nn.Linear(config.hidden_size, 1)
+
+    def forward(self, query_tokens, product_features, user_features):
+        query_emb = self.query_encoder(query_tokens)
+        product_emb = self.product_encoder(product_features)
+        cross_emb = self.cross_attention(query_emb, product_emb, user_features)
+        return self.scorer(cross_emb)
+\end{lstlisting}
+
+\textbf{Training data.} Click-through logs provide training signal:
+\begin{itemize}
+\item Queries with clicked results (positive).
+\item Queries with skipped results (negative).
+\item Purchase after search (strong positive).
+\end{itemize}
+
+\subsubsection{Fraud Detection}
+
+Fraud detection operates at multiple stages: account creation, checkout, and post-transaction.
+
+\textbf{Model architecture.} An ensemble of gradient boosted trees (XGBoost) and neural networks:
+
+\begin{equation}
+\text{fraud\_score} = \alpha \cdot \text{XGB}(x) + (1-\alpha) \cdot \text{NN}(x)
+\end{equation}
+
+XGBoost captures interpretable rules; the neural network captures complex patterns.
+
+\textbf{Features.} Fraud features span multiple categories:
+\begin{itemize}
+\item \textbf{Velocity}: Orders per hour, distinct cards per user, shipping addresses per card.
+\item \textbf{Device}: Device fingerprint, IP geolocation, browser anomalies.
+\item \textbf{Behavioral}: Time on site, navigation patterns, form fill speed.
+\item \textbf{Network}: Graph features connecting users, devices, and addresses.
+\end{itemize}
+
+\textbf{Decision engine.} Fraud scores trigger actions:
+\begin{itemize}
+\item Score < 0.3: Approve automatically.
+\item 0.3 $\leq$ Score < 0.7: Additional verification (3D Secure, phone verification).
+\item Score $\geq$ 0.7: Manual review or automatic decline.
+\end{itemize}
+
+\subsubsection{Dynamic Pricing}
+
+Dynamic pricing optimizes prices in real-time based on demand, competition, and inventory.
+
+\textbf{Model.} A demand model predicts quantity sold at each price point:
+
+\begin{equation}
+q(p) = \exp(\beta_0 + \beta_1 \log p + \beta_2 x)
+\end{equation}
+
+where $p$ is price and $x$ are contextual features (day of week, competitor prices, inventory level).
+
+\textbf{Optimization.} Given demand model, optimize for profit:
+
+\begin{equation}
+p^* = \arg\max_p (p - c) \cdot q(p)
+\end{equation}
+
+where $c$ is cost. Constraints include:
+\begin{itemize}
+\item Minimum margin: $p \geq (1 + m) \cdot c$.
+\item Price consistency: $|p - p_{\text{prev}}| \leq \delta$.
+\item Competitor parity: $p \leq \max(\text{competitor prices}) + \epsilon$.
+\end{itemize}
+
+\subsubsection{Inventory Optimization}
+
+Predictive inventory management reduces stockouts and overstock.
+
+\textbf{Demand forecasting.} A hierarchical time series model \cite{hyndman2011} predicts demand:
+
+\begin{equation}
+y_{t+h} = \text{trend}_t + \text{season}_t + \text{promo}_t + \epsilon_t
+\end{equation}
+
+The model forecasts at multiple aggregation levels (SKU, category, store) with reconciliation ensuring consistency.
+
+\textbf{Reorder optimization.} Given demand forecast and lead times:
+
+\begin{equation}
+\text{reorder\_point} = \mu_L + z_\alpha \cdot \sigma_L
+\end{equation}
+
+where $\mu_L$ is expected demand during lead time, $\sigma_L$ is demand standard deviation, and $z_\alpha$ is the safety stock factor for target service level $\alpha$.
+

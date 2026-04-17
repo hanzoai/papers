@@ -1,0 +1,168 @@
+\section{Production Implementation}
+
+\label{sec:implementation}
+
+\subsection{Infrastructure Overview}
+
+The Hanzo UAH is deployed on two Kubernetes clusters managed by DigitalOcean
+Kubernetes Service (DOKS):
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{hanzo-k8s} (24.199.76.156, 4 worker nodes, v1.34.1):
+          Primary cluster hosting all Hanzo services including the UAH
+          gateway, agent runtime, LLM proxy, IAM, and KMS.
+    \item \textbf{lux-k8s} (24.144.69.101):
+          Secondary cluster for Lux blockchain infrastructure (not directly
+          relevant to the UAH but shares the observability stack).
+\end{itemize}
+
+\subsection{Layer 1 Implementation: LLM Gateway}
+
+The LLM Access layer is implemented as the Hanzo LLM Gateway
+(\texttt{/llm}), a LiteLLM-based proxy extended with a custom routing engine.
+The gateway exposes an OpenAI-compatible API at \texttt{api.hanzo.ai} and
+\texttt{llm.hanzo.ai}, serving 100+ model providers through a single
+endpoint.
+
+Key implementation details:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Routing engine:} A Go-based routing service that maintains
+          a real-time capacity map, updated every 30 seconds via provider
+          health checks. Routing decisions are made in $<1$ ms.
+    \item \textbf{Failover:} Exponential backoff with jitter on provider
+          errors; automatic rerouting to a secondary provider within 200 ms.
+    \item \textbf{Cost tracking:} Every API call is logged to PostgreSQL with
+          model, provider, input tokens, output tokens, and calculated cost.
+          Aggregate cost is queryable via Prometheus metrics.
+\end{itemize}
+
+\subsection{Layer 2 Implementation: MCP Server}
+
+The Hanzo MCP Server (\texttt{/mcp}) implements the full Model Context
+Protocol specification and provides 260 tools (54 built-in plus 206 via
+plugin extensions). The server is available as an npm package
+(\texttt{@hanzo/mcp}) and as a Docker image for server deployment.
+
+Architecture: a TypeScript Node.js server with tool handlers organized into
+category modules. Each tool handler is registered with the MCP runtime at
+startup, exposing a \texttt{tools/list} endpoint and handling
+\texttt{tools/call} RPC calls via JSON-RPC 2.0 over stdio or HTTP/SSE.
+
+Sandbox isolation for shell execution tools uses
+\texttt{seccomp} profiles and Linux namespaces (via \texttt{runc}), providing
+filesystem, network, and process isolation without VM overhead. Measured
+overhead: $<5$ ms per container spawn (using pre-forked process pool).
+
+\subsection{Layer 3 Implementation: Agent Runtime}
+
+The Agent Runtime is implemented as the Hanzo Agent SDK (\texttt{/agent}),
+a Python package providing the \texttt{Agent[TContext]} generic dataclass
+and the \texttt{AgentNetwork} orchestration engine. Workflow state is
+persisted in Temporal~\cite{temporal2023} for durability and resumability:
+each agent step is a Temporal activity, and long-horizon tasks are Temporal
+workflows with up to 10-year retention.
+
+Multi-agent routing is implemented as a tournament selection policy:
+\begin{equation}
+    a^* = \argmax_{a \in \text{Candidates}(\tau)}
+          \text{CompatibilityScore}(a, \tau),
+\end{equation}
+where $\text{CompatibilityScore}$ is computed as the cosine similarity
+between the task embedding and the agent's skill embedding, both using
+\texttt{text-embedding-3-large} embeddings stored in Qdrant.
+
+\subsection{Layer 4 Implementation: Channel Integration}
+
+Channel adapters are implemented as independent microservices that normalize
+channel-specific message formats to the UAH canonical message schema. Each
+adapter maintains a persistent WebSocket connection to the NATS message
+bus~\cite{nats2023}, which routes messages to the appropriate agent
+instance.
+
+The identity system (Hanzo IAM, deployed at \texttt{hanzo.id}) maps
+channel-specific identities to canonical users using the Casdoor
+platform~\cite{casdoor2023} with custom identity federation extensions.
+All user data is encrypted at rest using Hanzo KMS (\texttt{kms.hanzo.ai},
+based on Infisical~\cite{infisical2023}).
+
+\subsection{Layer 5 Implementation: Compute Tiers}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Tier 0:} Handled directly by the UAH gateway process;
+          no separate provisioning.
+    \item \textbf{Tier 1:} Docker containers on the hanzo-k8s cluster,
+          orchestrated by a custom pod manager with a pool of 50 pre-warmed
+          containers. Container images are based on \texttt{ubuntu:22.04}
+          with standard development tools pre-installed.
+    \item \textbf{Tier 2:} Operative Desktop pods with Xvfb, VNC server,
+          and Chromium. Managed by the Hanzo Operative framework
+          (\texttt{/operative}). VNC sessions are proxied via WebSocket to
+          the agent's browser automation tools.
+    \item \textbf{Tier 3:} DigitalOcean Droplets provisioned via the
+          DigitalOcean API (4 vCPU / 8 GB baseline; scalable to 32 vCPU /
+          64 GB). Provisioned in $\leq 90$ seconds from the UAH's
+          pre-authenticated API client.
+    \item \textbf{Tier 4:} Local machines register with the UAH gateway
+          via a lightweight daemon (\texttt{hanzo-local-agent}), which
+          establishes a Tailscale~\cite{tailscale2023} encrypted tunnel
+          and registers the machine's capabilities in the tier registry.
+\end{itemize}
+
+\subsection{Layer 6 Implementation: Self-Improvement}
+
+The Self-Improvement layer is implemented as a set of periodic Temporal
+workflows:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Session summarizer} (runs on session close): Extracts key
+          patterns from the session trace and updates the agent's episodic
+          memory in Qdrant.
+    \item \textbf{Hourly analyzer}: Aggregates the past hour's traces,
+          identifies the top-10 failure modes by frequency, and generates
+          candidate policy patches via an LLM introspection call.
+    \item \textbf{Daily optimizer}: Evaluates candidate patches against a
+          held-out validation set, selects improvements with
+          $\Delta\text{success} \geq 1\%$ and deploys them via a GitOps
+          workflow.
+    \item \textbf{Weekly fine-tuner}: Prepares a fine-tuning dataset from
+          the week's successful traces and submits a fine-tuning job for
+          domain-specific specialist models.
+\end{itemize}
+
+\subsection{Layer 7 Implementation: Observability}
+
+All layers emit spans in OpenTelemetry format to an OpenTelemetry
+Collector deployed in the cluster. The collector fans out to:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Tempo} (Grafana): Distributed trace storage, queried
+          via the Grafana trace explorer.
+    \item \textbf{Loki} (Grafana): Structured log aggregation with
+          LogQL query support.
+    \item \textbf{Prometheus}: Metric scraping from all services;
+          dashboards in Grafana.
+    \item \textbf{AlertManager}: PagerDuty integration for critical
+          alerts (agent failures, cost budget overruns, tier provisioning
+          failures).
+\end{itemize}
+
+Every trace includes: \texttt{trace\_id} (UUID), \texttt{session\_id},
+\texttt{user\_id}, \texttt{agent\_id}, \texttt{tier}, \texttt{model},
+\texttt{provider}, \texttt{input\_tokens}, \texttt{output\_tokens},
+\texttt{tool\_calls} (array), \texttt{success} (bool), \texttt{cost\_usd},
+and \texttt{duration\_ms}.
+
+\subsection{Total System Metrics}
+
+As of February 2026, the production UAH system processes:
+\begin{itemize}[leftmargin=1.5em]
+    \item $\sim$12,000 agent sessions per day across all domains.
+    \item $\sim$840,000 LLM API calls per day through the gateway.
+    \item $\sim$3.2 million tool invocations per day.
+    \item Peak Tier 1 concurrency: 180 active containers.
+    \item Total observability volume: $\sim$4.8 GB compressed spans per day.
+    \item P99 end-to-end session latency (Tier 0): 3.8 seconds.
+    \item P99 tier upgrade latency (Tier 0$\to$1, pre-warmed): 1.3 seconds.
+\end{itemize}
+
+% ============================================================================
+% 9. DISCUSSION AND FUTURE WORK
+% ============================================================================

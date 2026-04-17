@@ -1,0 +1,131 @@
+\section{Deployment}
+
+
+\subsection{Kubernetes Sidecar Pattern}
+
+Every Base service deploys \texttt{replicate} as an init container (restore)
+and a sidecar container (continuous replication).
+
+\begin{lstlisting}[language=YAML,caption={Kubernetes pod spec (abbreviated).}]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ats
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: replicate-restore
+          image: ghcr.io/hanzoai/replicate:latest
+          args:
+            - restore
+            - -if-db-not-exists
+            - -if-replica-exists
+            - -config
+            - /etc/replicate/replicate.yml
+            - /data/base/data.db
+          volumeMounts:
+            - name: data
+              mountPath: /data/base
+            - name: replicate-config
+              mountPath: /etc/replicate
+            - name: age-secrets
+              mountPath: /secrets/age
+              readOnly: true
+          resources:
+            requests: { memory: 16Mi, cpu: 10m }
+            limits:   { memory: 64Mi, cpu: 100m }
+      containers:
+        - name: base
+          image: ghcr.io/hanzoai/ats:latest
+          # ... service container
+          volumeMounts:
+            - name: data
+              mountPath: /data/base
+        - name: replicate
+          image: ghcr.io/hanzoai/replicate:latest
+          args:
+            - replicate
+            - -config
+            - /etc/replicate/replicate.yml
+          volumeMounts:
+            - name: data
+              mountPath: /data/base
+            - name: replicate-config
+              mountPath: /etc/replicate
+            - name: age-secrets
+              mountPath: /secrets/age
+              readOnly: true
+          env:
+            - name: LITESTREAM_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key-id
+            - name: LITESTREAM_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-access-key
+          resources:
+            requests: { memory: 16Mi, cpu: 10m }
+            limits:   { memory: 64Mi, cpu: 100m }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: replicate-config
+          configMap:
+            name: replicate-config
+        - name: age-secrets
+          secret:
+            secretName: replicate-age-keys
+\end{lstlisting}
+
+Note: the \texttt{data} volume is \texttt{emptyDir}. PVCs are no longer
+required. On pod startup, the init container restores the database from S3.
+During operation, the sidecar continuously replicates. On pod termination,
+the sidecar flushes pending WAL frames before exiting.
+
+\subsection{Resource Requirements}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Container} & \textbf{CPU Req} & \textbf{CPU Lim} & \textbf{Mem Req} & \textbf{Mem Lim} \\
+\midrule
+replicate-restore (init) & 10m   & 100m  & 16Mi  & 64Mi \\
+replicate (sidecar)      & 10m   & 100m  & 16Mi  & 64Mi \\
+\bottomrule
+\end{tabular}
+\caption{Resource requirements. The sidecar is lightweight---it reads the WAL file
+and uploads compressed, encrypted chunks.}
+\label{tab:resources}
+\end{table}
+
+\subsection{Multi-Database Services}
+
+Services with per-org databases (ATS, BD, TA) replicate multiple SQLite
+files. The \texttt{replicate.yml} configuration supports multiple
+\texttt{dbs} entries. A filesystem watcher discovers new databases created at
+runtime and adds them to the replication set dynamically.
+
+\begin{lstlisting}[language=YAML,caption={Multi-database configuration.}]
+dbs:
+  - path: /data/base/data.db
+    replicas:
+      - type: s3
+        bucket: hanzo-replicate
+        path: ats/liquidity/ats-0/system
+        # ... same age config
+  - path: /data/base/orgs/*.db
+    replicas:
+      - type: s3
+        bucket: hanzo-replicate
+        path: ats/liquidity/ats-0/orgs
+        # ... same age config
+\end{lstlisting}
+
+% ============================================================================
+% 7. AFFECTED SERVICES
+% ============================================================================

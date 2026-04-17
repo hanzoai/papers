@@ -1,0 +1,70 @@
+\section{Implementation}
+
+
+\subsection{Technology Stack}
+
+\begin{itemize}
+\item \textbf{Event streaming}: Apache Kafka.
+\item \textbf{Feature store}: Custom implementation on Redis (online) + BigQuery (offline).
+\item \textbf{Model training}: TensorFlow, XGBoost.
+\item \textbf{Model serving}: TensorFlow Serving, custom Python services.
+\item \textbf{Orchestration}: Kubernetes, Airflow.
+\end{itemize}
+
+\subsection{Latency Requirements}
+
+Commerce AI must meet strict latency requirements:
+
+\begin{table}[h]
+\centering
+\caption{Latency requirements by surface}
+\label{tab:latency}
+\begin{tabular}{lrr}
+\hline
+Surface & p50 (ms) & p99 (ms) \\
+\hline
+Search ranking & 20 & 50 \\
+Recommendations & 15 & 40 \\
+Fraud scoring & 100 & 250 \\
+Dynamic pricing & 50 & 150 \\
+\hline
+\end{tabular}
+\end{table}
+
+We achieve these through:
+\begin{itemize}
+\item Feature caching with 1-minute TTL.
+\item Batch prediction for non-real-time surfaces.
+\item Model quantization and optimization.
+\item Geographic distribution (models deployed to edge).
+\end{itemize}
+
+\subsection{Model Updates}
+
+Models update through a continuous training pipeline:
+
+\begin{enumerate}
+\item New events flow to training data store.
+\item Nightly jobs retrain models on recent data.
+\item Shadow deployment compares new model to production.
+\item Automatic promotion if metrics improve.
+\item Rollback if degradation detected.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption=Model promotion logic]
+def should_promote(shadow_metrics, prod_metrics):
+    # Require improvement on primary metric
+    if shadow_metrics.conversion_rate < prod_metrics.conversion_rate:
+        return False
+
+    # Guard rails on secondary metrics
+    if shadow_metrics.latency_p99 > prod_metrics.latency_p99 * 1.1:
+        return False
+
+    # Statistical significance
+    if not is_significant(shadow_metrics, prod_metrics, alpha=0.05):
+        return False
+
+    return True
+\end{lstlisting}
+

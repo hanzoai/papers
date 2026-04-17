@@ -1,0 +1,259 @@
+\section{Agent-Level GRPO}
+
+\label{sec:agentgrpo}
+
+\subsection{Tool-Use Trajectory Definition}
+\label{sec:trajectories}
+
+\begin{definition}[Tool-Use Trajectory]
+\label{def:trajectory}
+A tool-use trajectory is a tuple
+\begin{equation}
+    \tau = \bigl(x,\;\bm{\xi},\;R\bigr),
+    \quad \bm{\xi} = \bigl((t_1, \bm{p}_1, o_1, s_1),\;\ldots,\;(t_K, \bm{p}_K, o_K, s_K)\bigr),
+    \label{eq:trajectory}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em]
+    \item $x \in \mathcal{X}$ is the natural-language task description,
+    \item $K \geq 0$ is the number of tool calls made,
+    \item $t_i \in \mathcal{T}$ is the name of the $i$-th tool invoked from
+          tool registry $\mathcal{T}$,
+    \item $\bm{p}_i \in \mathcal{P}(t_i)$ is the parameter dictionary for
+          tool $t_i$,
+    \item $o_i \in \mathcal{O}$ is the output returned by tool $t_i$,
+    \item $s_i \in \{0, 1\}$ is the binary success indicator ($s_i = 1$ iff
+          the call completed without error and produced well-formed output),
+    \item $R \in [0, 1]$ is the trajectory-level composite reward defined in
+          Section~\ref{sec:reward}.
+\end{itemize}
+\end{definition}
+
+\begin{remark}
+The length $K$ is not fixed a priori; it varies across trajectories in the
+same group. This is fundamentally different from the text setting where all
+rollouts have a common output space $\mathcal{V}^*$. Agent-GRPO must compare
+trajectories of potentially different lengths, which motivates the
+summarization approach in Stage~1.
+\end{remark}
+
+Let $\mathcal{T}$ be a finite registry of $|\mathcal{T}|$ available tools.
+We partition $\mathcal{T}$ into \emph{domains} $\mathcal{D} =
+\{d_1, \ldots, d_L\}$ based on functionality: $d_{\text{fs}}$ (file system),
+$d_{\text{shell}}$ (shell execution), $d_{\text{search}}$ (web/code search),
+$d_{\text{k8s}}$ (Kubernetes operations), and so on. Domain membership informs
+the scoped retrieval of experiences (Section~\ref{sec:retrieval}).
+
+\subsection{Reward Computation}
+\label{sec:reward}
+
+The trajectory-level reward $R$ decomposes into two observable components:
+
+\paragraph{Tool Success Rate.}
+The per-trajectory tool success rate is the fraction of tool calls that
+completed without error:
+\begin{equation}
+    \rho_s(\tau) = \frac{1}{K} \sum_{i=1}^K s_i \in [0, 1].
+    \label{eq:tool-success}
+\end{equation}
+For the degenerate case $K = 0$ (task completed without tool use), we set
+$\rho_s = 1$.
+
+\paragraph{User Acceptance Signal.}
+The user acceptance signal $\rho_a(\tau) \in \{0, 1\}$ is determined by
+observing whether the user corrects or rejects the agent's final output within
+a time window $\Delta t$:
+\begin{equation}
+    \rho_a(\tau) =
+    \begin{cases}
+        1 & \text{if user does not correct output within } \Delta t = 120\,\text{s,} \\
+        0 & \text{if user explicitly corrects or rejects output.}
+    \end{cases}
+    \label{eq:user-accept}
+\end{equation}
+This weak, delayed supervision signal is the only human signal required by
+Agent-GRPO; no explicit reward labeling is needed.
+
+\paragraph{Composite Reward.}
+The composite trajectory reward is:
+\begin{equation}
+    R(\tau) = w_1\,\rho_s(\tau) + w_2\,\rho_a(\tau),
+    \label{eq:composite-reward}
+\end{equation}
+with default weights $w_1 = 0.4$, $w_2 = 0.6$ (user acceptance is weighted
+more heavily as it reflects task-level quality, not just mechanical correctness).
+
+\begin{remark}
+The weights $w_1$ and $w_2$ can be tuned per deployment. In automated
+pipelines without a human in the loop, one may set $w_2 = 0$ and rely
+entirely on $\rho_s$. In interactive settings, $w_2 > 0$ captures the
+user's implicit preference signal.
+\end{remark}
+
+\paragraph{Step-Level Rewards.}
+For Stage-1 summarization (Section~\ref{sec:stage1}), we also compute step-level
+rewards $r_i = s_i$ for each tool call $i$, which enable the extractor to
+identify exactly which calls were beneficial or harmful.
+
+\subsection{Group-Relative Advantage for Agent Trajectories}
+
+Given a group of $G$ trajectories $\{\tau^{(j)}\}_{j=1}^G$ on the same task
+$x$, the group-relative advantage of trajectory $\tau^{(i)}$ is defined
+analogously to Equation~\eqref{eq:grpo-advantage}:
+\begin{equation}
+    A^{(i)} = \frac{R(\tau^{(i)}) - \mu_G}{\sigma_G + \epsilon},
+    \quad \mu_G = \frac{1}{G}\sum_{j=1}^G R(\tau^{(j)}),
+    \quad \sigma_G = \sqrt{\frac{1}{G-1}\sum_{j=1}^G \bigl(R(\tau^{(j)}) - \mu_G\bigr)^2}.
+    \label{eq:agent-advantage}
+\end{equation}
+Trajectories with $A^{(i)} > 0$ are identified as ``positive examples'' for
+Stage-2 extraction; those with $A^{(i)} < 0$ are ``negative examples.'' The
+group is required to contain at least one positive and one negative example for
+meaningful advantage extraction; groups where all trajectories achieve the same
+reward are discarded.
+
+\subsection{Stage 1: Tool Trajectory Summarization}
+\label{sec:stage1}
+
+Stage~1 processes each trajectory $\tau^{(i)}$ independently, producing a
+structured summary $\hat{\tau}^{(i)}$ suitable for group comparison.
+
+\begin{definition}[Trajectory Summary]
+A trajectory summary $\hat{\tau}$ is a natural-language description constrained
+to at most $W_{\max} = 64$ words that identifies: (a) the task type and domain,
+(b) the primary tool selection strategy employed, (c) the most significant
+parameter choice that affected outcome, and (d) the root cause of any failures.
+\end{definition}
+
+The summary is produced by the following LLM call:
+
+\begin{quote}
+\textit{Prompt template for Stage 1:}
+\texttt{You are analyzing a tool-use trajectory for task: \{x\}. The
+trajectory made \{K\} tool calls with overall reward \{R\}. The step-by-step
+calls were: \{$\xi$\}. Summarize in at most 64 words: (1) what tool selection
+strategy was used, (2) what parameter choices were made for key tools, (3) what
+failures occurred and why, (4) what the outcome was. Focus on patterns
+generalizable to similar future tasks.}
+\end{quote}
+
+The summary $\hat{\tau}^{(i)}$ retains the advantage sign: we annotate it as
+$\hat{\tau}^{(i)+}$ if $A^{(i)} > 0$ and $\hat{\tau}^{(i)-}$ if $A^{(i)} < 0$.
+
+\subsection{Stage 2: Group Advantage Extraction}
+\label{sec:stage2}
+
+Stage~2 operates on the full group of summaries $\{\hat{\tau}^{(j)}\}_{j=1}^G$
+and produces a set of \emph{operations} $\Omega^{(g)}$ on the experience library.
+
+\begin{definition}[Experience Library Operation]
+\label{def:operation}
+An operation $\omega \in \Omega$ is one of:
+\begin{itemize}[leftmargin=1.5em]
+    \item $\textsc{add}(e_{\text{new}})$: insert a new experience $e_{\text{new}}$ into $\mathcal{E}$,
+    \item $\textsc{modify}(e_{\text{id}}, e_{\text{new}})$: replace experience with identifier $e_{\text{id}}$,
+    \item $\textsc{delete}(e_{\text{id}})$: remove experience $e_{\text{id}}$ from $\mathcal{E}$,
+    \item $\textsc{merge}(e_{\text{id}_1}, e_{\text{id}_2}, e_{\text{new}})$: replace two near-duplicate
+          experiences with a single consolidated entry.
+\end{itemize}
+\end{definition}
+
+The Stage-2 LLM prompt compares positive and negative group summaries:
+
+\begin{quote}
+\textit{Prompt template for Stage 2:}
+\texttt{You are extracting generalizable tool-use lessons. Below are
+SUCCESSFUL trajectories (high reward): \{$\hat{\tau}^{(i)+}$\}. And FAILED
+trajectories (low reward): \{$\hat{\tau}^{(i)-}$\}. Current experience library:
+\{$\mathcal{E}_{\text{relevant}}$\}. Produce operations (add/modify/delete/merge)
+that update the library. Each new/modified experience must: (a) be $\leq$32
+words, (b) be actionable and specific, (c) explain WHEN and HOW to apply.
+Format: OPERATION | experience\_id (if modify/delete/merge) | text.}
+\end{quote}
+
+The output $\Omega^{(g)}$ from Stage~2 contains all proposed library
+modifications arising from task group $g$.
+
+\subsection{Stage 3: Batch Consolidation}
+\label{sec:stage3}
+
+Stage~3 merges the operation sets $\{\Omega^{(g)}\}_{g=1}^{N_g}$ from all
+$N_g$ task groups processed in the current session, producing a final
+consolidated operation set $\Omega^*$ that is applied atomically to $\mathcal{E}$.
+
+Consolidation proceeds in three passes:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Conflict resolution:} If two groups issue conflicting
+          \textsc{modify} or \textsc{delete} operations on the same $e_{\text{id}}$,
+          the operation from the group with higher mean group advantage
+          $\bar{A}^{(g)} = \frac{1}{G}\sum_i |A^{(i)}_g|$ takes precedence.
+    \item \textbf{Deduplication:} \textsc{add} operations whose proposed text
+          has cosine similarity above $\theta_{\text{dup}} = 0.85$ with an
+          existing library entry are converted to \textsc{modify} operations.
+    \item \textbf{Length enforcement:} Any experience text exceeding 32 words
+          is compressed via an LLM call: \texttt{Summarize in $\leq$32 words,
+          preserving the actionable core: \{text\}}.
+\end{enumerate}
+
+\subsection{The AGENT-GRPO Algorithm}
+\label{sec:algorithm}
+
+Algorithm~\ref{alg:agent-grpo} presents the complete Agent-GRPO procedure.
+
+\begin{algorithm}[H]
+\caption{AGENT-GRPO: Agent-Level Training-Free GRPO}
+\label{alg:agent-grpo}
+\begin{algorithmic}[1]
+\Require Session trajectories $\mathcal{S} = \{(\tau^{(j)}_g)\}_{g,j}$,
+         experience library $\mathcal{E}$,
+         group size $G$, consolidation threshold $\theta_{\text{dup}}$
+\Ensure Updated experience library $\mathcal{E}'$
+
+\State $\Omega \gets \emptyset$ \Comment{Accumulated operations}
+\For{each task group $g$ in $\mathcal{S}$}
+    \State $\{\tau^{(j)}\}_{j=1}^G \gets$ trajectories for group $g$
+    \State \textbf{// Compute rewards and advantages}
+    \For{$j = 1$ to $G$}
+        \State $R^{(j)} \gets w_1\,\rho_s(\tau^{(j)}) + w_2\,\rho_a(\tau^{(j)})$
+    \EndFor
+    \State $\mu_G, \sigma_G \gets \text{GroupStats}(\{R^{(j)}\})$
+    \If{$\sigma_G < \epsilon$}
+        \State \textbf{continue} \Comment{No variance: group provides no learning signal}
+    \EndIf
+    \For{$j = 1$ to $G$}
+        \State $A^{(j)} \gets (R^{(j)} - \mu_G) / (\sigma_G + \epsilon)$
+    \EndFor
+
+    \State \textbf{// Stage 1: Trajectory Summarization}
+    \For{$j = 1$ to $G$}
+        \State $\hat{\tau}^{(j)} \gets \text{Summarize}(\tau^{(j)},\, \text{sign}(A^{(j)}))$
+    \EndFor
+
+    \State \textbf{// Stage 2: Group Advantage Extraction}
+    \State $\mathcal{E}_{\text{rel}} \gets \text{Retrieve}(\mathcal{E},\, x_g,\, K_{\text{stage2}}=5)$
+    \State $\Omega^{(g)} \gets \text{ExtractAdvantages}(\{\hat{\tau}^{(j)}\},\, \mathcal{E}_{\text{rel}})$
+    \State $\Omega \gets \Omega \cup \Omega^{(g)}$
+\EndFor
+
+\State \textbf{// Stage 3: Batch Consolidation}
+\State $\Omega^* \gets \text{Consolidate}(\Omega,\, \theta_{\text{dup}})$
+
+\State \textbf{// Apply operations}
+\State $\mathcal{E}' \gets \text{Apply}(\mathcal{E},\, \Omega^*)$
+
+\State \Return $\mathcal{E}'$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.}
+Let $N_g$ be the number of task groups, $G$ the group size, and $L_{\text{LLM}}$
+the cost of a single LLM extraction call. Stage~1 requires $N_g G$ LLM calls.
+Stage~2 requires $N_g$ calls. Stage~3 requires $O(|\Omega|)$ comparisons plus
+at most $|\Omega|$ LLM compression calls. Total cost: $O(N_g(G + 1))$ LLM
+calls, typically 50--200 calls per session at approximately \$0.05--\$0.10
+each, yielding a per-session adaptation cost of \$2.50--\$20.
+
+% ============================================================================
+% 4. SEMANTIC MEMORY MANAGER
+% ============================================================================

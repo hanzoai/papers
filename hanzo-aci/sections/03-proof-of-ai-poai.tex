@@ -1,0 +1,103 @@
+\section{Proof of AI (PoAI)}
+
+\label{sec:poai}
+
+\subsection{Design Goals}
+
+PoAI must satisfy four properties:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Correctness}: Honest computation is always accepted.
+    \item \textbf{Soundness}: Incorrect computation is detected with high probability.
+    \item \textbf{Efficiency}: Verification cost is a small fraction of computation cost.
+    \item \textbf{Incentive compatibility}: Rational actors are incentivized to compute honestly.
+\end{enumerate}
+
+\subsection{TEE Attestation}
+
+Workers execute AI jobs within Trusted Execution Environments (Intel SGX, AMD SEV, ARM TrustZone)~\cite{costan2016intel}. The TEE generates a hardware-signed attestation:
+
+\begin{definition}[PoAI Attestation]
+An attestation is a tuple $\sigma = (h_{\text{input}}, h_{\text{output}}, h_{\text{model}}, t, \text{metrics}, \text{sig}_{\text{TEE}})$ where:
+\begin{itemize}[leftmargin=1.1em]
+    \item $h_{\text{input}} = \text{SHA-256}(\text{input})$: Hash of job input.
+    \item $h_{\text{output}} = \text{SHA-256}(\text{output})$: Hash of job output.
+    \item $h_{\text{model}} = \text{SHA-256}(\text{model weights})$: Hash of model used.
+    \item $t$: Execution timestamp and duration.
+    \item $\text{metrics}$: GPU utilization, memory usage, floating-point operations count.
+    \item $\text{sig}_{\text{TEE}}$: Hardware signature from the TEE enclave.
+\end{itemize}
+\end{definition}
+
+\subsection{Statistical Verification}
+
+TEE attestations can be forged if the TEE hardware is compromised. PoAI adds a statistical verification layer:
+
+\begin{algorithm}[H]
+\caption{PoAI Statistical Verification}
+\label{alg:poai}
+\begin{algorithmic}[1]
+\Require Attestation $\sigma$, sampling rate $\alpha = 0.003$
+\State \Comment{Level 1: Attestation validation}
+\State Verify TEE signature $\text{sig}_{\text{TEE}}$
+\State Verify hash chain: $h_{\text{input}}, h_{\text{output}}, h_{\text{model}}$
+\State Verify metrics consistency (FLOPs vs. model size vs. duration)
+\State \Comment{Level 2: Statistical sampling}
+\State Draw $u \sim \text{Uniform}(0, 1)$
+\If{$u < \alpha$} \Comment{Selected for full verification}
+    \State Re-execute job on a verifier node
+    \State Compare output hashes: $h_{\text{output}}' \stackrel{?}{=} h_{\text{output}}$
+    \If{mismatch}
+        \State Initiate dispute resolution
+    \EndIf
+\EndIf
+\State \Comment{Level 3: Quality scoring}
+\State If inference: compare output distribution with reference
+\State Update worker quality score: $q_j \gets \alpha \cdot \text{result} + (1-\alpha) \cdot q_j$
+\State \Return verification result
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Handling Non-Determinism}
+
+LLM inference is non-deterministic due to floating-point ordering and sampling. PoAI handles this via:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Seed pinning}: Workers use a deterministic seed derived from the job hash. Verification re-executes with the same seed.
+    \item \textbf{Distribution matching}: For sampling-based generation, we compare the output distribution rather than exact tokens. The KL divergence between the worker's output distribution and the reference must be below a threshold $\epsilon_{\text{KL}}$.
+    \item \textbf{Approximate matching}: For numerical outputs (embeddings, logits), we allow element-wise error up to $\epsilon_{\text{num}} = 10^{-4}$ to account for floating-point non-associativity.
+\end{enumerate}
+
+\begin{theorem}[PoAI Detection Rate]
+\label{thm:detection}
+With sampling rate $\alpha$ and $N$ jobs per verification epoch, the probability of detecting a worker who deviates on fraction $\delta$ of their jobs is:
+\begin{equation}
+P(\text{detect}) = 1 - (1 - \alpha)^{\delta N}.
+\end{equation}
+For $\alpha = 0.003$, $N = 10{,}000$, $\delta = 0.01$: $P(\text{detect}) = 1 - (1-0.003)^{100} = 0.259$. Over 10 epochs: $P = 1 - (1-0.259)^{10} = 0.953$.
+\end{theorem}
+
+The key insight is that workers who cheat on even 1\% of jobs are detected with 95.3\% probability within 10 epochs (10 hours), and the slashing penalty far exceeds the savings from cheating.
+
+\subsection{Slashing Conditions}
+
+Workers are slashed (lose staked collateral) for:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Violation} & \textbf{Slash \%} & \textbf{Detection Method} \\
+\midrule
+Wrong output (verified) & 100\% & Statistical sampling \\
+Invalid attestation & 50\% & Signature verification \\
+Timeout ($> 2\times$ SLA) & 10\% & Deadline monitoring \\
+Quality below threshold & 5\%/epoch & Quality score decay \\
+Sybil detected & 100\% & Network analysis \\
+\bottomrule
+\end{tabular}
+\caption{PoAI slashing conditions.}
+\label{tab:slashing}
+\end{table}
+

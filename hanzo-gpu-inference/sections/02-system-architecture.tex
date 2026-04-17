@@ -1,0 +1,74 @@
+\section{System Architecture}
+
+\label{sec:arch}
+% ============================================================================
+
+The inference stack consists of four layers, each with well-defined interfaces.
+
+\begin{definition}[Inference Request]
+An inference request $r = (m, \mathbf{x}, \theta, \tau)$ consists of a model
+identifier $m$, input token sequence $\mathbf{x} \in \mathcal{V}^n$,
+generation parameters $\theta$ (temperature, top-$p$, max tokens), and a
+latency class $\tau \in \{\texttt{realtime}, \texttt{standard}, \texttt{batch}\}$.
+\end{definition}
+
+\subsection{Request Ingress}
+
+Requests enter through Hanzo Gateway~\cite{hanzogateway}, which performs:
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Authentication}: JWT validation via Hanzo IAM. Organization
+    extracted from the \texttt{owner} claim. All subsequent operations scoped
+    to the authenticated org.
+    \item \textbf{Rate limiting}: Token-bucket rate limiting per org, with burst
+    allowance proportional to subscription tier.
+    \item \textbf{Model resolution}: Maps model aliases (e.g.,
+    \texttt{zen-large}) to specific model versions and quantization levels.
+    \item \textbf{Priority assignment}: Determines latency class $\tau$ from
+    request headers and org SLA configuration.
+\end{enumerate}
+
+\subsection{Router Layer}
+
+The router maintains a real-time view of cluster state and selects the optimal
+GPU node for each request.
+
+\begin{definition}[GPU Node State]
+A GPU node $g$ exposes state $\sigma_g = (M_g, U_g, Q_g, T_g)$ where $M_g$ is
+the set of loaded models, $U_g \in [0,1]$ is current utilization, $Q_g$ is
+queue depth, and $T_g$ is GPU temperature in Celsius.
+\end{definition}
+
+The routing function minimizes expected latency subject to load balancing:
+\begin{equation}
+g^* = \arg\min_{g \in \mathcal{G}} \left[ \alpha \cdot \hat{L}(r, g) +
+\beta \cdot U_g + \gamma \cdot \mathbb{1}[m \notin M_g] \cdot C_{\text{load}} \right],
+\label{eq:routing}
+\end{equation}
+where $\hat{L}(r, g)$ is estimated latency, $C_{\text{load}}$ is the cold-load
+penalty, and $\alpha, \beta, \gamma$ are tunable weights.
+
+\subsection{Inference Engine}
+
+Each GPU node runs the Candle-based inference engine with the following
+components:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Model registry}: In-GPU-memory model cache with LRU eviction.
+    \item \textbf{KV-cache manager}: PagedAttention~\cite{vllm2023} implementation
+    managing key-value cache blocks across concurrent sequences.
+    \item \textbf{Batch scheduler}: Continuous batching engine that adds and
+    removes sequences from the running batch at each iteration step.
+    \item \textbf{Decode kernel}: Fused attention + sampling kernel compiled
+    for the specific GPU architecture (SM90 for H100, SM80 for A100).
+\end{itemize}
+
+\subsection{Metrics and Observability}
+
+Every inference request emits structured metrics to Prometheus:
+\begin{itemize}[leftmargin=1.1em]
+    \item Time-to-first-token (TTFT), inter-token latency (ITL), total latency.
+    \item GPU memory utilization, compute utilization, power draw.
+    \item Batch size, queue depth, cache hit rate.
+    \item Per-org request count, token count, error rate.
+\end{itemize}
+
+% ============================================================================

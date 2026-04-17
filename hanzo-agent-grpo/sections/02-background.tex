@@ -1,0 +1,120 @@
+\section{Background}
+
+\label{sec:background}
+
+\subsection{Group-Relative Policy Optimization}
+
+GRPO~\cite{shao2024deepseekmath} extends the REINFORCE
+algorithm~\cite{williams1992simple} by computing advantages relative to a
+group of simultaneously generated rollouts, eliminating the need for a learned
+value baseline. Given task $x$, a group of $G$ rollouts
+$\{y^{(i)}\}_{i=1}^G \sim \pi_\theta(\cdot \mid x)$, and associated scalar
+rewards $\{r^{(i)}\}_{i=1}^G$, the group-relative advantage is:
+\begin{equation}
+    A^{(i)} = \frac{r^{(i)} - \mu_G}{\sigma_G + \epsilon},
+    \quad \mu_G = \frac{1}{G}\sum_{j=1}^G r^{(j)},
+    \quad \sigma_G = \sqrt{\frac{1}{G-1}\sum_{j=1}^G (r^{(j)} - \mu_G)^2},
+    \label{eq:grpo-advantage}
+\end{equation}
+with $\epsilon = 10^{-8}$ for numerical stability. Standard GRPO then performs
+a clipped policy gradient update on $\theta$:
+\begin{equation}
+    \mathcal{L}_{\text{GRPO}}(\theta) = -\frac{1}{G}\sum_{i=1}^G \min\!\left(
+        \rho^{(i)} A^{(i)},\; \text{clip}(\rho^{(i)}, 1{-}\delta, 1{+}\delta) A^{(i)}
+    \right) + \lambda_{\text{KL}}\,\KL\bigl[\pi_\theta \| \pi_{\text{ref}}\bigr],
+    \label{eq:grpo-loss}
+\end{equation}
+where $\rho^{(i)} = \pi_\theta(y^{(i)} \mid x) / \pi_{\text{old}}(y^{(i)} \mid x)$
+is the importance weight and $\pi_{\text{ref}}$ is a reference policy.
+
+\subsection{Training-Free GRPO (TF-GRPO)}
+
+TF-GRPO~\cite{hanzo2026aso} replaces the gradient update in
+Equation~\eqref{eq:grpo-loss} with a semantic extraction and compression
+pipeline. The key insight is that the advantages $\{A^{(i)}\}$ encode
+\emph{what makes one solution better than another} in a form that can be
+distilled into reusable natural-language patterns, called \emph{semantic
+advantages}:
+\begin{equation}
+    S^{(i)} = \mathcal{F}_{\text{LLM}}\!\left(x,\;\{y^{(j)}, r^{(j)}\}_{j=1}^G,\; i\right),
+    \label{eq:semantic-advantage}
+\end{equation}
+where $\mathcal{F}_{\text{LLM}}$ denotes an LLM-based extraction call that
+produces a structured text description of why rollout $i$ outperformed or
+underperformed the group mean.
+
+These semantic advantages are then compressed into 1-bit token-level expert
+factors and applied at decode time via a Product-of-Experts (PoE)
+distribution~\cite{hinton2002training}:
+\begin{equation}
+    \pi_{\text{ASO}}(y_t \mid x, y_{<t}) \propto \pi_\theta(y_t \mid x, y_{<t})
+    \prod_{m=1}^{M} \phi_m(y_t \mid x, y_{<t})^{\eta_m},
+    \label{eq:poe}
+\end{equation}
+where $\eta_m = \log(q_m / (1 - q_m))$ and $q_m \in (0,1)$ is the quality
+attestation score for prior $m$. The composite reward used in ASO is:
+\begin{equation}
+    g^{(i)} = \alpha\, r^{(i)} + \beta\, u^{(i)},
+    \label{eq:aso-reward}
+\end{equation}
+where $r^{(i)}$ is the extrinsic reward (test pass rate) and $u^{(i)}$ is the
+epistemic reward (solution diversity and novelty).
+
+\subsection{The YouTou-Agent Three-Stage Pipeline}
+
+\cite{tencent2025youtoagent} propose a three-stage pipeline for extracting
+reusable experiences from groups of LLM trajectories:
+
+\begin{description}[leftmargin=1.5em, font=\normalfont\bfseries]
+    \item[Stage 1 -- Trajectory Summarization.]
+    Each individual trajectory $\tau^{(i)}$ in a group is summarized into a
+    structured description of the reasoning steps, decisions, and outcomes. The
+    summary is constrained to at most 32 words and must identify the key
+    decision that differentiated this trajectory from a baseline.
+
+    \item[Stage 2 -- Group Advantage Extraction.]
+    Given $G$ summaries from Stage~1, the group is analyzed as a unit. The
+    extractor identifies patterns that distinguish high-reward trajectories from
+    low-reward ones, and produces \emph{operations} on an experience library
+    $\mathcal{E}$: \textsc{add} new experiences, \textsc{modify} existing ones,
+    \textsc{delete} outdated entries, or \textsc{merge} near-duplicate entries.
+
+    \item[Stage 3 -- Batch Consolidation.]
+    Multiple Stage-2 outputs (from different task groups within a session) are
+    consolidated to remove redundancies, resolve conflicts, and ensure no single
+    experience exceeds 32 words. The final set of operations is applied atomically
+    to $\mathcal{E}$.
+\end{description}
+
+The original YouTou-Agent framework applies this pipeline to text-only LLM
+outputs. Agent-GRPO adapts all three stages to the richer structure of
+tool-use trajectories.
+
+\subsection{Agent Trajectories vs.\ Text Trajectories}
+\label{sec:traj-comparison}
+
+A text-only trajectory $\tau_{\text{text}} = (x, y, r)$ consists of a task
+$x$, a text output $y$, and a scalar reward $r$. An agent trajectory carries
+strictly more information:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Tool selection sequence:} which tools were called, and in what
+          order.
+    \item \textbf{Parameter choices:} the arguments passed to each tool,
+          reflecting the agent's understanding of the task.
+    \item \textbf{Intermediate outputs:} the return values of each tool call,
+          observable during execution.
+    \item \textbf{Per-step success signals:} whether each tool call succeeded
+          or raised an error, providing dense local reward information.
+    \item \textbf{Recovery patterns:} how the agent responded to errors---by
+          retrying, switching tools, or escalating.
+\end{itemize}
+
+This richer signal structure makes agent trajectories both more informative
+and more complex to process. The three-stage pipeline must be extended to
+handle sequences of (tool, parameters, output, success) tuples rather than
+single text outputs.
+
+% ============================================================================
+% 3. AGENT-LEVEL GRPO
+% ============================================================================

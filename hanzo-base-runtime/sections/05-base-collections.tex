@@ -1,0 +1,66 @@
+\section{Base Collections}
+
+\label{sec:collections}
+% ============================================================================
+
+Collections are Base's data model. A collection is a named set of records with
+a schema that is enforced but not rigid. Fields can be added at any time.
+Fields can have types, defaults, validation rules, and encryption directives.
+
+\subsection{Schema Model}
+
+Collections use a schema-on-write model. Every record in a collection shares
+the same field set, but the field set can evolve:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Add field}: New fields are added with a default value. Existing
+    records gain the field lazily on next read or write.
+    \item \textbf{Remove field}: Fields are marked deleted. Data is retained
+    but hidden from the API. Physical deletion is a separate admin action.
+    \item \textbf{Rename field}: Renames are tracked in the migration log,
+    preserving query compatibility via aliases.
+    \item \textbf{Type change}: Prohibited. A new field must be created and the
+    old field deprecated.
+\end{itemize}
+
+\subsection{Access Rules}
+
+Every collection has three access rule sets: \texttt{listRule},
+\texttt{viewRule}, and \texttt{createRule}/\texttt{updateRule}/\texttt{deleteRule}.
+Rules are expressions evaluated against the request context:
+
+\begin{lstlisting}[language=JavaScript,caption={Collection access rules.}]
+// Only the record owner can view
+viewRule: "@request.auth.id = id"
+
+// Org members can list
+listRule: "@request.auth.org = org_id"
+
+// Admins can delete
+deleteRule: "@request.auth.role = 'admin'"
+\end{lstlisting}
+
+Rules compose with boolean operators (\texttt{\&\&}, \texttt{||}). A missing
+rule defaults to deny. There is no ambient read or write access.
+
+\subsection{Field-Level KMS Encryption}
+
+Individual fields can be marked as encrypted. Encrypted fields are stored as
+ciphertext in the SQLite database and decrypted only when returned to an
+authorized requester. The encryption key for each field is managed by
+Hanzo KMS (kms.hanzo.ai):
+
+\begin{equation}
+c_f = \text{AES-256-GCM}(k_f, \text{nonce}, \text{plaintext}_f, \text{aad})
+\end{equation}
+
+where $k_f$ is the field-specific data encryption key (DEK), itself encrypted
+by a key encryption key (KEK) stored in KMS. The AAD (additional authenticated
+data) includes the record ID and collection name, binding the ciphertext to
+its context.
+
+Use cases: social security numbers, medical records, API keys, private notes.
+The database administrator (or an attacker who compromises the database file)
+sees only ciphertext for encrypted fields.
+
+% ============================================================================

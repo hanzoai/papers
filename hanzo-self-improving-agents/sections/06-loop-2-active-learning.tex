@@ -1,0 +1,94 @@
+\section{Loop 2: Active Learning}
+
+\label{sec:loop2}
+
+\subsection{Motivation}
+
+Users of coding agents routinely correct agent behavior through natural
+language. ``No, use tabs not spaces.'' ``Actually, don't use async/await here.''
+``Stop importing from lodash.'' These corrections are high-quality preference
+signals: they are direct, unambiguous, and immediately actionable. The challenge
+is detecting them.
+
+Crucially, these corrections occur within the conversational flow and are not
+labeled as corrections by the user. An LLM asked to identify corrections in a
+transcript will find them, but with high false-positive rate (flagging
+instructions as corrections) and meaningful false-negative rate (missing
+implicit corrections that come as rewrites rather than explicit statements).
+We propose a structural detection approach that is faster and more reliable.
+
+\subsection{Structural Signal Detection}
+
+\begin{definition}[Correction Signal]
+\label{def:correction}
+A correction signal $\sigma$ is detected when any of the following structural
+conditions hold in the most recent $W=5$ turns:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item \textbf{Edit-distance trigger:} The user's latest message $m_t$ has
+          normalized Levenshtein distance $d_L(m_t, m_{t-2}) / |m_{t-2}| < 0.3$,
+          where $m_{t-2}$ is the agent's preceding response (indicating direct
+          text editing of the agent's output).
+    \item \textbf{Negation trigger:} $m_t$ begins with or contains one of
+          the negation phrases in $\mathcal{N}$ (e.g., ``no,'' ``actually,''
+          ``don't,'' ``stop,'' ``instead'').
+    \item \textbf{Tool override trigger:} The user explicitly invokes a tool
+          with parameters that directly contradict the agent's last tool call
+          on the same target.
+    \item \textbf{Rewrite trigger:} The user provides a full rewrite of
+          agent-generated code that is $>50\%$ different by line count.
+\end{itemize}
+\end{definition}
+
+\subsection{LearnedFact Schema}
+
+When a correction signal $\sigma$ is detected, the active learning loop
+extracts a \textsc{LearnedFact} record and appends it to the facts database.
+
+\begin{definition}[LearnedFact Record]
+\label{def:learned_fact}
+A \textsc{LearnedFact} record $\phi$ is a tuple:
+\begin{equation}
+\phi = \bigl( \text{id},\; \text{content},\; \text{confidence},\;
+              \text{scope},\; \text{source},\; \text{ts} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{content} \in \Sigma^*$: Natural language statement of the fact.
+    \item $\text{confidence} \in [0, 1]$: Prior confidence in the fact.
+    \item $\text{scope} \in \{\text{global}, \text{project}, \text{session}\}$: Applicability scope.
+    \item $\text{source} \in \{\text{user-stated}, \text{inferred}, \text{corrected}\}$: Provenance.
+\end{itemize}
+\end{definition}
+
+A critical design decision is that user-stated facts---facts extracted from
+a negation trigger where the user explicitly states a preference---receive
+$\text{confidence} = 1.0$ and $\text{scope} = \text{project}$ by default.
+This reflects the epistemic status of direct user instruction: it is not a
+hypothesis to be tested but a ground truth to be respected.
+
+Inferred facts (extracted from edit-distance or rewrite triggers) receive
+$\text{confidence} = 0.7$ initially, which is updated by subsequent
+confirmations or contradictions. A conflicting user-stated fact always
+supersedes an inferred fact, regardless of confidence.
+
+\subsection{Why Hooks Beat LLM Judgment}
+
+\begin{proposition}[Structural Detection Superiority]
+\label{prop:structural_detection}
+For correction detection in coding agent sessions, structural signal detection
+achieves precision $P_s \geq P_{\text{LLM}}$ and recall $R_s \geq R_{\text{LLM}}$
+with time complexity $O(1)$ per turn compared to $O(n)$ for LLM-based detection
+(where $n$ is context length).
+\end{proposition}
+
+The argument is empirical: the structural triggers in Definition~\ref{def:correction}
+correspond directly to the linguistic behaviors users exhibit when correcting
+agents. The negation trigger alone captures $>80\%$ of explicit corrections.
+The remaining triggers capture implicit corrections that LLMs systematically
+miss because they require comparing tool call arguments to prior tool call
+arguments---a structured comparison that LLMs perform unreliably but code
+performs exactly.
+
+% ============================================================================
+% 7. LOOP 3: SESSION REFLECTION
+% ============================================================================

@@ -1,0 +1,124 @@
+\section{Three-Layer Semantic Storage Architecture}
+
+\label{sec:architecture}
+
+DSO employs a three-layer architecture optimizing for different properties at
+each level.
+
+\subsection{Layer 1: On-Chain Registry (Integrity)}
+
+The ExperienceRegistry smart contract stores metadata and integrity proofs for
+each submitted prior. No prior data is stored on-chain; only cryptographic
+commitments.
+
+\begin{definition}[Registry Entry]
+A registry entry $\mathcal{R}_i$ consists of:
+\begin{equation}
+    \mathcal{R}_i = \left(\texttt{merkleRoot}_i, \; \texttt{cid}_i, \;
+    \texttt{schema}_i, \; q_i, \; \texttt{addr}_i, \; D_i, \; t_i\right),
+\end{equation}
+where $\texttt{merkleRoot}_i$ is the Merkle root of the prior data,
+$\texttt{cid}_i$ is the content identifier on IPFS/Arweave, $\texttt{schema}_i$
+identifies the decomposition schema, $q_i$ is the quality score, $\texttt{addr}_i$
+is the submitter's address, $D_i$ is the bond amount, and $t_i$ is the
+submission timestamp.
+\end{definition}
+
+\paragraph{Contract Interface.}
+\begin{verbatim}
+interface IExperienceRegistry {
+    struct Entry {
+        bytes32 merkleRoot;
+        string  cid;             // IPFS or Arweave content ID
+        uint64  schema;          // Schema version identifier
+        uint64  quality;         // Quantized quality [0, 1000]
+        address submitter;       // Submitter address
+        uint256 bond;            // Staked bond amount
+        uint64  timestamp;       // Submission block timestamp
+    }
+
+    function submit(Entry calldata e)
+        external payable returns (uint256 id);
+
+    function voteQuality(uint256 id, uint64 score)
+        external;
+
+    function challenge(uint256 id, bytes calldata proof)
+        external returns (bool slashed);
+
+    function aggregate(uint256[] calldata ids)
+        external returns (bytes32 aggregateMerkleRoot);
+
+    function getEntry(uint256 id)
+        external view returns (Entry memory);
+
+    function getEntriesBySchema(uint64 schema)
+        external view returns (uint256[] memory ids);
+}
+\end{verbatim}
+
+\subsection{Layer 2: Content-Addressed Storage (Availability)}
+
+Prior data is stored on IPFS~\cite{benet2014ipfs} or
+Arweave~\cite{williams2019arweave} for persistent availability. Each prior is
+serialized as a Protocol Buffer message:
+
+\begin{verbatim}
+message ExperiencePrior {
+    bytes   delta_signs = 1;     // Packed 1-bit signs
+    float   scale = 2;          // Per-expert scale factor
+    float   quality = 3;        // Quality score
+    bytes   context_predicate = 4; // Serialized matching fn
+    bytes   task_embedding = 5;  // d-dimensional embedding
+    uint64  vocab_size = 6;     // |V_m|
+    repeated uint32 vocab_indices = 7; // Sparse support
+    bytes   merkle_proof = 8;   // Proof of inclusion
+}
+\end{verbatim}
+
+The content identifier (CID) is the SHA-256 hash of the serialized message,
+ensuring deduplication and integrity verification.
+
+\subsection{Layer 3: Local Replica Database (Performance)}
+
+Each node maintains a local LanceDB~\cite{lancedb2024} instance containing
+replicas of high-quality priors. The local database supports:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Vector search:} Nearest-neighbor queries over task embeddings
+          for prior retrieval in $O(\log N)$ time.
+    \item \textbf{CRDT semantics:} Conflict-free merge of priors from multiple
+          sources using last-writer-wins with quality-based tie-breaking.
+    \item \textbf{Garbage collection:} Automatic eviction of priors with quality
+          below $q_{\min}$ or age exceeding $T_{\max}$.
+    \item \textbf{Offline operation:} Full functionality without network access
+          using cached priors.
+\end{itemize}
+
+\begin{definition}[Replica Consistency]
+A local replica $L_i$ is \emph{$\tau$-consistent} with the registry if for
+every entry $\mathcal{R}_j$ with $q_j \geq q_{\text{fetch}}$ and
+$t_j \leq t_{\text{now}} - \tau$, the corresponding prior data is present in
+$L_i$ and its Merkle proof verifies against $\texttt{merkleRoot}_j$.
+\end{definition}
+
+\subsection{Cross-Layer Integrity}
+
+The three layers are connected by cryptographic commitments:
+
+\begin{proposition}[End-to-End Integrity]
+For any prior with registry entry $\mathcal{R}_i$, a verifier can confirm that
+the local replica data $E_i$ is authentic by:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Computing the Merkle root of $E_i$ and comparing with
+          $\texttt{merkleRoot}_i$ from the on-chain registry.
+    \item Verifying the CID of the serialized data matches $\texttt{cid}_i$.
+    \item Checking the Merkle proof within the serialized data.
+\end{enumerate}
+Any modification to the prior data is detected with probability
+$1 - 2^{-256}$ (collision resistance of SHA-256).
+\end{proposition}
+
+% ============================================================================
+% 4. DSO PROTOCOL SPECIFICATION
+% ============================================================================

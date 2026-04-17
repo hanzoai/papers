@@ -1,0 +1,206 @@
+\section{The Harness-Hacker Protocol}
+
+\label{sec:protocol}
+
+\subsection{Protocol Overview}
+\label{sec:protocol-overview}
+
+The Harness-Hacker Protocol specifies a six-state machine governing
+self-modification attempts. Figure~\ref{fig:state-machine} summarizes the
+transitions; Algorithm~\ref{alg:hhp} provides the complete pseudocode.
+
+\begin{figure}[H]
+\centering
+\setlength{\fboxsep}{8pt}
+\fbox{%
+\begin{minipage}{0.9\textwidth}
+\centering
+\textbf{HHP State Machine}
+
+\vspace{6pt}
+$\texttt{DETECT} \;\xrightarrow{\text{scope classified}}\; \texttt{ISOLATE}
+\;\xrightarrow{\text{worktree created}}\; \texttt{MODIFY}$
+
+\vspace{4pt}
+$\texttt{MODIFY} \;\xrightarrow{\text{diff produced}}\; \texttt{TEST}
+\;\xrightarrow{\Gamma_k = \text{pass}}\; \texttt{GATE}
+\;\xrightarrow{\text{approved}}\; \texttt{DEPLOY}$
+
+\vspace{4pt}
+$\texttt{TEST} \;\xrightarrow{\Gamma_k = \text{fail}}\; \texttt{MODIFY}$
+\quad (max 3 fix attempts)
+
+\vspace{4pt}
+$\texttt{GATE} \;\xrightarrow{\text{rejected}}\; \texttt{DETECT}$
+\quad (friction event archived, no modification)
+\end{minipage}
+}
+\caption{The six-state HHP state machine. Self-loops between MODIFY and TEST
+are bounded at three attempts before the hack cycle is abandoned.}
+\label{fig:state-machine}
+\end{figure}
+
+\subsection{State Transition Specifications}
+\label{sec:transitions}
+
+\paragraph{DETECT.}
+\textbf{Precondition:} A friction event $\mathcal{F} = (\tau, e, n)$ has been
+observed. \\
+\textbf{Action:} Classify the friction into a modification scope
+$k \in \{1, 2, 3, 4\}$ using Algorithm~\ref{alg:classify}. \\
+\textbf{Postcondition:} Scope $k$ is determined and the modification session
+budget is checked: $\text{SessionHacks} < 2$.
+
+\paragraph{ISOLATE.}
+\textbf{Precondition:} Scope $k$ and target component $\mathcal{R}$ are
+determined. \\
+\textbf{Action:} For $k \in \{2, 3, 4\}$: create a git worktree
+\texttt{git worktree add /tmp/hack-\$ID origin/main}. For $k = 1$: allocate
+an in-process sandbox. \\
+\textbf{Postcondition:} Isolation environment $B$ exists and satisfies
+Definition~\ref{def:isolation}. The running system state $\Sigma$ is unchanged.
+
+\paragraph{MODIFY.}
+\textbf{Precondition:} Isolation environment $B$ is established. \\
+\textbf{Action:} The agent writes modifications within $B$, producing diff
+$\Delta$. For Tier 1, this is an executable function. For Tiers 2--4, this is
+git-tracked source changes. \\
+\textbf{Postcondition:} $\Delta$ is complete and syntactically valid. Fix
+attempt counter is incremented if this is a re-entry from TEST.
+
+\paragraph{TEST.}
+\textbf{Precondition:} $\Delta$ is complete. \\
+\textbf{Action:} Apply validation gate $\Gamma_k(\Delta, \Sigma)$. \\
+\textbf{Postcondition:} If $\Gamma_k = \text{pass}$, transition to GATE.
+If $\Gamma_k = \text{fail}$ and fix-attempts $< 3$, transition back to MODIFY
+with the failure details appended to context. If fix-attempts $= 3$, abandon
+the hack cycle, archive the friction event, and return to normal operation.
+
+\paragraph{GATE.}
+\textbf{Precondition:} $\Gamma_k(\Delta, \Sigma) = \text{pass}$. \\
+\textbf{Action:} Submit $\Delta$ to the tier-appropriate gate:
+Tier 1: register immediately (gate is $\Gamma_1$, already passed in TEST).
+Tiers 2--3: invoke automated reviewer.
+Tier 4: open pull request on target repository. \\
+\textbf{Postcondition:} Deployment decision is received ($\text{approved}$ or
+$\text{rejected}$).
+
+\paragraph{DEPLOY.}
+\textbf{Precondition:} Gate decision is $\text{approved}$. \\
+\textbf{Action:} Apply $D_k(\Delta)$ (tier-appropriate deployment). \\
+\textbf{Postcondition:} Modification is live. Session hack counter is
+incremented. Worktree is cleaned up: \texttt{git worktree remove --force \$B}.
+
+\subsection{The HARNESS-HACK Algorithm}
+\label{sec:algorithm}
+
+\begin{algorithm}[H]
+\caption{HARNESS-HACK: Safe Agent Self-Modification}
+\label{alg:hhp}
+\begin{algorithmic}[1]
+\Require Friction event $\mathcal{F} = (\tau, e, n)$, session hack counter $H$
+\Ensure Modification deployed or friction archived; $H$ updated
+\If{$H \geq 2$}
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``session limit reached''
+    \State \Return \Comment{Maximum 2 hacks per session}
+\EndIf
+\State \texttt{// DETECT: classify scope}
+\State $k \gets \text{ClassifyScope}(\mathcal{F})$ \Comment{Algorithm~\ref{alg:classify}}
+\State $\mathcal{R} \gets \text{TargetComponent}(k, \tau)$
+\State \texttt{// ISOLATE: create environment}
+\If{$k = 1$}
+    \State $B \gets \text{InProcessSandbox}()$
+\Else
+    \State $B \gets \text{GitWorktree}(\mathcal{R}, \texttt{origin/main})$
+    \State \textbf{assert} $B.\text{rootDir} \cap \mathcal{F}_{\text{system}} = \emptyset$
+\EndIf
+\State $\text{fixAttempts} \gets 0$
+\Repeat \Comment{MODIFY--TEST loop}
+    \State \texttt{// MODIFY: generate change}
+    \State $\Delta \gets \text{AgentWrite}(\mathcal{F}, k, B, \text{failureContext})$
+    \State \texttt{// TEST: validate}
+    \State $\text{result} \gets \Gamma_k(\Delta, \Sigma)$
+    \State $\text{fixAttempts} \gets \text{fixAttempts} + 1$
+    \If{$\text{result} = \text{fail}$}
+        \State $\text{failureContext} \gets \text{ExtractFailureDetails}(\Delta)$
+    \EndIf
+\Until{$\text{result} = \text{pass}$ \textbf{or} $\text{fixAttempts} \geq 3$}
+\If{$\text{result} = \text{fail}$}
+    \State \textbf{Cleanup}($B$) \Comment{Remove worktree}
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``validation failed after 3 attempts''
+    \State \Return
+\EndIf
+\State \texttt{// GATE: request approval}
+\State $\text{decision} \gets \text{GateRequest}(k, \Delta)$
+\If{$\text{decision} = \text{rejected}$}
+    \State \textbf{Cleanup}($B$)
+    \State \textbf{Archive} $\mathcal{F}$ with reason ``gate rejected''
+    \State \Return
+\EndIf
+\State \texttt{// DEPLOY: apply modification}
+\State $D_k(\Delta)$ \Comment{Tier-appropriate deployment}
+\State \textbf{Cleanup}($B$) \Comment{git worktree remove --force}
+\State $H \gets H + 1$
+\State \textbf{Record} $(\Delta, k, \tau, \text{timestamp})$ in experience bank
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{ClassifyScope: Map Friction to Modification Tier}
+\label{alg:classify}
+\begin{algorithmic}[1]
+\Require Friction event $\mathcal{F} = (\tau, e, n)$
+\Ensure Tier $k \in \{1, 2, 3, 4\}$
+\If{$n < 3$ \textbf{and} $e$ is session-local}
+    \State \Return $1$ \Comment{Runtime tool: transient gap}
+\ElsIf{$e$ is a missing capability \textbf{and} no existing extension covers $\tau$}
+    \State \Return $2$ \Comment{Extension: persistent gap in this agent's harness}
+\ElsIf{$e$ is a knowledge or procedure gap \textbf{and} $n > 5$}
+    \State \Return $3$ \Comment{Skill: recurring knowledge gap}
+\ElsIf{$e$ is a system design gap affecting multiple agents}
+    \State \Return $4$ \Comment{Cross-component: ecosystem-level fix needed}
+\Else
+    \State \Return $1$ \Comment{Default: safest tier}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Session Budget and Time-Boxing}
+\label{sec:budget}
+
+To prevent the modification loop from consuming unbounded session resources,
+HHP enforces two constraints:
+
+\begin{invariant}[Session Modification Budget]
+In any single agent session, the total number of completed modifications
+(successful DEPLOY transitions) is bounded by $H_{\max} = 2$.
+\end{invariant}
+
+\begin{invariant}[Hack Cycle Time-Box]
+Each execution of HARNESS-HACK is bounded by a wall-clock timeout of
+$T_{\text{hack}} = 5$ minutes. If the timeout is reached before DEPLOY,
+the hack cycle is abandoned and the friction event is archived.
+\end{invariant}
+
+These two invariants together ensure that self-modification overhead is bounded:
+at most $2 \times 5 = 10$ minutes per session can be spent on harness hacking,
+independent of task difficulty or modification complexity.
+
+\begin{theorem}[Session Overhead Bound]
+\label{thm:overhead}
+Under HHP, the fraction of session time spent on self-modification is at most
+$10 / T_{\text{session}}$ where $T_{\text{session}}$ is the total session
+duration.
+\end{theorem}
+
+\begin{proof}
+By Invariants 2 and 3, each session contains at most $H_{\max} = 2$ hack cycles,
+each lasting at most $T_{\text{hack}} = 5$ minutes. Total modification time is
+bounded by $H_{\max} \cdot T_{\text{hack}} = 10$ minutes. Since
+$T_{\text{session}} \geq T_{\text{hack}}$ (a session contains at least one
+cycle), the fraction is at most $10 / T_{\text{session}}$. \qed
+\end{proof}
+
+% ============================================================================
+% 6. INTERACTION WITH CONTINUOUS LEARNING
+% ============================================================================

@@ -1,0 +1,84 @@
+\section{FROST for Ed25519}
+
+\label{sec:frost}
+% ============================================================================
+
+\subsection{Distributed Key Generation}
+
+FROST DKG produces key shares without any party learning the full secret key.
+Each participant $P_i$ acts as both dealer and verifier in a Pedersen
+DKG~\cite{pedersen1991}:
+
+\begin{definition}[$(t, n)$-Secret Sharing]
+A $(t, n)$-Shamir secret sharing of $s \in \mathbb{Z}_q$ distributes shares
+$s_i = f(i)$ where $f(X) = s + \sum_{j=1}^{t-1} a_j X^j$ is a random
+polynomial of degree $t-1$. Any $t$ shares determine $s$; fewer than $t$
+shares reveal no information about $s$.
+\end{definition}
+
+\begin{algorithm}
+\caption{FROST Distributed Key Generation}
+\label{alg:dkg}
+\begin{algorithmic}[1]
+\Require Participants $P_1, \ldots, P_n$, threshold $t$
+\Ensure Public key $Y$, shares $s_1, \ldots, s_n$
+\For{each participant $P_i$}
+    \State Sample random polynomial $f_i(X) = a_{i,0} + \sum_{j=1}^{t-1} a_{i,j} X^j$
+    \State Broadcast commitments $C_{i,j} = a_{i,j} \cdot G$ for $j = 0, \ldots, t-1$
+    \State Send share $f_i(k)$ privately to each $P_k$
+\EndFor
+\For{each participant $P_k$}
+    \State Verify: $f_i(k) \cdot G \stackrel{?}{=} \sum_{j=0}^{t-1} C_{i,j} \cdot k^j$ for all $i$
+    \State Compute combined share: $s_k = \sum_{i=1}^{n} f_i(k)$
+\EndFor
+\State $Y = \sum_{i=1}^{n} C_{i,0}$ \Comment{Combined public key}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[DKG Security]
+The FROST DKG protocol is secure against $t-1$ corrupted participants under
+the discrete logarithm assumption on the Ed25519 curve. No coalition of fewer
+than $t$ participants can reconstruct the secret key $s = \sum_i a_{i,0}$.
+\end{theorem}
+
+\subsection{Threshold Signing}
+
+FROST signing requires two rounds. In the first round, each signer generates
+and broadcasts a nonce commitment. In the second round, each signer produces a
+partial signature using their key share and the aggregated nonce.
+
+\begin{definition}[FROST Signature Share]
+Given message $m$, group nonce $R = \sum_{i \in S} R_i$, and challenge
+$c = H(R \| Y \| m)$, signer $P_i$ with share $s_i$ computes:
+\begin{equation}
+z_i = d_i + e_i \cdot \rho_i + \lambda_i \cdot s_i \cdot c,
+\end{equation}
+where $(d_i, e_i)$ are nonce secrets, $\rho_i = H(i, m, B)$ is the binding
+factor, and $\lambda_i$ is the Lagrange interpolation coefficient for the
+signing set $S$.
+\end{definition}
+
+The aggregated signature $\sigma = (R, z)$ where $z = \sum_{i \in S} z_i$ is a
+standard Ed25519 signature verifiable with the public key $Y$.
+
+\begin{proposition}[Unforgeability]
+FROST signatures are existentially unforgeable under chosen-message attack
+(EUF-CMA) in the random oracle model, assuming the hardness of the discrete
+logarithm problem on Curve25519~\cite{frost}.
+\end{proposition}
+
+\subsection{Nonce Pre-computation}
+
+To reduce signing latency, signers pre-compute nonce pairs during idle periods:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Each signer generates a batch of $B$ nonce pairs $(d_j, e_j)$ and
+    commitments $(D_j, E_j)$.
+    \item Commitments are broadcast and stored by all participants.
+    \item During signing, a pre-computed nonce pair is consumed. No
+    communication is needed in the first round.
+\end{enumerate}
+
+With $B = 10000$ pre-computed nonces, signing reduces to a single round with
+median latency of 8ms (vs.\ 12ms for 2-round signing).
+
+% ============================================================================

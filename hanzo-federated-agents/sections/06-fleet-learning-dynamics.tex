@@ -1,0 +1,117 @@
+\section{Fleet Learning Dynamics}
+
+\label{sec:convergence}
+
+\subsection{Experience Quality Metric}
+
+\begin{definition}[Fleet Experience Quality]
+\label{def:quality-metric}
+The fleet-wide experience quality at round $T$ is:
+\begin{equation}
+    Q^{(T)} = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{|\mathcal{L}_i^{(T)}|}
+    \sum_{E_m \in \mathcal{L}_i^{(T)}} q_m \cdot \Sim(E_m, \mathcal{T}_i),
+    \label{eq:fleet-quality}
+\end{equation}
+where $\Sim(E_m, \mathcal{T}_i)$ is the cosine similarity between the
+experience embedding $\bm{e}_m$ and the mean embedding of node $i$'s
+recent task distribution $\mathcal{T}_i$.
+\end{definition}
+
+$Q^{(T)}$ captures both the intrinsic quality of experiences (via $q_m$) and
+their relevance to each node's task distribution (via $\Sim$). A fleet where
+nodes only receive experiences from irrelevant domains would have high $q_m$
+but low $\Sim$, correctly receiving a low $Q$ score.
+
+\begin{theorem}[Monotonic Fleet Improvement]
+\label{thm:monotone}
+Under Assumptions~\ref{ass:threat}--\ref{ass:diversity}, if DeltaSoup's
+filter threshold $\tau_{\text{filter}}$ is set such that Byzantine experiences
+are excluded with probability $\geq 1 - \delta$ (as in
+Theorem~\ref{thm:deltasoup-robust}), then the expected fleet quality is
+non-decreasing:
+\begin{equation}
+    \mathbb{E}\left[Q^{(T+1)}\right] \geq \mathbb{E}\left[Q^{(T)}\right]
+    - O(\delta).
+    \label{eq:monotone}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+At round $T+1$, each node receives honest experiences from its peers and
+merges them via DeltaSoup. Any honest experience $E_m$ with $\Sim(E_m,
+\mathcal{T}_i) > 0$ and $q_m > 0$ increases the quality of node $i$'s
+library, contributing positively to $Q^{(T+1)}$. Byzantine experiences that
+pass the filter (probability $\leq \delta$ per experience) may decrease
+quality. Taking expectations and applying linearity, the expected quality
+change is $\geq -O(\delta) \cdot |\mathcal{E}_{\text{Byzantine}}|$. Since
+$|\mathcal{E}_{\text{Byzantine}}| = O(f)$ and $f < N/3$, the net expected
+change is non-negative for sufficiently small $\delta$.
+\end{proof}
+
+\subsection{Information Flow Model}
+
+The fleet learning cycle for a single round is:
+\begin{equation}
+    \underbrace{\text{Agent Session}}_{\text{tool calls, outcomes}}
+    \xrightarrow{\text{GRPO}}
+    \underbrace{\text{Local Experiences}}_{\mathcal{L}_i^{(T)}}
+    \xrightarrow{\text{BitDelta}}
+    \underbrace{\text{Compressed Batch}}_{\hat{B}_i}
+    \xrightarrow{\text{Gossip}}
+    \underbrace{\text{Peer Receives}}_{\hat{B}_j, j \neq i}
+    \xrightarrow{\text{DeltaSoup}}
+    \underbrace{\text{Updated Library}}_{\mathcal{L}_j^{(T+1)}}
+    \label{eq:info-flow}
+\end{equation}
+
+\paragraph{Compression-Decompression Semantic Preservation.}
+The information flow~\eqref{eq:info-flow} introduces two lossy steps:
+(i) BitDelta compression (Theorem~\ref{thm:reconstruction}) and
+(ii) DeltaSoup filtering and merging. By Corollary~\ref{cor:cosine},
+BitDelta preserves cosine similarity $\geq 0.95$. The DeltaSoup merge
+(Eq.~\ref{eq:weighted-merge}) is a convex combination within the cluster,
+so the merged embedding remains close to all cluster members. Combined,
+the end-to-end semantic preservation satisfies:
+\begin{equation}
+    \cos(\bm{e}_m, \bm{e}_m^{\text{final}}) \geq 0.95 \cdot 0.95 = 0.9025,
+    \label{eq:end-to-end-cosine}
+\end{equation}
+where $\bm{e}_m^{\text{final}}$ is the embedding after compression,
+broadcast, decompression, and DeltaSoup merge.
+
+\subsection{Specialization vs.\ Generalization}
+
+\paragraph{Domain-Aware Routing.}
+Each experience carries a domain tag (e.g., \texttt{coding}, \texttt{writing},
+\texttt{data-analysis}). During broadcast, nodes may optionally subscribe to
+specific domain tags, filtering incoming batches to relevant domains only.
+This provides two benefits:
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Bandwidth reduction:} A coding agent need not receive
+          marketing-domain experiences.
+    \item \textbf{Quality improvement:} Domain-filtered libraries have higher
+          mean $\Sim(E_m, \mathcal{T}_i)$, directly improving $Q^{(T)}$.
+\end{enumerate}
+
+\paragraph{Fleet Diversity.}
+Despite domain specialization, the fleet benefits from cross-domain transfer
+when tasks span multiple domains. DeltaSoup's confidence-weighted merge
+naturally weights domain-relevant experiences more heavily (as relevant
+experiences tend to have higher $q_m$ from the receiving node's evaluations).
+
+\begin{proposition}[Specialization-Generalization Tradeoff]
+\label{prop:tradeoff}
+Let $\rho \in [0,1]$ be the fraction of received experiences that are in the
+node's primary domain. The fleet quality satisfies:
+\begin{equation}
+    Q^{(T)}(\rho) = \rho \cdot Q_{\text{specialized}}^{(T)}
+                  + (1 - \rho) \cdot Q_{\text{general}}^{(T)},
+\end{equation}
+where $Q_{\text{specialized}}^{(T)} \geq Q_{\text{general}}^{(T)}$ for
+single-domain tasks and $Q_{\text{specialized}}^{(T)} \leq Q_{\text{general}}^{(T)}$
+for multi-domain tasks. The optimal $\rho^*$ depends on task distribution breadth.
+\end{proposition}
+
+% ============================================================================
+% 7. INTEGRATION WITH AGENT HARNESS
+% ============================================================================

@@ -1,0 +1,70 @@
+\section{Cross-Chain Swaps}
+
+
+\subsection{Atomic Swap Protocol}
+
+We implement \textbf{light client bridges} for instant cross-chain verification:
+
+\begin{algorithm}
+\caption{Lux $\leftrightarrow$ Ethereum Atomic Swap}
+\begin{algorithmic}
+\STATE \textbf{Setup}:
+\STATE Lux validator set: $V_L = \{v_1, \ldots, v_n\}$
+\STATE Ethereum light client on Lux: $LC_{ETH}$
+\STATE Lux light client on Ethereum: $LC_{LUX}$
+
+\STATE \textbf{User initiates swap} (100 LUX $\to$ 2 ETH):
+\STATE Lock 100 LUX in escrow contract on Lux
+\STATE Emit event: $E_L = \text{SwapInitiated}(user, 100 LUX)$
+
+\STATE \textbf{Relayers observe event} (50ms):
+\STATE Submit Merkle proof of $E_L$ to Ethereum
+\STATE $LC_{LUX}$ verifies proof against Lux block header
+
+\STATE \textbf{Ethereum executes swap} (12 seconds):
+\STATE If proof valid, release 2 ETH to user
+\STATE Emit event: $E_E = \text{SwapCompleted}(user, 2 ETH)$
+
+\STATE \textbf{Lux finalizes} (200ms):
+\STATE Relayers submit proof of $E_E$ to Lux
+\STATE $LC_{ETH}$ verifies, marks swap complete
+\STATE Burn 100 LUX (or keep in liquidity pool)
+
+\STATE \textbf{Total Time}: 12.25 seconds (dominated by Ethereum)
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Optimization for HFT}: Pre-stage liquidity on both chains, settle later.
+
+\subsection{Sub-500ms Settlement}
+
+For Lux $\leftrightarrow$ Lux appchain swaps:
+
+\begin{enumerate}
+    \item Both chains share validator set
+    \item Atomic transaction executed in single block
+    \item Settlement: 10ms (single GPU BLS consensus round)
+\end{enumerate}
+
+\begin{lstlisting}[language=Go]
+type AtomicSwap struct {
+    ChainA   string  // Source chain
+    ChainB   string  // Dest chain
+    AmountA  uint64
+    AmountB  uint64
+    Timeout  uint64  // Revert if not settled
+}
+
+func (s *AtomicSwap) Execute() error {
+    // Lock assets on both chains simultaneously
+    lockA := s.ChainA.Lock(s.AmountA, s.Timeout)
+    lockB := s.ChainB.Lock(s.AmountB, s.Timeout)
+    
+    // Validators sign both state transitions
+    sig := ValidatorSet.SignAtomic(lockA, lockB)
+    
+    // Finalize in single block
+    return Consensus.FinalizeAtomic(sig)
+}
+\end{lstlisting}
+

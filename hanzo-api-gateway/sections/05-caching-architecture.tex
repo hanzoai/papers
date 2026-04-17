@@ -1,0 +1,71 @@
+\section{Caching Architecture}
+
+
+\subsection{Cache Layers}
+
+\begin{enumerate}
+    \item \textbf{Edge Cache}: CDN caches public, immutable resources
+    \item \textbf{Gateway Cache}: Redis caches frequently accessed data
+    \item \textbf{Origin Cache}: Service-level caching for computed results
+\end{enumerate}
+
+\subsection{Cache Key Generation}
+
+\begin{definition}[Cache Key]
+For request $req$, the cache key is:
+\begin{equation}
+key(req) = hash(req.method, req.path, sort(req.query), req.vary\_headers)
+\end{equation}
+\end{definition}
+
+\subsection{Cache Invalidation}
+
+We implement a publish-subscribe invalidation protocol:
+
+\begin{algorithm}
+\caption{Cache Invalidation}
+\begin{algorithmic}[1]
+\Function{InvalidateCache}{$resource$}
+    \State $keys \gets$ \Call{ComputeAffectedKeys}{$resource$}
+    \For{$key \in keys$}
+        \State \Call{DeleteFromCache}{$key$}
+    \EndFor
+    \State \Call{Publish}{$invalidation\_channel$, $resource$}
+\EndFunction
+
+\Function{OnResourceChange}{$event$}
+    \State $resource \gets event.resource$
+    \State \Call{InvalidateCache}{$resource$}
+    \For{$related \in relationships(resource)$}
+        \State \Call{InvalidateCache}{$related$}
+    \EndFor
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cache Coherence}
+
+\begin{theorem}[Cache Consistency]
+For any read $r$ at time $t$ following a write $w$ at time $t_w < t$:
+\begin{equation}
+t - t_w > \delta_{invalidation} \Rightarrow read(r) \text{ reflects } write(w)
+\end{equation}
+where $\delta_{invalidation}$ is the maximum invalidation propagation delay.
+\end{theorem}
+
+In practice, $\delta_{invalidation} < 100ms$ with our pub-sub architecture.
+
+\subsection{Conditional Requests}
+
+Support for conditional requests reduces bandwidth:
+
+\begin{lstlisting}[caption=Conditional Request]
+# Client sends:
+GET /v1/products/123
+If-None-Match: "abc123"
+
+# Server responds:
+HTTP/1.1 304 Not Modified
+ETag: "abc123"
+\end{lstlisting}
+

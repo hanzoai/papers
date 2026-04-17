@@ -1,0 +1,201 @@
+\section{Implementation}
+
+\label{sec:implementation}
+
+\subsection{TypeScript Plugin Architecture}
+
+The 4-Loop Architecture is implemented as a TypeScript plugin for the Hanzo
+bot SDK. The plugin architecture exposes extension points at each loop
+boundary, allowing downstream integrators to customize trigger thresholds,
+storage backends, and LLM prompts without modifying the core loop logic.
+
+\begin{verbatim}
+interface SelfImprovementPlugin {
+  // Loop 0: Telemetry
+  onToolInvocation(record: ToolInvocation): Promise<void>;
+
+  // Loop 1: Build It Now
+  onBINTrigger(event: BINEvent): Promise<ToolLibraryUpdate | null>;
+
+  // Loop 2: Active Learning
+  onCorrectionSignal(signal: CorrectionSignal): Promise<LearnedFact | null>;
+
+  // Loop 3: Session Reflection
+  onSessionEnd(session: SessionSummary): Promise<SessionReflection>;
+
+  // Loop 4: Maintenance Pass (human-gated)
+  generateMaintenanceProposals(
+    reflections: SessionReflection[],
+    telemetry: TelemetryAggregate
+  ): Promise<MaintenanceProposal[]>;
+}
+\end{verbatim}
+
+\subsection{Telemetry Service}
+
+The telemetry service is the lowest-level component. It intercepts all tool
+invocations via a proxy wrapper around the tool registry, records each
+invocation as a \textsc{ToolInvocation} record, appends to the JSONL log,
+and publishes to NATS JetStream.
+
+\begin{verbatim}
+class TelemetryService {
+  private log: AppendOnlyLog<ToolInvocation>;
+  private nats: NATSClient;
+  private sessionId: number;
+
+  async record(invocation: ToolInvocation): Promise<void> {
+    const record = {
+      ...invocation,
+      id: sha256(JSON.stringify(invocation)),
+      session_id: this.sessionId,
+      ts: Date.now(),
+    };
+    await this.log.append(record);
+    await this.nats.publish(
+      `telemetry.${this.sessionId}.${invocation.tool}`,
+      record
+    );
+  }
+}
+\end{verbatim}
+
+\subsection{Friction Detector}
+
+The friction detector subscribes to the NATS telemetry stream and maintains
+the in-memory counter $C$ from Algorithm~\ref{alg:friction_detect}. It
+emits BINEvents when thresholds are crossed.
+
+\begin{verbatim}
+class FrictionDetector {
+  private counts: Map<string, number> = new Map();
+  private evidence: Map<string, ToolInvocation[]> = new Map();
+  private fired: Set<string> = new Set();
+
+  async processRecord(record: ToolInvocation): Promise<BINEvent | null> {
+    if (record.outcome !== 'failure' || !record.failure_mode) return null;
+
+    const key = `${record.tool}:${record.failure_mode}`;
+    const count = (this.counts.get(key) ?? 0) + 1;
+    this.counts.set(key, count);
+    this.evidence.set(key, [
+      ...(this.evidence.get(key) ?? []),
+      record
+    ]);
+
+    if (count >= this.threshold && !this.fired.has(key)) {
+      this.fired.add(key);
+      return {
+        tool: record.tool,
+        failure_mode: record.failure_mode,
+        evidence: this.evidence.get(key)!,
+      };
+    }
+    return null;
+  }
+}
+\end{verbatim}
+
+\subsection{Active Learning Hooks}
+
+The active learning hooks are registered as message-level observers in the
+bot conversation loop. They examine each user turn for correction signals
+without blocking the conversation.
+
+\begin{verbatim}
+class ActiveLearningHook {
+  private readonly NEGATION_PHRASES =
+    ['no,', "don't", 'stop', 'instead', 'actually',
+     "that's wrong", 'use X not Y'];
+
+  async onUserMessage(
+    message: string,
+    prevAgentResponse: string,
+    prevToolCall?: ToolCall
+  ): Promise<LearnedFact | null> {
+    const signal = this.detectCorrectionSignal(
+      message, prevAgentResponse, prevToolCall
+    );
+    if (!signal) return null;
+
+    return await this.extractFact(message, signal);
+  }
+
+  private detectCorrectionSignal(
+    msg: string,
+    prevResponse: string,
+    prevToolCall?: ToolCall
+  ): CorrectionSignal | null {
+    // Negation trigger
+    if (this.NEGATION_PHRASES.some(p =>
+        msg.toLowerCase().startsWith(p))) {
+      return { type: 'negation', confidence: 1.0 };
+    }
+    // Edit-distance trigger
+    const dist = levenshtein(msg, prevResponse);
+    if (dist / prevResponse.length < 0.3) {
+      return { type: 'edit', confidence: 0.7 };
+    }
+    // Tool override trigger
+    if (prevToolCall && this.isOverride(msg, prevToolCall)) {
+      return { type: 'tool_override', confidence: 0.9 };
+    }
+    return null;
+  }
+}
+\end{verbatim}
+
+\subsection{Reflection Hooks}
+
+The reflection hook fires at session end and uses the structured template
+from Section~\ref{sec:loop3} to produce a \textsc{SessionReflection} record.
+
+\begin{verbatim}
+class ReflectionHook {
+  async onSessionEnd(
+    session: SessionContext,
+    telemetry: ToolInvocation[]
+  ): Promise<SessionReflection> {
+    const digest = this.computeDigest(telemetry);
+
+    const prompt = this.buildReflectionPrompt(telemetry, digest);
+    const response = await this.llm.complete(prompt, {
+      responseSchema: SessionReflectionSchema, // JSON Schema
+      maxTokens: 512,
+      temperature: 0.2, // Low temperature for structured output
+    });
+
+    return {
+      session_id: session.id,
+      successes: response.successes,
+      failures: response.failures,
+      proposals: response.proposals.filter(p => p.evidence.length > 0),
+      telemetry_digest: digest,
+    };
+  }
+}
+\end{verbatim}
+
+\subsection{Maintenance Tool and Proposal Lifecycle}
+
+The maintenance tool implements Algorithm~\ref{alg:maintenance} and exposes
+a CLI interface for human review. Proposals are stored as JSONL and presented
+with evidence summaries that reference specific session IDs and telemetry records.
+
+\begin{verbatim}
+$ hanzo-bot maintenance --sessions 20 --since 2026-01-01
+Analyzing 20 sessions across 847 tool invocations...
+
+Proposal 1 (HIGH CONFIDENCE): New tool for 'bash:TIMEOUT'
+  - 34 failures across 12 sessions (avg 2.8/session)
+  - Pattern: commands exceeding 30s default timeout
+  - Proposed: background_exec tool with configurable timeout
+  - Evidence: sessions 44, 51, 53, 57, 60, 61, ...
+  [A]pprove  [R]eject  [S]kip  [V]iew evidence? A
+
+Implementing...done. Tool added to library.
+\end{verbatim}
+
+% ============================================================================
+% 12. EVALUATION
+% ============================================================================

@@ -1,0 +1,73 @@
+\section{Configuration}
+
+
+\subsection{Replicate Configuration File}
+
+The configuration file follows the Litestream YAML format with the addition
+of age encryption fields.
+
+\begin{lstlisting}[language=YAML,caption={replicate.yml --- canonical configuration.}]
+dbs:
+  - path: /data/base/data.db
+    replicas:
+      - type: s3
+        bucket: hanzo-replicate
+        path: ${SERVICE}/${NAMESPACE}/${POD_NAME}
+        endpoint: s3.hanzo.ai
+        region: us-east-1
+        sync-interval: 1s
+        snapshot-interval: 24h
+        retention: 72h
+        retention-check-interval: 1h
+        age:
+          identities: /secrets/age/identity.txt
+          recipients: /secrets/age/recipients.txt
+\end{lstlisting}
+
+\subsection{Environment Variables}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Variable} & \textbf{Required} & \textbf{Purpose} \\
+\midrule
+\texttt{LITESTREAM\_ACCESS\_KEY\_ID}     & Yes & S3 access key \\
+\texttt{LITESTREAM\_SECRET\_ACCESS\_KEY} & Yes & S3 secret key \\
+\texttt{SERVICE}                          & Yes & Service name (ats, iam, kms, ...) \\
+\texttt{NAMESPACE}                        & Yes & K8s namespace \\
+\texttt{POD\_NAME}                        & Yes & K8s pod name (from fieldRef) \\
+\bottomrule
+\end{tabular}
+\caption{Required environment variables.}
+\label{tab:env}
+\end{table}
+
+S3 credentials are stored in Hanzo KMS (HIP-0027) and injected as
+Kubernetes Secrets. They are never committed to manifests.
+
+\subsection{S3 Path Structure}
+
+Replicas are organized by service, namespace, and pod:
+
+\begin{lstlisting}[language=bash,caption={S3 path layout.}]
+s3://hanzo-replicate/
+  ats/liquidity/ats-0/
+    generations/
+      00000001/          # snapshot + WAL segments
+      00000002/
+  iam/liquidity/iam-0/
+    generations/
+      00000001/
+  kms/liquidity/kms-0/
+    generations/
+      00000001/
+\end{lstlisting}
+
+The three-level prefix (\texttt{service/namespace/pod}) ensures per-tenant
+isolation. No service can read another service's replicas without the
+corresponding age identity.
+
+% ============================================================================
+% 5. KEY MANAGEMENT
+% ============================================================================

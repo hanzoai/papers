@@ -1,0 +1,64 @@
+\section{Background}
+
+
+\subsection{Hanzo Base Architecture}
+
+Hanzo Base runs one SQLite database per organization. Each database is
+encrypted at rest with sqlcipher (AES-256-CBC, PBKDF2-derived key). The
+encryption key is stored in Hanzo KMS (HIP-0027) and fetched at startup.
+Base exposes a REST API, a realtime SSE subscription layer, and a JavaScript
+plugin runtime (Goja VM). All data operations go through SQLite's WAL
+(Write-Ahead Log) mode.
+
+WAL mode is critical to this proposal. In WAL mode, SQLite writes all
+changes to a separate WAL file before checkpointing them into the main
+database. This creates a sequential, append-only stream of changes---exactly
+the primitive that continuous replication requires.
+
+\subsection{Litestream}
+
+Litestream~\cite{litestream} is an open-source tool by Ben Johnson that
+continuously replicates SQLite databases to S3-compatible storage. It works
+by monitoring the SQLite WAL file and streaming new frames to a replica as
+they are written. On restore, it downloads the most recent snapshot and
+replays WAL frames to reconstruct the database to its last replicated state.
+
+Litestream operates as a separate process alongside the application. It
+requires no application code changes, no special SQLite build, and no
+coordination protocol. It reads the WAL file directly from the filesystem.
+
+\subsection{Beeper's Encryption Fork}
+
+Beeper (acquired by Automattic, 2024) forked Litestream to add age
+encryption for their Matrix bridge infrastructure. Their fork encrypts each
+WAL segment and snapshot with an age recipient before uploading to S3. This
+ensures that the S3 operator (or any party with bucket access) cannot read
+the replicated data without the age identity (private key).
+
+Beeper's fork demonstrated the viability of encrypted Litestream replication
+in production at scale (millions of Matrix bridge databases). However, it
+was never upstreamed and has diverged from mainline Litestream.
+
+\subsection{age Encryption}
+
+age~\cite{age} is a file encryption tool by Filippo Valsorda designed as a
+modern replacement for PGP. It uses X25519 for key agreement, ChaCha20-Poly1305
+for authenticated encryption, and HKDF for key derivation. age has three
+properties that make it suitable for this use case:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Small keys.} An age identity (private key) is a single
+    62-character string. A recipient (public key) is a single 59-character
+    string. Both fit in a Kubernetes Secret without base64 bloat.
+
+    \item \textbf{Composable recipients.} A file can be encrypted to multiple
+    recipients. This supports key rotation (encrypt to both old and new keys)
+    and escrow (encrypt to both service key and recovery key).
+
+    \item \textbf{No configuration.} age has no cipher suites, no key
+    formats, no modes. There is one algorithm. There is one way.
+\end{enumerate}
+
+% ============================================================================
+% 3. SPECIFICATION
+% ============================================================================

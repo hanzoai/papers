@@ -1,0 +1,112 @@
+\section{AI-Native Virtual Machine (AIVM)}
+
+\label{sec:aivm}
+
+\subsection{Design Rationale}
+
+The EVM (Ethereum Virtual Machine) operates on 256-bit integers and lacks native support for floating-point arithmetic, tensor operations, and model verification. AIVM extends a WASM-based VM with AI-specific opcodes.
+
+\subsection{AIVM Instruction Set}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Category} & \textbf{Opcode} & \textbf{Description} \\
+\midrule
+\multirow{4}{*}{Tensor} & \texttt{TENSOR\_ALLOC} & Allocate tensor \\
+& \texttt{TENSOR\_MATMUL} & Matrix multiplication \\
+& \texttt{TENSOR\_NORM} & Layer normalization \\
+& \texttt{TENSOR\_SOFTMAX} & Softmax operation \\
+\midrule
+\multirow{3}{*}{Model} & \texttt{MODEL\_LOAD} & Load model by hash \\
+& \texttt{MODEL\_INFER} & Execute inference \\
+& \texttt{MODEL\_HASH} & Compute model hash \\
+\midrule
+\multirow{3}{*}{Verify} & \texttt{TEE\_VERIFY} & Verify TEE attestation \\
+& \texttt{HASH\_COMPARE} & Compare output hashes \\
+& \texttt{KL\_DIVERGE} & KL divergence test \\
+\midrule
+\multirow{3}{*}{Market} & \texttt{HMM\_QUOTE} & Get HMM price quote \\
+& \texttt{HMM\_SWAP} & Execute HMM swap \\
+& \texttt{ESCROW\_LOCK} & Lock escrow payment \\
+\bottomrule
+\end{tabular}
+\caption{AIVM instruction set extensions.}
+\label{tab:opcodes}
+\end{table}
+
+\subsection{Gas Model}
+
+AIVM gas costs reflect the actual computational cost of operations:
+
+\begin{equation}
+\text{Gas}(\text{op}) = \text{base\_cost}(\text{op}) + \text{size\_cost}(\text{op}, |\text{data}|),
+\end{equation}
+
+where $\text{base\_cost}$ is a fixed cost per opcode and $\text{size\_cost}$ scales with data size. For tensor operations:
+
+\begin{equation}
+\text{Gas}(\texttt{MATMUL}(A, B)) = g_0 + g_1 \cdot m \cdot n \cdot k,
+\end{equation}
+
+where $A \in \mathbb{R}^{m \times k}$, $B \in \mathbb{R}^{k \times n}$, and $g_0 = 100$, $g_1 = 0.001$ are gas constants.
+
+\subsection{Smart Contract Example}
+
+An AI compute marketplace contract in AIVM:
+
+\begin{lstlisting}[caption={AIVM marketplace contract (pseudocode).}]
+contract AIMarketplace {
+    mapping(uint => Job) public jobs;
+
+    function submitJob(
+        bytes32 modelHash,
+        bytes input,
+        uint maxPrice
+    ) external payable {
+        // Get HMM quote
+        (uint price, uint worker) =
+            HMM_QUOTE(modelHash, input.length);
+        require(price <= maxPrice);
+
+        // Lock escrow
+        ESCROW_LOCK(msg.sender, price);
+
+        // Create job
+        jobs[nextId] = Job({
+            client: msg.sender,
+            worker: worker,
+            modelHash: modelHash,
+            input: input,
+            price: price,
+            status: Status.Pending
+        });
+    }
+
+    function settleJob(
+        uint jobId,
+        bytes output,
+        bytes attestation
+    ) external {
+        Job storage job = jobs[jobId];
+        require(msg.sender == job.worker);
+
+        // Verify TEE attestation
+        require(TEE_VERIFY(attestation));
+
+        // Verify model hash
+        require(HASH_COMPARE(
+            attestation.modelHash,
+            job.modelHash
+        ));
+
+        // Release payment
+        ESCROW_RELEASE(job.client,
+            job.worker, job.price);
+        job.status = Status.Completed;
+    }
+}
+\end{lstlisting}
+

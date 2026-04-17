@@ -1,0 +1,102 @@
+\section{Agent-Specific Adaptations}
+
+\label{sec:adaptations}
+
+Beyond the structural adaptations to the GRPO pipeline, Agent-GRPO incorporates
+three classes of agent-specific experience types.
+
+\subsection{Tool Selection Experiences}
+
+Tool selection experiences encode when to prefer one tool over another for
+a class of tasks. These are the most valuable experiences for reducing tool
+call errors, as incorrect tool selection typically leads to cascading failures.
+
+\paragraph{Examples of Tool Selection Experiences.}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textit{For JSON extraction from \texttt{package.json}, prefer
+          \texttt{read\_json} over \texttt{bash\,+\,jq}; 3$\times$ faster,
+          no shell escaping required.}
+    \item \textit{For Kubernetes pod logs, use \texttt{kubectl\_logs}
+          with \texttt{--tail=100} before \texttt{kubectl\_exec}; avoids
+          unnecessary shell sessions.}
+    \item \textit{When searching code for function definitions, prefer
+          \texttt{ast\_search} over \texttt{grep}; handles multiline
+          definitions correctly.}
+\end{itemize}
+
+Tool selection experiences are tagged with domain $d \in \mathcal{D}$ and
+assigned high initial confidence ($c_0 = 0.7$) when extracted from groups with
+large positive advantages ($|A^{(i)}| > 1.5$).
+
+\subsection{Failure Pattern Experiences}
+
+Failure pattern experiences encode common failure modes and their remediation
+strategies. They are derived primarily from Stage-2 analysis of negative
+examples ($A^{(i)} < -0.5$).
+
+\paragraph{Examples of Failure Pattern Experiences.}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textit{Git push to \texttt{main} fails on protected repos; always
+          create a PR branch first.}
+    \item \textit{Docker build fails if \texttt{COPY} precedes \texttt{RUN
+          apt-get}; reorder to install deps first.}
+    \item \textit{Kubernetes \texttt{kubectl apply} without \texttt{--namespace}
+          silently targets \texttt{default}; always specify namespace.}
+\end{itemize}
+
+Failure pattern experiences carry a \texttt{failure\_mode} annotation that
+enables targeted retrieval when the agent encounters error messages matching
+known patterns. The retrieval query is augmented with the error message:
+$x' = \text{concat}(x, \text{error\_message})$ before embedding.
+
+\subsection{Domain-Specific Convention Experiences}
+
+Convention experiences encode task-domain norms that are not explicit in tool
+documentation but emerge from observed agent behavior across many sessions.
+These are partitioned by domain $d \in \mathcal{D}$.
+
+\paragraph{Coding Domain ($d_{\text{code}}$).}
+\begin{itemize}[leftmargin=1.5em]
+    \item Commit message format: \texttt{type(scope): description}.
+    \item Test before commit: always run \texttt{pytest} or \texttt{go test}
+          before pushing.
+    \item PR description template: Summary, Test Plan, Breaking Changes.
+\end{itemize}
+
+\paragraph{DevOps Domain ($d_{\text{devops}}$).}
+\begin{itemize}[leftmargin=1.5em]
+    \item Deployment sequence: build $\to$ push image $\to$ update manifest
+          $\to$ apply $\to$ verify rollout.
+    \item Rollback procedure: \texttt{kubectl rollout undo} before any
+          destructive cleanup.
+    \item Health check: \texttt{kubectl get pods} within 60\,s of deployment.
+\end{itemize}
+
+\paragraph{Data Science Domain ($d_{\text{ds}}$).}
+\begin{itemize}[leftmargin=1.5em]
+    \item Always set random seeds before experiments.
+    \item Log hyperparameters before training starts.
+    \item Validate data shapes immediately after loading.
+\end{itemize}
+
+Convention experiences are assigned domain $d$ during Stage-1 summarization
+(the LLM is instructed to classify the domain of each trajectory). They are
+retrieved with domain filtering active ($D_x = \{d\}$), preventing convention
+experiences from one domain from polluting retrieval for another.
+
+\subsection{Hierarchical Experience Structure}
+
+The three experience types form a natural hierarchy:
+\begin{equation}
+    \text{Convention} \supseteq \text{Tool Selection} \supseteq \text{Failure Pattern}
+\end{equation}
+in terms of generality. Convention experiences apply broadly; tool selection
+experiences apply to specific tool pairs; failure pattern experiences apply
+to specific error conditions. At retrieval time, we sample experiences from
+all three types, with a soft budget: at most $K_c = 2$ convention experiences,
+$K_t = 2$ tool selection experiences, and $K_f = 1$ failure pattern experience
+in the default $K = 5$ budget.
+
+% ============================================================================
+% 6. INTEGRATION WITH SELF-IMPROVEMENT SYSTEM
+% ============================================================================

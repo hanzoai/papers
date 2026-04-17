@@ -1,0 +1,82 @@
+\section{Multi-Consensus Architecture}
+
+\label{sec:consensus}
+
+\subsection{Dual-Track Design}
+
+ACI uses two consensus mechanisms optimized for different latency requirements:
+
+\begin{definition}[Dual-Track Consensus]
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Fast-path} (DAG-based, $< 200$ms): Handles job matching, resource allocation, and real-time updates. Uses a Directed Acyclic Graph (DAG) consensus~\cite{danezis2022narwhal} where transactions are ordered by causal dependency rather than total order.
+    \item \textbf{Settlement-path} (BFT, $< 2$s): Handles payment finalization, dispute resolution, and governance. Uses a classical BFT consensus~\cite{yin2019hotstuff} with $3f+1$ validators tolerating $f$ Byzantine faults.
+\end{itemize}
+\end{definition}
+
+\subsection{Fast-Path Consensus}
+
+The fast-path processes job matching as a DAG of causally related transactions:
+
+\begin{algorithm}[H]
+\caption{Fast-Path DAG Consensus}
+\label{alg:fastpath}
+\begin{algorithmic}[1]
+\Require Transaction $\text{tx}$ from client/router
+\State $\text{vertex} \gets (\text{tx}, \text{round}, \text{author}, \text{parents})$
+\State Broadcast $\text{vertex}$ to all validators
+\State \Comment{Each validator maintains a local DAG}
+\State Add $\text{vertex}$ to local DAG
+\State \Comment{Consensus by 2/3 acknowledgment}
+\If{$\text{vertex}$ acknowledged by $\ge 2n/3$ validators}
+    \State $\text{vertex}$ is committed
+    \State Execute job matching transaction
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+The DAG structure allows concurrent transaction processing (no sequential block ordering), achieving throughput proportional to network bandwidth rather than consensus rounds.
+
+\subsection{Settlement-Path Consensus}
+
+Payment settlement requires total ordering and finality. We use a modified HotStuff~\cite{yin2019hotstuff} protocol:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Prepare}: Leader proposes a block of settlement transactions.
+    \item \textbf{Pre-commit}: Validators verify PoAI attestations and vote.
+    \item \textbf{Commit}: Block is committed with $2f+1$ signatures.
+    \item \textbf{Decide}: Block is finalized and irreversible.
+\end{enumerate}
+
+Settlement blocks are produced every 2 seconds, batching all verified jobs from the fast-path.
+
+\subsection{Cross-Track Coordination}
+
+The fast-path and settlement-path are coordinated via a checkpoint mechanism:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item Every 100 fast-path rounds, a checkpoint is submitted to the settlement-path.
+    \item The checkpoint contains a Merkle root of all committed fast-path transactions.
+    \item Settlement-path validators verify the checkpoint against their local DAG state.
+    \item Once the checkpoint is settled, the corresponding fast-path transactions are considered final.
+\end{enumerate}
+
+\subsection{Throughput Analysis}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Consensus} & \textbf{TPS} & \textbf{Finality} & \textbf{Validators} \\
+\midrule
+Ethereum L1 & 15 & 12 min & 900K+ \\
+Solana & 3,000 & 12s & 2,000 \\
+Sui (Narwhal) & 120,000 & 2s & 100 \\
+ACI fast-path & 12,000 & 200ms & 100 \\
+ACI settlement & 2,000 & 2s & 100 \\
+\bottomrule
+\end{tabular}
+\caption{Consensus throughput comparison.}
+\label{tab:consensus}
+\end{table}
+

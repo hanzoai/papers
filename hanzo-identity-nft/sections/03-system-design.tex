@@ -1,0 +1,293 @@
+\section{System Design}
+
+
+\subsection{Identity Structure}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.6cm, align=center, font=\small},
+    arrow/.style={->, thick}
+]
+\node[box, fill=blue!10] (identity) {@alice.lux};
+\node[box, below=of identity, fill=green!10] (nft) {NFT Token \#42};
+\node[box, below left=0.8cm and -0.3cm of nft] (owner) {Owner: 0x1a2b...};
+\node[box, below=of nft] (stake) {Staked: 1,000 AI};
+\node[box, below right=0.8cm and -0.3cm of nft] (keys) {Encryption Key};
+\node[box, below=of stake] (delegate) {Delegated: 500 AI};
+
+\draw[arrow] (identity) -- (nft);
+\draw[arrow] (nft) -- (owner);
+\draw[arrow] (nft) -- (stake);
+\draw[arrow] (nft) -- (keys);
+\draw[arrow] (stake) -- (delegate);
+\end{tikzpicture}
+\caption{Identity structure with NFT binding and stake.}
+\label{fig:identity}
+\end{figure}
+
+Each identity (Figure~\ref{fig:identity}) consists of:
+
+\begin{lstlisting}[language=Solidity]
+struct IdentityData {
+    uint256 boundNft;        // ERC-721 token ID
+    uint256 stakedTokens;    // AI tokens locked
+    string encryptionKey;    // X25519 public key
+    string signatureKey;     // Ed25519 public key
+    bool routing;            // Direct vs proxy
+    string[] addressOrProxyNodes;
+    uint256 delegatedTokens;
+    uint256 lastUpdated;
+}
+\end{lstlisting}
+
+\paragraph{NFT Binding.} The identity-NFT binding is bidirectional: the registry maps identity strings to token IDs, and token IDs to identity strings. NFT transfer automatically transfers identity ownership.
+
+\paragraph{Cryptographic Keys.} Each identity stores public keys for encrypted communication (X25519) and message signing (Ed25519). Keys can be rotated without identity transfer.
+
+\paragraph{Routing.} Identities can specify either direct addresses or proxy nodes for message routing, enabling privacy-preserving communication.
+
+\subsection{Multi-Network Namespaces}
+
+\begin{table}[h]
+\centering
+\caption{Network namespaces and chain IDs.}
+\label{tab:namespaces}
+\begin{tabular}{lll}
+\toprule
+\textbf{Network} & \textbf{Chain ID} & \textbf{Suffix} \\
+\midrule
+Hanzo Mainnet & 36963 & (none) \\
+Hanzo Testnet & 36962 & .hanzotest \\
+Lux Mainnet & 96369 & .lux \\
+Lux Testnet & 96368 & .luxtest \\
+Zoo Mainnet & 200200 & .zoo \\
+Zoo Testnet & 200201 & .zootest \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The registry supports six networks (Table~\ref{tab:namespaces}) with hierarchical namespacing:
+
+\begin{lstlisting}[language=Solidity]
+function getIdentity(string calldata name,
+                     uint256 namespace)
+    public view returns (string memory)
+{
+    string memory ns = namespaces[namespace];
+    // Mainnet has no suffix: @alice
+    if (bytes(ns).length == 0) {
+        return string(abi.encodePacked("@", name));
+    }
+    // Other networks: @alice.lux
+    return string(abi.encodePacked(
+        "@", name, ".", ns));
+}
+\end{lstlisting}
+
+Hanzo mainnet identities have no suffix (\texttt{@alice}), while other networks append their namespace (\texttt{@alice.lux}). This prioritizes the primary network while maintaining clear disambiguation.
+
+\subsection{Pricing Model}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    xlabel={Name Length (characters)},
+    ylabel={Required Stake (AI tokens)},
+    width=8cm,
+    height=5cm,
+    ymode=log,
+    xtick={1,2,3,4,5,6,7,8},
+    ytick={10,100,1000,10000,100000},
+    yticklabels={10,100,1K,10K,100K},
+    grid=major,
+    legend pos=north east,
+]
+\addplot[blue, thick, mark=*] coordinates {
+    (1, 100000)
+    (2, 10000)
+    (3, 1000)
+    (4, 100)
+    (5, 10)
+    (6, 10)
+    (7, 10)
+    (8, 10)
+};
+\addplot[red, dashed, thick, mark=square] coordinates {
+    (1, 50000)
+    (2, 5000)
+    (3, 500)
+    (4, 50)
+    (5, 5)
+    (6, 5)
+    (7, 5)
+    (8, 5)
+};
+\legend{Standard, With Referrer}
+\end{axis}
+\end{tikzpicture}
+\caption{Stake requirements by name length.}
+\label{fig:pricing}
+\end{figure}
+
+The pricing model (Figure~\ref{fig:pricing}) uses exponential scaling:
+
+\begin{lstlisting}[language=Solidity]
+uint256 public price1Char = 100000 * 1e18;   // 100K AI
+uint256 public price2Char = 10000 * 1e18;    // 10K AI
+uint256 public price3Char = 1000 * 1e18;     // 1K AI
+uint256 public price4Char = 100 * 1e18;      // 100 AI
+uint256 public price5PlusChar = 10 * 1e18;   // 10 AI
+uint256 public referrerDiscountBps = 5000;   // 50%
+\end{lstlisting}
+
+\paragraph{Economic Rationale.} Short names are inherently more memorable and valuable. The 10x multiplier per character creates natural price discovery: a 3-character name costs 100x more than a 5+ character name, reflecting its scarcity (26 letters yield only 17,576 3-character combinations vs. 11.8M 5-character combinations).
+
+\paragraph{Referral Mechanism.} Users with existing identities can refer new users for a 50\% discount. This incentivizes network growth while maintaining economic barriers.
+
+\begin{lstlisting}[language=Solidity]
+function identityStakeRequirement(
+    string calldata name,
+    uint256 namespace,
+    bool validReferrer
+) public view returns (uint256) {
+    uint256 length = bytes(name).length;
+    uint256 baseStake;
+
+    if (length == 1) baseStake = price1Char;
+    else if (length == 2) baseStake = price2Char;
+    else if (length == 3) baseStake = price3Char;
+    else if (length == 4) baseStake = price4Char;
+    else baseStake = price5PlusChar;
+
+    return validReferrer
+        ? (baseStake * (10000 - referrerDiscountBps)) / 10000
+        : baseStake;
+}
+\end{lstlisting}
+
+\subsection{Staking and Rewards}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.8cm, align=center},
+    arrow/.style={->, thick}
+]
+\node[box, fill=blue!10] (alice) {@alice\\Staked: 1000 AI};
+\node[box, right=2cm of alice, fill=green!10] (bob) {@bob\\Staked: 500 AI};
+\node[box, right=2cm of bob, fill=yellow!10] (charlie) {@charlie\\Staked: 200 AI};
+\node[box, below=1.5cm of bob, fill=red!10] (rewards) {Rewards Pool\\10,000 AI/epoch};
+
+\draw[arrow] (alice) -- node[above] {delegate 200} (bob);
+\draw[arrow] (charlie) -- node[above] {delegate 100} (bob);
+\draw[arrow, dashed] (rewards) -- node[left] {5.88\%} (alice);
+\draw[arrow, dashed] (rewards) -- node[right] {47.06\%} (bob);
+\draw[arrow, dashed] (rewards) -- node[right] {47.06\%} (charlie);
+\end{tikzpicture}
+\caption{Delegation and reward distribution. @bob receives delegated stake from @alice and @charlie, increasing governance weight.}
+\label{fig:delegation}
+\end{figure*}
+
+\paragraph{Staking.} Identity owners can increase their stake beyond the minimum:
+
+\begin{lstlisting}[language=Solidity]
+function increaseStake(string calldata identity,
+                       uint256 amount) external {
+    _requireOwner(identity);
+    shinToken.transferFrom(msg.sender, address(this),
+                           amount);
+    _identityData[identity].stakedTokens += amount;
+    emit StakeUpdate(identity,
+        _identityData[identity].stakedTokens);
+}
+\end{lstlisting}
+
+\paragraph{Delegation.} Stake can be delegated to other identities without transfer (Figure~\ref{fig:delegation}):
+
+\begin{lstlisting}[language=Solidity]
+struct Delegation {
+    string delegatee;
+    uint256 amount;
+}
+
+function setDelegations(string calldata identity,
+    Delegation[] calldata delegations) external {
+    _requireOwner(identity);
+    uint256 totalDelegated = 0;
+
+    for (uint256 i = 0; i < delegations.length; i++) {
+        identityDelegations[identity]
+            [delegations[i].delegatee] =
+            delegations[i].amount;
+        totalDelegated += delegations[i].amount;
+    }
+
+    require(totalDelegated <=
+        _identityData[identity].stakedTokens,
+        "Exceeds staked");
+    _identityData[identity].delegatedTokens =
+        totalDelegated;
+}
+\end{lstlisting}
+
+\paragraph{Rewards.} Rewards are distributed proportionally to total stake (owned + received delegations):
+
+\begin{equation}
+    R_i = R_{\text{total}} \cdot \frac{S_i + D_i}{\sum_j (S_j + D_j)}
+\end{equation}
+
+where $S_i$ is owned stake and $D_i$ is received delegations.
+
+\subsection{Identity Lifecycle}
+
+\paragraph{Claiming.} Identity creation requires staking and mints a bound NFT:
+
+\begin{lstlisting}[language=Solidity]
+function _claimIdentity(ClaimIdentityParams calldata params,
+                        address caller) private {
+    require(validName(params.name), "Invalid name");
+    require(_identityToOwner[identity] == address(0),
+            "Not available");
+
+    uint256 requiredStake = identityStakeRequirement(
+        params.name, params.namespace, validReferrer);
+    require(params.stakeAmount >= requiredStake,
+            "Insufficient stake");
+
+    shinToken.transferFrom(caller, address(this),
+                           params.stakeAmount);
+    uint256 tokenId = hanzoNft.mint(params.owner);
+
+    _identityToOwner[identity] = params.owner;
+    tokenIdToIdentity[tokenId] = identity;
+    _identityData[identity] = IdentityData({...});
+}
+\end{lstlisting}
+
+\paragraph{Unclaiming.} Identities can be released, burning the NFT and returning stake:
+
+\begin{lstlisting}[language=Solidity]
+function unclaimIdentity(string calldata identity)
+    external {
+    _requireOwner(identity);
+
+    uint256 tokenId = _identityData[identity].boundNft;
+    uint256 stake = _identityData[identity].stakedTokens;
+
+    if (stake > 0) {
+        shinToken.transfer(msg.sender, stake);
+    }
+
+    hanzoNft.burn(tokenId);
+    delete _identityToOwner[identity];
+    delete tokenIdToIdentity[tokenId];
+    delete _identityData[identity];
+}
+\end{lstlisting}
+
+\paragraph{Transfer.} NFT transfer triggers ownership update via the \texttt{onERC721Received} hook or explicit registration.
+

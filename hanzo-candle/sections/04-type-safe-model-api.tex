@@ -1,0 +1,96 @@
+\section{Type-Safe Model API}
+
+\label{sec:api}
+
+\subsection{Design Philosophy}
+
+Candle's model definition API leverages Rust's type system to provide compile-time guarantees:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Dimension checking}: Tensor shapes are tracked at the type level where possible, catching shape mismatches at compile time.
+    \item \textbf{Device safety}: Operations between tensors on different devices are compile-time errors.
+    \item \textbf{Dtype safety}: Operations between incompatible dtypes require explicit casting.
+    \item \textbf{Lifetime safety}: Rust's ownership system prevents use-after-free and double-free bugs that plague C++ tensor libraries.
+\end{enumerate}
+
+\subsection{Core Traits}
+
+The API is built on three core traits:
+
+\begin{lstlisting}[language=Rust,caption={Core Candle traits.}]
+/// A neural network module
+pub trait Module {
+    fn forward(&self, x: &Tensor)
+        -> Result<Tensor>;
+}
+
+/// A module with learnable parameters
+pub trait ModuleT: Module {
+    fn parameters(&self) -> Vec<&Tensor>;
+}
+
+/// Quantized module for efficient inference
+pub trait QuantizedModule {
+    fn forward_q(&self, x: &Tensor)
+        -> Result<Tensor>;
+    fn quantization(&self) -> Quantization;
+}
+\end{lstlisting}
+
+\subsection{Model Definition Example}
+
+A transformer layer in Candle:
+
+\begin{lstlisting}[language=Rust,caption={Transformer layer definition.}]
+pub struct TransformerBlock {
+    attn: MultiHeadAttention,
+    ffn: FeedForward,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+}
+
+impl Module for TransformerBlock {
+    fn forward(&self, x: &Tensor)
+        -> Result<Tensor> {
+        // Pre-norm attention
+        let h = self.norm1.forward(x)?;
+        let h = self.attn.forward(&h)?;
+        let x = (x + h)?;
+        // Pre-norm FFN
+        let h = self.norm2.forward(&x)?;
+        let h = self.ffn.forward(&h)?;
+        let x = (x + h)?;
+        Ok(x)
+    }
+}
+\end{lstlisting}
+
+\subsection{Error Handling}
+
+Candle uses Rust's \texttt{Result} type for all fallible operations, providing precise error messages:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \texttt{ShapeMismatch \{expected: [B, S, D], got: [B, D]\}}: Dimension error with full context.
+    \item \texttt{DtypeMismatch \{op: "matmul", lhs: f16, rhs: f32\}}: Type mismatch with operation context.
+    \item \texttt{DeviceMismatch \{lhs: Cuda(0), rhs: Cpu\}}: Device placement error.
+    \item \texttt{OutOfMemory \{requested: 4GB, available: 2.1GB, device: Cuda(0)\}}: Memory error with allocation context.
+\end{itemize}
+
+Errors propagate via the \texttt{?} operator with zero runtime cost on the success path (Rust's zero-cost error handling).
+
+\subsection{Compile-Time Guarantees}
+
+\begin{theorem}[Type Safety]
+A Candle program that compiles without \texttt{unsafe} blocks satisfies the following invariants:
+\begin{enumerate}[leftmargin=1.4em]
+    \item No use-after-free: Tensor storage is valid for the lifetime of any reference.
+    \item No data races: Concurrent access requires \texttt{Arc<Mutex<T>>} or \texttt{Arc<RwLock<T>>}.
+    \item No null pointers: All tensor references are guaranteed non-null by Rust's type system.
+    \item No buffer overflows: Array bounds are checked at runtime (and compile-time where shapes are static).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+These invariants follow directly from Rust's ownership, borrowing, and lifetime rules as proven by RustBelt~\cite{jung2018rustbelt}.
+\end{proof}
+

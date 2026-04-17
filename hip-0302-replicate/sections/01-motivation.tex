@@ -1,0 +1,47 @@
+\section{Motivation}
+
+
+Hanzo Base (HIP Base Runtime) packages an encrypted SQLite database per
+organization into a single Go binary. This architecture delivers
+sub-millisecond CRUD latency, per-tenant isolation by construction, and zero
+external database dependencies. It is the right architecture for sovereign
+applications.
+
+It has one gap: durability on ephemeral infrastructure.
+
+Kubernetes pods are ephemeral. A node drain, an OOM kill, a failed health
+check, or a routine deployment all destroy local state. Current Base
+deployments use either \texttt{emptyDir} volumes (state lost on every
+restart) or PersistentVolumeClaims (state survives restart but not node
+failure, and PVCs introduce scheduling constraints that conflict with
+horizontal scaling).
+
+The consequences are concrete:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Data loss on restart.} An \texttt{emptyDir} deployment of
+    ATS loses all trade records, order history, and portfolio state when the
+    pod restarts. This is unacceptable for a regulated securities exchange.
+
+    \item \textbf{Node affinity locks.} A PVC-backed deployment pins a pod to
+    one node. If that node fails, the pod cannot reschedule until the volume
+    is manually detached or the cloud provider's volume controller completes
+    failover---typically 2--10 minutes on GKE.
+
+    \item \textbf{No disaster recovery.} Neither \texttt{emptyDir} nor PVC
+    provides off-site backup. A storage controller bug, a zone outage, or
+    accidental \texttt{kubectl delete pvc} destroys all state with no
+    recovery path.
+
+    \item \textbf{No cross-region replication.} PVCs are zone-scoped. A zone
+    failure takes down both the pod and its data. Regional redundancy requires
+    an external replication mechanism.
+\end{enumerate}
+
+This HIP solves all four problems with a single mechanism: continuous WAL
+replication to S3-compatible object storage, encrypted with age before
+leaving the pod.
+
+% ============================================================================
+% 2. BACKGROUND
+% ============================================================================

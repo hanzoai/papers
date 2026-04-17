@@ -1,0 +1,72 @@
+\section{FHE-Compatible Layers}
+
+
+\subsection{Polynomial Approximations}
+
+FHE schemes support only polynomial operations efficiently. We approximate non-polynomial activations using Chebyshev polynomials:
+
+\begin{equation}
+    f(x) \approx \sum_{k=0}^{n} c_k T_k(x)
+\end{equation}
+
+where $T_k$ are Chebyshev polynomials of the first kind.
+
+\paragraph{GELU Approximation.} For GELU, we use a degree-7 polynomial:
+
+\begin{equation}
+    \text{GELU}(x) \approx 0.5x(1 + \tanh(\sqrt{2/\pi}(x + 0.044715x^3)))
+\end{equation}
+
+The $\tanh$ is further approximated with:
+
+\begin{equation}
+    \tanh(x) \approx x - \frac{x^3}{3} + \frac{2x^5}{15} - \frac{17x^7}{315}
+\end{equation}
+
+\begin{lstlisting}[language=Rust]
+pub fn gelu_polynomial(x: &Tensor) -> Result<Tensor> {
+    let x2 = x.sqr()?;
+    let x3 = x.mul(&x2)?;
+    let x5 = x3.mul(&x2)?;
+    let x7 = x5.mul(&x2)?;
+
+    let tanh_inner = x.affine(SQRT_2_PI, 0.0)?
+        .add(&x3.affine(0.044715 * SQRT_2_PI, 0.0)?)?;
+
+    // Polynomial tanh approximation
+    let tanh_approx = tanh_inner
+        .sub(&tanh_inner.pow(3.0)?.affine(1.0/3.0, 0.0)?)?
+        .add(&tanh_inner.pow(5.0)?.affine(2.0/15.0, 0.0)?)?;
+
+    x.mul(&tanh_approx.affine(0.5, 0.5)?)
+}
+\end{lstlisting}
+
+\paragraph{Softmax Approximation.} Softmax requires division, which is expensive in FHE. We use the Newton-Raphson method for reciprocal:
+
+\begin{equation}
+    x_{n+1} = x_n(2 - ax_n)
+\end{equation}
+
+with initial guess from a polynomial approximation.
+
+\subsection{FHE-Friendly Architecture}
+
+\begin{table}[h]
+\centering
+\caption{Standard vs. FHE-compatible layer implementations.}
+\label{tab:fhe}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Layer} & \textbf{Standard} & \textbf{FHE-Compatible} \\
+\midrule
+Activation & ReLU/GELU & Polynomial approx \\
+Normalization & LayerNorm & Polynomial normalization \\
+Attention & Softmax & Polynomial softmax \\
+Pooling & Max pool & Average pool \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:fhe} summarizes the substitutions. FHE-compatible models trade accuracy for encrypted inference capability.
+

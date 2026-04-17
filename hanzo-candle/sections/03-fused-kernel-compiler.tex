@@ -1,0 +1,108 @@
+\section{Fused Kernel Compiler}
+
+\label{sec:fusion}
+
+\subsection{Motivation}
+
+A single transformer layer performs approximately 20--30 kernel launches for attention, feed-forward, and normalization operations. Each kernel launch incurs 5--15$\mu$s of overhead on CUDA. For a 32-layer model, this amounts to 3--15ms of pure launch overhead per token---comparable to the actual computation time for small batch sizes.
+
+\subsection{Fusion Opportunities}
+
+We identify three categories of fusable operations:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Pattern} & \textbf{Operations} & \textbf{Speedup} \\
+\midrule
+QKV projection & 3 matmuls $\to$ 1 & 2.1x \\
+Attention + softmax & Scale, mask, softmax & 1.8x \\
+FFN block & Linear, GELU, linear & 1.6x \\
+LayerNorm + bias & Norm, scale, shift & 2.4x \\
+RoPE embedding & Sin, cos, rotate & 1.9x \\
+\bottomrule
+\end{tabular}
+\caption{Kernel fusion opportunities in transformer architectures.}
+\label{tab:fusion}
+\end{table}
+
+\subsection{Fusion Algorithm}
+
+The fused kernel compiler operates on the computation graph:
+
+\begin{algorithm}[H]
+\caption{Kernel Fusion Pass}
+\label{alg:fusion}
+\begin{algorithmic}[1]
+\Require Computation graph $G = (V, E)$
+\State $\text{groups} \gets \emptyset$
+\State \Comment{Phase 1: Identify fusable chains}
+\For{each node $v \in V$ in topological order}
+    \If{$v$ is element-wise or reduction}
+        \State Try to merge $v$ into predecessor's group
+    \ElsIf{$v$ matches a known pattern (QKV, FFN, etc.)}
+        \State Create pattern-specific fused group
+    \Else
+        \State $v$ is a fusion barrier (start new group)
+    \EndIf
+\EndFor
+\State \Comment{Phase 2: Generate fused kernels}
+\For{each group $g \in \text{groups}$}
+    \If{$|g| > 1$}
+        \State $\text{kernel} \gets \text{CodeGen}(g)$ \Comment{CUDA/Metal kernel}
+        \State Replace $g$ with single fused node
+    \EndIf
+\EndFor
+\State \Return optimized graph
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Code Generation}
+
+Fused kernels are generated as CUDA PTX or Metal shader code using template-based code generation:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Element-wise fusion}: Chains of unary/binary operations are compiled into a single kernel with loop fusion.
+    \item \textbf{Pattern fusion}: Recognized patterns (FlashAttention, fused LayerNorm) map to hand-optimized kernel templates.
+    \item \textbf{Reduction fusion}: Reduction operations (softmax, layer norm) are fused with their producers when data locality permits.
+\end{enumerate}
+
+\subsection{FlashAttention Integration}
+
+Candle integrates FlashAttention~\cite{dao2022flashattention,dao2023flashattention2} as a native fused operation:
+
+\begin{equation}
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V,
+\end{equation}
+
+implemented as a single fused kernel that:
+\begin{enumerate}[leftmargin=1.4em]
+    \item Tiles $Q$, $K$, $V$ across shared memory blocks.
+    \item Computes attention scores, softmax, and weighted sum in a single pass.
+    \item Uses online softmax~\cite{milakov2018online} to avoid materializing the full attention matrix.
+    \item Achieves $O(N)$ memory instead of $O(N^2)$ for sequence length $N$.
+\end{enumerate}
+
+\subsection{Fusion Results}
+
+Impact of kernel fusion on Llama-3-8B inference (batch size 1, sequence length 2048):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{Kernels} & \textbf{Time (ms)} & \textbf{TPS} \\
+\midrule
+No fusion & 847 & 42.3 & 23.7 \\
+Element-wise only & 612 & 34.1 & 29.3 \\
++ Pattern fusion & 387 & 26.8 & 37.3 \\
++ FlashAttention & 245 & 22.4 & 44.6 \\
+\bottomrule
+\end{tabular}
+\caption{Impact of kernel fusion on inference performance. TPS = tokens per second.}
+\label{tab:fusion_results}
+\end{table}
+

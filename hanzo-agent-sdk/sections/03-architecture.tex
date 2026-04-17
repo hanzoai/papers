@@ -1,0 +1,136 @@
+\section{Architecture}
+
+
+\subsection{Agent Dataclass}
+
+The core abstraction is the \texttt{Agent[TContext]} generic dataclass:
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class Agent(Generic[TContext]):
+    name: str
+    instructions: str | Callable[[
+        RunContextWrapper[TContext],
+        Agent[TContext]
+    ], MaybeAwaitable[str]] | None
+    handoffs: list[Agent | Handoff[TContext]]
+    model: str | Model | None
+    model_settings: ModelSettings
+    tools: list[Tool]
+    input_guardrails: list[InputGuardrail]
+    output_guardrails: list[OutputGuardrail]
+    output_type: type[Any] | None
+    hooks: AgentHooks[TContext] | None
+\end{lstlisting}
+
+\paragraph{Dynamic Instructions.} Instructions can be either static strings or async callables that generate prompts based on runtime context. This enables agents to adapt their behavior based on conversation history, user preferences, or external state.
+
+\paragraph{Typed Context.} The generic \texttt{TContext} parameter enables type-safe context propagation. The \texttt{RunContextWrapper} provides access to the mutable context object, which is passed to all tool functions, guardrails, and handoff filters.
+
+\paragraph{Guardrails.} Input guardrails run in parallel with initial agent execution, validating user input before response generation. Output guardrails validate the final response, enabling content filtering, format validation, and safety checks.
+
+\subsection{Memory System}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.8cm, align=center},
+    arrow/.style={->, thick}
+]
+\node[box] (store) {Memory Store};
+\node[box, below=of store] (retriever) {Semantic Retriever};
+\node[box, below=of retriever] (compress) {Auto-Compressor};
+\node[box, right=2cm of store] (conv) {Conversation};
+\node[box, below=of conv] (reflect) {Reflection};
+\node[box, below=of reflect] (fact) {Facts};
+
+\draw[arrow] (store) -- (retriever);
+\draw[arrow] (retriever) -- (compress);
+\draw[arrow] (conv) -- (store);
+\draw[arrow] (reflect) -- (store);
+\draw[arrow] (fact) -- (store);
+\end{tikzpicture}
+\caption{Memory system architecture with three storage tiers and automatic compression.}
+\label{fig:memory}
+\end{figure}
+
+The memory system implements a three-tier architecture (Figure~\ref{fig:memory}):
+
+\paragraph{Storage Backend.} The \texttt{MemoryStore} interface supports pluggable backends (in-memory, Redis, PostgreSQL). Each memory entry contains content, type, timestamp, importance score, and access count.
+
+\paragraph{Semantic Retrieval.} The \texttt{MemoryRetriever} uses embedding-based similarity search to retrieve relevant memories given a query. We employ a hybrid scoring function:
+\begin{equation}
+    \text{score}(m, q) = \alpha \cdot \text{sim}(e_m, e_q) + \beta \cdot \text{recency}(m) + \gamma \cdot \text{access}(m)
+\end{equation}
+where $e_m$ and $e_q$ are embedding vectors, and $\alpha, \beta, \gamma$ are tunable weights.
+
+\paragraph{Automatic Compression.} When memory count exceeds a threshold, the system compresses older memories using an LLM-generated summary. The compression algorithm prioritizes memories with low importance and access counts.
+
+\paragraph{Reflection.} The \texttt{reflect()} method generates meta-cognitive summaries from recent memories, enabling agents to synthesize insights and update their world model.
+
+\subsection{Agent Network}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    agent/.style={circle, draw, minimum size=1.2cm, align=center, fill=blue!10},
+    router/.style={diamond, draw, minimum size=1cm, align=center, fill=green!10},
+    state/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.8cm, fill=yellow!10},
+    arrow/.style={->, thick}
+]
+\node[router] (router) {Router};
+\node[agent, above left=of router] (a1) {Agent\\Planner};
+\node[agent, above right=of router] (a2) {Agent\\Coder};
+\node[agent, below left=of router] (a3) {Agent\\Reviewer};
+\node[agent, below right=of router] (a4) {Agent\\Tester};
+\node[state, below=2cm of router] (state) {Shared State Store};
+
+\draw[arrow] (router) -- (a1);
+\draw[arrow] (router) -- (a2);
+\draw[arrow] (router) -- (a3);
+\draw[arrow] (router) -- (a4);
+\draw[arrow, dashed] (a1) -- (state);
+\draw[arrow, dashed] (a2) -- (state);
+\draw[arrow, dashed] (a3) -- (state);
+\draw[arrow, dashed] (a4) -- (state);
+
+\draw[arrow, bend left=30] (a1) to node[above] {handoff} (a2);
+\draw[arrow, bend left=30] (a2) to node[right] {handoff} (a4);
+\draw[arrow, bend left=30] (a4) to node[below] {handoff} (a3);
+\end{tikzpicture}
+\caption{AgentNetwork with semantic routing, shared state, and handoff connections.}
+\label{fig:network}
+\end{figure*}
+
+The \texttt{AgentNetwork} class orchestrates multiple agents with shared state (Figure~\ref{fig:network}):
+
+\begin{lstlisting}[language=Python]
+class AgentNetwork:
+    def __init__(self, config: NetworkConfig,
+                 router: Router | None = None):
+        self.config = config
+        self.router = router or SemanticRouter()
+        self.nodes: Dict[str, NetworkNode] = {}
+        self.state_store = config.state_store
+
+    def add_agent(self, agent: Agent,
+                  capabilities: list[str],
+                  dependencies: list[str]):
+        node = NetworkNode(
+            agent=agent,
+            capabilities=capabilities,
+            dependencies=dependencies
+        )
+        self.nodes[agent.name] = node
+        self.router.update_agent_info(
+            agent.name, capabilities)
+\end{lstlisting}
+
+\paragraph{Semantic Router.} The \texttt{SemanticRouter} selects the optimal starting agent based on input embeddings and agent capability descriptions. The routing decision includes a confidence score used for fallback logic.
+
+\paragraph{Parallel Execution.} Independent agents can execute concurrently using \texttt{asyncio.Semaphore} for concurrency control. The \texttt{max\_parallel\_agents} configuration prevents resource exhaustion.
+
+\paragraph{Network Handoffs.} Each agent receives dynamically-generated handoffs to other network members. Handoff filters validate transitions using the router, ensuring semantic coherence.
+

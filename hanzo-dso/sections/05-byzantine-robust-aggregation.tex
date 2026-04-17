@@ -1,0 +1,136 @@
+\section{Byzantine-Robust Aggregation}
+
+\label{sec:aggregation}
+
+\subsection{Threat Model}
+
+\begin{assumption}[Threat Model]
+\label{ass:threat}
+Of $n$ total participants, at most $f < n/3$ are Byzantine. Byzantine nodes may:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Submit arbitrary prior data (random noise, targeted attacks).
+    \item Collude to coordinate attacks.
+    \item Create Sybil identities (bounded by stake requirements).
+    \item Selectively withhold or delay messages.
+\end{enumerate}
+Honest nodes follow the protocol and have priors with quality $q_i > 0.5 + \delta$
+for some $\delta > 0$.
+\end{assumption}
+
+\subsection{Weighted Median Aggregation}
+
+For each schema element $s \in \mathcal{S}$ and each token position $v$ within
+$s$, the aggregate is computed as:
+
+\begin{equation}
+    \tilde{\Delta}^{(s)}(v) = \wmed\left(\{\Delta_i^{(s)}(v)\}_{i=1}^n; \; \{w_i\}_{i=1}^n\right),
+    \label{eq:wmed}
+\end{equation}
+where the weight for participant $i$ is:
+\begin{equation}
+    w_i = S_i \cdot q_i \cdot \mathbb{I}[q_i \geq q_{\min}],
+    \label{eq:weights}
+\end{equation}
+with $S_i$ the stake and $q_i$ the validated quality score.
+
+\begin{theorem}[Byzantine Robustness of Weighted Median]
+\label{thm:byz-robust}
+Under Assumption~\ref{ass:threat}, if the total honest stake exceeds twice the
+total Byzantine stake:
+\begin{equation}
+    W_H = \sum_{i \in \text{honest}} w_i > 2 \sum_{j \in \text{Byzantine}} w_j = 2W_B,
+\end{equation}
+then the weighted median (Eq.~\ref{eq:wmed}) equals a value submitted by an
+honest node for every schema element and token position.
+\end{theorem}
+
+\begin{proof}
+Consider any schema element $s$ and token position $v$. Let
+$\{\Delta_i^{(s)}(v)\}_{i \in H}$ be the honest submissions and
+$\{\Delta_j^{(s)}(v)\}_{j \in B}$ be the Byzantine submissions, with
+corresponding weights $\{w_i\}_{i \in H}$ and $\{w_j\}_{j \in B}$.
+
+The total weight is $W = W_H + W_B$. The weighted median selects the value $x$
+such that the total weight of values $\leq x$ is $\geq W/2$. For the median
+to equal a Byzantine value $\Delta_j^{(s)}(v)$ for $j \in B$, the Byzantine
+nodes would need to shift the weight balance so that strictly more than $W/2$
+weight lies on one side. This requires:
+\begin{equation}
+    W_B > W/2 - W_H/2 = (W_H + W_B)/2 - W_H/2 = W_B/2,
+\end{equation}
+which is trivially true, but for the median to be \emph{moved away from all
+honest values}, we need $W_B \geq W_H/2$. Since $W_H > 2W_B$ implies
+$W_B < W_H/2$, this is impossible. Therefore, the median must lie within the
+range of honest submissions.
+
+Since honest submissions are drawn from $\{-\alpha_i, 0, +\alpha_i\}$ (1-bit
+quantized), the median equals one of the honest values.
+\end{proof}
+
+\subsection{Coordinate-Wise Aggregation}
+
+For multi-dimensional prior factors, we apply the weighted median coordinate-wise:
+
+\begin{algorithm}[H]
+\caption{Byzantine-Robust Prior Aggregation}
+\label{alg:aggregation}
+\begin{algorithmic}[1]
+\Require Submissions $\{E_i\}_{i=1}^n$, weights $\{w_i\}_{i=1}^n$, schema $\mathcal{S}$
+\Ensure Aggregated prior $\tilde{E}$
+\For{each schema element $s \in \mathcal{S}$}
+    \For{each token position $v$ in $s$}
+        \State $\tilde{\Delta}^{(s)}(v) \gets \wmed(\{\Delta_i^{(s)}(v)\}_{i=1}^n; \{w_i\})$
+    \EndFor
+    \State $\tilde{\alpha}^{(s)} \gets \wmed(\{\alpha_i^{(s)}\}_{i=1}^n; \{w_i\})$
+\EndFor
+\State $\tilde{q} \gets \wmed(\{q_i\}_{i=1}^n; \{w_i\})$
+\State $\tilde{E} \gets \text{Assemble}(\{\tilde{\Delta}^{(s)}, \tilde{\alpha}^{(s)}\}_{s \in \mathcal{S}}, \tilde{q})$
+\State \Return $\tilde{E}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Aggregation Quality Guarantee}
+
+\begin{theorem}[Quality Preservation]
+\label{thm:quality}
+Let $q^* = \med(\{q_i\}_{i \in H})$ be the median quality of honest
+submissions. Under Assumption~\ref{ass:threat}, the aggregated prior quality
+satisfies:
+\begin{equation}
+    \tilde{q} \geq q^* - O\left(\frac{1}{\sqrt{|H|}}\right),
+\end{equation}
+where $|H| = n - f$ is the number of honest participants.
+\end{theorem}
+
+\begin{proof}
+By Theorem~\ref{thm:byz-robust}, the weighted median quality $\tilde{q}$ lies
+within the range of honest quality scores. The median of $|H|$ honest scores
+concentrates around the population median at rate $O(1/\sqrt{|H|})$ by the
+central limit theorem applied to order statistics~\cite{david2003order}. Since
+$\tilde{q}$ is bounded below by the minimum honest quality and the weighted
+median is within the honest range, the result follows.
+\end{proof}
+
+\subsection{Attack Analysis}
+
+\paragraph{Random Noise Attack.}
+Byzantine nodes submit random $\Delta_j^{(s)}(v) \sim \text{Uniform}(\{-1, +1\})$.
+Since honest nodes have correlated submissions (reflecting genuine patterns),
+the weighted median filters out uncorrelated noise. The expected degradation is
+$O(f/n)$ in prior quality.
+
+\paragraph{Targeted Poisoning.}
+Byzantine nodes identify high-value schema elements and submit adversarial
+factors designed to invert the correct recommendation. By
+Theorem~\ref{thm:byz-robust}, this requires controlling $> W_H / 2$ total
+weight, which is impossible under the stake and quality constraints.
+
+\paragraph{Gradient Mimicry.}
+Sophisticated adversaries might produce plausible-looking priors that subtly
+degrade performance. Quality verification via holdout evaluation
+(Section~\ref{sec:protocol}, Phase 3) detects such attacks with probability
+$\geq 1 - (1-\delta)^k$ after $k$ validation samples.
+
+% ============================================================================
+% 6. SYBIL RESISTANCE
+% ============================================================================

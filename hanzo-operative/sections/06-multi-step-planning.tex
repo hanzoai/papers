@@ -1,0 +1,91 @@
+\section{Multi-Step Planning}
+
+\label{sec:planning}
+
+\subsection{Hierarchical Task Decomposition}
+
+Given a high-level goal (e.g., ``Book a flight from SFO to JFK for March 15''), the planner decomposes it into a hierarchy of sub-tasks:
+
+\begin{enumerate}[leftmargin=*]
+    \item Open browser and navigate to flight booking site.
+    \item Enter departure city (SFO).
+    \item Enter destination city (JFK).
+    \item Select date (March 15).
+    \item Search for flights.
+    \item Select preferred flight from results.
+    \item Complete booking process.
+\end{enumerate}
+
+Each sub-task is further decomposed into atomic actions:
+
+\begin{lstlisting}[language=Python, caption=Task decomposition structure]
+@dataclass
+class Task:
+    goal: str
+    subtasks: list["Task"]
+    actions: list[Action]  # Leaf level
+    status: TaskStatus
+    checkpoint: ScreenState | None
+
+    def is_complete(self, state) -> bool:
+        """Check completion condition."""
+
+    def rollback_to(self, checkpoint):
+        """Restore to checkpoint state."""
+\end{lstlisting}
+
+\subsection{Observation-Action Loop}
+
+The core execution loop follows an Observe-Think-Act cycle:
+
+\begin{algorithm}[t]
+\caption{Observation-Action Loop}
+\label{alg:loop}
+\begin{algorithmic}[1]
+\REQUIRE Goal $g$, safety policy $\pi$, model $M$
+\STATE $\text{plan} \gets M.\text{decompose}(g)$
+\STATE $\text{history} \gets []$
+\WHILE{not plan.is\_complete()}
+    \STATE $s \gets \text{perceive}()$ \COMMENT{Screen understanding}
+    \STATE $\text{history.append}(s)$
+    \STATE $a \gets M.\text{select\_action}(s, \text{plan}, \text{history})$
+    \IF{not $\pi.\text{allows}(a)$}
+        \STATE $a \gets M.\text{replan}(s, a, \pi.\text{reason})$
+    \ENDIF
+    \IF{$a.\text{requires\_confirmation}$}
+        \STATE $\text{await\_user\_approval}(a)$
+    \ENDIF
+    \STATE $\text{result} \gets \text{execute}(a)$
+    \STATE $\text{history.append}(a, \text{result})$
+    \IF{$\text{result.failed}$}
+        \STATE $\text{plan.update}(M.\text{handle\_error}(s, a, \text{result}))$
+    \ENDIF
+    \STATE $\text{plan.update\_progress}(s)$
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Error Recovery}
+
+When actions fail, the planner employs a graduated recovery strategy:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Retry}: For transient failures (element not yet loaded), wait and retry.
+    \item \textbf{Alternative action}: Try a different approach to the same sub-goal (e.g., keyboard shortcut instead of menu click).
+    \item \textbf{Rollback and replan}: Restore to the last checkpoint and generate a new plan for the remaining sub-tasks.
+    \item \textbf{Escalate}: Report failure to the user with context and request guidance.
+\end{enumerate}
+
+Checkpoints are created automatically at sub-task boundaries and can be created manually at any point. For browser tasks, checkpoints capture the page URL and relevant form state. For desktop tasks, checkpoints capture a screenshot and the accessibility tree.
+
+\subsection{Context Window Management}
+
+Computer use tasks generate large observation histories that can exceed LLM context windows. Operative manages context through:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Summarization}: Older observations are summarized by a secondary LLM call that extracts key state changes and decisions.
+    \item \textbf{Relevance filtering}: Only elements relevant to the current sub-task are included in the prompt.
+    \item \textbf{Screenshot compression}: Screenshots are resized and compressed before inclusion as vision inputs. Element annotations are overlaid on screenshots to reduce reliance on text descriptions.
+    \item \textbf{Sliding window}: The most recent 5 observations are included in full; older observations are represented by their summaries.
+\end{itemize}
+

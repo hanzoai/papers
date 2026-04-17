@@ -1,0 +1,70 @@
+\section{Hanzo Dev Agent Architecture}
+
+\label{sec:agent}
+
+\subsection{System Overview}
+
+Hanzo Dev is a production CLI agent that implements ASO for agentic code
+generation. It integrates with standard development workflows and provides a
+simple interface for automated software engineering tasks.
+
+\subsection{CLI Interface}
+
+\begin{verbatim}
+hanzo dev solve <issue_file>
+  --repo <path>              # Target repository
+  --commit <hash>            # Git commit to base from
+  --group-size 4             # TF-GRPO group size (G)
+  --max-iterations 3         # Maximum refinement iterations (K)
+  --test-cmd "pytest"        # Test command for reward signal
+  --prior-bank <path>        # Path to prior bank (LanceDB)
+  --temperature 0.7          # PoE decoding temperature
+  --epistemic-weight 0.3     # Weight for exploration term (beta)
+\end{verbatim}
+
+\subsection{Workflow Pipeline}
+
+The agent executes the following pipeline for each issue:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Issue Analysis:} Parse issue description, extract requirements,
+          identify affected components via semantic search over the codebase.
+    \item \textbf{Code Localization:} Use embedding-based retrieval to identify
+          relevant files and functions. Rank by relevance score and filter by
+          edit distance to the issue description.
+    \item \textbf{Prior Retrieval:} Query the prior bank for experiential priors
+          relevant to the current issue type (content-addressed by task
+          embedding similarity).
+    \item \textbf{TF-GRPO Rollouts:} Generate $G$ candidate patches using PoE
+          decoding with retrieved priors. Each rollout produces a complete
+          git-compatible patch.
+    \item \textbf{Test Execution:} Apply each patch, run the test suite, collect
+          pass/fail results and coverage metrics.
+    \item \textbf{Advantage Extraction:} Compute group-relative advantages,
+          extract semantic patterns via LLM introspection.
+    \item \textbf{Prior Compression:} Distill patterns into 1-bit expert factors,
+          store in LanceDB with Merkle proofs.
+    \item \textbf{Iteration or Termination:} If no solution passes all tests
+          and $k < K$, return to step 4 with updated priors. Otherwise, select
+          the best patch and emit it.
+\end{enumerate}
+
+\subsection{Prior Bank Storage}
+
+Experience priors are stored in a local LanceDB instance with the following schema:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Key:} SHA-256 hash of the task specification embedding.
+    \item \textbf{Value:} 1-bit quantized delta vector + per-expert scale factor.
+    \item \textbf{Metadata:} Timestamp, quality score $q_m$, source attribution,
+          iteration number, task type embedding.
+    \item \textbf{Integrity:} Merkle proof for optional on-chain registry
+          submission (see DSO protocol).
+\end{itemize}
+
+The prior bank supports efficient nearest-neighbor queries over task embeddings,
+enabling retrieval of relevant priors for new tasks in $O(\log N)$ time where
+$N$ is the total number of stored priors.
+
+% ============================================================================
+% 9. EXPERIMENTAL RESULTS
+% ============================================================================

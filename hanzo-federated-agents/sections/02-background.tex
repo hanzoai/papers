@@ -1,0 +1,118 @@
+\section{Background}
+
+\label{sec:background}
+
+\subsection{Classical Federated Learning}
+
+Federated learning~\cite{mcmahan2017communication} trains a shared model
+across $N$ participants without centralizing raw data. The canonical
+FedAvg algorithm alternates between local training steps and global parameter
+averaging:
+\begin{equation}
+    \bm{\theta}^{t+1} = \sum_{i=1}^{N} \frac{n_i}{n} \bm{\theta}_i^{t+1},
+    \quad \bm{\theta}_i^{t+1} = \bm{\theta}^t - \eta \nabla_{\bm{\theta}} \mathcal{L}_i(\bm{\theta}^t),
+\end{equation}
+where $n_i$ is the local dataset size and $n = \sum_i n_i$.
+
+\paragraph{Communication Compression.}
+Communication overhead is the primary bottleneck in federated learning.
+\cite{seide20141bit} propose 1-bit SGD, quantizing gradient signs:
+$\hat{g} = \sign(g) \cdot \|g\|_1 / d$.
+\cite{bernstein2018signsgd} formalize SignSGD and prove convergence under
+symmetric gradient noise. 1-bit compression reduces communication by $32\times$
+versus full-precision floats.
+
+\paragraph{Byzantine Robustness.}
+Byzantine participants~\cite{lamport1982byzantine} can send arbitrary
+gradients to poison the aggregate. Krum~\cite{blanchard2017machine} selects the
+gradient closest to its $n - f - 2$ nearest neighbors as the aggregate.
+\cite{yin2018byzantine} prove that coordinate-wise median and trimmed mean
+achieve statistical rates within a factor of $f^2$ of the optimal non-Byzantine
+estimator. DeltaSoup inherits this framework and adapts it to semantic
+experience embeddings.
+
+\subsection{DSO: Decentralized Semantic Optimization}
+
+DSO~\cite{hanzo2026dso} (ZIP-001) is a protocol for sharing and aggregating
+experiential priors across distributed language model agents.
+
+\begin{definition}[Experiential Prior]
+\label{def:prior}
+An experiential prior $E_m$ consists of:
+\begin{itemize}[leftmargin=1.5em]
+    \item A natural language pattern description $\text{pattern}_m$ ($\leq 32$ words).
+    \item A task embedding $\bm{e}_m \in \mathbb{R}^d$ encoding the domain.
+    \item A quality score $q_m \in (0, 1)$ estimating pattern reliability.
+    \item A 1-bit quantized expert factor $\widehat{\Delta}_m \in \{-1,+1\}^V$
+          with scale $\alpha_m > 0$ for PoE decoding.
+    \item Metadata: timestamp, source node, domain tag, iteration count.
+\end{itemize}
+\end{definition}
+
+The \emph{experience library} $\mathcal{L} = \{E_1, \ldots, E_M\}$ is the
+shared artifact. Agents use it for retrieve-and-apply at decode time:
+\begin{equation}
+    \pi_{\text{ASO}}(y_t \mid x, y_{<t}) \propto \pi_\theta(y_t \mid x, y_{<t})
+    \prod_{m \in \text{retrieved}(x)} \phi_m(y_t)^{\eta_m},
+    \label{eq:poe}
+\end{equation}
+where $\eta_m = \log(q_m / (1 - q_m))$ and $\phi_m$ is constructed from
+$\widehat{\Delta}_m$.
+
+Unlike classical federated learning, DSO shares no model parameters, no
+gradients, and no raw training data. The shared artifact is entirely composed
+of compressed semantic patterns in natural language plus corresponding
+quantized embedding perturbations.
+
+\subsection{BitDelta Compression}
+\label{sec:background-bitdelta}
+
+BitDelta (ZIP-007)~\cite{hanzo2026bitdelta} applies 1-bit quantization to
+embedding \emph{deltas} relative to a shared baseline. For experience embedding
+$\bm{e} \in \mathbb{R}^d$ and baseline $\bar{\bm{e}} \in \mathbb{R}^d$:
+
+\begin{definition}[BitDelta Quantization]
+\label{def:bitdelta}
+Given delta $\Delta = \bm{e} - \bar{\bm{e}} \in \mathbb{R}^d$, the BitDelta
+quantization is:
+\begin{equation}
+    \widehat{\Delta} = \alpha \cdot \sign(\Delta),
+    \quad \alpha = \frac{1}{d} \|\Delta\|_1 = \frac{1}{d}\sum_{j=1}^d |\Delta_j|,
+    \label{eq:bitdelta}
+\end{equation}
+where $\alpha \in \mathbb{R}_{>0}$ is the per-group scale factor and
+$\sign(\Delta) \in \{-1, +1\}^d$ is the elementwise sign vector stored as
+packed bits (1 bit per dimension).
+\end{definition}
+
+With group-wise scaling (group size $g = 128$), each group uses one float32
+scale and $g$ bits, giving:
+\begin{equation}
+    \text{bits per element} = \frac{32 + g}{g} = 1 + \frac{32}{g}.
+\end{equation}
+For $g = 128$: $1.25$ bits/element, a $25.6\times$ reduction from float32.
+Accounting for metadata overhead, practical compression is ${\approx}10\times$.
+
+\subsection{DeltaSoup Aggregation}
+\label{sec:background-deltasoup}
+
+DeltaSoup is a Byzantine-robust aggregation protocol for community delta
+contributions. Conceptually, it applies the geometric median~\cite{minsker2015geometric}
+rather than the arithmetic mean, so a minority of adversarial contributors
+cannot shift the aggregate arbitrarily.
+
+Given $N$ compressed experience batches $\{\hat{B}_i\}_{i=1}^N$ received from
+peers, DeltaSoup:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Decompresses all batches to full-precision embeddings.
+    \item Computes pairwise cosine similarity across all experiences.
+    \item Filters experiences whose embedding lies more than $2\sigma$ from
+          the coordinate-wise median (outlier rejection).
+    \item Merges surviving experiences with confidence-weighted averaging.
+\end{enumerate}
+
+Formal properties are developed in Section~\ref{sec:deltasoup}.
+
+% ============================================================================
+% 3. SYSTEM ARCHITECTURE
+% ============================================================================

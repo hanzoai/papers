@@ -1,0 +1,93 @@
+\section{Hierarchical Memory Architecture}
+
+\label{sec:memory}
+
+\subsection{Memory Hierarchy}
+
+Hanzo Chat implements a three-tier memory hierarchy:
+
+\begin{definition}[Memory Tiers]
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Session Memory} ($\mathcal{M}_S$): Full conversation history within the current session. Stored in-memory, evicted on session close. Capacity: full context window.
+    \item \textbf{Project Memory} ($\mathcal{M}_P$): Facts, decisions, and summaries relevant to a specific project. Persisted in vector database. Retention: indefinite.
+    \item \textbf{Global Memory} ($\mathcal{M}_G$): User preferences, frequently referenced information, and cross-project knowledge. Persisted globally. Retention: indefinite.
+\end{itemize}
+\end{definition}
+
+\subsection{Memory Storage}
+
+Each memory entry is a tuple $(k, v, \bm{e}, t, s, \rho)$ where $k$ is a unique identifier, $v$ is the content string, $\bm{e} \in \mathbb{R}^d$ is the embedding vector, $t$ is the creation timestamp, $s \in \{S, P, G\}$ is the scope, and $\rho \in [0, 1]$ is the relevance score.
+
+Embeddings are computed using a fine-tuned E5-large model~\cite{wang2022text} ($d = 1024$) and stored in a pgvector~\cite{pgvector2023} index for efficient similarity search.
+
+\subsection{Memory Retrieval}
+
+Given a query embedding $\bm{e}_t$, we retrieve the top-$k$ memories from each tier:
+
+\begin{equation}
+\mathcal{R}_s = \text{Top-}k_s\left(\{m \in \mathcal{M}_s : \cos(\bm{e}_t, m.\bm{e}) > \tau_s\}\right),
+\end{equation}
+
+where $k_S = 20$, $k_P = 10$, $k_G = 5$ and $\tau_S = 0.3$, $\tau_P = 0.5$, $\tau_G = 0.6$ are tier-specific thresholds (higher thresholds for broader scopes to maintain relevance).
+
+The combined retrieval set $\mathcal{R} = \mathcal{R}_S \cup \mathcal{R}_P \cup \mathcal{R}_G$ is re-ranked by a cross-encoder~\cite{nogueira2019passage} and truncated to fit within the context budget.
+
+\subsection{Automatic Summarization}
+
+When session memory exceeds a threshold (default: 75\% of context window), older conversation turns are automatically summarized:
+
+\begin{algorithm}[H]
+\caption{Adaptive Memory Summarization}
+\label{alg:summarize}
+\begin{algorithmic}[1]
+\Require Session history $H = [h_1, \ldots, h_T]$, context budget $B$
+\State $\text{tokens} \gets \text{CountTokens}(H)$
+\While{$\text{tokens} > 0.75 \cdot B$}
+    \State $\text{oldest} \gets H[1:\lfloor T/3 \rfloor]$ \Comment{Oldest third}
+    \State $\text{summary} \gets \text{LLM.Summarize}(\text{oldest})$
+    \State Extract facts $\mathcal{F} \gets \text{LLM.ExtractFacts}(\text{oldest})$
+    \State Store $\mathcal{F}$ in project memory $\mathcal{M}_P$
+    \State $H \gets [\text{summary}] \cup H[\lfloor T/3 \rfloor + 1 : T]$
+    \State $\text{tokens} \gets \text{CountTokens}(H)$
+\EndWhile
+\State \Return $H$
+\end{algorithmic}
+\end{algorithm}
+
+This process is transparent to the user: the full conversation appears continuous even though the underlying representation has been compressed.
+
+\subsection{Memory Consolidation}
+
+We periodically consolidate memories across tiers using a process inspired by hippocampal replay in neuroscience~\cite{mcclelland1995memory}:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Deduplication}: Merge memories with cosine similarity $> 0.95$.
+    \item \textbf{Promotion}: Session memories accessed $> 3$ times are promoted to project memory.
+    \item \textbf{Generalization}: Cluster project memories and extract general rules for global memory.
+    \item \textbf{Decay}: Memories not accessed for 90 days have their relevance score decayed by 10\%.
+\end{enumerate}
+
+\subsection{Context Window Management}
+
+The context window is partitioned as follows:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Section} & \textbf{Budget (\%)} & \textbf{Example (128K)} \\
+\midrule
+System prompt & 5\% & 6,400 tokens \\
+Global memory & 5\% & 6,400 tokens \\
+Project memory & 10\% & 12,800 tokens \\
+Retrieved context & 15\% & 19,200 tokens \\
+Conversation history & 50\% & 64,000 tokens \\
+Tool definitions & 5\% & 6,400 tokens \\
+Current query & 5\% & 6,400 tokens \\
+Generation headroom & 5\% & 6,400 tokens \\
+\bottomrule
+\end{tabular}
+\caption{Context window budget allocation for a 128K token model.}
+\label{tab:context_budget}
+\end{table}
+

@@ -1,0 +1,140 @@
+\section{System Design}
+
+
+\subsection{Architectural Principles}
+
+Crowdstart adheres to four design principles:
+
+\textbf{Principle 1: Stateless Request Handling.} No request depends on state from a previous request to the same instance. All state resides in managed services.
+
+\textbf{Principle 2: Idempotent Operations.} All mutating operations can be safely retried. This enables automatic retry on transient failures without application-level deduplication logic.
+
+\textbf{Principle 3: Eventual Consistency by Default.} We accept eventual consistency for most operations, reserving strong consistency for the critical path (inventory decrements, payment capture).
+
+\textbf{Principle 4: Event-Driven Processing.} Long-running operations execute asynchronously via task queues. Synchronous request handlers complete within milliseconds.
+
+\subsection{Core Components}
+
+The Crowdstart architecture comprises five primary components:
+
+\subsubsection{API Gateway}
+
+The gateway handles authentication, rate limiting, and request routing. Implemented as a stateless Go service, it validates JWT tokens against a cached public key and routes requests to appropriate backend services.
+
+\begin{lstlisting}[language=Go,caption=Request routing]
+func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    ctx := appengine.NewContext(r)
+
+    // Authenticate
+    claims, err := g.auth.Validate(ctx, r)
+    if err != nil {
+        http.Error(w, "Unauthorized", 401)
+        return
+    }
+
+    // Route to backend
+    backend := g.router.Match(r.URL.Path)
+    backend.ServeHTTP(w, r.WithContext(
+        context.WithValue(ctx, "claims", claims),
+    ))
+}
+\end{lstlisting}
+
+\subsubsection{Product Catalog}
+
+The catalog service manages product data: descriptions, pricing, images, and variants. Data resides in Google Cloud Datastore with Memcache providing read-through caching.
+
+We model products as entities with multiple ancestor relationships:
+
+\begin{lstlisting}[language=Go,caption=Product entity model]
+type Product struct {
+    ID          string    `datastore:"-"`
+    StoreKey    *datastore.Key `datastore:"-"`
+    Name        string
+    Description string    `datastore:",noindex"`
+    Price       int64     // cents
+    Currency    string
+    Variants    []Variant `datastore:"-"`
+    CreatedAt   time.Time
+    UpdatedAt   time.Time
+}
+\end{lstlisting}
+
+Ancestor queries enable strongly consistent reads within a store's product hierarchy, while cross-store queries accept eventual consistency.
+
+\subsubsection{Inventory Management}
+
+Inventory presents the primary consistency challenge. We implement a reservation-based model:
+
+\begin{enumerate}
+\item Customer adds item to cart $\rightarrow$ soft reservation (TTL: 15 minutes).
+\item Checkout initiated $\rightarrow$ hard reservation (transaction).
+\item Payment confirmed $\rightarrow$ inventory decrement.
+\item Payment failed $\rightarrow$ reservation released.
+\end{enumerate}
+
+Hard reservations use Datastore transactions with optimistic concurrency:
+
+\begin{lstlisting}[language=Go,caption=Inventory reservation]
+func (s *InventoryService) Reserve(ctx context.Context, sku string, qty int) error {
+    key := datastore.NewKey(ctx, "Inventory", sku, 0, nil)
+
+    _, err := datastore.RunInTransaction(ctx, func(tc context.Context) error {
+        var inv Inventory
+        if err := datastore.Get(tc, key, &inv); err != nil {
+            return err
+        }
+
+        if inv.Available < qty {
+            return ErrInsufficientInventory
+        }
+
+        inv.Available -= qty
+        inv.Reserved += qty
+        _, err := datastore.Put(tc, key, &inv)
+        return err
+    }, nil)
+
+    return err
+}
+\end{lstlisting}
+
+\subsubsection{Order Processing}
+
+Orders transition through a state machine: \texttt{PENDING} $\rightarrow$ \texttt{PAID} $\rightarrow$ \texttt{FULFILLED} $\rightarrow$ \texttt{COMPLETED}. State transitions are driven by task queue handlers, ensuring durability and retry semantics.
+
+\subsubsection{Payment Integration}
+
+Payment processing integrates with Stripe via their Go library. We implement the payment flow as an idempotent operation using Stripe's idempotency keys:
+
+\begin{lstlisting}[language=Go,caption=Idempotent payment capture]
+func (p *PaymentService) Capture(ctx context.Context, order *Order) error {
+    params := &stripe.ChargeParams{
+        Amount:   stripe.Int64(order.Total),
+        Currency: stripe.String(order.Currency),
+        Source:   &stripe.SourceParams{Token: stripe.String(order.PaymentToken)},
+    }
+    params.SetIdempotencyKey(order.ID)
+
+    _, err := charge.New(params)
+    return err
+}
+\end{lstlisting}
+
+\subsection{Data Model}
+
+We employ a denormalized data model optimized for read-heavy workloads. Entity relationships are represented through key embedding rather than joins:
+
+\begin{align}
+\text{Store} &\rightarrow \text{Products} \rightarrow \text{Variants} \\
+\text{Store} &\rightarrow \text{Orders} \rightarrow \text{LineItems} \\
+\text{Customer} &\rightarrow \text{Addresses}, \text{PaymentMethods}
+\end{align}
+
+Denormalization introduces update anomalies. We mitigate this through:
+\begin{itemize}
+\item Immutable entities where possible (orders, transactions).
+\item Background consistency jobs for derived data.
+\item Version vectors for conflict resolution.
+\end{itemize}
+

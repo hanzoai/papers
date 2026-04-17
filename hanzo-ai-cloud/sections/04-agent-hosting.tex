@@ -1,0 +1,89 @@
+\section{Agent Hosting}
+
+\label{sec:agents}
+% ============================================================================
+
+Hanzo AI Cloud hosts autonomous agents---persistent AI processes with memory,
+tools, and goals. Each agent runs inside a \textbf{capsule}: an isolated
+execution environment with its own data, identity, and resource budget.
+
+\subsection{Capsule Architecture}
+
+\begin{definition}[Agent Capsule]
+A capsule is a tuple $(\text{vault}, \text{did}, \text{caps}, \text{budget},
+\text{mem})$ where:
+\begin{itemize}[leftmargin=1.1em]
+    \item $\text{vault}$: A private Base instance (encrypted SQLite) containing
+    the agent's persistent state.
+    \item $\text{did}$: A decentralized identifier on the Lux I-Chain,
+    uniquely identifying the agent.
+    \item $\text{caps}$: A capability set defining what the agent can access
+    (collections, APIs, other agents, network).
+    \item $\text{budget}$: A HANZO token budget limiting the agent's compute
+    and API spending.
+    \item $\text{mem}$: Encrypted working memory (conversation history,
+    scratchpad, retrieved context) stored in the vault.
+\end{itemize}
+\end{definition}
+
+\subsection{Isolation Guarantees}
+
+Capsule isolation is enforced at three levels:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Storage isolation}: Each capsule's vault is a separate
+    encrypted SQLite database with a unique encryption key. The platform
+    cannot read the vault contents without the agent's key.
+    \item \textbf{Compute isolation}: Each capsule runs in a separate Goja VM
+    instance (for tool execution) and a separate inference context (for model
+    calls). No shared state between capsules.
+    \item \textbf{Network isolation}: Capsule network access is restricted to
+    the capabilities declared in $\text{caps}$. An agent without the
+    \texttt{network} capability cannot make outbound requests.
+\end{enumerate}
+
+\subsection{Agent Memory}
+
+Agent memory is structured as three tiers:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llp{5cm}}
+\toprule
+\textbf{Tier} & \textbf{Storage} & \textbf{Behavior} \\
+\midrule
+Working & In-process & Current conversation context. Lost on capsule
+restart. \\
+Episodic & Vault (encrypted) & Past interactions, indexed by time and topic.
+Persists across restarts. Searchable via vector similarity. \\
+Semantic & Vault (encrypted) & Distilled knowledge extracted from episodic
+memory. Compact, structured, versioned. \\
+\bottomrule
+\end{tabular}
+\caption{Agent memory tiers. All persistent memory is encrypted in the
+capsule vault.}
+\label{tab:memory}
+\end{table}
+
+Episodic-to-semantic distillation runs as a scheduled Base Function inside the
+capsule. The agent periodically reviews its episodic memory and extracts
+durable facts, preferences, and learned patterns into the semantic tier. This
+is analogous to sleep consolidation in biological memory systems.
+
+\subsection{Budget Enforcement}
+
+Each capsule has a HANZO token budget that limits:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Inference tokens}: Maximum tokens generated per period.
+    \item \textbf{API calls}: Maximum outbound API calls per period.
+    \item \textbf{Storage}: Maximum vault size in bytes.
+    \item \textbf{Compute}: Maximum CPU-seconds for function execution.
+\end{itemize}
+
+Budget is enforced at the platform level. When a capsule exhausts its budget,
+it is suspended (not terminated). The capsule's vault and memory persist.
+The owner can replenish the budget to resume the agent.
+
+% ============================================================================

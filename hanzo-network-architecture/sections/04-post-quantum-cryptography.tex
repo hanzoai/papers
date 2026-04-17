@@ -1,0 +1,135 @@
+\section{Post-Quantum Cryptography}
+
+
+Hanzo implements production-ready PQC compliant with NIST FIPS 203/204 standards, addressing the threat of quantum computers to current cryptographic systems.
+
+\subsection{Algorithm Selection}
+
+\subsubsection{ML-KEM (FIPS 203)}
+
+Module-Lattice Key Encapsulation Mechanism:
+
+\begin{itemize}
+\item \textbf{ML-KEM-512}: 128-bit security, lightweight IoT
+\item \textbf{ML-KEM-768}: 192-bit security, \textbf{default}
+\item \textbf{ML-KEM-1024}: 256-bit security, maximum protection
+\end{itemize}
+
+Key sizes (ML-KEM-768):
+\begin{itemize}
+\item Encapsulation key: 1184 bytes
+\item Decapsulation key: 2400 bytes
+\item Ciphertext: 1088 bytes
+\item Shared secret: 32 bytes
+\end{itemize}
+
+\subsubsection{ML-DSA (FIPS 204)}
+
+Module-Lattice Digital Signature Algorithm:
+
+\begin{itemize}
+\item \textbf{ML-DSA-44}: 128-bit security, fast verification
+\item \textbf{ML-DSA-65}: 192-bit security, \textbf{default}
+\item \textbf{ML-DSA-87}: 256-bit security, maximum protection
+\end{itemize}
+
+Signature sizes (ML-DSA-65):
+\begin{itemize}
+\item Verification key: 1952 bytes
+\item Signing key: 4032 bytes
+\item Signature: 3309 bytes (deterministic)
+\end{itemize}
+
+\subsection{Privacy Tiers}
+
+Hanzo implements a five-tier privacy model with automatic algorithm selection:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|c|l|c|c|}
+\hline
+\textbf{Tier} & \textbf{Environment} & \textbf{ML-KEM} & \textbf{ML-DSA} \\
+\hline
+0 & Open Data & 768 & 65 \\
+1 & At-Rest Encryption & 768 & 65 \\
+2 & CPU TEE & 768 & 65 \\
+3 & GPU CC (H100) & 1024 & 87 \\
+4 & GPU TEE-I/O & 1024 & 87 \\
+\hline
+\end{tabular}
+\caption{Privacy tier algorithm selection}
+\label{tab:privacy_tiers}
+\end{table}
+
+Tier 3/4 support NVIDIA H100 Confidential Computing and Blackwell TEE-I/O with:
+\begin{itemize}
+\item Encrypted DMA transfers
+\item NVLink security
+\item Attestation-based key release
+\item Hardware-backed enclave protection
+\end{itemize}
+
+\subsection{Hybrid Mode}
+
+Defense-in-depth via combined PQC + classical crypto:
+
+\begin{equation}
+K_{\text{shared}} = \text{KDF}(K_{\text{ML-KEM}} \parallel K_{\text{X25519}})
+\end{equation}
+
+Using HKDF (SP 800-56C compliant):
+
+\begin{equation}
+\text{KDF}(IKM, salt, info, L) = \text{HKDF-Expand}(\text{HKDF-Extract}(salt, IKM), info, L)
+\end{equation}
+
+This protects against both classical and quantum attacks, with security level $\max(\text{ML-KEM}, \text{X25519})$.
+
+\subsection{Key Broker Service (KBS)}
+
+Attestation-based key release (\texttt{hanzo-kbs}):
+
+\begin{algorithm}
+\caption{PQC-Enhanced Key Release}
+\begin{algorithmic}[1]
+\REQUIRE TEE attestation report, privacy tier
+\ENSURE Wrapped DEK (Data Encryption Key)
+\STATE Verify TEE attestation signature
+\STATE Check attestation measurements against policy
+\STATE Select KEK (Key Encryption Key) based on tier
+\IF{tier $\geq$ 3}
+    \STATE Use ML-KEM-1024 with GPU CC vault
+\ELSE
+    \STATE Use ML-KEM-768 with standard vault
+\ENDIF
+\STATE Generate ephemeral keypair $(pk, sk)$
+\STATE Encapsulate: $(ct, ss) \leftarrow$ ML-KEM.Encap$(pk)$
+\STATE Derive KEK $\leftarrow$ HKDF$(ss)$
+\STATE Wrap DEK with ChaCha20Poly1305-KEK
+\RETURN $(ct, \text{wrapped\_DEK})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Performance Benchmarks}
+
+Measured on Apple M2 Max (12-core CPU):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Operation} & \textbf{ML-KEM-768} & \textbf{ML-DSA-65} \\
+\hline
+Keygen & 47 μs & 98 μs \\
+Encap/Sign & 58 μs & 241 μs \\
+Decap/Verify & 71 μs & 117 μs \\
+\hline
+\end{tabular}
+\caption{PQC operation latencies}
+\label{tab:pqc_perf}
+\end{table}
+
+These timings enable real-time encryption/signing for high-throughput workloads.
+

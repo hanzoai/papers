@@ -1,0 +1,157 @@
+\section{Loop 1: Build It Now}
+
+\label{sec:loop1}
+
+\subsection{Motivation and Trigger Condition}
+
+The Build-It-Now (BIN) loop is the most novel contribution of this architecture.
+Its design philosophy is that \emph{the best time to fix a recurring problem
+is the third time it occurs}, not at the end of the session, not in the next
+sprint, and not after it has been documented in a backlog. The third occurrence
+provides enough evidence that the problem is systematic (ruling out one-off
+errors) while the session context is still fresh enough to build a targeted
+solution.
+
+\begin{definition}[BIN Trigger]
+\label{def:bin_trigger}
+The BIN trigger $\mathcal{T}_{\text{BIN}}$ fires when the telemetry stream
+contains a pattern match:
+\begin{equation}
+\mathcal{T}_{\text{BIN}}(\mathcal{T}_{\text{cur}}) = \mathbf{1}\bigl[
+    \exists\, (t, f) \in \mathcal{V}_T \times \mathcal{V}_F :
+    \#\{ \tau \in \mathcal{T}_{\text{cur}} \mid \tau.\text{tool}=t,\;
+    \tau.\text{failure\_mode}=f \} \geq \theta
+\bigr],
+\end{equation}
+where $\theta = 3$ is the default threshold and $\mathcal{T}_{\text{cur}}$
+is the current session slice.
+\end{definition}
+
+The threshold $\theta = 3$ is motivated by the coupon-collector problem: with
+$k$ distinct failure modes, the expected number of trials to observe any mode
+three times is $3k$ when modes are uniformly distributed, and substantially
+less when one mode is dominant (which is the case of interest). We show in
+Section~\ref{sec:triggers} that $\theta \in \{2,3,4\}$ yields the best
+precision-recall tradeoff, with $\theta = 3$ being Pareto-optimal in most
+regimes.
+
+\subsection{FRICTION-DETECT Algorithm}
+
+Algorithm~\ref{alg:friction_detect} specifies the FRICTION-DETECT procedure
+that continuously monitors the telemetry stream and fires the BIN trigger.
+
+\begin{algorithm}[H]
+\caption{FRICTION-DETECT$(S, \theta)$}
+\label{alg:friction_detect}
+\begin{algorithmic}[1]
+\Require Telemetry stream $S$ (NATS subscription), threshold $\theta$
+\Ensure BIN trigger events with $(t, f, \text{evidence})$ payload
+\State $C \gets \textsc{DefaultDict}(\mathbb{N})$ \Comment{Failure counter: $(t,f) \to \mathbb{N}$}
+\State $E \gets \textsc{DefaultDict}(\text{list})$ \Comment{Evidence collector: $(t,f) \to [\tau]$}
+\State $\text{fired} \gets \emptyset$ \Comment{Set of already-triggered pairs}
+\For{each record $\tau$ from $S$}
+    \If{$\tau.\text{outcome} = \textsc{failure}$ \textbf{and} $\tau.\text{failure\_mode} \neq \bot$}
+        \State $k \gets (\tau.\text{tool},\; \tau.\text{failure\_mode})$
+        \State $C[k] \mathrel{+}= 1$
+        \State $E[k].\textsc{append}(\tau)$
+        \If{$C[k] \geq \theta$ \textbf{and} $k \notin \text{fired}$}
+            \State $\text{fired}.\textsc{add}(k)$
+            \State \textbf{emit} $\textsc{BINEvent}(t=k_1,\; f=k_2,\; \text{evidence}=E[k])$
+        \EndIf
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{BIN Build Pipeline}
+
+When a BINEvent fires, the agent executes the following multi-stage pipeline.
+The pipeline is designed to be atomic: if any stage fails, the agent rolls back
+to its pre-BIN state and resumes the paused task.
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Pause.} Serialize the current task state (context snapshot,
+          pending actions queue) to a checkpoint file.
+
+    \item \textbf{Design.} Prompt the LLM with: (a) the BINEvent evidence
+          (up to 3 example failure records), (b) the current tool library
+          manifest, and (c) a structured template requesting a micro-tool
+          design. The design must specify: tool name, input schema, output
+          schema, implementation sketch, and acceptance criteria.
+
+    \item \textbf{Build.} Generate tool implementation from the design. Tools
+          are TypeScript modules conforming to the Hanzo bot plugin interface.
+          The LLM generates the implementation; a static linter and type
+          checker run immediately.
+
+    \item \textbf{Test.} Execute the acceptance criteria as unit tests against
+          the reproduced failure case (reconstructed from the evidence records).
+          A tool that does not pass its own acceptance criteria is not loaded.
+
+    \item \textbf{Gate.} If all acceptance criteria pass, the tool is added to
+          the tool library with a \texttt{status: "probationary"} flag. A
+          probationary tool requires two more successful uses before its status
+          is promoted to \texttt{"stable"}.
+
+    \item \textbf{Reload.} Load the new tool into the active tool registry.
+
+    \item \textbf{Resume.} Restore the serialized task state and continue
+          execution with the new tool available.
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{BIN-BUILD-PIPELINE$(\text{event}, \mathcal{K})$}
+\label{alg:bin_build}
+\begin{algorithmic}[1]
+\Require BINEvent $\text{event}$, current tool library $\mathcal{K}$
+\Ensure Updated tool library $\mathcal{K}'$ or $\mathcal{K}$ on failure
+\State $\text{checkpoint} \gets \textsc{SerializeContext}()$
+\State $\text{design} \gets \textsc{LLM-Design}(\text{event.evidence}, \mathcal{K})$
+\If{$\text{design} = \bot$}
+    \State \Return $\mathcal{K}$ \Comment{LLM could not produce design; resume without change}
+\EndIf
+\State $\text{impl} \gets \textsc{LLM-Implement}(\text{design})$
+\State $\text{lint\_ok} \gets \textsc{TypeCheck}(\text{impl})$
+\If{$\neg \text{lint\_ok}$}
+    \State \Return $\mathcal{K}$
+\EndIf
+\State $\text{test\_result} \gets \textsc{RunAcceptanceCriteria}(\text{impl}, \text{design.criteria}, \text{event.evidence})$
+\If{$\neg \text{test\_result.passed}$}
+    \State \Return $\mathcal{K}$
+\EndIf
+\State $\text{tool} \gets \textsc{Package}(\text{impl}, \text{status}=\texttt{"probationary"})$
+\State $\mathcal{K}' \gets \mathcal{K} \cup \{\text{tool}\}$
+\State $\textsc{ReloadRegistry}(\mathcal{K}')$
+\State $\textsc{RestoreContext}(\text{checkpoint})$
+\State \Return $\mathcal{K}'$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Anti-Deferral Properties}
+
+\begin{proposition}[No Backlog Accumulation]
+\label{prop:no_backlog}
+In a system running the BIN protocol, the expected size of the improvement
+backlog grows as $O(\log s)$ in the number of sessions $s$, compared to
+$O(s)$ in deferral-based systems.
+\end{proposition}
+
+\begin{proof}
+In a deferral-based system, each session generates at most $B$ improvement
+opportunities (where $B$ is session length divided by minimum failure stride).
+These are appended to the backlog. Without a consumption mechanism of comparable
+rate, the backlog grows as $O(B \cdot s) = O(s)$.
+
+In the BIN system, each failure pattern $(t, f)$ triggers a build the first
+time it reaches threshold $\theta$. Subsequent occurrences of the same
+$(t, f)$ pair after a successful build do not trigger another build (the tool
+is already in the library). New $(t, f)$ pairs can only arise from the
+vocabulary expansion rate, which grows at most as $O(\log s)$ by the
+information-theoretic lower bound on new information in a stationary environment
+(new failure modes are progressively rarer as the tool library matures).
+Therefore the backlog size is $O(\log s)$.
+\end{proof}
+
+% ============================================================================
+% 6. LOOP 2: ACTIVE LEARNING
+% ============================================================================

@@ -1,0 +1,85 @@
+\section{Loop 4: Maintenance Pass}
+
+\label{sec:loop4}
+
+\subsection{Design Principles}
+
+Loop~4 is deliberately human-gated. This is not a limitation but a design
+choice based on three considerations:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Risk asymmetry.} Changes to the base tool library or system
+          prompt affect all future sessions. A false positive (deploying a
+          change that degrades performance) is harder to recover from than
+          a false negative (delaying a beneficial change by one cycle).
+
+    \item \textbf{Evidence requirement.} Loop~4 requires evidence from $N \geq 5$
+          sessions before generating a proposal. This ensures that proposals
+          are based on systematic patterns, not one-off observations.
+
+    \item \textbf{Human expertise.} Changes to the tool library may require
+          domain expertise that the LLM does not have (e.g., choosing between
+          two correct implementations based on performance characteristics
+          that cannot be measured in unit tests).
+\end{enumerate}
+
+\subsection{Cross-Session Aggregation}
+
+Loop~4 aggregates telemetry across all sessions to identify systematic patterns.
+The aggregation operates on the telemetry digest in each SessionReflection record,
+not the raw telemetry log, to bound processing time.
+
+\begin{definition}[MaintenanceProposal]
+\label{def:maintenance_proposal}
+A \textsc{MaintenanceProposal} record $\pi$ is a tuple:
+\begin{equation}
+\pi = \bigl( \text{id},\; \text{type},\; \text{description},\; \text{evidence},\;
+             \text{expected\_impact},\; \text{risk},\; \text{status} \bigr),
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em, nosep]
+    \item $\text{type} \in \{\text{new-tool}, \text{modify-tool}, \text{retire-tool}, \text{system-prompt}, \text{fact-update}\}$
+    \item $\text{evidence}$: References to SessionReflection records and telemetry patterns supporting the proposal.
+    \item $\text{expected\_impact}$: Estimated change in tool success rate (with confidence interval).
+    \item $\text{risk} \in \{\text{low}, \text{medium}, \text{high}\}$: Human-assessed risk category.
+    \item $\text{status} \in \{\text{pending}, \text{approved}, \text{rejected}, \text{implemented}\}$
+\end{itemize}
+\end{definition}
+
+\subsection{Proposal Generation Algorithm}
+
+\begin{algorithm}[H]
+\caption{MAINTENANCE-PASS$(\mathcal{R}_{1:N}, \mathcal{T}_{1:N})$}
+\label{alg:maintenance}
+\begin{algorithmic}[1]
+\Require Session reflections $\mathcal{R}_{1:N}$, telemetry logs $\mathcal{T}_{1:N}$
+\Ensure Set of \textsc{MaintenanceProposal} records
+\State $\text{proposals} \gets \emptyset$
+\State $\text{patterns} \gets \textsc{AggregateFailurePatterns}(\mathcal{T}_{1:N})$
+\For{each pattern $p = (t, f, \text{count}, \text{sessions}) \in \text{patterns}$}
+    \If{$p.\text{count} \geq \gamma_{\text{count}}$ \textbf{and} $|\text{sessions}| \geq \gamma_{\text{sessions}}$}
+        \State $\text{supporting} \gets \{r \in \mathcal{R}_{1:N} \mid p \in r.\text{failures}\}$
+        \State $\pi \gets \textsc{LLM-Propose}(p, \text{supporting}, \text{current-toolkit})$
+        \State $\pi.\text{evidence} \gets \text{supporting}$
+        \State $\pi.\text{status} \gets \texttt{"pending"}$
+        \State $\text{proposals} \mathrel{\cup}= \{\pi\}$
+    \EndIf
+\EndFor
+\For{each proposal $\pi \in \text{proposals}$}
+    \State \textsc{HumanReview}$(\pi)$ \Comment{Blocking: awaits human approval/rejection}
+    \If{$\pi.\text{status} = \texttt{"approved"}$}
+        \State \textsc{ImplementProposal}$(\pi)$
+    \EndIf
+\EndFor
+\State \Return $\text{proposals}$
+\end{algorithmic}
+\end{algorithm}
+
+The thresholds $\gamma_{\text{count}} = 10$ and $\gamma_{\text{sessions}} = 3$
+are defaults that balance sensitivity (detecting real problems) with specificity
+(avoiding spurious proposals from noisy sessions). These thresholds should be
+tuned to the agent's deployment context.
+
+% ============================================================================
+% 9. FORMAL ANALYSIS
+% ============================================================================

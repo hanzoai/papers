@@ -1,0 +1,177 @@
+\section{Analytical Capabilities}
+
+
+\subsection{Live Dashboards}
+
+Dashboards query materialized views for sub-second response:
+
+\begin{lstlisting}[language=SQL,caption=Dashboard query]
+-- Orders and revenue, last hour, by minute
+SELECT
+    window_start,
+    SUM(order_count) AS orders,
+    SUM(total_revenue) AS revenue
+FROM mv_revenue_by_minute
+WHERE store_id = 'store_123'
+  AND window_start >= NOW() - INTERVAL '1' HOUR
+GROUP BY window_start
+ORDER BY window_start;
+\end{lstlisting}
+
+Query latency: 15--50ms (served entirely from Redis).
+
+\subsection{Cohort Analysis}
+
+Cohort analysis groups users by acquisition characteristics and tracks behavior over time:
+
+\begin{lstlisting}[language=SQL,caption=Cohort retention query]
+WITH cohorts AS (
+    SELECT
+        user_id,
+        DATE_TRUNC('week', MIN(event_time)) AS cohort_week
+    FROM events
+    WHERE event_type = 'purchase'
+      AND store_id = 'store_123'
+    GROUP BY user_id
+),
+activity AS (
+    SELECT
+        e.user_id,
+        c.cohort_week,
+        DATE_TRUNC('week', e.event_time) AS activity_week
+    FROM events e
+    JOIN cohorts c ON e.user_id = c.user_id
+    WHERE e.event_type = 'purchase'
+      AND e.store_id = 'store_123'
+)
+SELECT
+    cohort_week,
+    DATE_DIFF('week', cohort_week, activity_week) AS weeks_since_cohort,
+    COUNT(DISTINCT user_id) AS active_users
+FROM activity
+GROUP BY cohort_week, weeks_since_cohort
+ORDER BY cohort_week, weeks_since_cohort;
+\end{lstlisting}
+
+We provide cohort analysis as a built-in function:
+
+\begin{lstlisting}[language=SQL,caption=Cohort analysis function]
+SELECT * FROM COHORT_ANALYSIS(
+    events,
+    cohort_date := DATE_TRUNC('week', first_purchase_date),
+    activity_date := DATE_TRUNC('week', event_time),
+    user_id := user_id,
+    metric := COUNT(DISTINCT order_id),
+    filters := [store_id = 'store_123', event_type = 'purchase']
+);
+\end{lstlisting}
+
+\subsection{Funnel Analysis}
+
+Funnel analysis tracks conversion through defined steps:
+
+\begin{lstlisting}[language=SQL,caption=Conversion funnel]
+SELECT * FROM FUNNEL(
+    events,
+    steps := [
+        event_type = 'page_view' AND page = '/products',
+        event_type = 'product_view',
+        event_type = 'add_to_cart',
+        event_type = 'checkout_start',
+        event_type = 'purchase'
+    ],
+    window := INTERVAL '30' MINUTE,
+    group_by := [device_type, utm_source]
+);
+\end{lstlisting}
+
+The funnel operator uses session-based windowing to track users through steps:
+
+\begin{lstlisting}[language=Python,caption=Funnel computation]
+def compute_funnel(events, steps, window, group_by):
+    results = defaultdict(lambda: [0] * len(steps))
+
+    for session in group_by_session(events):
+        # Track furthest step reached per session
+        step_times = [None] * len(steps)
+
+        for event in sorted(session.events, key=lambda e: e.timestamp):
+            for i, step_predicate in enumerate(steps):
+                if step_predicate(event):
+                    if i == 0 or (step_times[i-1] and
+                        event.timestamp - step_times[i-1] <= window):
+                        step_times[i] = event.timestamp
+
+        # Increment counts for reached steps
+        group_key = tuple(getattr(session, g) for g in group_by)
+        for i, t in enumerate(step_times):
+            if t is not None:
+                results[group_key][i] += 1
+
+    return results
+\end{lstlisting}
+
+\subsection{Anomaly Detection}
+
+Verus integrates anomaly detection into the analytics pipeline:
+
+\subsubsection{Statistical Anomalies}
+
+We detect anomalies using seasonal decomposition:
+
+\begin{equation}
+y_t = T_t + S_t + R_t
+\end{equation}
+
+where $T_t$ is trend, $S_t$ is seasonal component, and $R_t$ is residual. Anomalies are residuals exceeding threshold:
+
+\begin{equation}
+|R_t| > k \cdot \sigma_R
+\end{equation}
+
+\begin{lstlisting}[language=Python,caption=Anomaly detection]
+class AnomalyDetector:
+    def __init__(self, sensitivity=3.0):
+        self.k = sensitivity
+
+    def detect(self, series: pd.Series) -> List[Anomaly]:
+        # Seasonal decomposition
+        decomposition = seasonal_decompose(series, period=24*7)  # Weekly
+        residual = decomposition.resid.dropna()
+
+        # Detect anomalies
+        threshold = self.k * residual.std()
+        anomalies = []
+
+        for timestamp, value in residual.items():
+            if abs(value) > threshold:
+                anomalies.append(Anomaly(
+                    timestamp=timestamp,
+                    expected=series[timestamp] - value,
+                    actual=series[timestamp],
+                    severity=abs(value) / threshold
+                ))
+
+        return anomalies
+\end{lstlisting}
+
+\subsubsection{Alert Integration}
+
+Anomalies trigger alerts through configurable channels:
+
+\begin{lstlisting}[language=SQL,caption=Alert configuration]
+CREATE ALERT order_drop AS
+SELECT
+    store_id,
+    COUNT(*) AS order_count,
+    AVG(COUNT(*)) OVER (
+        PARTITION BY store_id
+        ORDER BY window_start
+        ROWS BETWEEN 168 PRECEDING AND 1 PRECEDING  -- Last week
+    ) AS expected
+FROM mv_orders_by_hour
+GROUP BY store_id, window_start
+HAVING order_count < expected * 0.5  -- 50% drop
+WITH NOTIFICATION slack_webhook, email;
+\end{lstlisting}
+

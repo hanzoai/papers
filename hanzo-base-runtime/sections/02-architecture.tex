@@ -1,0 +1,62 @@
+\section{Architecture}
+
+\label{sec:architecture}
+% ============================================================================
+
+Base is a single statically-linked Go binary. It embeds all components: the
+database engine, the HTTP server, the WebSocket server, the JavaScript VM, the
+authentication system, the admin dashboard, and the migration runner. There is
+no external dependency at runtime---no PostgreSQL, no Redis, no message broker,
+no reverse proxy.
+
+\subsection{System Components}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llp{5.5cm}}
+\toprule
+\textbf{Component} & \textbf{Implementation} & \textbf{Function} \\
+\midrule
+Database & SQLite + sqlcipher & Encrypted embedded storage \\
+HTTP API & Go net/http & REST endpoints, admin UI \\
+Realtime & WebSocket & Live subscriptions, change feeds \\
+Plugin VM & Goja (ES2023) & TypeScript/JS function runtime \\
+Auth & Hanzo IAM (OIDC) & Federated identity, org scoping \\
+Admin & Embedded SPA & Collection manager, log viewer \\
+Migration & SQL + Go & Schema versioning, auto-migration \\
+KMS Client & hanzoai/kms & Field-level encryption keys \\
+\bottomrule
+\end{tabular}
+\caption{Base runtime components. All are compiled into a single binary.}
+\label{tab:components}
+\end{table}
+
+\subsection{Binary Size and Startup}
+
+The Base binary is 28~MB (stripped, compressed with UPX: 12~MB). Startup time
+from cold to serving HTTP requests is 45~ms on an M4 MacBook and 120~ms on a
+Raspberry Pi~4. This is not a framework that boots a JVM, connects to three
+external services, and runs database migrations. It is a process that opens a
+file and starts listening.
+
+\subsection{Deployment Modes}
+
+Base supports three deployment modes with identical API surfaces:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Local}: Single binary on the user's machine. Data in
+    \texttt{\textasciitilde/.base/data.db}. No network required.
+    \item \textbf{Server}: Single binary on a VPS or bare-metal host. Exposed
+    via DNS. Optional TLS termination via Hanzo Ingress.
+    \item \textbf{Cluster}: Multiple Base instances behind a load balancer,
+    sharing a PostgreSQL database for write coordination. SQLite remains the
+    local cache on each node.
+\end{enumerate}
+
+The critical property: applications written for local mode work in cluster mode
+without modification. The API is the same. The data model is the same. The
+auth flow is the same. Only the storage backend changes, and that change is a
+single environment variable.
+
+% ============================================================================

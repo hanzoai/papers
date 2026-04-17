@@ -1,0 +1,84 @@
+\section{Loop 3: Session Reflection}
+
+\label{sec:loop3}
+
+\subsection{Motivation and Design}
+
+Session reflection occupies the final 2 minutes of each session. Its purpose
+is to synthesize the session's telemetry and context into a compact structured
+record that Loop~4 can aggregate across sessions. The key design constraint is
+that reflection must use \emph{constrained templates} rather than open-ended
+prompts.
+
+Open-ended reflection prompts (``What did you learn this session?'') produce
+outputs that are useful as prose but difficult to aggregate. Two sessions with
+similar issues will produce different prose descriptions of those issues,
+making cross-session pattern detection unreliable. Constrained templates with
+fixed output schemas solve this.
+
+\subsection{Reflection Template}
+
+The session reflection uses the following three-question template, which
+the LLM answers with structured JSON output:
+
+\vspace{0.5em}
+\noindent\textbf{Question 1: What worked?}
+Enumerate tool invocations or strategies with outcome $=$ \textsc{success}
+that were reused $\geq 2$ times in the session. Report as:
+$\{$\texttt{tool}, \texttt{strategy}, \texttt{success\_count}, \texttt{why\_effective}$\}$.
+
+\noindent\textbf{Question 2: What failed repeatedly?}
+Enumerate $(t, f)$ pairs with count $\geq 2$ that did not trigger the BIN
+loop (i.e., threshold not yet reached). Report as:
+$\{$\texttt{tool}, \texttt{failure\_mode}, \texttt{count}, \texttt{hypothesis}$\}$.
+
+\noindent\textbf{Question 3: What should change?}
+Based on the above, enumerate proposed changes to the tool library, system
+prompt, or behavior patterns. Each proposal must reference specific evidence
+from Questions 1 and 2. No proposal without evidence is recorded.
+
+\vspace{0.5em}
+
+\begin{definition}[SessionReflection Record]
+\label{def:session_reflection}
+A \textsc{SessionReflection} record $\rho$ is a tuple:
+\begin{equation}
+\rho = \bigl( \text{session\_id},\; \text{successes},\; \text{failures},\;
+              \text{proposals},\; \text{telemetry\_digest} \bigr),
+\end{equation}
+where $\text{telemetry\_digest}$ is a compact statistical summary of
+$\mathcal{T}^{(s)}_{\text{cur}}$ (tool usage histogram, failure rate per tool,
+session duration, task count) that is appended to the reflection record for
+Loop~4 consumption without requiring Loop~4 to replay the full log.
+\end{definition}
+
+\subsection{Constrained Templates vs.\ Open-Ended Reflection}
+
+\begin{theorem}[Template Aggregation Advantage]
+\label{thm:template_aggregation}
+Let $R_T$ be the set of reflections produced by the constrained template, and
+$R_O$ be the set of reflections produced by an open-ended prompt, over $N$
+sessions with the same underlying pattern distribution. Then the expected
+precision of cross-session pattern detection is:
+\begin{equation}
+P(\text{detect} \mid R_T) \geq P(\text{detect} \mid R_O) + \Delta,
+\end{equation}
+where $\Delta > 0$ depends on the entropy of the natural language description
+of patterns and the schema alignment between sessions.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Cross-session pattern detection requires matching descriptions of similar events
+across sessions. For templated reflections, matching reduces to structured key
+equality (same tool name, same failure mode code). For open-ended reflections,
+matching requires semantic similarity, which has non-trivial false-negative
+rate $\varepsilon > 0$ (e.g., ``permission denied on file writes'' and
+``cannot write to read-only path'' describe the same pattern but are
+lexically dissimilar). Therefore $P(\text{detect} \mid R_T) = 1 - O(|\mathcal{V}_T|^{-1})$
+while $P(\text{detect} \mid R_O) \leq 1 - \varepsilon$ for some $\varepsilon > 0$
+that depends on the natural language variability of failure descriptions.
+\end{proof}
+
+% ============================================================================
+% 8. LOOP 4: MAINTENANCE PASS
+% ============================================================================

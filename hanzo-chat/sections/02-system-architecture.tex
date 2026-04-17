@@ -1,0 +1,52 @@
+\section{System Architecture}
+
+\label{sec:architecture}
+
+\subsection{Overview}
+
+Hanzo Chat comprises five layers:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item \textbf{Presentation Layer}: React-based UI with markdown rendering, code highlighting, file previews, and streaming response display.
+    \item \textbf{Routing Layer}: Model selection, load balancing, and failover across providers.
+    \item \textbf{Memory Layer}: Hierarchical storage and retrieval of conversational context.
+    \item \textbf{Tool Layer}: MCP server management, tool discovery, and execution sandboxing.
+    \item \textbf{Gateway Layer}: Unified API proxy (Hanzo LLM Gateway) translating between provider-specific formats.
+\end{enumerate}
+
+\subsection{Request Flow}
+
+A user message $m_t$ at turn $t$ triggers the following pipeline:
+
+\begin{algorithm}[H]
+\caption{Hanzo Chat Request Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require User message $m_t$, conversation history $H_{<t}$, user profile $U$
+\State $\bm{e}_t \gets \text{Embed}(m_t)$ \Comment{Semantic embedding}
+\State $\mathcal{R} \gets \text{RetrieveMemory}(\bm{e}_t, U)$ \Comment{Memory retrieval}
+\State $C_t \gets \text{BuildContext}(H_{<t}, \mathcal{R}, m_t)$ \Comment{Context assembly}
+\State $\hat{M} \gets \text{RouteModel}(C_t, U.\text{policy})$ \Comment{Model selection}
+\State $\mathcal{T} \gets \text{DiscoverTools}(C_t, \hat{M})$ \Comment{Tool discovery}
+\State $r_t \gets \text{Generate}(\hat{M}, C_t, \mathcal{T})$ \Comment{LLM generation}
+\While{$r_t$ contains tool calls}
+    \State $\text{results} \gets \text{ExecuteTools}(r_t.\text{tool\_calls})$
+    \State $r_t \gets \text{Generate}(\hat{M}, C_t \cup \text{results}, \mathcal{T})$
+\EndWhile
+\State $\text{UpdateMemory}(m_t, r_t, \bm{e}_t)$
+\State \Return $r_t$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Gateway Integration}
+
+Hanzo Chat connects to LLM providers through the Hanzo LLM Gateway~\cite{hanzollm2025}, which provides:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item Unified OpenAI-compatible API for 100+ models across providers (OpenAI, Anthropic, Google, Together, Ollama, etc.).
+    \item Automatic retry with exponential backoff and provider failover.
+    \item Request/response logging for analytics and debugging.
+    \item Token counting and cost tracking per request.
+    \item Rate limiting and quota management per user/organization.
+\end{itemize}
+

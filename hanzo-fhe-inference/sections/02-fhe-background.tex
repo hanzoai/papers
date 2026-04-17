@@ -1,0 +1,89 @@
+\section{FHE Background}
+
+\label{sec:background}
+% ============================================================================
+
+\begin{definition}[Fully Homomorphic Encryption]
+An FHE scheme $\mathcal{E} = (\texttt{KeyGen}, \texttt{Enc}, \texttt{Dec},
+\texttt{Eval})$ satisfies: for any function $f$ and plaintexts $x_1, \ldots, x_k$,
+\begin{equation}
+\texttt{Dec}_{sk}\!\left(\texttt{Eval}_{ek}(f, \texttt{Enc}_{pk}(x_1), \ldots,
+\texttt{Enc}_{pk}(x_k))\right) = f(x_1, \ldots, x_k),
+\end{equation}
+where $(pk, sk, ek) \leftarrow \texttt{KeyGen}(\lambda)$ for security
+parameter $\lambda$.
+\end{definition}
+
+The computational cost of FHE depends on the depth of the arithmetic circuit
+being evaluated. Each homomorphic operation increases noise in the ciphertext;
+\emph{bootstrapping} refreshes noise levels but is expensive.
+
+\subsection{CKKS for Neural Networks}
+
+CKKS~\cite{ckks2017} supports approximate arithmetic on encrypted real-valued
+vectors. A single ciphertext encodes $N/2$ complex values (or $N$ real values)
+via SIMD packing, where $N$ is the polynomial ring degree.
+
+\begin{definition}[CKKS Encoding]
+Given a plaintext vector $\mathbf{z} \in \mathbb{C}^{N/2}$, the encoding map
+$\sigma^{-1}: \mathbb{C}^{N/2} \to \mathbb{Z}[X]/(X^N+1)$ produces a
+polynomial $m(X)$ such that $\sigma(m) \approx \Delta \cdot \mathbf{z}$, where
+$\Delta$ is a scaling factor controlling precision.
+\end{definition}
+
+CKKS supports:
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Addition}: $\texttt{Enc}(a) + \texttt{Enc}(b) =
+    \texttt{Enc}(a + b)$, consuming no multiplicative depth.
+    \item \textbf{Multiplication}: $\texttt{Enc}(a) \cdot \texttt{Enc}(b) =
+    \texttt{Enc}(a \cdot b)$, consuming one level of multiplicative depth.
+    \item \textbf{Rotation}: $\texttt{Rot}(\texttt{Enc}(\mathbf{z}), k) =
+    \texttt{Enc}(\text{rotate}(\mathbf{z}, k))$, enabling SIMD-parallel
+    operations.
+\end{itemize}
+
+A neural network layer $\mathbf{y} = \phi(W\mathbf{x} + \mathbf{b})$ is
+evaluated homomorphically by encoding matrix-vector products as diagonal
+rotations and approximating activation functions with low-degree polynomials.
+
+\begin{proposition}[Polynomial Activation Approximation]
+The ReLU function $\phi(x) = \max(0, x)$ is approximated on $[-B, B]$ by a
+degree-$d$ minimax polynomial $\hat{\phi}_d(x)$ with error:
+\begin{equation}
+\|\phi - \hat{\phi}_d\|_\infty \leq \frac{2B}{\pi} \cdot
+\frac{1}{2^d},
+\end{equation}
+where $d = 7$ suffices for $<$0.1\% classification accuracy loss.
+\end{proposition}
+
+\subsection{TFHE for Decision Trees}
+
+TFHE~\cite{tfhe2020} operates on encrypted bits and integers with exact
+arithmetic. Programmable bootstrapping allows evaluating arbitrary lookup tables
+on encrypted values in a single operation.
+
+\begin{definition}[Programmable Bootstrapping]
+Given a ciphertext $c$ encrypting $m \in \mathbb{Z}_p$ and a function $f:
+\mathbb{Z}_p \to \mathbb{Z}_p$, programmable bootstrapping produces a fresh
+ciphertext encrypting $f(m)$ with reset noise:
+\begin{equation}
+\texttt{PBS}(c, f) = \texttt{Enc}(f(\texttt{Dec}(c))),
+\end{equation}
+without revealing $m$ to the evaluator.
+\end{definition}
+
+Decision tree evaluation reduces to a sequence of encrypted comparisons. Each
+tree node performs an encrypted comparison $\texttt{Enc}(x_i) \stackrel{?}{<}
+t_j$ using TFHE's Boolean gates, and the result selects the left or right child.
+
+\begin{theorem}[Decision Tree Complexity]
+A decision tree of depth $d$ with threshold values in $\mathbb{Z}_{2^b}$
+requires $d$ encrypted comparisons, each costing $b$ programmable bootstrappings.
+Total cost: $O(d \cdot b)$ bootstrappings.
+\end{theorem}
+
+For a gradient-boosted ensemble with $T$ trees of depth $d$, the total cost is
+$O(T \cdot d \cdot b)$ bootstrappings. Crucially, all $T$ trees can be
+evaluated in parallel.
+
+% ============================================================================

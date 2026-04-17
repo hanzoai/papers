@@ -1,0 +1,203 @@
+\section{Algorithm Design}
+
+
+\subsection{Population Initialization}
+
+The initial population combines:
+
+\begin{enumerate}
+\item \textbf{Seed campaigns}: Human-designed campaigns providing domain knowledge.
+\item \textbf{Random variants}: Randomly generated campaigns for diversity.
+\item \textbf{Historical winners}: Top performers from previous campaigns.
+\end{enumerate}
+
+\begin{algorithm}
+\caption{Population Initialization}
+\begin{algorithmic}[1]
+\REQUIRE Seeds $S$, population size $N$
+\STATE $P \leftarrow S$
+\STATE $P \leftarrow P \cup \text{loadHistorical}(|S|)$
+\WHILE{$|P| < N$}
+    \STATE $G \leftarrow \text{randomGenome}()$
+    \IF{$\text{isValid}(G)$}
+        \STATE $P \leftarrow P \cup \{G\}$
+    \ENDIF
+\ENDWHILE
+\RETURN $P$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Selection}
+
+We employ tournament selection with elitism:
+
+\begin{algorithm}
+\caption{Tournament Selection}
+\begin{algorithmic}[1]
+\REQUIRE Population $P$, tournament size $k$, elite count $e$
+\STATE $\text{elite} \leftarrow \text{top}_e(P, f)$
+\STATE $\text{selected} \leftarrow \text{elite}$
+\WHILE{$|\text{selected}| < |P|$}
+    \STATE $T \leftarrow \text{sample}(P, k)$
+    \STATE $\text{winner} \leftarrow \arg\max_{G \in T} f(G)$
+    \STATE $\text{selected} \leftarrow \text{selected} \cup \{\text{winner}\}$
+\ENDWHILE
+\RETURN selected
+\end{algorithmic}
+\end{algorithm}
+
+Elitism preserves the top $e$ individuals unchanged, preventing regression.
+
+\subsection{Crossover Operators}
+
+We define domain-specific crossover operators:
+
+\subsubsection{Creative Crossover}
+
+For text genes (headline, body), we use semantic-aware crossover:
+
+\begin{lstlisting}[language=Python,caption=Semantic text crossover]
+def crossover_text(parent1, parent2):
+    # Parse into semantic units
+    units1 = parse_semantic_units(parent1)
+    units2 = parse_semantic_units(parent2)
+
+    # Combine units preserving grammar
+    child_units = []
+    for i, (u1, u2) in enumerate(zip(units1, units2)):
+        if random() < 0.5:
+            child_units.append(u1)
+        else:
+            child_units.append(u2)
+
+    return reconstruct(child_units)
+\end{lstlisting}
+
+Semantic units include noun phrases, verb phrases, and adjective modifiers. Crossover combines units while preserving grammatical validity.
+
+\subsubsection{Image Crossover}
+
+For image genes, we cannot directly combine pixels. Instead, we crossover image metadata:
+
+\begin{lstlisting}[language=Python,caption=Image metadata crossover]
+def crossover_image(parent1, parent2):
+    # Crossover style attributes
+    child_style = {
+        "brightness": choice([parent1, parent2]).brightness,
+        "contrast": choice([parent1, parent2]).contrast,
+        "saturation": choice([parent1, parent2]).saturation,
+    }
+
+    # Select base image
+    base = choice([parent1, parent2]).base_image
+
+    return apply_style(base, child_style)
+\end{lstlisting}
+
+\subsubsection{Targeting Crossover}
+
+Audience targeting uses set-based crossover:
+
+\begin{lstlisting}[language=Python,caption=Audience crossover]
+def crossover_targeting(parent1, parent2):
+    child = {}
+
+    # Numeric ranges: interpolate
+    child["age_min"] = (parent1.age_min + parent2.age_min) // 2
+    child["age_max"] = (parent1.age_max + parent2.age_max) // 2
+
+    # Set attributes: union with probability
+    child["interests"] = set()
+    for interest in parent1.interests | parent2.interests:
+        if random() < 0.7:  # Bias toward inclusion
+            child["interests"].add(interest)
+
+    return child
+\end{lstlisting}
+
+\subsection{Mutation Operators}
+
+Mutation introduces variation through domain-specific operators:
+
+\subsubsection{Text Mutation}
+
+\begin{lstlisting}[language=Python,caption=Text mutation operators]
+def mutate_text(text, rate):
+    if random() < rate:
+        op = choice(["synonym", "rephrase", "shorten", "expand"])
+        if op == "synonym":
+            return replace_with_synonym(text)
+        elif op == "rephrase":
+            return rephrase_sentence(text)
+        elif op == "shorten":
+            return remove_filler_words(text)
+        else:
+            return add_power_words(text)
+    return text
+\end{lstlisting}
+
+Synonym replacement uses WordNet \cite{wordnet1995}. Rephrasing uses a sequence-to-sequence model trained on paraphrase corpora.
+
+\subsubsection{Targeting Mutation}
+
+\begin{lstlisting}[language=Python,caption=Targeting mutation]
+def mutate_targeting(targeting, rate):
+    if random() < rate:
+        op = choice(["narrow", "broaden", "shift"])
+        if op == "narrow":
+            targeting.interests = random_subset(targeting.interests, 0.8)
+        elif op == "broaden":
+            related = get_related_interests(targeting.interests)
+            targeting.interests |= random_subset(related, 0.2)
+        else:
+            targeting.age_min += randint(-5, 5)
+            targeting.age_max += randint(-5, 5)
+    return targeting
+\end{lstlisting}
+
+\subsection{Fitness Evaluation}
+
+Fitness evaluation requires deploying campaigns and measuring results. This presents challenges:
+
+\begin{enumerate}
+\item \textbf{Cost}: Each evaluation costs real advertising spend.
+\item \textbf{Latency}: Conversions may occur hours or days after impression.
+\item \textbf{Noise}: Small sample sizes yield high-variance estimates.
+\end{enumerate}
+
+We address these through:
+
+\textbf{Surrogate modeling.} A neural network predicts fitness from genome features, reducing required evaluations:
+
+\begin{equation}
+\hat{f}(G) = \text{NN}(\phi(G))
+\end{equation}
+
+where $\phi(G)$ extracts features (text embeddings, audience size, historical performance of similar campaigns).
+
+\textbf{Bayesian updating.} We maintain posterior distributions over conversion rates:
+
+\begin{equation}
+p(\theta | D) \propto p(D | \theta) p(\theta)
+\end{equation}
+
+where $\theta$ is the true conversion rate and $D$ is observed data. We use Beta-Binomial conjugate priors.
+
+\textbf{Budget allocation.} We allocate budget to individuals proportional to their information value:
+
+\begin{equation}
+\text{budget}_i = \text{budget}_{\text{total}} \cdot \frac{\sigma_i^2}{\sum_j \sigma_j^2}
+\end{equation}
+
+where $\sigma_i^2$ is the variance of individual $i$'s fitness estimate.
+
+\subsection{Termination Criteria}
+
+The algorithm terminates when:
+
+\begin{enumerate}
+\item Budget exhausted: $\sum_G \text{spend}(G) \geq \text{budget}$.
+\item Convergence: Fitness improvement below threshold for $k$ generations.
+\item Time limit: Campaign end date reached.
+\end{enumerate}
+

@@ -1,0 +1,116 @@
+\section{Risk Analysis}
+
+\label{sec:risks}
+
+\subsection{Taxonomy of Failure Modes}
+\label{sec:failmodes}
+
+We enumerate the principal failure modes and bound the damage each can cause
+under HHP constraints.
+
+\paragraph{Risk R1: A generated tool makes things worse.}
+A Tier 1 tool that regresses performance (e.g., incorrectly implements a
+function, introduces latency) could harm task completion during its TTL window.
+
+\textbf{Bound:} The damage is bounded to the TTL window (7 days) and to tasks
+matching the tool's trigger pattern. By the validation gate $\Gamma_1$, the
+tool must pass all known triggering failure cases before deployment. Regression
+on \emph{previously passing} cases is impossible if the trigger set is
+comprehensive. Regression on \emph{novel} cases is bounded by the tool's
+invocation rate over 7 days. Telemetry monitoring (Section~\ref{sec:cycle})
+detects regressions within $O(\text{invocations})$ time and the tool can be
+manually deregistered before TTL expiry.
+
+\paragraph{Risk R2: An agent modifies security-sensitive code.}
+A Tier 4 modification targeting authentication, key management, or cryptographic
+code could introduce vulnerabilities.
+
+\textbf{Bound:} By the Worktree Isolation Theorem (Theorem~\ref{thm:isolation}),
+the modification cannot affect the running system until merged. The Tier 4 gate
+requires both CI (which typically includes security scans) and human review.
+Human reviewers are expected to apply heightened scrutiny to security-sensitive
+paths. In practice, repositories containing security-sensitive code (e.g., the
+KMS system) should be added to an explicit exclusion list $\mathcal{E}_{\text{excl}}$
+such that $\text{ClassifyScope}(\mathcal{F})$ returns $k = \text{forbidden}$ for
+any friction event involving $\mathcal{R} \in \mathcal{E}_{\text{excl}}$.
+
+\paragraph{Risk R3: Two agents modify the same component concurrently.}
+Two agents independently identifying friction in the same component and
+submitting conflicting Tier 4 PRs.
+
+\textbf{Bound:} Git merge conflicts are detected at PR merge time, not at
+worktree creation time. The conflict is surfaced to the human reviewer who
+can choose which change to apply or request a combined modification. Since
+worktrees are isolated (Theorem~\ref{thm:isolation}), conflicting worktrees
+cannot corrupt each other; only the merge resolution step requires intervention.
+In multi-agent deployments, a distributed lock on the target repository path
+can serialize Tier 4 hack cycles to prevent concurrent conflicts.
+
+\paragraph{Risk R4: The modification loop never terminates.}
+An agent in the MODIFY--TEST loop that cannot produce a passing modification
+could loop indefinitely.
+
+\textbf{Bound:} By Invariants 2 and 3, each hack cycle is bounded at 3 fix
+attempts and $T_{\text{hack}} = 5$ minutes. After 3 failed attempts, the loop
+terminates, the friction event is archived, and the session budget is
+\emph{not} decremented (an abandoned hack does not consume the session budget).
+The time-box provides an absolute wall-clock bound independent of fix attempt
+count.
+
+\paragraph{Risk R5: An agent promotes a harmful tool to a higher tier.}
+A Tier 1 tool that produces subtly wrong outputs but meets the basic validation
+criteria ($\Gamma_1$) could be promoted to Tier 2 with a broader invocation scope.
+
+\textbf{Bound:} Promotion from Tier 1 to Tier 2 requires $\tau(\rho, t) > 0.8$
+after $\geq 10$ uses. This means the tool must have produced successful outcomes
+in at least 80\% of its invocations over a statistically significant number of
+uses. A subtly wrong tool will manifest in the telemetry (Section~\ref{sec:cycle})
+as reduced task completion rates, which will suppress its trust score below the
+promotion threshold.
+
+\subsection{Comparative Risk Table}
+\label{sec:risk-table}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{l X X c}
+\toprule
+Risk & Failure Mode & HHP Mitigation & Max Blast Radius \\
+\midrule
+R1 & Tool regresses performance & TTL + telemetry monitoring & 7 days, tool-scoped \\
+R2 & Security-sensitive modification & Exclusion list + human review & Zero (gated) \\
+R3 & Concurrent conflicting PRs & Git conflict detection + reviewer & PR-scoped \\
+R4 & Non-terminating loop & 3-attempt limit + 5-min time-box & 5 min session overhead \\
+R5 & Harmful tool promotion & Trust score threshold (0.8, 10 uses) & Tier-bounded \\
+\bottomrule
+\end{tabularx}
+\caption{Risk analysis with HHP mitigations and maximum blast radius under
+the protocol constraints.}
+\label{tab:risks}
+\end{table}
+
+\subsection{Adversarial Threat Model}
+\label{sec:adversarial}
+
+We briefly consider an adversarial setting where an attacker can influence the
+agent's friction event classification (e.g., via prompt injection in tool outputs).
+
+\begin{proposition}[Adversarial Containment]
+\label{prop:adversarial}
+Under the HHP constraints, an adversary who can inject arbitrary friction events
+into the agent's context cannot deploy a modification that bypasses at least
+one human gate (for Tier 4) or causes system-wide impact (for Tiers 1--3).
+\end{proposition}
+
+\begin{proof}
+For Tier 4: any modification requires $\Gamma_4 = $ CI $\wedge$ HumanApproval.
+An adversary cannot forge a human approval without compromising the human
+reviewer or the PR platform. For Tiers 1--3: modifications are scoped to the
+individual agent's session or extension registry; they cannot affect shared
+infrastructure. Tier 1 tools expire after 7 days. Thus, the maximum persistence
+of any adversarially-injected modification is bounded. \qed
+\end{proof}
+
+% ============================================================================
+% 9. DISCUSSION AND FUTURE WORK
+% ============================================================================

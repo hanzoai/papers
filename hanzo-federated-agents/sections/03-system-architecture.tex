@@ -1,0 +1,111 @@
+\section{System Architecture}
+
+\label{sec:architecture}
+
+The FAI system consists of three components running at each agent node:
+(i) the local node with experience library and GRPO optimizer,
+(ii) the network layer for P2P broadcast and receive, and
+(iii) the aggregation layer implementing DeltaSoup.
+
+\subsection{Local Node}
+
+\paragraph{SemanticMemoryManager.}
+Each node maintains a \emph{local experience library} $\mathcal{L}$ as a
+vector database (LanceDB~\cite{lancedb2024}). Each entry stores:
+\begin{itemize}[leftmargin=1.5em]
+    \item The pattern text (natural language, $\leq 32$ words).
+    \item A $d$-dimensional embedding $\bm{e}_m \in \mathbb{R}^d$ (default $d = 768$).
+    \item Quality score $q_m \in (0,1)$, domain tag, and provenance metadata.
+    \item A 1-bit quantized expert factor for PoE decoding.
+\end{itemize}
+The library supports approximate nearest-neighbor queries over embeddings,
+enabling retrieval of relevant experiences for new tasks in $O(\log M)$ time
+where $M = |\mathcal{L}|$.
+
+\paragraph{LocalDSOOptimizer.}
+The optimizer runs in the background after each agent session:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Collect tool-use telemetry from the session (tool calls, outcomes,
+          reward signals).
+    \item Construct agent trajectories grouping related tool calls.
+    \item Run GRPO on the trajectory group to extract semantic advantages.
+    \item Compress resulting experience embeddings via BitDelta.
+    \item Store in $\mathcal{L}$ and enqueue for DSO broadcast.
+\end{enumerate}
+
+\paragraph{Tool Telemetry Pipeline.}
+The telemetry pipeline intercepts tool calls at the harness layer and records:
+\begin{equation}
+    \tau_t = \left(\text{tool}_t, \; \text{input}_t, \; \text{output}_t, \; r_t\right),
+\end{equation}
+where $r_t \in \mathbb{R}$ is a task-specific reward signal (e.g., test pass
+rate, user rating, completion confirmation). A trajectory is a sequence
+$\tau = (\tau_1, \ldots, \tau_T)$ associated with a single task.
+
+\subsection{Network Layer}
+
+\paragraph{P2P Gossip Protocol.}
+Agents communicate via an epidemic gossip protocol~\cite{demers1987epidemic}.
+Each node maintains a peer list of size $k_{\text{peers}}$ (default 8) and
+broadcasts compressed experience batches at configurable intervals
+(default every 60 seconds or after accumulating $B_{\min} = 10$ new experiences).
+
+\paragraph{Node Discovery.}
+Initial peers are bootstrapped from:
+\begin{itemize}[leftmargin=1.5em]
+    \item A configurable seed list (static bootstrap nodes).
+    \item The DSO registry smart contract~\cite{hanzo2026dso} (on-chain
+          peer advertisement).
+    \item mDNS for local-network discovery in development settings.
+\end{itemize}
+Each node advertises its address by posting a signed advertisement to the
+DSO registry. Advertisements expire after 24 hours and must be renewed.
+
+\paragraph{Hash-Based Integrity.}
+Each broadcast batch is accompanied by a SHA-256 hash over its canonical
+serialization. Receiving nodes verify the hash before processing; batches
+with invalid hashes are silently dropped and the sending node's reputation
+score is decremented.
+
+\subsection{Compressed Experience Format}
+
+We define the \texttt{CompressedBatch} wire format as a JSON-serializable
+protocol message:
+
+\begin{verbatim}
+{
+  "node_id":   string,          // SHA-256 of node public key
+  "timestamp": number,          // Unix milliseconds
+  "experiences": {
+    "<exp_id>": {
+      "text":       string,     // Pattern description (<= 32 words)
+      "signs":      int[],      // Packed 1-bit sign vectors (uint32 words)
+      "scale":      float,      // Per-group L1 scale factor
+      "shape":      int[],      // [num_groups, group_size]
+      "confidence": float,      // Quality score in (0, 1)
+      "domain":     string      // Domain tag (e.g. "coding", "writing")
+    }
+  },
+  "hash":      string           // SHA-256 of canonical serialization
+}
+\end{verbatim}
+
+\begin{definition}[Canonical Serialization]
+The canonical serialization of a \texttt{CompressedBatch} is the
+deterministic JSON serialization with keys sorted lexicographically and
+no whitespace. The \texttt{hash} field is excluded during hash computation
+and appended afterward.
+\end{definition}
+
+For $M$ experiences each with embedding dimension $d = 768$ using group size
+$g = 128$, the compressed batch size is approximately:
+\begin{equation}
+    |B_{\text{compressed}}| = M \cdot \left(\frac{d}{8} + \frac{d}{g} \cdot 4 + 64\right) \; \text{bytes},
+\end{equation}
+where $d/8$ bytes stores the sign bits, $d/g \cdot 4$ bytes stores float32
+scales, and 64 bytes stores metadata. For $M = 100$: ${\approx}29\,\text{KB}$
+versus ${\approx}307\,\text{KB}$ uncompressed---a $10.6\times$ reduction.
+
+% ============================================================================
+% 4. BITDELTA EXPERIENCE COMPRESSION
+% ============================================================================

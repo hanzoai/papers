@@ -1,0 +1,177 @@
+\section{Formal Analysis}
+
+\label{sec:analysis}
+
+\subsection{Self-Improvement as Optimization}
+
+We formalize the self-improvement objective in terms of tool success rates.
+
+\begin{definition}[Tool Success Rate]
+\label{def:success_rate}
+The success rate $\mu_t^{(s)}$ of tool $t$ at session $s$ is:
+\begin{equation}
+\mu_t^{(s)} = \E\bigl[\mathbf{1}[\tau.\text{outcome}=\textsc{success}]
+               \mid \tau.\text{tool}=t,\; \Sigma^{(s)}\bigr],
+\end{equation}
+where the expectation is over the task distribution conditional on the agent
+state at session $s$.
+\end{definition}
+
+\begin{definition}[Self-Improvement Objective]
+\label{def:objective}
+The self-improvement objective is:
+\begin{equation}
+\max_{\{\mathcal{K}^{(s)}, \mathcal{F}^{(s)}\}_{s \geq 1}} \lim_{S \to \infty}
+\frac{1}{S} \sum_{s=1}^{S} \E\biggl[\frac{1}{|\mathcal{V}_T|} \sum_{t \in \mathcal{V}_T} \mu_t^{(s)}\biggr],
+\end{equation}
+i.e., maximize the long-run average tool success rate over all tools.
+\end{definition}
+
+\subsection{Convergence of the 4-Loop System}
+
+\begin{theorem}[4-Loop Convergence]
+\label{thm:convergence}
+Under the following conditions:
+\begin{enumerate}[leftmargin=1.5em, nosep]
+    \item[\textbf{(A1)}] The task distribution $\mathcal{D}$ is stationary.
+    \item[\textbf{(A2)}] The BIN build pipeline succeeds with probability $p_b > 0$
+          on any triggered $(t,f)$ pair.
+    \item[\textbf{(A3)}] The space of failure modes $\mathcal{V}_F$ is finite.
+    \item[\textbf{(A4)}] The agent does not regress: adding a new tool does not
+          decrease the success rate of existing tools.
+\end{enumerate}
+the 4-Loop System achieves:
+\begin{equation}
+\lim_{S \to \infty} \frac{1}{|\mathcal{V}_T|} \sum_{t \in \mathcal{V}_T} \mu_t^{(S)} = 1
+\quad \text{almost surely.}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+We proceed by showing that every $(t,f)$ pair with positive occurrence
+probability is eventually eliminated.
+
+\textit{Step 1.} Fix any $(t, f)$ with positive probability $p_{tf} > 0$.
+Under stationarity (A1), the expected number of sessions until $\theta = 3$
+failures of $(t, f)$ occur in a single session is finite:
+$\E[\tau_{tf}] \leq 1 / p_{tf}^\theta < \infty$.
+
+\textit{Step 2.} When the BIN trigger fires for $(t,f)$, the build pipeline
+succeeds with probability $p_b > 0$ (A2). If it fails, the same session
+continues accumulating failures, so the trigger fires again in the next session
+by Step 1. By the second Borel-Cantelli lemma, the build pipeline succeeds
+infinitely often, so with probability 1, there exists a session $s^*_{tf}$
+after which the $(t,f)$ pair is eliminated from the active failure modes.
+
+\textit{Step 3.} By finiteness of $\mathcal{V}_F$ (A3), the number of distinct
+$(t,f)$ pairs is $|\mathcal{V}_T| \times |\mathcal{V}_F| < \infty$. Therefore
+$s^* = \max_{t,f} s^*_{tf} < \infty$ with probability 1.
+
+\textit{Step 4.} By the no-regression assumption (A4), the tool library $\mathcal{K}^{(s)}$
+is monotonically improving. After session $s^*$, all failure modes have been
+addressed and $\mu_t^{(s)} \to 1$ for all $t$ as $s \to \infty$.
+\end{proof}
+
+\begin{remark}
+Assumption (A4) is the strongest assumption and may fail in practice if new
+tools have bugs. The probationary status mechanism in the BIN pipeline
+(Section~\ref{sec:loop1}) is designed to mitigate this by quarantining
+unproven tools until they accumulate positive evidence.
+\end{remark}
+
+\subsection{Information-Theoretic Analysis}
+\label{sec:info_theory}
+
+We now show formally that append-only telemetry logs preserve more
+decision-relevant information than narrative summaries.
+
+\begin{definition}[Decision-Relevant Information]
+\label{def:relevant_info}
+Given telemetry log $\mathcal{T}$, the decision-relevant information for the
+BIN trigger is:
+\begin{equation}
+I_{\text{BIN}}(\mathcal{T}) = H\bigl(\{(t,f) : \#_{tf}(\mathcal{T}) \geq \theta\}\bigr),
+\end{equation}
+where $H$ denotes Shannon entropy and $\#_{tf}(\mathcal{T})$ is the count of
+$(t,f)$ failures in $\mathcal{T}$.
+\end{definition}
+
+\begin{theorem}[Telemetry Entropy Bound]
+\label{thm:entropy}
+Let $\mathcal{T}_n$ be a telemetry log of $n$ records and let $\hat{\mathcal{T}}_k$ be
+any narrative summary of $\mathcal{T}_n$ using $k$ tokens ($k \ll n$). Then:
+\begin{equation}
+I_{\text{BIN}}(\mathcal{T}_n) \geq I_{\text{BIN}}(\hat{\mathcal{T}}_k) + \Omega\!\left(\log n\right),
+\end{equation}
+with high probability over the distribution of narrative summaries.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The BIN trigger requires exact counts $\#_{tf}(\mathcal{T}) \geq \theta$ for
+specific $(t,f)$ pairs. Reconstructing exact counts from a $k$-token summary
+requires at least $\log_2(\max_{t,f} \#_{tf}) \approx \log_2(n)$ bits per
+$(t,f)$ pair that is near the threshold. A $k$-token summary has at most
+$k \cdot \log_2 |\mathcal{V}|$ bits of total information. For $k \ll n$, this
+cannot represent all pairs at threshold-resolution, so information about
+near-threshold pairs is discarded. The direct telemetry log represents every
+record exactly, preserving $O(\log n)$ more bits of threshold-resolution
+information per near-threshold pair.
+\end{proof}
+
+\subsection{Deterministic vs.\ LLM-Based Triggers}
+\label{sec:triggers}
+
+We analyze the precision and recall of two trigger mechanisms for the BIN loop:
+deterministic counting (our approach) vs.\ LLM-based self-judgment.
+
+\begin{definition}[Trigger Precision and Recall]
+\label{def:precision_recall}
+For a trigger mechanism $M$ and ground truth $G$ (set of $(t,f)$ pairs that
+genuinely benefit from a new tool):
+\begin{align}
+P(M) &= \frac{|M \cap G|}{|M|}, \quad R(M) = \frac{|M \cap G|}{|G|}.
+\end{align}
+\end{definition}
+
+\begin{proposition}[Deterministic Trigger Dominance]
+\label{prop:trigger_dominance}
+For $\theta = 3$ and a stationary failure mode distribution, the deterministic
+counting trigger $M_D$ satisfies:
+\begin{equation}
+P(M_D) \geq P(M_{\text{LLM}}) \quad \text{and} \quad R(M_D) \geq R(M_{\text{LLM}}),
+\end{equation}
+with probability $\geq 1 - \delta$ for any $\delta > 0$ when $n \geq n_0(\delta)$.
+\end{proposition}
+
+The empirical support for this proposition comes from our evaluation
+(Section~\ref{sec:evaluation}), where we measure $P(M_D) = 0.94$, $R(M_D) = 0.89$
+against $P(M_{\text{LLM}}) = 0.61$, $R(M_{\text{LLM}}) = 0.72$. The LLM
+trigger has higher recall in low-count regimes (detecting problems with fewer
+than $\theta$ occurrences) but much lower precision (many false positives from
+LLM hallucination about problems that did not occur frequently).
+
+\begin{table}[H]
+\centering
+\caption{Threshold sensitivity analysis for BIN trigger at $\theta \in \{2,3,4,5\}$.}
+\label{tab:threshold_sensitivity}
+\begin{tabular}{ccccc}
+\toprule
+$\theta$ & Precision & Recall & F1 & Builds/Session \\
+\midrule
+2 & 0.81 & 0.95 & 0.87 & 2.3 \\
+3 & \textbf{0.94} & \textbf{0.89} & \textbf{0.91} & 1.1 \\
+4 & 0.97 & 0.72 & 0.83 & 0.6 \\
+5 & 0.99 & 0.58 & 0.73 & 0.3 \\
+\midrule
+LLM & 0.61 & 0.72 & 0.66 & 1.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:threshold_sensitivity} confirms that $\theta = 3$ is Pareto-optimal:
+it achieves the highest F1 score while keeping the builds-per-session rate
+below 1.5 (a reasonable upper bound for the 5-minute latency budget per session).
+
+% ============================================================================
+% 10. ANTI-PATTERNS AND DESIGN DECISIONS
+% ============================================================================

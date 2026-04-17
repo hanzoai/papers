@@ -1,0 +1,116 @@
+\section{Integration with the Four-Loop Self-Improvement Architecture}
+
+\label{sec:integration}
+
+The Hanzo Dev agent implements a four-loop self-improvement architecture
+inspired by~\cite{shinn2023reflexion} and extended with proactive tool
+creation~\cite{wang2023voyager}. Agent-GRPO integrates with each loop.
+
+\subsection{Loop 0: Telemetry}
+
+Loop 0 instruments every tool call with structured telemetry:
+\begin{equation}
+    \text{TelemetryEvent} = \bigl(\texttt{session\_id},\; t_i,\; \bm{p}_i,\; o_i,\; s_i,\; \Delta t_i,\; \text{context}\bigr),
+    \label{eq:telemetry}
+\end{equation}
+where $\Delta t_i$ is the wall-clock duration of the tool call and \text{context}
+captures the surrounding conversational context.
+
+Telemetry events are aggregated at the end of each session to construct the
+raw trajectory $\tau$ according to Definition~\ref{def:trajectory}. Loop 0
+thus provides the \emph{raw data} for Agent-GRPO's trajectory processing
+pipeline without any additional instrumentation cost.
+
+\subsection{Loop 1: Build-It-Now}
+
+Loop 1 monitors for repeated tool-call failures and proactively proposes
+new tool implementations~\cite{wang2023voyager}. Agent-GRPO informs this loop
+via two mechanisms:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Failure pattern retrieval:} When Loop 1 detects a recurring
+          failure (e.g., the same error message appearing across three or more
+          sessions), it queries $\mathcal{E}$ for failure pattern experiences
+          matching the error. If no remediation experience exists, Loop 1
+          escalates to tool creation.
+    \item \textbf{Tool selection experience audit:} Experience entries of the
+          form ``prefer \texttt{X} over \texttt{Y}'' indicate that tool \texttt{X}
+          satisfies a need better than \texttt{Y}. If \texttt{X} does not exist
+          in the tool registry $\mathcal{T}$, Loop 1 receives a tool creation
+          proposal.
+\end{enumerate}
+
+\subsection{Loop 2: Active Learning}
+
+Loop 2 captures explicit user corrections as high-confidence, high-priority
+experiences. When a user corrects the agent's output (triggering
+$\rho_a(\tau) = 0$), the correction is processed by a dedicated prompt:
+
+\begin{quote}
+\textit{The user corrected the agent's response. Original task: \{x\}. Agent
+output: \{y\}. User correction: \{y'\}. In $\leq$32 words, what should the
+agent have done differently? Format as an actionable guideline.}
+\end{quote}
+
+The resulting experience is added to $\mathcal{E}$ with $c = 0.8$ (high
+confidence, since it reflects direct human preference) and is exempt from the
+standard GRPO extraction pipeline.
+
+\subsection{Loop 3: Reflection}
+
+At the end of each session, Loop 3 produces a session summary:
+\begin{itemize}[leftmargin=1.5em]
+    \item Total tool calls, success rate, task completion rate.
+    \item Top-3 recurring failure modes.
+    \item Top-3 most-retrieved experiences (by session usage).
+    \item Proposed new experiences (preliminary, before GRPO refinement).
+\end{itemize}
+
+This summary serves as the primary input to Agent-GRPO: the session
+trajectories $\mathcal{S}$ fed to Algorithm~\ref{alg:agent-grpo} are
+precisely the trajectories recorded during this session. Loop 3 fires
+Agent-GRPO asynchronously after session end, so experience library updates
+are available for the next session.
+
+\subsection{Loop 4: Maintenance}
+
+Loop 4 performs periodic library maintenance using statistics accumulated
+across sessions:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Staleness audit:} Experiences with $u = 0$ after
+          $K_{\text{stale}} = 20$ sessions are flagged for deletion.
+    \item \textbf{Confidence audit:} Experiences with $c < c_{\text{min}}$
+          after at least $u \geq 5$ uses are deleted.
+    \item \textbf{Redundancy audit:} Experience pairs with cosine similarity
+          above $\theta_{\text{dup}}$ are merged via LLM consolidation.
+    \item \textbf{Compression trigger:} When $|\mathcal{E}| > N_{\max}$,
+          Loop 4 triggers the hybrid compression strategy
+          (Section~\ref{sec:compression}).
+\end{itemize}
+
+The maintenance interval is configurable (default: every 10 sessions).
+
+\subsection{Closed-Loop Diagram}
+
+The integration of all four loops with Agent-GRPO forms a closed improvement
+cycle:
+\begin{equation}
+    \underbrace{\text{Loop 0}}_{\text{Telemetry}}
+    \;\xrightarrow{\tau}\;
+    \underbrace{\text{Loop 3}}_{\text{Reflection}}
+    \;\xrightarrow{\mathcal{S}}\;
+    \underbrace{\text{Agent-GRPO}}_{\text{Alg.~\ref{alg:agent-grpo}}}
+    \;\xrightarrow{\Omega^*}\;
+    \underbrace{\mathcal{E}}_{\text{Library}}
+    \;\xrightarrow{\text{top-}K}\;
+    \underbrace{\text{Agent}}_{\text{next session}}
+    \;\circlearrowleft
+    \label{eq:closed-loop}
+\end{equation}
+with Loop 2 (user corrections) providing an out-of-band high-confidence
+injection path and Loop 4 performing periodic quality control.
+
+% ============================================================================
+% 7. THEORETICAL ANALYSIS
+% ============================================================================

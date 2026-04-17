@@ -1,0 +1,57 @@
+\section{GPU Acceleration}
+
+\label{sec:gpu}
+% ============================================================================
+
+FHE's primary bottleneck is polynomial arithmetic over large rings
+($N = 2^{14}$ to $2^{16}$). We accelerate two critical operations on GPU using
+the Candle runtime~\cite{hanzocandle}.
+
+\subsection{Number Theoretic Transform}
+
+The Number Theoretic Transform (NTT) converts polynomials from coefficient to
+evaluation representation, enabling $O(N)$ pointwise multiplication instead of
+$O(N^2)$ schoolbook multiplication.
+
+\begin{definition}[NTT]
+For polynomial $a(X) = \sum_{i=0}^{N-1} a_i X^i$ over $\mathbb{Z}_q$, the NTT
+is:
+\begin{equation}
+\hat{a}_j = \sum_{i=0}^{N-1} a_i \cdot \omega^{ij} \mod q,
+\quad j = 0, \ldots, N-1,
+\end{equation}
+where $\omega$ is a primitive $N$-th root of unity modulo $q$.
+\end{definition}
+
+Our GPU NTT kernel processes $N = 65536$ elements across 256 CUDA threads per
+block, with each thread performing butterfly operations on 256 elements. Shared
+memory stores twiddle factors to minimize global memory access.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Ring Degree $N$} & \textbf{CPU (ms)} & \textbf{GPU (ms)} & \textbf{Speedup} \\
+\midrule
+$2^{14}$ & 1.2 & 0.09 & 13.3$\times$ \\
+$2^{15}$ & 2.6 & 0.18 & 14.4$\times$ \\
+$2^{16}$ & 5.8 & 0.41 & 14.1$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{NTT performance: single-threaded CPU (AMD EPYC 9654) vs GPU (NVIDIA H100).}
+\label{tab:ntt}
+\end{table}
+
+\subsection{Bootstrapping Acceleration}
+
+TFHE bootstrapping dominates encrypted computation cost. Each bootstrapping
+operation performs a blind rotation (polynomial multiplication controlled by
+encrypted bits) followed by key switching.
+
+On GPU, we parallelize across bootstrapping operations (independent across
+encrypted bits) and within each operation (NTT-based polynomial multiplication).
+A single H100 GPU executes 18,000 bootstrappings per second, compared to 1,200
+on a 96-core CPU.
+
+% ============================================================================

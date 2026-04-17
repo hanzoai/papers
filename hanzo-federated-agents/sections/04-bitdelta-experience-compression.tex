@@ -1,0 +1,187 @@
+\section{BitDelta Experience Compression}
+
+\label{sec:bitdelta}
+
+\subsection{Embedding Quantization}
+
+Let $\mathcal{L} = \{E_1, \ldots, E_M\}$ be the local experience library with
+embeddings $\{\bm{e}_1, \ldots, \bm{e}_M\} \subset \mathbb{R}^d$. The BitDelta
+compression operates as follows.
+
+\begin{definition}[Library Baseline]
+The baseline embedding $\bar{\bm{e}} \in \mathbb{R}^d$ is the mean embedding
+of the current experience library:
+\begin{equation}
+    \bar{\bm{e}} = \frac{1}{M} \sum_{m=1}^{M} \bm{e}_m.
+    \label{eq:baseline}
+\end{equation}
+The baseline is recomputed before each broadcast and shared (uncompressed)
+with the batch header.
+\end{definition}
+
+\begin{definition}[Embedding Delta]
+For experience $E_m$ with embedding $\bm{e}_m$, the embedding delta is:
+\begin{equation}
+    \Delta_m = \bm{e}_m - \bar{\bm{e}} \in \mathbb{R}^d.
+    \label{eq:delta}
+\end{equation}
+\end{definition}
+
+Following Definition~\ref{def:bitdelta}, we partition $\Delta_m$ into
+$G = d / g$ groups $\Delta_m^{(1)}, \ldots, \Delta_m^{(G)} \in \mathbb{R}^g$
+and apply independent scaling per group:
+
+\begin{equation}
+    \alpha_m^{(j)} = \frac{1}{g} \left\|\Delta_m^{(j)}\right\|_1,
+    \qquad
+    \bm{s}_m^{(j)} = \sign\!\left(\Delta_m^{(j)}\right) \in \{-1,+1\}^g.
+    \label{eq:group-quantize}
+\end{equation}
+
+The compressed representation is $\widehat{E}_m = \left(\{\bm{s}_m^{(j)}, \alpha_m^{(j)}\}_{j=1}^G\right)$,
+stored as packed bits plus $G$ float32 scales.
+
+\begin{definition}[Reconstruction]
+Given compressed representation $\widehat{E}_m$, reconstruct:
+\begin{equation}
+    \hat{\Delta}_m^{(j)} = \alpha_m^{(j)} \cdot \bm{s}_m^{(j)},
+    \qquad
+    \hat{\bm{e}}_m = \bar{\bm{e}} + \left[\hat{\Delta}_m^{(1)}; \cdots; \hat{\Delta}_m^{(G)}\right].
+    \label{eq:reconstruct}
+\end{equation}
+\end{definition}
+
+\subsection{Compression Analysis}
+
+\begin{proposition}[Compression Ratio]
+\label{prop:compression}
+For embedding dimension $d$ and group size $g$, the compression ratio of
+BitDelta relative to float32 storage is:
+\begin{equation}
+    \rho = \frac{32d}{d + 32 \cdot d/g} = \frac{32g}{g + 32}.
+    \label{eq:compression-ratio}
+\end{equation}
+As $g \to \infty$: $\rho \to 32$. For $g = 128$: $\rho = 32 \cdot 128 / 160 = 25.6$.
+Including the float32 baseline vector (shared per-batch, not per-experience):
+effective per-experience compression for $M = 100$ experiences is ${\approx}10\times$.
+\end{proposition}
+
+\begin{proof}
+Float32 storage requires $32d$ bits. BitDelta requires $d$ bits (signs) plus
+$32 \cdot (d/g)$ bits (scales). The ratio is $32d / (d + 32d/g) = 32g/(g+32)$.
+The baseline amortizes over $M$ experiences: overhead per experience is $32d / M$
+bits, which is $32 \cdot 768 / 100 \approx 246$ bits, or ${\approx}5\%$ overhead.
+\end{proof}
+
+\begin{theorem}[Reconstruction Error Bound]
+\label{thm:reconstruction}
+Let $\Delta \in \mathbb{R}^d$ be an embedding delta partitioned into groups
+$\Delta^{(1)}, \ldots, \Delta^{(G)} \in \mathbb{R}^g$. For group $j$, the
+reconstruction error satisfies:
+\begin{equation}
+    \left\|\Delta^{(j)} - \hat{\Delta}^{(j)}\right\|_2^2
+    = \sum_{k=1}^{g} \left(\Delta_k^{(j)} - \alpha^{(j)} \cdot \sign(\Delta_k^{(j)})\right)^2
+    = \sum_{k=1}^{g} \left(|\Delta_k^{(j)}| - \alpha^{(j)}\right)^2.
+    \label{eq:group-error}
+\end{equation}
+Setting $\alpha^{(j)} = \frac{1}{g}\|\Delta^{(j)}\|_1$ minimizes
+$\sum_k (|\Delta_k^{(j)}| - \alpha^{(j)})^2$ over all scalar $\alpha^{(j)} \geq 0$,
+yielding:
+\begin{equation}
+    \left\|\Delta^{(j)} - \hat{\Delta}^{(j)}\right\|_2^2
+    = \sum_{k=1}^{g} \left(|\Delta_k^{(j)}| - \bar{|\Delta|}^{(j)}\right)^2
+    = g \cdot \mathrm{Var}\!\left[|\Delta^{(j)}|\right],
+    \label{eq:var-error}
+\end{equation}
+where $\bar{|\Delta|}^{(j)} = \frac{1}{g}\sum_k |\Delta_k^{(j)}|$ and the variance
+is over coordinates. The total reconstruction error across all groups is:
+\begin{equation}
+    \|\Delta - \hat{\Delta}\|_2^2 = \sum_{j=1}^{G} g \cdot \mathrm{Var}\!\left[|\Delta^{(j)}|\right]
+    = d \cdot \overline{\mathrm{Var}}\!\left[|\Delta|\right],
+\end{equation}
+where $\overline{\mathrm{Var}}$ is the mean per-group variance of the absolute delta.
+\end{theorem}
+
+\begin{proof}
+From Eq.~\eqref{eq:group-error}, each term is $(|\Delta_k| - \alpha)^2$ where
+$\alpha$ minimizes the sum of squared deviations from the absolute values.
+By the first-order optimality condition:
+$\frac{\partial}{\partial \alpha} \sum_k (|\Delta_k| - \alpha)^2 = -2\sum_k(|\Delta_k| - \alpha) = 0$,
+giving $\alpha = \frac{1}{g}\|\Delta^{(j)}\|_1 = \bar{|\Delta|}^{(j)}$.
+Substituting: $\sum_k (|\Delta_k| - \bar{|\Delta|})^2 = g \cdot \mathrm{Var}[|\Delta^{(j)}|]$.
+Summing over $G$ groups completes the proof.
+\end{proof}
+
+\begin{corollary}[Cosine Similarity Preservation]
+\label{cor:cosine}
+Let $\cos(\bm{e}, \hat{\bm{e}})$ denote cosine similarity between original
+and reconstructed embeddings. Under the assumption that $\|\Delta\|_2 \ll
+\|\bar{\bm{e}}\|_2$ (experience embeddings cluster near the baseline), the
+expected cosine similarity satisfies:
+\begin{equation}
+    \mathbb{E}\left[\cos(\bm{e}_m, \hat{\bm{e}}_m)\right]
+    \geq 1 - \frac{d \cdot \overline{\mathrm{Var}}[|\Delta|]}{2\|\bar{\bm{e}}\|_2^2}.
+\end{equation}
+For well-clustered libraries where $\overline{\mathrm{Var}}[|\Delta|] \leq 0.01$
+(empirically observed for sentence-transformer embeddings), this gives
+$\cos(\bm{e}_m, \hat{\bm{e}}_m) \geq 0.95$---i.e., less than 5\% semantic
+similarity loss.
+\end{corollary}
+
+\begin{proof}
+Using the identity $\cos(\bm{u}, \bm{v}) = 1 - \frac{\|\bm{u} - \bm{v}\|^2}{2\|\bm{u}\|\|\bm{v}\|}$
+for unit-normalized vectors, and bounding $\|\bm{e}_m - \hat{\bm{e}}_m\|_2^2 =
+\|\Delta_m - \hat{\Delta}_m\|_2^2 = d \cdot \overline{\mathrm{Var}}[|\Delta_m|]$
+from Theorem~\ref{thm:reconstruction}. Since $\|\bm{e}_m\|_2 \approx
+\|\hat{\bm{e}}_m\|_2 \approx \|\bar{\bm{e}}\|_2$, the result follows.
+\end{proof}
+
+\subsection{Algorithms}
+
+\begin{algorithm}[H]
+\caption{\textsc{BitDelta-Compress}}
+\label{alg:compress}
+\begin{algorithmic}[1]
+\Require Experience library $\mathcal{L} = \{E_m\}_{m=1}^M$, group size $g$
+\Ensure Baseline $\bar{\bm{e}}$, compressed representations $\{\widehat{E}_m\}_{m=1}^M$
+\State $\bar{\bm{e}} \gets \frac{1}{M}\sum_{m=1}^M \bm{e}_m$ \Comment{Compute library baseline}
+\State $G \gets d / g$ \Comment{Number of groups}
+\For{$m = 1, \ldots, M$}
+    \State $\Delta_m \gets \bm{e}_m - \bar{\bm{e}}$ \Comment{Embedding delta}
+    \For{$j = 1, \ldots, G$}
+        \State Extract group: $\Delta_m^{(j)} \gets \Delta_m[(j-1)g : jg]$
+        \State $\alpha_m^{(j)} \gets \frac{1}{g}\left\|\Delta_m^{(j)}\right\|_1$
+              \Comment{L1 mean scale}
+        \State $\bm{s}_m^{(j)} \gets \sign\!\left(\Delta_m^{(j)}\right)$
+              \Comment{1-bit sign vector}
+        \State Pack $\bm{s}_m^{(j)}$ into $\lceil g/32 \rceil$ uint32 words
+    \EndFor
+    \State $\widehat{E}_m \gets \left(\{\bm{s}_m^{(j)}, \alpha_m^{(j)}\}_{j=1}^G,\;
+           E_m.\text{text},\; E_m.q,\; E_m.\text{domain}\right)$
+\EndFor
+\State \Return $\bar{\bm{e}}$, $\{\widehat{E}_m\}_{m=1}^M$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{BitDelta-Decompress}}
+\label{alg:decompress}
+\begin{algorithmic}[1]
+\Require Baseline $\bar{\bm{e}}$, compressed batch $\{\widehat{E}_m\}_{m=1}^M$, group size $g$
+\Ensure Reconstructed embeddings $\{\hat{\bm{e}}_m\}_{m=1}^M$
+\State $G \gets d / g$
+\For{$m = 1, \ldots, M$}
+    \State $\hat{\Delta}_m \gets \bm{0}^d$
+    \For{$j = 1, \ldots, G$}
+        \State Unpack $\bm{s}_m^{(j)}$ from uint32 words to $\{-1,+1\}^g$
+        \State $\hat{\Delta}_m[(j-1)g : jg] \gets \alpha_m^{(j)} \cdot \bm{s}_m^{(j)}$
+    \EndFor
+    \State $\hat{\bm{e}}_m \gets \bar{\bm{e}} + \hat{\Delta}_m$
+\EndFor
+\State \Return $\{\hat{\bm{e}}_m\}_{m=1}^M$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+% 5. DELTASOUP: BYZANTINE-ROBUST AGGREGATION
+% ============================================================================

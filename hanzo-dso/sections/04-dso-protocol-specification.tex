@@ -1,0 +1,105 @@
+\section{DSO Protocol Specification}
+
+\label{sec:protocol}
+
+\subsection{Roles}
+
+The DSO protocol defines five roles:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Agents:} Run local ASO, extract experiential priors, submit
+          to registry. Each agent has a keypair $(pk_i, sk_i)$ and stake $S_i$.
+    \item \textbf{Aggregators:} Compute Byzantine-robust aggregations of
+          submitted priors. May be a subset of agents or dedicated nodes.
+    \item \textbf{Validators:} Verify PoAI attestations, vote on quality scores,
+          execute slashing for malicious submissions.
+    \item \textbf{Storage Providers:} Pin prior data on IPFS/Arweave, earn
+          propagation rebates.
+    \item \textbf{Registry:} Smart contract managing entries, bonds, quality
+          votes, and aggregation requests.
+\end{enumerate}
+
+\subsection{Protocol Phases}
+
+\begin{algorithm}[H]
+\caption{DSO Protocol: Full Lifecycle}
+\label{alg:dso-lifecycle}
+\begin{algorithmic}[1]
+\Require Agent set $\mathcal{A} = \{a_1, \ldots, a_n\}$, task distribution $\mathcal{D}$
+\Ensure Aggregated prior bank $\mathcal{E}_{\text{agg}}$
+
+\State \texttt{// Phase 1: Local Prior Generation}
+\For{each agent $a_i \in \mathcal{A}$ \textbf{in parallel}}
+    \State Sample task $x \sim \mathcal{D}$
+    \State $\mathcal{E}_i \gets \text{ASO}(x, \pi_\theta)$
+    \Comment{Local TF-GRPO + PoE}
+\EndFor
+
+\State \texttt{// Phase 2: Submission}
+\For{each agent $a_i$ with priors $\mathcal{E}_i$}
+    \For{each prior $E \in \mathcal{E}_i$}
+        \State $\texttt{cid} \gets \text{IPFS.Pin}(\text{Serialize}(E))$
+        \State $\texttt{root} \gets \text{MerkleRoot}(E)$
+        \State $\texttt{id} \gets \text{Registry.Submit}(\texttt{root}, \texttt{cid}, q_E, D)$
+        \Comment{Bond $D$ required}
+    \EndFor
+\EndFor
+
+\State \texttt{// Phase 3: Quality Verification}
+\For{each validator $v_j$}
+    \State Sample subset of submissions $\mathcal{S}_j$
+    \For{each $\texttt{id} \in \mathcal{S}_j$}
+        \State $E \gets \text{IPFS.Fetch}(\texttt{cid}_{\texttt{id}})$
+        \State Verify Merkle proof
+        \State $q' \gets \text{EvaluateQuality}(E, \text{holdout tasks})$
+        \State $\text{Registry.VoteQuality}(\texttt{id}, q')$
+    \EndFor
+\EndFor
+
+\State \texttt{// Phase 4: Aggregation}
+\State $\texttt{ids} \gets \text{Registry.GetEntriesBySchema}(\texttt{schema})$
+\State Filter: $\texttt{ids} \gets \{\texttt{id} : q_{\texttt{id}} \geq q_{\min}\}$
+\State $\mathcal{E}_{\text{agg}} \gets \text{ByzantineAggregate}(\texttt{ids})$
+\Comment{Section~\ref{sec:aggregation}}
+
+\State \texttt{// Phase 5: Gossip Propagation}
+\For{each node $n_k$}
+    \State Subscribe to registry events
+    \State Fetch and verify high-quality priors
+    \State Merge into local LanceDB
+    \Comment{Section~\ref{sec:gossip}}
+\EndFor
+
+\State \Return $\mathcal{E}_{\text{agg}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Schema Decomposition}
+
+Aggregation requires a common decomposition schema $\mathcal{S}$ so that priors
+from different agents can be compared element-wise.
+
+\begin{definition}[Schema]
+A schema $\mathcal{S} = \{s_1, \ldots, s_K\}$ partitions the token-level
+expert factor space into $K$ bins. Each bin $s_k$ corresponds to either:
+\begin{enumerate}[leftmargin=1.5em]
+    \item A \textbf{token bin:} A subset of vocabulary tokens grouped by
+          semantic similarity (e.g., all Python keywords, all arithmetic
+          operators).
+    \item An \textbf{embedding centroid:} A region in the task embedding space
+          identified by $k$-means clustering.
+    \item A \textbf{context type:} A category of generation contexts (e.g.,
+          function signature, loop body, error handling).
+\end{enumerate}
+\end{definition}
+
+Each submitted prior $E_i$ is decomposed under the schema:
+\begin{equation}
+    E_i = \{\Delta_i^{(s)}\}_{s \in \mathcal{S}},
+\end{equation}
+where $\Delta_i^{(s)} \in \{-\alpha_i, 0, +\alpha_i\}^{|s|}$ is the 1-bit
+quantized factor restricted to schema element $s$.
+
+% ============================================================================
+% 5. BYZANTINE-ROBUST AGGREGATION
+% ============================================================================

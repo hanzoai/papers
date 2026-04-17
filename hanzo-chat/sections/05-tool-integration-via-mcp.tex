@@ -1,0 +1,93 @@
+\section{Tool Integration via MCP}
+
+\label{sec:tools}
+
+\subsection{Model Context Protocol}
+
+The Model Context Protocol (MCP)~\cite{anthropic2024mcp} provides a standardized interface for LLMs to discover and invoke external tools. Hanzo Chat implements an MCP client that connects to multiple MCP servers simultaneously.
+
+\subsection{Tool Categories}
+
+Hanzo Chat ships with 260+ tools organized into categories:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Category} & \textbf{Tools} & \textbf{Example} \\
+\midrule
+Code execution & 15 & Python, Node.js, Bash \\
+File operations & 22 & Read, write, search, glob \\
+Web interaction & 18 & Fetch, search, browse \\
+Database & 12 & SQL, vector, key-value \\
+API integration & 45 & REST, GraphQL, gRPC \\
+DevOps & 28 & Docker, K8s, CI/CD \\
+Data analysis & 20 & Pandas, plotting, stats \\
+Communication & 15 & Email, Slack, Discord \\
+Version control & 18 & Git, GitHub, PRs \\
+Cloud services & 35 & AWS, GCP, DO \\
+AI/ML & 22 & Training, inference, eval \\
+System & 30 & OS, process, network \\
+\bottomrule
+\end{tabular}
+\caption{MCP tool categories and counts.}
+\label{tab:tools}
+\end{table}
+
+\subsection{Tool Discovery and Selection}
+
+Not all 260+ tools are included in every prompt. Hanzo Chat uses a two-stage tool selection process:
+
+\begin{algorithm}[H]
+\caption{Dynamic Tool Selection}
+\label{alg:tools}
+\begin{algorithmic}[1]
+\Require Query $m_t$, query embedding $\bm{e}_t$, all tools $\mathcal{T}_{\text{all}}$
+\State \Comment{Stage 1: Embedding-based retrieval}
+\State $\mathcal{T}_{\text{cand}} \gets \text{Top-}20(\cos(\bm{e}_t, \bm{e}_{\text{tool}}))$
+\State \Comment{Stage 2: LLM-based filtering}
+\State $\mathcal{T}_{\text{sel}} \gets \text{LLM.Filter}(m_t, \mathcal{T}_{\text{cand}})$
+\State \Comment{Always include core tools}
+\State $\mathcal{T}_{\text{final}} \gets \mathcal{T}_{\text{sel}} \cup \mathcal{T}_{\text{core}}$
+\State \Return $\mathcal{T}_{\text{final}}$ \Comment{Typically 8--15 tools}
+\end{algorithmic}
+\end{algorithm}
+
+This reduces the tool definition overhead from $\sim$50K tokens (all tools) to $\sim$4K tokens (selected subset) while maintaining 97\% recall on tool-use benchmarks.
+
+\subsection{Tool Execution Sandboxing}
+
+All tool executions run in isolated environments:
+
+\begin{itemize}[leftmargin=1.1em]
+    \item \textbf{Code execution}: Docker containers with resource limits (CPU: 2 cores, RAM: 4GB, time: 60s, no network unless explicitly granted).
+    \item \textbf{File operations}: Scoped to project directories with read/write permissions managed per user.
+    \item \textbf{Web requests}: Rate-limited (10 req/min), filtered for malicious URLs, response size capped at 1MB.
+    \item \textbf{API calls}: OAuth credentials stored in encrypted vault, never exposed to the LLM.
+\end{itemize}
+
+\subsection{Multi-Step Tool Chains}
+
+Hanzo Chat supports iterative tool use where the model can invoke multiple tools in sequence, using the output of one as input to the next. The execution loop (Algorithm~\ref{alg:pipeline}, lines 7--10) continues until the model produces a final text response without tool calls.
+
+We observe that complex tasks often require 3--7 tool calls. To prevent infinite loops, we impose a configurable maximum (default: 25 tool calls per turn).
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Task Type} & \textbf{Avg. Tool Calls} & \textbf{Success Rate} \\
+\midrule
+Simple file read & 1.2 & 99.1\% \\
+Code debugging & 3.8 & 87.4\% \\
+Data analysis & 5.1 & 82.3\% \\
+Multi-file refactor & 7.3 & 78.9\% \\
+Full-stack feature & 12.4 & 71.2\% \\
+\bottomrule
+\end{tabular}
+\caption{Tool call statistics by task complexity.}
+\label{tab:tool_stats}
+\end{table}
+

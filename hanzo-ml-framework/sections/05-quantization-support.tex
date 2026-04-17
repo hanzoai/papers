@@ -1,0 +1,64 @@
+\section{Quantization Support}
+
+
+\subsection{GGML/GGUF Formats}
+
+The framework supports loading GGML and GGUF quantized models:
+
+\begin{lstlisting}[language=Rust]
+pub mod quantized {
+    pub enum GgmlDType {
+        Q4_0, Q4_1, Q5_0, Q5_1,
+        Q8_0, Q8_1,
+        Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+        F16, F32,
+    }
+}
+\end{lstlisting}
+
+\subsection{K-Quants}
+
+K-quants use multiple quantization scales per block for improved accuracy:
+
+\begin{lstlisting}[language=Rust]
+#[repr(C)]
+pub struct BlockQ4K {
+    d: f16,           // Super-block scale
+    dmin: f16,        // Super-block minimum
+    scales: [u8; 12], // Sub-block scales/mins
+    qs: [u8; 128],    // Quantized values
+}
+\end{lstlisting}
+
+Dequantization:
+\begin{equation}
+    x_i = d \cdot s_j \cdot q_i + d_{\min} \cdot m_j
+\end{equation}
+where $s_j$ and $m_j$ are sub-block scale and minimum.
+
+\subsection{SIMD Dequantization}
+
+AVX2-optimized dequantization for Q4\_K:
+
+\begin{lstlisting}[language=Rust]
+#[cfg(target_arch = "x86_64")]
+pub fn dequantize_q4k_avx2(block: &BlockQ4K,
+                           out: &mut [f32]) {
+    unsafe {
+        let d = _mm256_set1_ps(f16::to_f32(block.d));
+        let dmin = _mm256_set1_ps(f16::to_f32(block.dmin));
+
+        for i in (0..128).step_by(8) {
+            let q = _mm256_cvtepi32_ps(/* load qs */);
+            let s = _mm256_set1_ps(/* get scale */);
+            let m = _mm256_set1_ps(/* get min */);
+
+            let result = _mm256_fmadd_ps(
+                _mm256_mul_ps(d, s), q,
+                _mm256_mul_ps(dmin, m));
+            _mm256_storeu_ps(&mut out[i], result);
+        }
+    }
+}
+\end{lstlisting}
+

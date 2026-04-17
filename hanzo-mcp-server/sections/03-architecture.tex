@@ -1,0 +1,208 @@
+\section{Architecture}
+
+
+\subsection{Server Factory}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.7cm, align=center, font=\small},
+    arrow/.style={->, thick}
+]
+\node[box, fill=blue!10] (server) {MCP Server};
+\node[box, below=of server, fill=green!10] (registry) {Tool Registry};
+\node[box, below left=0.5cm and -0.5cm of registry] (file) {File Ops};
+\node[box, below=of registry] (shell) {Shell};
+\node[box, below right=0.5cm and -0.5cm of registry] (search) {Search};
+\node[box, left=of file] (edit) {Edit};
+\node[box, right=of search] (ui) {UI};
+\node[box, below=of shell] (orch) {Orchestration};
+
+\draw[arrow] (server) -- (registry);
+\draw[arrow] (registry) -- (file);
+\draw[arrow] (registry) -- (shell);
+\draw[arrow] (registry) -- (search);
+\draw[arrow] (registry) -- (edit);
+\draw[arrow] (registry) -- (ui);
+\draw[arrow] (registry) -- (orch);
+\end{tikzpicture}
+\caption{MCP Server architecture with tool registry and categories.}
+\label{fig:arch}
+\end{figure}
+
+The server is created via a factory function (Figure~\ref{fig:arch}):
+
+\begin{lstlisting}[language=JavaScript]
+export async function createMCPServer(config?: {
+  name?: string;
+  version?: string;
+  projectPath?: string;
+  customTools?: Tool[];
+  toolConfig?: ToolConfig;
+}) {
+  const configuredTools = getConfiguredTools({
+    ...toolConfig,
+    customTools: [...(toolConfig.customTools || []),
+                   ...customTools]
+  });
+
+  const server = new Server(
+    { name, version },
+    { capabilities: { tools: {}, resources: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema,
+    async () => ({
+      tools: configuredTools.map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema
+      }))
+    }));
+
+  return { server, tools: configuredTools, start,
+           addTool, removeTool };
+}
+\end{lstlisting}
+
+\subsection{Tool Configuration}
+
+The \texttt{ToolConfig} interface enables selective tool loading:
+
+\begin{lstlisting}[language=TypeScript]
+export interface ToolConfig {
+  enableCore?: boolean;      // File, shell, edit
+  enableUI?: boolean;        // Playwright, UI registry
+  enableAutoGUI?: boolean;   // PyAutoGUI adapters
+  enableOrchestration?: boolean;  // Agent tools
+  enableUIRegistry?: boolean;
+  enableGitHubUI?: boolean;
+  enabledCategories?: string[];
+  disabledTools?: string[];
+  customTools?: Tool[];
+}
+\end{lstlisting}
+
+This design allows deployments to enable only required tools, reducing attack surface and memory footprint.
+
+\subsection{Tool Categories}
+
+\subsubsection{File Operations}
+
+Four tools for filesystem interaction:
+\begin{itemize}
+    \item \texttt{read\_file}: Read file contents with optional line range
+    \item \texttt{write\_file}: Write content to file (create or overwrite)
+    \item \texttt{list\_directory}: List directory contents with metadata
+    \item \texttt{file\_info}: Get file metadata (size, permissions, timestamps)
+\end{itemize}
+
+All file operations validate paths against a configurable allowlist to prevent directory traversal attacks.
+
+\subsubsection{Shell Execution}
+
+\begin{lstlisting}[language=TypeScript]
+interface ShellToolInput {
+  command: string;
+  cwd?: string;
+  timeout?: number;      // Default: 30000ms
+  background?: boolean;  // Run asynchronously
+}
+\end{lstlisting}
+
+The shell tool executes commands in isolated processes with:
+\begin{itemize}
+    \item Configurable timeouts to prevent runaway processes
+    \item Background execution for long-running commands
+    \item Output streaming for real-time feedback
+    \item Exit code propagation for error handling
+\end{itemize}
+
+\subsubsection{Edit Operations}
+
+Precise file editing with three modes:
+\begin{itemize}
+    \item \texttt{edit\_replace}: Replace exact string matches
+    \item \texttt{edit\_insert}: Insert at line number
+    \item \texttt{edit\_delete}: Delete line range
+\end{itemize}
+
+The edit tool uses fuzzy matching to handle whitespace variations while preserving indentation.
+
+\subsubsection{Search Engine}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm, align=center, font=\small},
+    arrow/.style={->, thick}
+]
+\node[box, fill=yellow!20] (query) {Query};
+\node[box, below left=0.8cm and 0cm of query] (text) {Text Search};
+\node[box, below=0.8cm of query] (ast) {AST Search};
+\node[box, below right=0.8cm and 0cm of query] (vector) {Vector Search};
+\node[box, below=1.5cm of ast, fill=green!20] (merge) {Result Merger};
+\node[box, below=of merge, fill=blue!20] (rank) {Ranked Results};
+
+\draw[arrow] (query) -- (text);
+\draw[arrow] (query) -- (ast);
+\draw[arrow] (query) -- (vector);
+\draw[arrow] (text) -- (merge);
+\draw[arrow] (ast) -- (merge);
+\draw[arrow] (vector) -- (merge);
+\draw[arrow] (merge) -- (rank);
+\end{tikzpicture}
+\caption{Unified search engine with three retrieval strategies.}
+\label{fig:search}
+\end{figure}
+
+The unified search engine (Figure~\ref{fig:search}) combines:
+
+\paragraph{Text Search.} Powered by ripgrep for high-performance regex matching across large codebases. Supports glob filtering, context lines, and match highlighting.
+
+\paragraph{AST Search.} Uses tree-sitter grammars to parse source files and match structural patterns. Enables queries like ``find all async functions returning Promise$<$T$>$''.
+
+\paragraph{Vector Search.} Embeds code snippets using a local model and stores vectors in LanceDB for similarity search. Useful for semantic queries like ``find authentication logic''.
+
+Results are merged using reciprocal rank fusion:
+\begin{equation}
+    \text{score}(d) = \sum_{s \in \text{strategies}} \frac{1}{k + \text{rank}_s(d)}
+\end{equation}
+where $k$ is a smoothing constant (default: 60).
+
+\subsubsection{UI Automation}
+
+Playwright integration enables cross-browser automation:
+
+\begin{lstlisting}[language=TypeScript]
+interface UIToolInput {
+  action: 'navigate' | 'click' | 'type' |
+          'screenshot' | 'evaluate';
+  selector?: string;
+  url?: string;
+  text?: string;
+  code?: string;  // For evaluate
+  device?: 'mobile' | 'tablet' | 'desktop';
+}
+\end{lstlisting}
+
+Features include:
+\begin{itemize}
+    \item Device emulation (iPhone, Pixel, iPad, desktop)
+    \item Network interception for mocking APIs
+    \item Trace recording for debugging
+    \item PDF generation for documentation
+\end{itemize}
+
+\subsubsection{Agent Orchestration}
+
+Tools for multi-agent coordination:
+\begin{itemize}
+    \item \texttt{spawn\_agent}: Create sub-agent with specific role
+    \item \texttt{send\_message}: Inter-agent communication
+    \item \texttt{await\_result}: Wait for agent completion
+    \item \texttt{terminate\_agent}: Clean shutdown
+\end{itemize}
+

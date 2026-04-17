@@ -1,0 +1,125 @@
+\section{Training-Free Group-Relative Policy Optimization}
+
+\label{sec:tfgrpo}
+
+\subsection{Formulation}
+
+TF-GRPO replaces the gradient update in standard GRPO with a semantic
+extraction and compression pipeline. Given task $x$ and base model $\pi_\theta$:
+
+\begin{definition}[TF-GRPO Objective]
+The training-free GRPO objective for group $\{y^{(i)}\}_{i=1}^G$ is:
+\begin{equation}
+    \mathcal{J}_{\text{TF}}(x) = \frac{1}{G} \sum_{i=1}^{G} A^{(i)} \cdot S(y^{(i)}, x),
+\end{equation}
+where $A^{(i)}$ is the group-relative advantage and $S(y^{(i)}, x)$ is the
+semantic advantage descriptor---a structured text representation of what makes
+$y^{(i)}$ better or worse than the group mean.
+\end{definition}
+
+\subsection{Semantic Advantage Extraction}
+
+The semantic advantage $S(y^{(i)}, x)$ is extracted via LLM introspection.
+Given the task $x$, the group of solutions $\{y^{(j)}\}$, and their rewards
+$\{r^{(j)}\}$, we prompt the base model to produce a structured analysis:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Comparative Analysis:} Identify key differences between
+          high-reward and low-reward solutions.
+    \item \textbf{Pattern Extraction:} Distill differences into reusable
+          patterns (e.g., ``prefer \texttt{dict.get(key, default)} over
+          \texttt{key in dict}'').
+    \item \textbf{Confidence Scoring:} Estimate reliability of each pattern
+          based on consistency across the group.
+\end{enumerate}
+
+Formally, for each pattern $k$ extracted from group analysis:
+\begin{equation}
+    s_k = \left(\text{pattern}_k, \; c_k, \; \mathcal{V}_k\right),
+\end{equation}
+where $\text{pattern}_k$ is the natural language description, $c_k \in [0, 1]$
+is the confidence score, and $\mathcal{V}_k \subseteq \mathcal{V}$ is the set
+of vocabulary tokens affected by this pattern.
+
+\subsection{Reward Structure}
+
+The reward for rollout $i$ combines extrinsic and epistemic components:
+\begin{equation}
+    r^{(i)} = \alpha \cdot r_{\text{ext}}^{(i)} + \beta \cdot r_{\text{epi}}^{(i)},
+    \label{eq:reward}
+\end{equation}
+where $\alpha, \beta > 0$ are weighting coefficients (default $\alpha = 0.7$,
+$\beta = 0.3$).
+
+\paragraph{Extrinsic Reward.}
+The extrinsic reward captures task performance:
+\begin{equation}
+    r_{\text{ext}}^{(i)} = w_1 \cdot \frac{n_{\text{pass}}^{(i)}}{n_{\text{total}}}
+                         + w_2 \cdot \frac{n_{\text{new}}^{(i)}}{n_{\text{fail}}}
+                         + w_3 \cdot \text{CodeQuality}(y^{(i)}),
+\end{equation}
+where $n_{\text{pass}}^{(i)}$ is the number of tests passed, $n_{\text{new}}^{(i)}$
+is the number of previously-failing tests now passing, and
+$\text{CodeQuality}$ measures cyclomatic complexity, line count, and style
+adherence. Default weights: $w_1 = 0.5$, $w_2 = 0.3$, $w_3 = 0.2$.
+
+\paragraph{Epistemic Reward.}
+The epistemic reward encourages exploration:
+\begin{equation}
+    r_{\text{epi}}^{(i)} = \underbrace{H[\pi_\theta(y^{(i)} \mid x)]}_{\text{solution diversity}}
+    + \underbrace{\mathbb{I}[y^{(i)} \notin \mathcal{Y}_{\text{seen}}]}_{\text{novelty bonus}},
+\end{equation}
+where $H[\cdot]$ is the entropy of the generation distribution and
+$\mathcal{Y}_{\text{seen}}$ is the set of previously generated solutions.
+
+\subsection{Group-Relative Advantage Computation}
+
+Given rewards $\{r^{(i)}\}_{i=1}^G$, we compute whitened advantages:
+\begin{equation}
+    A^{(i)} = \frac{r^{(i)} - \mu_G}{\sigma_G + \epsilon},
+    \quad \mu_G = \frac{1}{G}\sum_j r^{(j)},
+    \quad \sigma_G = \sqrt{\frac{1}{G-1}\sum_j (r^{(j)} - \mu_G)^2},
+\end{equation}
+with $\epsilon = 10^{-8}$ for numerical stability. The whitening ensures
+advantages are zero-mean and unit-variance regardless of reward scale, which is
+critical for stable prior extraction across different task types.
+
+\subsection{Multi-Iteration Refinement}
+
+TF-GRPO operates iteratively. At iteration $k$:
+\begin{enumerate}[leftmargin=1.5em]
+    \item Generate group $\{y^{(i)}_k\}_{i=1}^G$ using PoE with priors from
+          iterations $1, \ldots, k-1$.
+    \item Compute rewards and advantages.
+    \item Extract semantic advantages and compress to expert factors.
+    \item Add new factors to the prior bank.
+\end{enumerate}
+
+The iterative process terminates when (a) a solution passes all tests, (b) the
+maximum iteration count $K$ is reached, or (c) the inter-iteration improvement
+$\Delta r = \max_i r_k^{(i)} - \max_i r_{k-1}^{(i)}$ falls below threshold
+$\delta$ (default $\delta = 0.01$).
+
+\begin{proposition}[Monotonic Improvement]
+\label{prop:monotonic}
+Under the assumption that semantic advantage extraction correctly identifies
+patterns with confidence $c_k > 0.5$, the expected maximum reward in each group
+is non-decreasing across iterations:
+\begin{equation}
+    \mathbb{E}\left[\max_i r_k^{(i)}\right] \geq \mathbb{E}\left[\max_i r_{k-1}^{(i)}\right].
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+At iteration $k$, the PoE decoder applies priors from all previous iterations.
+Each prior with confidence $c > 0.5$ biases generation toward patterns
+correlated with higher rewards. Since the prior bank is append-only and
+low-confidence priors receive weight $\eta \to 0$, the effective decoding
+distribution can only improve or remain unchanged. The group maximum, being the
+upper order statistic of $G$ i.i.d.\ draws from an improving distribution, is
+itself non-decreasing in expectation.
+\end{proof}
+
+% ============================================================================
+% 4. PRODUCT-OF-EXPERTS DECODING
+% ============================================================================

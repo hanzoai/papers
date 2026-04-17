@@ -1,0 +1,188 @@
+\section{Semantic Memory Manager}
+
+\label{sec:memory}
+
+\subsection{Experience Representation}
+
+\begin{definition}[Experience Entry]
+\label{def:experience}
+An experience entry $e \in \mathcal{E}$ is a tuple:
+\begin{equation}
+    e = \bigl(\texttt{id},\; \texttt{text},\; c,\; d,\; \bm{v},\; u,\; k\bigr),
+    \label{eq:experience}
+\end{equation}
+where:
+\begin{itemize}[leftmargin=1.5em]
+    \item $\texttt{id} \in \mathbb{N}$ is a unique identifier,
+    \item $\texttt{text} \in \Sigma^{\leq 32}$ is the natural-language experience
+          (at most 32 words),
+    \item $c \in (0, 1)$ is the confidence score (initialized to $c_0 = 0.5$
+          for new entries, updated via online learning),
+    \item $d \in \mathcal{D}$ is the domain label,
+    \item $\bm{v} \in \mathbb{R}^{384}$ is the sentence embedding produced by
+          \texttt{all-MiniLM-L6-v2}~\cite{reimers2019sentence},
+    \item $u \in \mathbb{N}$ is the usage count (number of times retrieved and
+          applied),
+    \item $k \in \mathbb{N}$ is the epoch of creation (session index).
+\end{itemize}
+\end{definition}
+
+The confidence score is updated via a Bayesian-flavored online rule after each
+session in which experience $e$ was applied:
+\begin{equation}
+    c \leftarrow
+    \begin{cases}
+        \min(c + \gamma(1 - c),\; c_{\max}) & \text{if applying } e \text{ improved task reward,} \\
+        \max(c - \gamma c,\; c_{\min}) & \text{if applying } e \text{ did not improve reward,}
+    \end{cases}
+    \label{eq:confidence-update}
+\end{equation}
+where $\gamma = 0.1$ is the learning rate, $c_{\min} = 0.05$, and
+$c_{\max} = 0.95$.
+
+\subsection{Retrieval}
+\label{sec:retrieval}
+
+At the start of each agent session with task $x$, the memory manager retrieves
+the top-$K$ experiences most relevant to $x$.
+
+\paragraph{Query Embedding.}
+The task query is embedded: $\bm{q} = \text{Enc}(x) \in \mathbb{R}^{384}$.
+
+\paragraph{Domain-Filtered Cosine Similarity.}
+For each experience $e \in \mathcal{E}$, the retrieval score is:
+\begin{equation}
+    \text{score}(e, x) =
+    \begin{cases}
+        \dfrac{\bm{q} \cdot \bm{v}_e}{\|\bm{q}\|\,\|\bm{v}_e\|} & \text{if } d_e \in D_x \text{ or } D_x = \emptyset, \\
+        -\infty & \text{otherwise,}
+    \end{cases}
+    \label{eq:retrieval-score}
+\end{equation}
+where $D_x \subseteq \mathcal{D}$ is the set of domains inferred from the task
+(empty if domain is ambiguous, in which case all domains are eligible). The
+top-$K$ experiences by score are returned.
+
+\paragraph{Context Injection.}
+Retrieved experiences are prepended to the agent's system prompt in ranked order:
+\begin{quote}
+\texttt{[G0] \{e[0].text\}}\\
+\texttt{[G1] \{e[1].text\}}\\
+$\vdots$\\
+\texttt{[G\{K-1\}] \{e[K-1].text\}}
+\end{quote}
+This format signals to the model that the bracketed items are learned
+guidelines (``G'' for guideline), distinguishing them from task instructions
+and conversation history. Default $K = 5$ retrieved experiences per session.
+
+\subsection{Confidence-Weighted Retrieval Score}
+
+The pure cosine similarity score can be augmented by confidence weighting to
+prioritize well-validated experiences:
+\begin{equation}
+    \tilde{\text{score}}(e, x) = (1 - \lambda)\,\frac{\bm{q} \cdot \bm{v}_e}{\|\bm{q}\|\,\|\bm{v}_e\|}
+    + \lambda\, c_e,
+    \label{eq:conf-weighted-score}
+\end{equation}
+with $\lambda = 0.2$. This blends semantic relevance with empirical reliability.
+
+\subsection{Memory Compression}
+\label{sec:compression}
+
+As the experience library grows, unconstrained addition would eventually
+degrade retrieval precision (too many near-duplicate or stale entries) and
+increase context injection cost. The memory manager applies one of four
+compression strategies when $|\mathcal{E}| > N_{\max}$ (default $N_{\max} = 500$).
+
+\paragraph{Strategy 1: Diversity Compression.}
+Apply $K$-means clustering to the embedding matrix
+$V = [\bm{v}_1, \ldots, \bm{v}_{|\mathcal{E}|}]^\top$. Within each cluster
+$\mathcal{C}_k$, retain only the experience with highest confidence:
+\begin{equation}
+    e^*_k = \argmax_{e \in \mathcal{C}_k} c_e.
+    \label{eq:diversity-compression}
+\end{equation}
+This ensures the surviving library spans the full semantic space of learned
+patterns.
+
+\paragraph{Strategy 2: Importance Compression.}
+Sort experiences by confidence and discard the bottom-$p$ fraction:
+\begin{equation}
+    \mathcal{E}' = \bigl\{e \in \mathcal{E} : c_e \geq Q_{1-p}(\{c_e : e \in \mathcal{E}\})\bigr\},
+    \label{eq:importance-compression}
+\end{equation}
+where $Q_{1-p}$ is the $(1-p)$-quantile. Default $p = 0.2$ (discard lowest
+20\% by confidence).
+
+\paragraph{Strategy 3: Temporal Decay Compression.}
+Assign each experience a time weight via exponential decay:
+\begin{equation}
+    w_t(e) = \exp\bigl(-\lambda(k_{\text{now}} - k_e)\bigr),
+    \label{eq:temporal-decay}
+\end{equation}
+where $k_e$ is the epoch of creation, $k_{\text{now}}$ is the current epoch,
+and $\lambda > 0$ is the decay constant (default $\lambda = 0.05$). Experiences
+with $w_t(e) < w_{\min}$ are pruned. Temporal decay is appropriate in
+fast-changing environments where older experiences may reflect outdated tool
+behavior.
+
+\paragraph{Strategy 4: Hybrid Compression.}
+The hybrid strategy combines confidence, temporal weight, and a diversity
+penalty into a single utility score:
+\begin{equation}
+    U(e) = \alpha \cdot c_e^{\,\beta} \cdot w_t(e)^{\,\gamma} \cdot d_{\text{div}}(e)^{\,\delta},
+    \label{eq:hybrid-utility}
+\end{equation}
+where $d_{\text{div}}(e) = \min_{e' \neq e, e' \in \mathcal{E}}\|\bm{v}_e - \bm{v}_{e'}\|_2$
+is a diversity distance that penalizes experiences that are too similar to
+others in the library (encouraging diversity), and $\alpha, \beta, \gamma, \delta > 0$
+are tunable exponents (defaults: $\beta = 1.0$, $\gamma = 0.5$, $\delta = 0.3$).
+Experiences are pruned in ascending order of $U(e)$ until $|\mathcal{E}| \leq N_{\max}$.
+
+\begin{remark}
+In practice, we recommend hybrid compression for production deployments, as
+it balances all three considerations. Diversity compression alone can
+inadvertently discard valid experiences that happen to share semantic space
+with a higher-confidence entry. Importance compression alone can cause the
+library to become stale. Temporal decay alone discards valuable stable patterns.
+\end{remark}
+
+\subsection{Memory Manager Algorithm}
+
+\begin{algorithm}[H]
+\caption{SemanticMemoryManager.Update}
+\label{alg:memory-update}
+\begin{algorithmic}[1]
+\Require Experience library $\mathcal{E}$, operation set $\Omega^*$,
+         capacity $N_{\max}$, compression strategy $\mathcal{C}$
+\Ensure Updated $\mathcal{E}'$
+
+\State $\mathcal{E}' \gets \mathcal{E}$
+\For{each $\omega \in \Omega^*$}
+    \If{$\omega = \textsc{add}(e_{\text{new}})$}
+        \State $e_{\text{new}}.\bm{v} \gets \text{Enc}(e_{\text{new}}.\texttt{text})$
+        \State $\mathcal{E}' \gets \mathcal{E}' \cup \{e_{\text{new}}\}$
+    \ElsIf{$\omega = \textsc{modify}(e_{\text{id}}, e_{\text{new}})$}
+        \State Find $e$ with $e.\texttt{id} = e_{\text{id}}$ in $\mathcal{E}'$
+        \State $e_{\text{new}}.\bm{v} \gets \text{Enc}(e_{\text{new}}.\texttt{text})$
+        \State $e_{\text{new}}.c \gets e.c$ \Comment{Preserve confidence history}
+        \State $\mathcal{E}' \gets (\mathcal{E}' \setminus \{e\}) \cup \{e_{\text{new}}\}$
+    \ElsIf{$\omega = \textsc{delete}(e_{\text{id}})$}
+        \State $\mathcal{E}' \gets \mathcal{E}' \setminus \{e : e.\texttt{id} = e_{\text{id}}\}$
+    \ElsIf{$\omega = \textsc{merge}(e_{\text{id}_1}, e_{\text{id}_2}, e_{\text{new}})$}
+        \State $c_{\text{merged}} \gets \max(c_{e_{\text{id}_1}}, c_{e_{\text{id}_2}})$
+        \State $e_{\text{new}}.c \gets c_{\text{merged}}$
+        \State $e_{\text{new}}.\bm{v} \gets \text{Enc}(e_{\text{new}}.\texttt{text})$
+        \State $\mathcal{E}' \gets (\mathcal{E}' \setminus \{e_{\text{id}_1}, e_{\text{id}_2}\}) \cup \{e_{\text{new}}\}$
+    \EndIf
+\EndFor
+\If{$|\mathcal{E}'| > N_{\max}$}
+    \State $\mathcal{E}' \gets \text{Compress}(\mathcal{E}',\; \mathcal{C},\; N_{\max})$
+\EndIf
+\State \Return $\mathcal{E}'$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================================
+% 5. AGENT-SPECIFIC ADAPTATIONS
+% ============================================================================

@@ -111,11 +111,57 @@ with the Lux 4.0 boundary so that the family hard-fork is atomic.}
 \label{sec:triumvirate}
 % ============================================================================
 
-A Lux-family L1 is \emph{triumvirate-complete} when it carries a native
-DEX, a Cancun-equivalent EVM (or AIVM superset), and an FHE substrate
-exposed as a first-class chain. Hanzo 4.0 is the second network in the
-family to ship the triumvirate, after Lux 4.0 (same date), and the first
-purpose-built around AI compute.
+The \emph{triumvirate} is the three-pillar set of DEX + EVM + FHE that
+defines a complete financial-rail-resident L1. Hanzo 4.0 is the
+canonical \emph{triumvirate network}: its chain set \emph{is} exactly
+those three subsystems --- DEX (HMM), EVM (Cancun-equivalent C-Chain
+template), and FHE (confidential AI inference) --- and nothing else.
+Hanzo's EVM is plain EVM; AIVM is the dedicated A-Chain VM at the
+Lux primary network (LP-134, attestation + AI provenance), which
+Hanzo accesses \emph{natively} (\S\ref{sec:lux-native-access}), not
+as a Hanzo-local clone.
+
+The other Lux-family networks carry the financial-rail core too, but
+as a subset of broader chain sets: Lux 4.0 runs the full 9-chain
+topology (LP-134); Zoo 4.0 adds per-LLM chains, conservation chains,
+and L1$\to$L4 tenancy; Pars 2.0 adds P/X/S-Chain plus
+Persian-diaspora precompiles. Hanzo is the focused triumvirate where
+every chain is the financial rail; everything non-financial is
+serviced by Lux primary natively.
+
+Hanzo 4.0 also serves as the **Rust canonical node** of the family:
+\texttt{\textasciitilde/work/hanzo/cli} (Rust) and the
+\texttt{hanzo-libs} workspace under \texttt{\textasciitilde/work/hanzo/node}
+are the reference Rust implementations the other networks integrate
+against.
+
+\subsection{Native Lux primary-chain access}
+\label{sec:lux-native-access}
+
+Hanzo, like every Lux-family L1, natively uses the Lux primary
+network's chains --- P, C, X, Q, Z, A, B, M, F --- without bridging.
+"Native" means same Quasar cert lanes, same subject-binding, same
+finality, no wrapped assets, no cross-chain hop tax. Hanzo
+specifically reaches into Lux primary for:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{A-Chain (AIVM)} for attestation, model-registry
+      anchors, and AI-provenance receipts. The 8 AIVM precompiles
+      (\texttt{0x0a01}--\texttt{0x0a08}) live on \emph{Lux} A-Chain;
+      Hanzo's HMM marketplace records AI-compute attestations there
+      directly.
+\item \textbf{Z-Chain (ZVM)} for ZK rollups when Hanzo customers need
+      proof-aggregated batches.
+\item \textbf{M-Chain (MVM)} for any MPC ceremony Hanzo's HMM
+      requires (CGGMP21, FROST, Ringtail-general).
+\item \textbf{B-Chain (BVM)} for canonical cross-ecosystem bridging.
+\item \textbf{F-Chain (FVM)} when Hanzo's local FHE service needs to
+      delegate to Lux primary's FHE substrate.
+\end{itemize}
+
+Hanzo does not duplicate any of those chains locally. The boundary
+between Hanzo's three chains and Lux's primary nine is cert-lane
+subject-binding, not a bridge.
 
 \subsection{DEX --- Hanzo Market Maker (HMM)}
 
@@ -129,7 +175,8 @@ matches, and settles five compute primitives:
 \item \textbf{Training slots.} Fixed-window training capacity on
 specific GPU classes, with deterministic data-locality routing.
 \item \textbf{GPU leases.} Bare-metal capacity by hour, expressed
-through the AIVM \texttt{GPU\_LEASE} opcode (\texttt{0x0a05}).
+through the AIVM \texttt{GPU\_LEASE} opcode (\texttt{0x0a05}) on
+Lux A-Chain, accessed natively from Hanzo's EVM.
 \item \textbf{Embedding throughput.} Tokens/sec for retrieval-augmented
 generation pipelines.
 \item \textbf{Active-inference budgets.} Hamiltonian LLM compute
@@ -146,7 +193,7 @@ where $x_t$ is unsold compute capacity, $y_t$ is the AI-coin
 reserve, $k_p$ is the genesis liquidity, and $\lambda_p$ is the
 capacity-decay rate calibrated per pool to express that compute time
 not used by $t$ is forever lost. Equation~\ref{eq:hmm-decay} is solved
-on-GPU within the AIVM execution path; round-trip latency for a swap is
+on-GPU within the EVM execution path with native AIVM hooks; round-trip latency for a swap is
 under one millisecond.
 
 \paragraph{Liquidity Protocol cross-listing.} HMM registered with the
@@ -155,12 +202,16 @@ router exposes HMM pools to Lux D-Chain and Zoo DEX, allowing a
 single transaction to draw inference capacity quoted on Hanzo against
 collateral held on Lux or Zoo.
 
-\subsection{EVM --- AIVM, GPU-native superset}
+\subsection{EVM --- C-Chain template, GPU-native}
 
-The Hanzo EVM is the AIVM: a Cancun-compatible EVM with eight
-AI-specific precompiles in the \texttt{0x0a01}--\texttt{0x0a08}
-range. AIVM was specified in 3.0 (\texttt{hanzo-ai-chain});
-4.0 makes it GPU-resident.
+Hanzo's EVM is plain Cancun-equivalent EVM (the C-Chain template
+from LP-134), GPU-native via cevm v0.41+. AIVM is the dedicated
+A-Chain VM at the Lux primary network and is \emph{not} a Hanzo
+local; Hanzo uses Lux A-Chain (AIVM) natively for AI-provenance
+opcodes. The eight AIVM precompiles (\texttt{0x0a01}--\texttt{0x0a08})
+live on Lux A-Chain. From Hanzo's EVM, calls into AIVM look like any
+other native primary-chain access (no bridge, same cert lanes, same
+subject-binding):
 
 \begin{table}[H]
 \centering
@@ -179,7 +230,7 @@ range. AIVM was specified in 3.0 (\texttt{hanzo-ai-chain});
 \texttt{0x0a08} & \textsc{M\_CUSTODY} & Cross-chain call to M-Chain (MPC) \\
 \bottomrule
 \end{tabular}
-\caption{AIVM precompile surface, all GPU-resident at the 4.0 boundary.}
+\caption{AIVM precompile surface (Lux A-Chain, accessed natively by Hanzo). All GPU-resident at the 4.0 boundary.}
 \end{table}
 
 GPU-residency is enforced by the same QuasarSTM 4.0 transactional

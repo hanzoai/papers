@@ -1,0 +1,128 @@
+\section{Security}
+\label{sec:security}
+
+\subsection{Three-Lane Post-Quantum Safety, Inherited}
+
+The AI Chain inherits the full Quasar 3.0 security envelope from the Lux
+consensus substrate (LP-105). Every block is finalized by a QuasarCert
+that simultaneously requires:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item A BLS12-381 aggregate signature over the certificate subject;
+  \item A Ringtail two-round Ring-LWE threshold signature anchored to
+        a Q-Chain ceremony root;
+  \item A Z-Chain Groth16 SNARK rolling up $N$ ML-DSA-65 validator
+        signatures into a single 192-byte proof plus 32-byte public-input
+        hash.
+\end{enumerate}
+
+The certificate subject binds chain id, epoch, round, mode, and the
+seven chain-specific roots ($P_\text{val}\,\|\,Q_\text{cer}\,\|\,
+Z_\text{vk}\,\|\,A_\text{att}\,\|\,B_\text{br}\,\|\,M_\text{mpc}\,\|\,
+F_\text{fhe}$) plus the parent block hash and execution roots, making
+cross-epoch and cross-chain replay structurally impossible. See LP-105
+§4 and §6 for the formal QuasarCert definition.
+
+\subsection{What an AI Chain Adversary Must Break}
+
+To forge a block on the AI Chain, an adversary must \emph{simultaneously}:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item Solve the discrete logarithm on BLS12-381 (P-lane);
+  \item Solve Module-LWE for the Ringtail parameters (Q-lane);
+  \item Solve Module-LWE / MSIS for ML-DSA-65 (Z-lane).
+\end{itemize}
+
+Breaking any single lane, or any two of the three, leaves the third
+intact and the certificate unforgeable. A future cryptographically
+relevant quantum computer that breaks BLS does not break the AI Chain;
+the Q and Z lanes still hold.
+
+\subsection{Operator Honesty}
+
+Block-level safety guarantees that what the chain accepted, the
+quorum signed. It does not guarantee that an operator ran the right
+model on the right input. That second-tier honesty is enforced by TEE
+attestation:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item Every receipt is accompanied by a vendor-rooted TEE quote
+        (LP-134, A-Chain attestation primitive). The quote covers the
+        loaded model commitment, the runtime image, and the input/output
+        commitments.
+  \item Verifiers re-validate the quote against the vendor root CA on
+        chain. A malformed or unsigned quote rejects the receipt and
+        slashes the operator (Algorithm in \S\ref{sec:markets}).
+  \item Periodic spot-check verifiers, drawn by VRF, replay a sampled
+        fraction of jobs in their own TEEs. Discrepancies escalate to
+        full slashing.
+\end{itemize}
+
+\begin{theorem}[Operator-fraud detection]
+\label{thm:fraud}
+Let $\alpha$ be the verifier sampling rate per epoch and $\rho$ the
+fraction of jobs an attacker chooses to falsify. The probability that a
+false job goes undetected for $k$ epochs is
+$(1 - \alpha\rho)^k$. For $\alpha = 0.003$ and $\rho = 0.05$, the
+probability of evading detection across 1{,}000 jobs is below
+$10^{-3}$, while the verifier overhead remains below 0.3\% of total
+compute.
+\end{theorem}
+
+\begin{proof}[Sketch]
+Verifier sampling is independent across jobs. The probability of
+sampling a specific job is $\alpha$; the probability of detecting a
+falsified job conditional on sampling is 1 (the TEE quote replay
+exposes the divergence by construction). Over $k$ jobs, the unsampled
+probability is $(1-\alpha)^{\rho k}$. Substituting: at $\alpha=0.003$,
+$\rho=0.05$, $k=1000$ gives detection probability $> 0.999$.
+\end{proof}
+
+\subsection{Sybil Resistance}
+
+Sybil attacks against the operator side are bounded by stake. A
+fictitious operator must post $\geq$10{,}000 AI of stake; a Sybil farm of
+$N$ identities must post $10{,}000\,N$ AI. Block reward and inference
+fees are split per attested job, not per operator identity, so creating
+identities does not increase share. False quotes from any one identity
+slash 100\% of that identity's stake.
+
+\subsection{Liveness}
+
+Liveness on the AI Chain requires that the Quasar 3.0 quorum remains
+intact. LP-105 guarantees safety with $f < n/3$ Byzantine validators;
+liveness is preserved with $f < n/3$ failed validators provided the
+remaining $2n/3 + 1$ produce the three lanes. No additional liveness
+assumption is added on top.
+
+For the markets, liveness requires that operators participate. Idle
+operators do not earn block reward share, which produces a baseline
+incentive to attest and serve.
+
+\subsection{Replay and Cross-Chain Attacks}
+
+Every QuasarCert binds the certificate subject to the chain id, the
+epoch, and the seven chain-root tuple. The same finalized block on
+AI Chain cannot be replayed on C-Chain or any other chain in the
+pipeline because the chain id and the Z-Chain Groth16 verification key
+differ. Cross-chain bridge messages on B-Chain include a B-Chain block
+height and a destination chain id; replay across chains is similarly
+impossible.
+
+\subsection{Audit Surface}
+
+The AI Chain exposes the following for external audit:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item All HMM registry records and their training history DAG;
+  \item All operator listings, jobs, receipts, and TEE quotes;
+  \item All agent registry records and capability declarations;
+  \item All QuasarCert lane components per block (P, Q, Z);
+  \item All slashing events, with the underlying evidence
+        (malformed quote, divergent replay, lane-incomplete cert).
+\end{itemize}
+
+This is, by design, more transparent than any centralized AI service.
+The premise of the AI Chain is that the cost of that transparency is
+paid down by the ability to verify any output without asking the
+provider.

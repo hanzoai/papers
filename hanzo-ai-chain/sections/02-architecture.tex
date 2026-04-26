@@ -1,0 +1,139 @@
+\section{Architecture}
+\label{sec:arch}
+
+\subsection{AI Chain = A-Chain, Reframed}
+
+The Hanzo AI Chain is the Lux A-Chain (LP-134), the unified global
+attestation ledger, viewed as the AI Virtual Machine. There is exactly one
+chain; the term ``AI Chain'' is the public-facing identity of A-Chain when
+it is acting as the open AI protocol for the Hanzo Network. This avoids the
+proliferation of ledgers that has plagued every prior decentralized AI
+proposal: a single canonical chain hosts attestations for value-settlement
+chains (P/Q/Z lanes), and it hosts the AI registry, agent registry,
+compute markets, and AI coin economics described in this paper.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.9cm and 1.1cm,
+    box/.style={rectangle, draw, minimum width=2.4cm, minimum height=0.7cm,
+                font=\small, rounded corners=1pt},
+    arrow/.style={->, thick}
+]
+\node[box] (achain) {A-Chain (= AI Chain / AIVM)};
+\node[box, below left=of achain] (lux) {Lux Quasar 3.0 (LP-105)};
+\node[box, below right=of achain] (gpu) {QuasarGPU (LP-132)};
+\node[box, below=of achain] (stm) {QuasarSTM (LP-010)};
+\node[box, above=of achain] (hmm) {HMM Registry};
+\node[box, left=of hmm] (mkts) {Compute Markets};
+\node[box, right=of hmm] (agents) {Agent Registry};
+\draw[arrow] (achain) -- (lux);
+\draw[arrow] (achain) -- (gpu);
+\draw[arrow] (achain) -- (stm);
+\draw[arrow] (hmm) -- (achain);
+\draw[arrow] (mkts) -- (achain);
+\draw[arrow] (agents) -- (achain);
+\end{tikzpicture}
+\caption{The AI Chain is the AIVM persona of A-Chain. It is settled by
+Quasar 3.0, executed by QuasarGPU, and scheduled by QuasarSTM. On top of
+that single ledger sit the HMM registry, the agent registry, and the
+compute markets.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Settlement: Lux Quasar 3.0 (LP-105)}
+
+Every block on the AI Chain is finalized by a single \emph{QuasarCert}
+that aggregates three independent post-quantum verification lanes:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{P-lane} — BLS12-381 aggregate signature (classical fast path);
+  \item \textbf{Q-lane} — Ringtail two-round Ring-LWE threshold signature;
+  \item \textbf{Z-lane} — a Z-Chain Groth16 SNARK rolling up $N$ ML-DSA-65
+        validator signatures into a single 192-byte proof plus a 32-byte
+        public-inputs hash.
+\end{itemize}
+
+Lane independence guarantees that an adversary must simultaneously break
+the discrete logarithm on BLS12-381, Module-LWE for Ringtail, and
+Module-LWE/MSIS for ML-DSA to forge a certificate. Breaking any one or any
+two lanes leaves the third intact. See LP-105 for the formal definition,
+the certificate-subject binding, and the security proofs.
+
+For the AI Chain, this means every inference receipt and every market
+state transition inherits the same three-lane post-quantum envelope used
+to settle LUX value transfers. There is no separate, weaker security tier
+for ``AI things.''
+
+\subsection{Execution: QuasarGPU (LP-132)}
+
+QuasarGPU is the GPU-resident execution substrate that verifies QuasarCerts
+and runs the AIVM. The same hardware that batches BLS aggregate verify
+($\sim$875\,$\mu$s for $n{=}100$), Ringtail batch verify ($O(1)$ amortized
+after DKG), and the single Groth16 pairing check (200--500\,$\mu$s) also
+hosts the inference kernels invoked by AIVM opcodes. Co-location is
+deliberate: a GPU that has already loaded a Hanzo model into HBM can
+service the next inference job without paging weights from main memory,
+and it can produce the TEE quote that anchors the result without leaving
+the trusted boundary.
+
+QuasarGPU exposes a small set of primitives the AIVM relies on:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{ATTEST(quote)} — produce a vendor-rooted attestation
+        quote (Intel TDX, AMD SEV-SNP, NVIDIA H100/H200/B100 confidential
+        compute, ARM CCA) covering the loaded model commitment and
+        runtime version;
+  \item \texttt{INFER(model\_root, input)} — run forward pass under the
+        attested boundary, returning $(\text{output}, \text{quote})$;
+  \item \texttt{VERIFY(quasarcert)} — verify a QuasarCert on GPU
+        (used by light clients and by cross-chain bridges).
+\end{itemize}
+
+\subsection{Scheduling: QuasarSTM Lanes (LP-010)}
+
+QuasarSTM (LP-010) is the lane-based software transactional memory model
+used by the Quasar pipeline. The AI Chain reuses the same lane
+abstraction: independent compute jobs that do not touch overlapping state
+run in parallel lanes; only state-touching transitions (operator stake
+updates, market settlement, model registry mutations) serialize. Because
+inference is read-mostly with respect to the chain (model commitments are
+read; only the receipt is written), the AI Chain achieves throughput
+limited by GPU capacity, not by chain serialization.
+
+\subsection{The AIVM Opcode Surface}
+
+The AIVM is a superset of the EVM with tensor-aware opcodes. Standard
+EVM opcodes execute unchanged. AI-specific operations are exposed as
+precompiles addressable from any EVM contract:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Address} & \textbf{Name} & \textbf{Purpose} \\
+\midrule
+\texttt{0x0a01} & \texttt{HMM\_LOOKUP}    & Resolve model\_root → metadata \\
+\texttt{0x0a02} & \texttt{INFER\_REQUEST} & Submit inference job to market \\
+\texttt{0x0a03} & \texttt{INFER\_VERIFY}  & Verify TEE quote + receipt \\
+\texttt{0x0a04} & \texttt{TRAIN\_BOUNTY}  & Post training bounty \\
+\texttt{0x0a05} & \texttt{GPU\_LEASE}     & Lease GPU pool capacity \\
+\texttt{0x0a06} & \texttt{AGENT\_AUTH}    & Authorize agent action under cap \\
+\texttt{0x0a07} & \texttt{F\_CALL}        & Cross-chain call to F-Chain (FHE) \\
+\texttt{0x0a08} & \texttt{M\_CUSTODY}     & Cross-chain call to M-Chain (MPC) \\
+\bottomrule
+\end{tabular}
+\caption{AIVM precompile addresses. EVM contracts may call any of these
+to interact with the AI Chain registries and markets without leaving the
+solidity programming model.}
+\end{table}
+
+\subsection{Block Time and Throughput}
+
+The AI Chain targets the same 500\,ms block time and $\geq$100\,K
+TPS-per-chain envelope as the rest of Quasar 3.0 (LP-105 §8). Inference
+throughput is bounded by aggregate operator GPU capacity, not by the
+chain itself; in practice each block can record thousands of inference
+receipts because each receipt is a fixed-size commitment, not a
+re-execution.

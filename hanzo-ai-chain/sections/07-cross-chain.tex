@@ -1,0 +1,116 @@
+\section{Cross-Chain Integration}
+\label{sec:xchain}
+
+The AI Chain is one chain in the Lux multi-chain layout (LP-134, the
+P/Q/Z/A/B/M/F pipeline). Each peer chain has a single, well-defined
+purpose; AI Chain composes with them through small, typed precompiles
+rather than redefining their work.
+
+\subsection{C-Chain (EVM)}
+
+The Lux C-Chain runs the general-purpose EVM. The AI Chain runs the
+AIVM, which is a strict superset of the EVM (\S\ref{sec:arch}). Any
+solidity contract that runs on C-Chain runs on AI Chain unmodified;
+contracts on AI Chain may additionally call the AIVM precompiles.
+
+The two chains exchange value and messages through B-Chain bridges.
+A C-Chain ERC-20 contract holding USDC can settle the receivable side
+of a Hanzo inference contract that lives on AI Chain; the bridge
+message is what makes the cross-chain transfer atomic with respect to
+the AI receipt.
+
+\subsection{F-Chain (FHE Confidential Inference)}
+
+F-Chain is the Lux fully homomorphic encryption chain (LP-013) and the
+home of confidential ERC-20 patterns (LP-067). For inference workloads
+where the input data must remain encrypted end-to-end, the AI Chain
+delegates execution to F-Chain through the \texttt{F\_CALL} precompile.
+
+The flow:
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item Caller encrypts input under CKKS to the operator's public key
+        on F-Chain.
+  \item Caller invokes \texttt{F\_CALL}(model\_root, fhe\_input,
+        max\_payment) on AI Chain.
+  \item AI Chain emits a B-Chain bridge message routing the FHE
+        ciphertext and the model commitment to F-Chain.
+  \item F-Chain operator runs the homomorphic forward pass under TEE,
+        emits an encrypted output and a TEE quote.
+  \item Bridge returns (encrypted\_output, tee\_quote) to AI Chain;
+        the receipt is recorded.
+  \item Caller decrypts the output under their secret key.
+\end{enumerate}
+
+The provider sees only ciphertext throughout. The receipt on AI Chain
+proves which model produced the result without revealing inputs or
+outputs. This is the same primitive Hanzo AI Cloud describes for
+confidential inference (\texttt{\textasciitilde/work/hanzo/papers/hanzo-ai-cloud}),
+now anchored on chain.
+
+\subsection{M-Chain (Threshold Custody)}
+
+M-Chain is the Lux MPC chain. Model owners with high-value or
+regulated weights may custody their model decryption keys on M-Chain
+under threshold MPC: a quorum of custodians must sign to release a
+decryption shard. The AI Chain references the custody record through
+the \texttt{M\_CUSTODY} precompile; an operator that wants to load
+encrypted weights must request and receive the threshold-signed
+release.
+
+This composes with HMMs in two useful ways. First, a model owner can
+publish weights publicly under a permissive license while reserving a
+specialized fine-tune under threshold custody. Second, regulated
+domains (medical, financial) can satisfy data-residency requirements
+by anchoring decryption authority to a custody quorum that includes
+in-jurisdiction parties.
+
+\subsection{B-Chain (Bridges)}
+
+B-Chain (LP-134 §5) is the chain of bridges. All cross-chain messages
+in the AI Chain workflows above flow over B-Chain. The bridge is itself
+QuasarCert-secured: a B-Chain message attesting that ``AI Chain block
+$h$ recorded receipt $r$'' is signed by the same three-lane consensus
+that finalized the underlying block. There is no weaker bridge security
+tier.
+
+\subsection{P-Chain, Q-Chain, Z-Chain (Consensus Substrate)}
+
+P/Q/Z are the consensus chains that produce the lanes of every
+QuasarCert (LP-105). The AI Chain is a consumer of those certificates,
+not a producer of them, in the same way every other Lux chain is.
+This is why AI Chain inherits Quasar 3.0 security without modification:
+the lanes are produced once, on the consensus substrate, and reused by
+every chain that asks for finality.
+
+\subsection{Topology Summary}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.0cm,
+    box/.style={rectangle, draw, minimum width=1.7cm, minimum height=0.55cm,
+                font=\footnotesize, rounded corners=1pt},
+    arrow/.style={<->, thick}
+]
+\node[box] (a) {A (= AI)};
+\node[box, above=of a]      (c) {C (EVM)};
+\node[box, below=of a]      (b) {B (Bridges)};
+\node[box, left=of a]       (f) {F (FHE)};
+\node[box, right=of a]      (m) {M (MPC)};
+\node[box, below left=of b] (p) {P (val)};
+\node[box, below=of b]      (q) {Q (cer)};
+\node[box, below right=of b](z) {Z (snark)};
+\draw[arrow] (c) -- (a);
+\draw[arrow] (a) -- (b);
+\draw[arrow] (a) -- (f);
+\draw[arrow] (a) -- (m);
+\draw[arrow] (b) -- (p);
+\draw[arrow] (b) -- (q);
+\draw[arrow] (b) -- (z);
+\end{tikzpicture}
+\caption{The AI Chain (A) sits at the center: it composes with the EVM
+(C) above, with bridges (B) below, with FHE (F) on the left, and with
+MPC (M) on the right. P/Q/Z produce the lanes that finalize every
+chain.}
+\end{figure}

@@ -1,0 +1,132 @@
+\section{Agent Registry}
+\label{sec:agents}
+
+\subsection{Agents as First-Class Citizens}
+
+A Hanzo Agent (\texttt{\textasciitilde/work/hanzo/agents}) is an
+autonomous program that calls models, holds state, and takes actions on
+behalf of a principal. Without an on-chain registry, agents are
+indistinguishable from any other API caller and cannot accumulate
+durable identity, capability, or reputation. The AI Chain promotes
+agents to first-class citizens with three primitives: \emph{persistent
+identity}, \emph{capability declaration}, and \emph{on-chain reputation}.
+
+\subsection{Persistent Identity}
+
+An agent is created on chain with a record:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{6.0cm}}
+\toprule
+\textbf{Field} & \textbf{Definition} \\
+\midrule
+\texttt{agent\_id}      & Hash of (creator address, nonce). Stable for
+                          the agent's lifetime. \\
+\texttt{controller}     & Address authorized to update the agent
+                          record (or rotate keys, retire the agent). \\
+\texttt{principal}      & Address on whose behalf the agent acts.
+                          May equal controller. \\
+\texttt{model\_set}     & Set of allowed HMM \texttt{model\_root}s the
+                          agent may invoke. \\
+\texttt{capability\_root}& Merkle root of the agent's capability
+                           declaration (see below). \\
+\texttt{spend\_cap}     & Per-epoch ceiling on AI the agent may spend
+                          on compute. \\
+\texttt{reputation}     & A monotonically updated score in $[0,1]$
+                          (\S\ref{sec:reputation}). \\
+\bottomrule
+\end{tabular}
+\caption{Agent registry record.}
+\end{table}
+
+The agent's identity is its \texttt{agent\_id}. It does not require an
+externally owned account in the EVM sense; it is referenced as a chain
+object addressable from any contract through the
+\texttt{AGENT\_AUTH} precompile (\S\ref{sec:arch}).
+
+\subsection{Capability Declaration}
+
+A capability declaration is a typed list of actions the agent is
+authorized to take. Declarations are content-addressed (committed to via
+\texttt{capability\_root}) and machine-readable. Examples:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{infer:hmm:zen-text@*}: invoke any version of zen-text;
+  \item \texttt{spend:ai:max=10}: may spend up to 10 AI per epoch;
+  \item \texttt{cross:f-chain:fhe-infer:hmm:medic-7b}: may issue
+        confidential inference calls to F-Chain on the named model;
+  \item \texttt{settle:c-chain:erc20:USDC@<addr>}: may transfer USDC on
+        the EVM C-Chain.
+\end{itemize}
+
+The declaration is the contract between the agent's principal and the
+chain; precompiles enforce it at every action. An agent attempting to
+exceed its declaration is rejected at the precompile boundary, before
+any external side effects.
+
+\subsection{Reputation}
+\label{sec:reputation}
+
+Reputation is a function of the agent's compute and settlement history:
+
+\begin{equation}
+  \text{rep}(a) = \sigma\!\left(
+     w_1 \cdot \text{success\_rate}(a) +
+     w_2 \cdot \log(1 + \text{volume}(a)) +
+     w_3 \cdot \text{age}(a) -
+     w_4 \cdot \text{disputes}(a)
+  \right)
+\end{equation}
+
+with the logistic $\sigma$ mapping to $[0,1]$. Weights $w_i$ are
+governance parameters. \texttt{success\_rate} is the fraction of jobs
+that produced valid TEE-attested receipts; \texttt{volume} is total AI
+spent; \texttt{age} is epochs since registration;
+\texttt{disputes} is the count of dispute resolutions against the agent.
+
+Reputation is read by markets and by other agents: an inference operator
+may price differently for high- vs.\ low-reputation callers; an agent
+network may decline to delegate work to a low-reputation peer. The chain
+publishes reputation; consumers act on it.
+
+\subsection{Cross-Chain Authorization}
+
+Agents transact across the Lux multi-chain layout (\S\ref{sec:xchain})
+through capability-bound precompiles. To call the EVM C-Chain on the
+agent's behalf, a contract invokes \texttt{AGENT\_AUTH} with (agent\_id,
+target\_chain, action). The precompile verifies that the agent's
+capability declaration permits the action, decrements
+\texttt{spend\_cap}, and emits a B-Chain bridge message. The cross-chain
+side then sees a single canonical authorization rooted at the agent
+record on AI Chain.
+
+\subsection{Privacy of Agent Memory}
+
+The agent registry does not record agent memory or working state on
+chain; only commitments. Agent memory lives in the agent's private
+storage (capsule, in Hanzo Cloud parlance), encrypted under keys
+custodied by M-Chain MPC if the agent so configures. The chain knows
+which agent acted; it does not know what the agent thought.
+
+\subsection{Worked Example: A Research Agent}
+
+A user creates a research agent with the following capability
+declaration:
+
+\begin{lstlisting}
+infer:hmm:zen-text@*
+infer:hmm:zen-vision@*
+spend:ai:max=50
+settle:c-chain:none
+cross:f-chain:none
+\end{lstlisting}
+
+The agent is registered with \texttt{spend\_cap} 50 AI/epoch and
+\texttt{model\_set} = \{zen-text, zen-vision\}. Over the next epoch the
+agent runs 1{,}200 inference calls on zen-text and 240 calls on
+zen-vision, spending 38.7 AI. Each call produces a TEE-attested receipt
+referenced by the agent's record. After 30 successful epochs and zero
+disputes, the agent's reputation has saturated near 1.0 and downstream
+markets begin offering it preferred pricing on reserved capacity.

@@ -1,0 +1,141 @@
+\section{Hanzo Models (HMMs)}
+\label{sec:hmm}
+
+\subsection{What Lives On Chain}
+
+A Hanzo Model is a content-addressed, versioned bundle of weights,
+metadata, and license. The chain does \emph{not} store weight blobs;
+those live in content-addressed storage (Hanzo object storage,
+\texttt{hanzo/storage}, or any compatible CAS) and are referenced by
+their root hash. The chain stores a small fixed-size record per model
+version that commits to everything a caller, an operator, or an auditor
+needs to verify a job:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{6.0cm}}
+\toprule
+\textbf{Field} & \textbf{Definition} \\
+\midrule
+\texttt{model\_root}      & Merkle root over the weight tensors at
+                            version $V$. Content-addressed; pinning the
+                            root pins the weights bit-exactly. \\
+\texttt{benchmark\_root}  & Merkle root over a canonical evaluation
+                            harness output (e.g.\ MMLU, HELM, internal
+                            evals). Submitted by the model owner;
+                            challengeable on chain. \\
+\texttt{license\_root}    & Hash of the license document (commercial,
+                            research, or open under explicit terms),
+                            with a machine-readable summary. \\
+\texttt{inference\_price} & A price function $p(\cdot)$ in AI per
+                            output token (or per call, per byte for
+                            non-text models). May be a constant, a
+                            piecewise function, or a reference to an
+                            on-chain pricing oracle. \\
+\texttt{training\_history}& Linked list of parent model\_roots, each
+                            edge annotated with the training dataset
+                            commitment, the trainer identity, and the
+                            block height at which training completed. \\
+\texttt{owner}            & Address authorized to publish new versions
+                            and to update license / price; may be a
+                            multisig or a DAO. \\
+\bottomrule
+\end{tabular}
+\caption{HMM registry record. Six fields per model version. The chain
+holds the commitments; weights and bench artifacts live in CAS.}
+\label{tab:hmm-record}
+\end{table}
+
+\subsection{Versioning and Provenance}
+
+Each new version of a model is a new record with a fresh
+\texttt{model\_root} and a \texttt{training\_history} edge pointing to
+the parent. This produces a directed acyclic graph rooted at the genesis
+of each model family. Anyone can walk the graph to see the full
+provenance: the original pretraining run, every fine-tune, every
+distillation, and the dataset commitment used at each step.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.1cm,
+    box/.style={rectangle, draw, minimum width=1.9cm, minimum height=0.5cm,
+                font=\footnotesize, rounded corners=1pt},
+    arrow/.style={->, thick, gray}
+]
+\node[box] (v0) {hmm:zen-1.0};
+\node[box, right=of v0] (v1) {hmm:zen-1.1};
+\node[box, right=of v1] (v2) {hmm:zen-2.0};
+\node[box, below right=of v0] (ft) {hmm:zen-1.0-medic};
+\node[box, below=of v2] (q) {hmm:zen-2.0-q4};
+\draw[arrow] (v0) -- (v1) node[midway,above,font=\tiny]{ft +1.2T tok};
+\draw[arrow] (v1) -- (v2) node[midway,above,font=\tiny]{full retrain};
+\draw[arrow] (v0) -- (ft) node[midway,below,font=\tiny]{specialize};
+\draw[arrow] (v2) -- (q) node[midway,right,font=\tiny]{quantize};
+\end{tikzpicture}
+\caption{Provenance DAG. Each edge is a chain transaction recording the
+parent model\_root, the training dataset commitment, and the trainer
+identity.}
+\end{figure}
+
+\subsection{License Enforcement}
+
+The \texttt{license\_root} commits to a license document with three
+machine-readable fields: \emph{usage} (commercial / research / open),
+\emph{redistribution} (allowed / restricted / prohibited), and
+\emph{derivative} (allowed / restricted / prohibited). Compute operators
+are required to read and respect the license at job time; the
+\texttt{INFER\_REQUEST} precompile (\S\ref{sec:arch}) refuses to schedule
+a job if the caller has not posted a matching license attestation.
+
+\subsection{Price Function}
+
+\texttt{inference\_price} is a first-class on-chain object. The simplest
+form is a constant \texttt{uint256} in AI per output token. More
+expressive forms are supported:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \emph{Piecewise tiered}: a price ladder that lowers per-token
+        cost above batch thresholds.
+  \item \emph{Time-of-day}: a function over block timestamp, used to
+        clear demand at peak.
+  \item \emph{Oracle-backed}: a reference to an on-chain price oracle
+        whose own update mechanism is visible on chain.
+\end{itemize}
+
+The model owner sets the function and may update it; updates are
+rate-limited (one update per epoch by default) to prevent surprise
+price moves between job submission and execution.
+
+\subsection{Benchmark Commitments and Challenges}
+
+A model owner publishes a \texttt{benchmark\_root} when registering a
+version. Any address may post a \emph{challenge}: a deposit-bonded
+claim that the published benchmark output does not match the actual
+output of the published \texttt{model\_root} on the canonical eval
+harness. Challenges are resolved by a designated set of operators
+re-running the harness inside a TEE and signing the result. If the
+challenge succeeds, the challenger collects the model owner's
+benchmark bond; if it fails, the challenger forfeits theirs. This
+matches the dispute pattern used elsewhere in Lux for attestation
+challenges (LP-134 §6).
+
+\subsection{Native Hanzo Models at Activation}
+
+At 25 December 2025 activation, the chain is genesis-seeded with the
+core Hanzo model family registered at version 1.0:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{hmm:zen-text} (text-to-text foundation model);
+  \item \texttt{hmm:zen-vision} (multimodal vision-language);
+  \item \texttt{hmm:zen-audio} (speech and audio);
+  \item \texttt{hmm:zen-code} (code-specialized);
+  \item \texttt{hmm:zen-embed} (embedding model).
+\end{itemize}
+
+These are the production models served by the Hanzo LLM Gateway
+(\texttt{\textasciitilde/work/hanzo/llm}) and by Jin
+(\texttt{\textasciitilde/work/hanzo/jin}). Registration on chain is the
+single source of truth for which weights are canonical and at what price
+they are offered.

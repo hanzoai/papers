@@ -22,6 +22,8 @@ Auto-generated catalogue of research papers.
 | `hanzo-agent-grpo` | ✓ | `hanzo-agent-grpo/hanzo-agent-grpo.tex` |
 | `hanzo-agent-sdk` | ✓ | `hanzo-agent-sdk/hanzo-agent-sdk.tex` |
 | `hanzo-agi-platform` | ✓ | `hanzo-agi-platform/hanzo-agi-platform.tex` |
+| `hanzo-4-0-launch` | ✓ | `hanzo-4-0-launch/hanzo-4-0-launch.tex` |
+| `hanzo-ai-chain` | ✓ | `hanzo-ai-chain/hanzo-ai-chain.tex` |
 | `hanzo-ai-cloud` | ✓ | `hanzo-ai-cloud/hanzo-ai-cloud.tex` |
 | `hanzo-ai-commerce` | ✓ | `hanzo-ai-commerce/hanzo-ai-commerce.tex` |
 | `hanzo-ai-safety` | ✓ | `hanzo-ai-safety/hanzo-ai-safety.tex` |
@@ -173,4 +175,4 @@ Auto-generated catalogue of research papers.
 | `zen4-thinking_whitepaper` | ✓ | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | ✓ | `zen/zen4-ultra_whitepaper.tex` |
 
-**Total**: 168 papers, 326 PDFs compiled
+**Total**: 169 papers, 327 PDFs compiled

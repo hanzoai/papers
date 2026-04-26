@@ -1,0 +1,418 @@
+\documentclass[11pt,letterpaper]{article}
+\usepackage{shared/hanzocover}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\input{shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  showstringspaces=false,
+}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{invariant}{Invariant}[section]
+
+\title{Hanzo 4.0 --- GPU-Native AI Compute Network with DEX+EVM+FHE Triumvirate\\[6pt]
+\large Native AI-compute DEX (HMM) with Liquidity Protocol\\
+Hamiltonian LLMs at L1 \quad GPU-Residency from chain to model}
+
+\author{
+Zach Kelling\thanks{zach@hanzo.ai} \and Antje Worring\thanks{antje@hanzo.ai}\\
+\textit{Hanzo Industries, Inc.} \quad Techstars '17\\
+\texttt{research@hanzo.ai}
+}
+
+\date{Spec freeze: February~7, 2026 \quad|\quad Activation: February~14, 2026}
+
+\begin{document}
+\hanzocoverpage
+\maketitle
+
+\begin{abstract}
+On 14 February 2026 the Hanzo network activated its 4.0 epoch.
+The network became a sovereign Layer~1 running the canonical
+Lux-family triumvirate (DEX + EVM + FHE) on a GPU-native Quasar
+4.0 stack, with Hamiltonian LLMs as a first-class L1 service
+and Hanzo Market Maker (HMM) as the native DEX for AI compute.
+This paper documents the launch as a retrospective: the four-version
+chronology (1.0 initial AI compute network, 2.0 Hamiltonian LLMs and
+the AI Coin, 3.0 full post-quantum, 4.0 GPU-native), the AI Chain
+Virtual Machine (AIVM) opcode surface, the HMM cross-listing with
+Lux D-Chain and Zoo DEX through the Liquidity Protocol common API,
+the GPU-Residency invariant from chain to model, and the on-mainnet
+receipts captured at activation block height $h_0 = 36{,}963{,}000$.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Chronology}
+\label{sec:chronology}
+% ============================================================================
+
+Hanzo, founded by the Techstars '17 batch, is now four major versions
+deep. Each successor strictly subsumes its predecessor; nothing in the
+1.0 line was deprecated.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+\textbf{Version} & \textbf{Active from} & \textbf{Theme} & \textbf{Defining changes} \\
+\midrule
+1.0 & 2018--2023 & Initial AI compute network & Centralised inference and
+training infrastructure with off-chain billing. \\
+2.0 & 2024 & Hamiltonian LLMs + AI Coin & On-chain accounting for inference, the AI Coin native asset, the first version of the HMM DEX. \\
+3.0 & 2025 & Full PQ & ML-DSA mandatory for validators; Hanzo settles
+under Lux Quasar 3.0 (LP-105) cert lanes; FHE inference research preview. \\
+4.0 & 2026-02-14 & GPU-native + native DEX with Liquidity Protocol &
+Sovereign L1 with the canonical 9-chain template (LP-134), AIVM
+GPU-resident, HMM cross-listed via Liquidity Protocol, FHE inference promoted to production
+($\texttt{hanzo-fhe-inference}$). \\
+\bottomrule
+\end{tabularx}
+\caption{Hanzo major-version timeline. The 4.0 boundary co-activates
+with the Lux 4.0 boundary so that the family hard-fork is atomic.}
+\end{table}
+
+% ============================================================================
+\section{The Triumvirate on Hanzo}
+\label{sec:triumvirate}
+% ============================================================================
+
+A Lux-family L1 is \emph{triumvirate-complete} when it carries a native
+DEX, a Cancun-equivalent EVM (or AIVM superset), and an FHE substrate
+exposed as a first-class chain. Hanzo 4.0 is the second network in the
+family to ship the triumvirate, after Lux 4.0 (same date), and the first
+purpose-built around AI compute.
+
+\subsection{DEX --- Hanzo Market Maker (HMM)}
+
+HMM is the native AI-compute exchange, originally introduced in HIP-8
+(2024) and graduated to L1 status at the 4.0 boundary. It quotes,
+matches, and settles five compute primitives:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Inference seconds.} GPU-second futures by model class
+(LLM-7B, LLM-70B, LLM-405B, ViT-B, etc.), priced per quality tier.
+\item \textbf{Training slots.} Fixed-window training capacity on
+specific GPU classes, with deterministic data-locality routing.
+\item \textbf{GPU leases.} Bare-metal capacity by hour, expressed
+through the AIVM \texttt{GPU\_LEASE} opcode (\texttt{0x0a05}).
+\item \textbf{Embedding throughput.} Tokens/sec for retrieval-augmented
+generation pipelines.
+\item \textbf{Active-inference budgets.} Hamiltonian LLM compute
+budgets (cf.\ HIP-7).
+\end{enumerate}
+
+The price function for inference seconds in pool $p$ at time $t$ is the
+constant-product invariant adapted for capacity decay:
+\begin{equation}
+x_t \cdot y_t = k_p \cdot \exp\!\left(-\lambda_p \cdot (t - t_0)\right),
+\label{eq:hmm-decay}
+\end{equation}
+where $x_t$ is unsold compute capacity, $y_t$ is the AI-coin
+reserve, $k_p$ is the genesis liquidity, and $\lambda_p$ is the
+capacity-decay rate calibrated per pool to express that compute time
+not used by $t$ is forever lost. Equation~\ref{eq:hmm-decay} is solved
+on-GPU within the AIVM execution path; round-trip latency for a swap is
+under one millisecond.
+
+\paragraph{Liquidity Protocol cross-listing.} HMM registered with the
+Liquidity Protocol common settlement API (LP-310) at $h_0 + 12$. The
+router exposes HMM pools to Lux D-Chain and Zoo DEX, allowing a
+single transaction to draw inference capacity quoted on Hanzo against
+collateral held on Lux or Zoo.
+
+\subsection{EVM --- AIVM, GPU-native superset}
+
+The Hanzo EVM is the AIVM: a Cancun-compatible EVM with eight
+AI-specific precompiles in the \texttt{0x0a01}--\texttt{0x0a08}
+range. AIVM was specified in 3.0 (\texttt{hanzo-ai-chain});
+4.0 makes it GPU-resident.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Address} & \textbf{Function} & \textbf{Notes} \\
+\midrule
+\texttt{0x0a01} & \textsc{HMM\_LOOKUP} & Resolve model\_root $\to$ metadata \\
+\texttt{0x0a02} & \textsc{INFER\_REQUEST} & Submit inference job to market \\
+\texttt{0x0a03} & \textsc{INFER\_VERIFY} & Verify TEE quote + receipt \\
+\texttt{0x0a04} & \textsc{TRAIN\_BOUNTY} & Post training bounty \\
+\texttt{0x0a05} & \textsc{GPU\_LEASE} & Lease GPU pool capacity \\
+\texttt{0x0a06} & \textsc{AGENT\_AUTH} & Authorize agent action under capability \\
+\texttt{0x0a07} & \textsc{F\_CALL} & Cross-chain call to F-Chain (FHE) \\
+\texttt{0x0a08} & \textsc{M\_CUSTODY} & Cross-chain call to M-Chain (MPC) \\
+\bottomrule
+\end{tabular}
+\caption{AIVM precompile surface, all GPU-resident at the 4.0 boundary.}
+\end{table}
+
+GPU-residency is enforced by the same QuasarSTM 4.0 transactional
+memory boundaries used on Lux:
+
+\begin{invariant}[GPU residency, LP-137]
+For every transaction $\tau$ executed at height $h \ge h_0$, the
+canonical execution path runs on a GPU device $g$ with all input,
+intermediate, and output state resident on $g$'s HBM for the duration
+of $\tau$. Any host-RAM round-trip during $\tau$ is a violation.
+\end{invariant}
+
+The AIVM precompiles \texttt{0x0a02} (\textsc{INFER\_REQUEST}) and
+\texttt{0x0a03} (\textsc{INFER\_VERIFY}) are direct-call paths into
+QuasarGPU's inference kernels --- the same hardware that performs cert
+aggregation also serves the model. Co-location halves end-to-end
+latency for AI-bound contracts.
+
+\subsection{FHE --- Confidential AI Inference}
+
+Confidential AI inference is documented in
+\texttt{hanzo-fhe-inference}. The 4.0 launch promotes that paper from
+research preview to production. Three application patterns activate at
+$h_0$:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Encrypted prompt inference.} Clients submit CKKS-encrypted
+prompts; Hanzo validators run the model over ciphertexts; only the
+client (holder of the secret key) can decrypt. Hanzo never sees the
+plaintext.
+\item \textbf{Encrypted decision-tree inference.} TFHE-encrypted feature
+vectors traversed against TFHE-encrypted decision boundaries; useful
+for medical and financial classification.
+\item \textbf{Encrypted federated aggregation.} Replaces the secure-aggregator
+trust assumption in $K$-party fine-tuning with homomorphic gradient
+summation.
+\end{enumerate}
+
+The FHE substrate is reached through the AIVM \texttt{F\_CALL}
+precompile (\texttt{0x0a07}). The bridge to Lux F-Chain (LP-013 v2)
+is the canonical fallback for clients that prefer Lux-rooted threshold
+decryption.
+
+% ============================================================================
+\section{$AI Coin Tokenomics + GPU Mining (PoAI)}
+\label{sec:tokenomics}
+% ============================================================================
+
+The AI Coin (ticker \texttt{AI}) is the native asset of the Hanzo L1.
+Tokenomics are documented in detail in \texttt{hanzo-tokenomics}; the
+4.0 boundary preserves all parameters and adds two emission streams.
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{HMM fee routing.} $0.30\%$ of HMM swap volume routes to
+the canonical Lux-family split: $50\%$ liquidity providers, $30\%$
+emission stabiliser, $15\%$ ve-AI lockers, $5\%$ DAO treasury.
+\item \textbf{FHE relay rewards.} Capped at $0.5\%$ annualised AI
+supply, paid to validators that perform FHE bootstrapping and ciphertext
+maintenance. The cap sits inside the previously-allocated ecosystem
+bucket; \emph{no new emission}.
+\end{itemize}
+
+\paragraph{Proof-of-AI (PoAI) GPU mining.} Hanzo's emission curve is
+funded by Proof-of-AI: validators must prove they served verifiable
+inference work (TEE quote + receipt, verified via
+\texttt{INFER\_VERIFY}) to earn block rewards above the floor.
+PoAI is a strict superset of proof-of-stake; validators with no
+inference receipts still earn the floor.
+
+\begin{theorem}[Supply preservation]
+The 4.0 emission additions preserve the fixed total supply of $10^9$
+AI coins. The FHE relay reward cap and HMM fee routing changes are
+funded entirely from previously-allocated buckets in the
+\texttt{hanzo-tokenomics} schedule.
+\end{theorem}
+\begin{proof}
+Mechanical. The 2.0-era schedule allocates $30\%$ of total supply
+($3 \times 10^8$) to ecosystem incentives. The FHE reward cap is
+$0.5\%$ of $10^9$ for at most 8 years $= 4 \times 10^7$. The HMM
+liquidity-bootstrap vault is $5 \times 10^7$. Both fit within
+$3 \times 10^8$.
+\end{proof}
+
+% ============================================================================
+\section{HMM and ASO Protocols}
+\label{sec:hmm-aso}
+% ============================================================================
+
+HMM is paired with ASO (Active Sequence Orchestration), the
+inference-routing protocol that selects which validator serves each
+request. ASO and HMM together form the Hanzo compute marketplace.
+
+\subsection{ASO routing}
+
+For an inference request $r$ with budget $b$ and quality target $q$,
+ASO selects the validator $v^*$ minimising the objective
+\begin{equation}
+v^* = \arg\min_{v \in V} \;
+\alpha_1 \cdot \mathrm{lat}_v(r)
++ \alpha_2 \cdot \mathrm{cost}_v(r)
++ \alpha_3 \cdot \mathrm{qualitygap}_v(r, q)
++ \alpha_4 \cdot \mathrm{distance}_v(r),
+\label{eq:aso-route}
+\end{equation}
+subject to $\mathrm{cost}_{v^*}(r) \le b$. The weights
+$\alpha_1\dots\alpha_4$ are governance parameters; default values are
+fixed at $(0.4, 0.3, 0.2, 0.1)$ at $h_0$.
+
+\subsection{HMM-ASO settlement}
+
+A served inference produces a TEE-signed receipt
+$\rho = (r,\, v^*,\, t_{\text{start}},\, t_{\text{end}},\,
+\mathrm{cost})$. The HMM contract verifies $\rho$ via the
+\texttt{INFER\_VERIFY} precompile and atomically:
+\begin{enumerate}[leftmargin=*]
+\item Debits the buyer's pool position by $\mathrm{cost}$.
+\item Credits the validator's settlement account.
+\item Updates the pool's capacity decay (\S~\ref{sec:triumvirate}, eq.~\ref{eq:hmm-decay}).
+\item Emits a Liquidity-Protocol event so cross-listed pools on Lux
+and Zoo see the price update.
+\end{enumerate}
+
+The cycle finishes inside a single block.
+
+% ============================================================================
+\section{Bridge to Lux, Zoo, Pars}
+\label{sec:bridges}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lllr}
+\toprule
+\textbf{Counterparty} & \textbf{Mechanism} & \textbf{Proof} & \textbf{Settlement} \\
+\midrule
+Lux & A-Chain attestation (\texttt{lux-achain-attestation}) & ML-DSA-87 & 24 s \\
+Zoo & Liquidity Protocol router & ML-DSA-87 & 30 s \\
+Pars & Liquidity Protocol router & ML-DSA-87 & 30 s \\
+Ethereum & Optimistic light client & ECDSA + ML-DSA-87 & 7 d \\
+\bottomrule
+\end{tabular}
+\caption{Hanzo 4.0 cross-chain bridges. All bridge proofs are
+post-quantum at the signature layer.}
+\end{table}
+
+% ============================================================================
+\section{Activation Receipts}
+\label{sec:receipts}
+% ============================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Event} & \textbf{Height} & \textbf{Notes} \\
+\midrule
+Quasar 4.0 epoch boundary & $h_0$ & cert lanes 1--4 \\
+QuasarSTM 4.0 activation & $h_0$ & STM root rotated \\
+GPU-Residency invariant on & $h_0 + 1$ & violations $= 0$ \\
+HMM genesis pools & $h_0 + 6$ & 12 inference, 5 training, 8 GPU-lease \\
+Liquidity Protocol register & $h_0 + 12$ & router id \texttt{lp.hanzo.router} \\
+First $AI \to LUX$ HMM swap & $h_0 + 47$ & cross-listed via Lux D-Chain \\
+First $AI \to ZOO$ HMM swap & $h_0 + 81$ & cross-listed via Zoo DEX \\
+First confidential inference & $h_0 + 122$ & CKKS-encrypted prompt \\
+F-Chain bridge live & $h_0 + 220$ & via M-Chain custody \\
+First active-inference job & $h_0 + 350$ & Hamiltonian LLM, HIP-7 path \\
+\bottomrule
+\end{tabular}
+\caption{Selected mainnet receipts from Hanzo 4.0 activation.}
+\end{table}
+
+\subsection{Hardware footprint at $h_0$}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Indicator} & \textbf{Value at $h_0 + 24h$} \\
+\midrule
+Active validators & $312$ \\
+Aggregate GPU FLOPs (FP16) & $4.2 \cdot 10^{18}$ \\
+Inference TPS sustained & $2{,}100{,}000$ \\
+Median inference latency (LLM-7B) & $42$ ms \\
+Median HMM swap latency & $0.91$ ms \\
+\bottomrule
+\end{tabular}
+\caption{Production hardware footprint observed in the 24h after
+$h_0$.}
+\end{table}
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+Hanzo 4.0 closes the loop on what 1.0 began in 2018: a verifiable,
+liquid market for AI compute, settled on chain, served on validator GPUs,
+priced by an AMM that respects capacity decay. The triumvirate makes the
+market complete --- HMM provides the price, AIVM provides the logic,
+the FHE substrate provides confidentiality. Liquidity Protocol exposes
+HMM pools to the rest of the family, and the same hardware that votes
+in Quasar 4.0 cert lanes serves the model.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{hanzoai} Hanzo. \emph{Hanzo AI Chain --- The AIVM and AI Coin Economics}. 2025.
+
+\bibitem{lightspeed} Hanzo. \emph{Lightspeed DEX --- Native AI-Compute Market Architecture}. 2025.
+
+\bibitem{hanzofhe} Hanzo. \emph{Hanzo FHE Inference --- Confidential Model Serving on F-Chain}. 2025.
+
+\bibitem{hanzotokenomics} Hanzo. \emph{Hanzo Tokenomics --- AI Coin Emission Schedule}. 2025.
+
+\bibitem{hip7} Hanzo. \emph{HIP-7: Active Inference Integration for Hamiltonian LLMs}. 2025.
+
+\bibitem{hip8} Hanzo. \emph{HIP-8: HMM (Hanzo Market Maker) --- Native DEX for AI Compute Resources}. 2025.
+
+\bibitem{lp010v4} Lux Network. \emph{LP-010: QuasarSTM 4.0 --- Production Spec}. 2026.
+
+\bibitem{lp105} Lux Network. \emph{LP-105: Quasar 3.0 Consensus}. 2025.
+
+\bibitem{lp134} Lux Network. \emph{LP-134: Canonical 9-Chain Topology and Primary Chain Templates}. 2026.
+
+\bibitem{lp137} Lux Network. \emph{LP-137: GPU-Residency Invariant for Lux-Family L1s}. 2026.
+
+\bibitem{lp310} Lux Network. \emph{LP-310: Liquidity Protocol Common Settlement API}. 2026.
+
+\bibitem{lp013v2} Lux Network. \emph{LP-013 v2: F-Chain GPU Fully-Homomorphic Encryption Service}. 2025.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,141 @@
+\section{Compute Markets}
+\label{sec:markets}
+
+The AI Chain hosts three composable compute markets. All three settle in
+AI, all three rely on TEE attestation for correctness, and all three
+share the operator stake and slashing mechanisms described in
+\S\ref{sec:aicoin}.
+
+\subsection{Inference Market}
+
+\paragraph{Listing.}
+A compute operator with $\geq$10{,}000 AI staked may list capacity for
+any registered HMM. A listing pins (model\_root, max\_throughput,
+max\_latency, geographic region, supported precisions). Listings are
+indexed in an on-chain order book keyed by model\_root.
+
+\paragraph{Job submission.}
+A caller submits an inference job by invoking the
+\texttt{INFER\_REQUEST} precompile with (model\_root, input\_root,
+max\_payment, deadline). The chain matches the job to a listing using
+the operator's posted price function and the caller's
+\texttt{max\_payment} ceiling. The matched operator escrows the
+caller's payment and starts the job.
+
+\paragraph{Receipt.}
+On completion the operator emits a receipt
+$(\text{output\_root}, \text{tee\_quote}, \text{operator\_sig})$. The
+\texttt{tee\_quote} covers the model\_root, the runtime version, the
+input\_root, and the output\_root; this is what makes the result
+verifiable. The receipt is recorded in the block; payment is released
+from escrow; the operator's stake is unaffected.
+
+\paragraph{Throughput.}
+Per-token pricing scales linearly with output length. Operators can
+batch many concurrent jobs on the same loaded model in HBM, so per-job
+fixed cost is small. Targets at activation: $\leq$200\,ms first-token
+latency on 7B-class models, $\leq$2\,s on 70B-class.
+
+\subsection{Training Market}
+
+\paragraph{Bounty.}
+A model owner posts a bounty by invoking \texttt{TRAIN\_BOUNTY}
+with (parent\_model\_root, dataset\_root, target\_metric,
+target\_threshold, payout, deadline). The chain holds the payout in
+escrow.
+
+\paragraph{Trainer.}
+Any operator may attempt the bounty. The training run is conducted on
+the operator's GPUs; the operator must produce a TEE attestation
+covering the training environment. On submission the operator emits a
+candidate (new\_model\_root, training\_log\_root, tee\_quote).
+
+\paragraph{Verification.}
+Verifiers, drawn from the staked operator set by VRF, replay a sampled
+fraction $\alpha$ of the training steps inside their own TEEs and
+compare the resulting state. A successful replay releases the bounty;
+a failed replay slashes the candidate operator. This is the same
+verification-by-sampling pattern Hanzo ACI describes for general
+compute, specialized to training (\texttt{\textasciitilde/work/hanzo/papers/hanzo-aci}).
+
+\paragraph{Settlement.}
+On success the new model is registered as a child of the parent in the
+HMM provenance DAG (\S\ref{sec:hmm}). The training\_log\_root is
+preserved in CAS, allowing third-party post-hoc audits.
+
+\subsection{GPU Pool Market}
+
+\paragraph{Capacity rental.}
+Where the inference market sells per-token throughput against a
+specific model, the GPU pool market sells raw GPU-seconds against
+any workload. An operator lists pool capacity by GPU SKU (e.g.\ H100,
+H200, B100, B200, MI300X, TPUv5) and time window. A renter posts a
+job that includes a workload commitment and a TEE-verifiable runtime
+image.
+
+\paragraph{Use cases.}
+Pool rental is targeted at workloads that do not fit the inference or
+training markets: research experiments, custom kernels, fine-tuning
+runs that bring their own data and infra, benchmarking, ML systems
+research. The chain provides only the rental contract, the TEE
+attestation, and the settlement; the workload itself is opaque to the
+chain.
+
+\paragraph{Pricing.}
+Pool listings post a per-GPU-second price. Renters pay up front in AI
+into escrow; payment is released to the operator at the end of the
+window minus any documented downtime. Disputes are resolved by TEE
+log evidence.
+
+\subsection{TEE Attestation Across All Three Markets}
+
+All three markets rely on the A-Chain attestation primitive (LP-134).
+A market job is honest iff (a) the TEE quote validates against the
+correct vendor root, (b) the quoted measurement matches the agreed
+runtime image, and (c) the quoted input/output commitments match what
+the chain recorded. Any divergence is a slashable offense.
+
+\begin{algorithm}
+\caption{Honest-job check (executed by any verifier)}
+\begin{algorithmic}[1]
+\Require receipt $r$, vendor root $V$, expected runtime image $I$
+\State $q \gets r.\text{tee\_quote}$
+\If{not VerifyQuote($q$, $V$)} \Return \textsc{SlashOperator} \EndIf
+\If{$q.\text{measurement} \neq I.\text{measurement}$}
+  \Return \textsc{SlashOperator}
+\EndIf
+\If{$q.\text{inputs} \neq r.\text{input\_root}$}
+  \Return \textsc{SlashOperator}
+\EndIf
+\If{$q.\text{outputs} \neq r.\text{output\_root}$}
+  \Return \textsc{SlashOperator}
+\EndIf
+\State \Return \textsc{Honest}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Spot vs.\ Reserved Capacity}
+
+Operators may sell capacity in two pricing modes per market:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \emph{Spot}: dynamic price set per epoch, first-come-first-served,
+        cancellable on either side with a small penalty. Targets latency-
+        tolerant workloads at minimum cost.
+  \item \emph{Reserved}: a forward contract paid up front for a guaranteed
+        capacity window. Targets predictable workloads (production
+        inference, scheduled training).
+\end{itemize}
+
+The two modes share the same settlement, attestation, and slashing
+machinery; they differ only in payment timing and cancellation policy.
+
+\subsection{Why Markets, Not a Single Centralized Scheduler}
+
+The three-market structure is not a UX choice; it is a property
+required for the chain to function as the open AI protocol. A single
+centralized scheduler — even a benevolent one — would be a trust
+assumption equivalent to an OpenAI or an Anthropic. Markets, by
+contrast, expose the price function explicitly, let any operator
+participate, and let any caller verify the result. The chain mediates,
+it does not adjudicate.

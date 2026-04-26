@@ -1,0 +1,103 @@
+\section{Privacy}
+\label{sec:privacy}
+
+\subsection{Threat Model}
+
+The AI Chain assumes three independent adversaries:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item A \emph{network-level} adversary that observes traffic between
+        callers, operators, and the chain.
+  \item A \emph{provider-level} adversary that operates GPUs and runs
+        inference on caller data.
+  \item A \emph{chain-level} adversary that observes everything written
+        on chain.
+\end{itemize}
+
+Plaintext on chain is public to all three. The privacy primitives below
+move sensitive material outside the chain entirely or hide it under
+encryption that no level of the adversary can decrypt without keys.
+
+\subsection{Public Inference}
+
+The default mode is public inference. The caller sends plaintext input;
+the operator returns plaintext output; the receipt commits to both. This
+mode is appropriate for non-sensitive workloads (general chat, public
+data analysis, code completion on open-source code). The chain records
+input\_root and output\_root commitments — Merkle roots over the
+plaintext — but the underlying bytes live in CAS and are not stored on
+chain.
+
+\subsection{Confidential Inference (F-Chain Delegation)}
+
+For sensitive workloads — medical, financial, defense, and any case
+where the input itself is the sensitive asset — the AI Chain delegates
+to F-Chain (\S\ref{sec:xchain}). The caller encrypts under CKKS to the
+operator's public key on F-Chain. F-Chain operators run the
+homomorphic forward pass under TEE and return ciphertext. Neither the
+operator nor any chain observer sees plaintext.
+
+The F-Chain inference path inherits the LP-067 confidential ERC-20
+pattern in spirit: the on-chain object commits to a value and an
+authority but does not reveal the value. Here the object is a model
+query and an output, not a token amount. The TEE quote covers the
+homomorphic operation by binding (input ciphertext root, model
+commitment, output ciphertext root) to the GPU's hardware identity.
+
+\subsection{Threshold Custody for Model Weights}
+
+Model owners may custody decryption keys for their weights under M-Chain
+threshold MPC (\S\ref{sec:xchain}). This addresses two scenarios:
+
+\begin{itemize}[leftmargin=1.2em]
+  \item \emph{Selective release}: the model's weights are encrypted at
+        rest; an operator that wants to load the model must obtain a
+        threshold-signed decryption shard. Custody quorums can be drawn
+        to satisfy contractual or jurisdictional requirements.
+  \item \emph{Revocable inference}: a model that has been served for a
+        time can be retired by retiring the custody key — operators
+        cannot reload the weights once the custody quorum withholds the
+        shard. Useful for time-bounded research access or for
+        deprecating compromised checkpoints.
+\end{itemize}
+
+\subsection{Receipt Privacy}
+
+Even with FHE-protected inputs and outputs, the existence of a receipt
+is observable on chain. The chain records (caller, operator,
+model\_root, block, payment). For workloads where even this metadata
+is sensitive, callers may use a stealth-address pattern: the caller is
+a one-shot address, the payment is denominated in a confidential AI
+balance on F-Chain, and the receipt is encrypted to the caller's
+session key. The on-chain footprint becomes a generic ``some address
+paid some operator for some model.''
+
+\subsection{Privacy Layering Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Mode} & \textbf{Input} & \textbf{Output} & \textbf{Identity} \\
+\midrule
+Public               & plain & plain & visible \\
+Confidential (F)     & FHE   & FHE   & visible \\
+Custody (M)          & plain & plain & visible \\
+Custody + Confidential & FHE & FHE & visible \\
+Confidential + Stealth & FHE & FHE & hidden \\
+\bottomrule
+\end{tabular}
+\caption{Privacy modes available on AI Chain. Each row composes
+independent primitives; the chain validates the receipt regardless of
+which combination the caller chose.}
+\end{table}
+
+\subsection{What Is Not Hidden}
+
+The chain does not hide block height, the validator set, the existence
+of a receipt, the Quasar lane proofs, or the operator's stake state.
+These are network invariants and must be public for the consensus
+itself to function. Anything tied to the workload (input, output,
+model weights when custodied, optionally the caller identity) can be
+hidden behind the primitives above.

@@ -1,0 +1,185 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+\lstdefinestyle{mystyle}{backgroundcolor=\color{backcolour},commentstyle=\color{codegreen},keywordstyle=\color{codepurple},numberstyle=\tiny\color{codegray},stringstyle=\color{codegreen},basicstyle=\ttfamily\footnotesize,breaklines=true,captionpos=b,keepspaces=true,numbers=left,numbersep=5pt,showstringspaces=false,tabsize=2}
+\lstset{style=mystyle}
+
+\title{A Post-Quantum Object Store: Per-Tenant SQLite and a Dropbox-Class Filesystem over One Encrypted Block Substrate}
+\author{Zach Kelling\thanks{zach@hanzo.ai} \\ \textit{Hanzo Industries} \\ \texttt{research@hanzo.ai}}
+\date{June 2026}
+
+\begin{document}
+\hanzocoverpage
+
+\begin{abstract}
+We describe a single object store that presents two access surfaces over one
+content-addressed, post-quantum--encrypted block substrate backed by
+S3-compatible storage. The first surface is a native, in-process SQLite virtual
+file system (\texttt{hanzovfs}) that gives every tenant a private, encrypted
+database without FUSE or cgo. The second is a POSIX FUSE/WASI mount that exposes
+the same substrate as an ordinary read/write directory---Dropbox-class file sync
+with local-first caching. Both surfaces share one key hierarchy: per-object data
+keys sealed with a hybrid ML-KEM-768 + X25519 KEM (\texttt{luxfi/age}) and
+bulk encryption under ChaCha20-Poly1305. We show that the database surface
+sustains 720K inserts/s and 59.6K point-reads/s---$2.6\times$ writes and
+$5\times$ reads over a FUSE-mounted equivalent---while remaining end-to-end
+post-quantum. This realizes HIP-0302 (encrypted SQLite durability) and HIP-0107
+(streaming replication over VFS) as one deployable substrate.
+\end{abstract}
+
+\section{Introduction}
+Multi-tenant platforms accrete storage engines: Postgres for rows, Redis for
+cache, an object store for blobs, a separate sync service for files. Each adds a
+network service to operate, a credential to rotate, and a blast radius. We argue
+for the opposite: \emph{one} encrypted block substrate, addressed two ways.
+
+A tenant's structured state lives in a private SQLite database; a tenant's files
+live in a private directory; both are the same encrypted blocks in the same
+bucket, distinguished only by the access surface mounted over them. There is no
+second storage service, no shared relational database, and no plaintext at rest.
+Crucially, the design is \emph{post-quantum by construction}: an adversary who
+records every ciphertext object today cannot recover any tenant's data under a
+future quantum computer.
+
+\section{The Block Substrate}
+The substrate stores fixed-size, individually-sealed blocks behind the
+\texttt{Backend} interface (\texttt{Get/Put/Delete/List}), with concrete
+backends for \texttt{file://} (local dev) and \texttt{s3://} (production,
+served by \texttt{hanzoai/s3}). A local NVMe cache fronts the backend so hot
+working sets never touch the network; cold blocks are fetched and decrypted on
+demand. Objects are content-addressed: a block's key is derived from its sealed
+bytes, which yields intra-tenant deduplication and cheap, immutable snapshots.
+Cross-tenant deduplication is deliberately \emph{not} performed---it would leak
+equality of plaintext across tenants---so each tenant's blocks are sealed under
+that tenant's own key.
+
+\section{Post-Quantum Key Hierarchy}
+Symmetric encryption is already quantum-resistant: Grover's algorithm reduces a
+256-bit key to a 128-bit security level, which remains infeasible. The quantum
+threat is to \emph{asymmetric} primitives---Shor's algorithm breaks RSA, ECDH,
+and EdDSA. We therefore place post-quantum cryptography exactly where it matters:
+key encapsulation and signatures.
+
+\textbf{Bulk.} Each block (or each 4\,KiB database page) is sealed with
+ChaCha20-Poly1305 under a per-object \emph{data encryption key} (DEK), giving
+confidentiality and integrity (AEAD) for the payload.
+
+\textbf{Key wrap.} The DEK is sealed with \texttt{luxfi/age} using an HPKE
+hybrid recipient, \texttt{MLKEM768-X25519}. The wrap is secure if \emph{either}
+the post-quantum (ML-KEM-768) or the classical (X25519) component holds---hybrid
+defense-in-depth against both quantum attack and an implementation flaw in the
+young PQ primitive. Recording the sealed DEK conveys nothing without the
+corresponding ML-KEM identity.
+
+\textbf{Signatures.} Where the platform authenticates rather than encrypts
+(node handshakes, tokens), it uses ML-DSA-65. This closes the asymmetric surface
+end-to-end.
+
+\begin{lstlisting}[language=Go,caption={Sealing a per-tenant DEK (HIP-0302).}]
+dek := random(32)                 // ChaCha20-Poly1305 key
+w, _ := age.Encrypt(out, rcptPQ) // ML-KEM-768 + X25519
+w.Write(dek); w.Close()          // sealed DEK -> dek.age
+\end{lstlisting}
+
+\section{Surface 1: Native SQLite VFS}
+SQLite's virtual file system layer lets a host intercept all I/O. We implement
+it in pure Go (\texttt{hanzoai/sqlite3}, a fork of \texttt{ncruces/go-sqlite3};
+no cgo) so that a database opened as
+\texttt{file:/orgs/acme/app.db?vfs=hanzo} reads and writes encrypted pages
+directly, \emph{in process}---no kernel transition. Each page is an AEAD-sealed
+block; the database's DEK is the age-wrapped key above. A tenant is therefore one
+(or a few per-user) encrypted SQLite files plus their replica; restoring a tenant
+is fetching their objects, and revoking one is deleting them.
+
+This makes the relational, key-value, queue, and session needs of an application
+collapse into tables inside one per-tenant database---no Postgres, no Redis.
+
+\section{Surface 2: A Dropbox-Class FUSE Mount}
+The same substrate is exposed as a POSIX filesystem via a FUSE node
+(\texttt{bazil.org/fuse}; a WASI guest mode is planned for sandboxed hosts). The
+mount is fully read/write: \texttt{Create}, \texttt{Mkdir}, \texttt{Write},
+\texttt{Setattr}, \texttt{Remove}, and \texttt{Fsync} map file operations onto
+block \texttt{Put/Get}. Writes are encrypted on the local host \emph{before} a
+byte leaves for S3, so the provider sees only ciphertext.
+
+\begin{lstlisting}[language=bash,caption={Mounting S3 as an encrypted folder.}]
+vfs mount /mnt/drive \
+  --backend s3://bucket/acme?endpoint=... \
+  --age-recipient age1pq1... --age-key id.key
+\end{lstlisting}
+
+This is the Dropbox-class surface. Three properties make it practical:
+\begin{itemize}
+\item \textbf{Local-first.} The NVMe cache serves the working set at local
+latency; only misses and flushes touch S3. The mount is usable offline for cached
+paths and reconciles on reconnect.
+\item \textbf{Content-addressed sync.} Because blocks are keyed by content, an
+edit re-uploads only changed blocks, and a file's history is a sequence of
+immutable block sets---natural versioning and dedup of unchanged regions.
+\item \textbf{Sharing by re-wrap.} Sharing a path means re-wrapping its DEK to
+another principal's ML-KEM recipient (resolved from \texttt{lux.id}); the bulk
+ciphertext is untouched. Revocation rotates the DEK and re-seals forward.
+\end{itemize}
+Conflicts are handled at the block/inode level: concurrent writers produce
+divergent content hashes that are reconciled by a last-writer-wins default with
+an explicit conflict copy, mirroring consumer sync semantics while preserving the
+encrypted-at-rest invariant.
+
+\section{Replication and Durability}
+Durability is HIP-0107: a source adapter streams the substrate's write-ahead
+records through the same \texttt{age} envelope to a \texttt{vfs.Backend}, so
+SQLite WAL, the file mount, and blockchain state all replicate to S3 through one
+pipeline. Restore is hydration of the latest snapshot plus replay of
+incrementals; a wiped node rejoins by pulling its tenant objects.
+
+\section{Evaluation}
+We benchmark the database surface against a FUSE-mounted equivalent of the same
+encrypted substrate (same cipher, same block size), isolating the cost of the
+kernel round-trip. All figures are single-tenant on arm64; each tenant is an
+independent database, so these are per-tenant, not shared-bottleneck, rates.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lrr}
+\toprule
+Path & insert (rows/s) & point-read (q/s) \\
+\midrule
+Native VFS, no crypto & 1{,}250{,}000 & 1{,}130{,}000 \\
+Native VFS + AEAD (in-mem) & 980{,}000 & 1{,}100{,}000 \\
+\textbf{Native PQ VFS (durable)} & \textbf{720{,}000} & \textbf{59{,}600} \\
+FUSE mount (encrypted) & 274{,}000 & 11{,}909 \\
+\bottomrule
+\end{tabular}
+\caption{Native, durable, post-quantum SQLite outperforms the FUSE path by
+$2.6\times$ on writes and $5\times$ on point-reads. AEAD encryption costs
+$\sim$20\% on writes and $\sim$0 on reads; the dominant FUSE tax is the kernel
+transition, not the cryptography.}
+\end{table}
+
+The takeaway determines surface selection: \emph{databases} use the native VFS
+(no FUSE tax); \emph{files} use the FUSE mount, where POSIX semantics matter more
+than raw IOPS and the kernel cost is amortized by the page cache.
+
+\section{Conclusion}
+One encrypted, content-addressed, post-quantum block store; two surfaces---an
+in-process SQLite VFS for structured tenant state and a read/write FUSE mount for
+Dropbox-class files. No second database, no separate sync service, no plaintext
+at rest, and no classical-only link in the path from a tenant's bytes to an S3
+object. The asymmetric attack surface is ML-KEM and ML-DSA throughout; the
+symmetric layer is AEAD. The result is a storage tier that is simultaneously
+simpler to operate and durable against a quantum adversary.
+
+\end{document}

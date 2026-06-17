@@ -127,7 +127,7 @@ export default async function PaperPage({
 
             <div className="rounded-lg border border-border/60 overflow-hidden bg-card">
               <object
-                data={pdfHref}
+                data={`${pdfHref}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
                 type="application/pdf"
                 className="w-full h-[80vh]"
                 aria-label={`${paper.title} PDF preview`}

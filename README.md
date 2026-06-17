@@ -2,6 +2,41 @@
 
 Technical papers covering Hanzo AI compute infrastructure, agent frameworks, ML inference, platform services, and defense applications. Includes the Zen model family co-developed with Zoo Labs Foundation.
 
+## About
+
+Hanzo AI is an American-owned, Techstars-backed ('17) applied AI lab, founded 2014,
+building the **Zen** frontier model family alongside a vertically integrated,
+post-quantum AI and cryptography stack. The work spans frontier models, an agentic
+runtime, edge inference, and production post-quantum cryptography — engineered to run
+sovereign and disconnected in defense, regulated, and air-gapped environments rather
+than on centralized cloud.
+
+## 2026 Highlights
+
+Each claim below is developed in the catalogued papers ([INDEX.md](INDEX.md)):
+
+- **Defense research suite (10 papers).** Autonomous agentic AI for cyber/intel/decision
+  support (`hanzo-agentic-ai`), DDIL/tactical assured networking over mesh and packet
+  radio (`hanzo-assured-networking`), FHE-mediated cross-domain MLS (`hanzo-cross-domain`),
+  edge AI/ML on embedded hardware (`hanzo-edge-ai-ml`), counter-exploitation
+  (`hanzo-countermeasures`), full-spectrum cyber (`hanzo-full-spectrum-cyber`), quantum
+  sensing/QKD (`hanzo-quantum-sensing-qkd`), verification & validation
+  (`hanzo-test-evaluation`), and the ZAP protocol (`hanzo-zap-protocol`).
+- **Production post-quantum cryptography.** All three NIST PQC standards — FIPS 203
+  (ML-KEM), 204 (ML-DSA), 205 (SLH-DSA) — integrated into a live consensus system with
+  hybrid classical/post-quantum security (`hanzo-full-spectrum-cyber`).
+- **Formal verification.** 50 machine-checked Lean 4 proofs, 18 cryptographic security
+  reductions (incl. ML-DSA EU-CMA, ML-KEM IND-CCA2), and NIST Known-Answer-Test
+  validation across FIPS 203/204/205 (`hanzo-formal-verification`).
+- **ZAP (Zero-copy Application Protocol).** 2.2 ns parse latency, 11.5M transactions/s,
+  91% memory and 96% energy reduction vs JSON-RPC; native post-quantum transport
+  (ML-KEM-768 + ML-DSA-65) and W3C DID identity (`hanzo-zap-protocol`).
+- **Agentic runtime.** 83 specialized agents and 15 orchestrators executing 200–300
+  sequential tool calls, fully offline on embedded ARM with quantized Zen models
+  (`hanzo-agentic-ai`, `hanzo-edge-ai-ml`).
+- **Zen frontier models.** An 18-model family (0.8B–1T+ parameters), co-developed with
+  Zoo Labs Foundation, with owned weights and full provenance.
+
 ## Structure
 
 Each paper lives in its own subdirectory:

@@ -15,13 +15,21 @@ than on centralized cloud.
 
 Each claim below is developed in the catalogued papers ([INDEX.md](INDEX.md)):
 
-- **Defense research suite (10 papers).** Autonomous agentic AI for cyber/intel/decision
-  support (`hanzo-agentic-ai`), DDIL/tactical assured networking over mesh and packet
-  radio (`hanzo-assured-networking`), FHE-mediated cross-domain MLS (`hanzo-cross-domain`),
-  edge AI/ML on embedded hardware (`hanzo-edge-ai-ml`), counter-exploitation
-  (`hanzo-countermeasures`), full-spectrum cyber (`hanzo-full-spectrum-cyber`), quantum
-  sensing/QKD (`hanzo-quantum-sensing-qkd`), verification & validation
-  (`hanzo-test-evaluation`), and the ZAP protocol (`hanzo-zap-protocol`).
+- **Defense & Reindustrialization suite (16 papers + one-pager).** Positioned for the
+  American industrial base — sovereign AI, robotics, post-quantum, and low-latency
+  on-chain coordination for factories, vehicles, drones, ships, and contested-edge
+  systems. **Strategy & case studies:** sovereign-vs-closed AI (`hanzo-vs-claude`), the
+  ~90% cloud-cost migration on real numbers (`hanzo-cloud-economics`), agentic
+  engineering at regulated scale (`hanzo-agentic-prowess`), FHE-native confidential
+  computing (`hanzo-fhe-native`), automated security auditing (`hanzo-security`), and
+  audit-ready compliance (`hanzo-compliance`). **Capability depth:** autonomous agentic
+  AI (`hanzo-agentic-ai`), DDIL/tactical assured networking (`hanzo-assured-networking`),
+  FHE-mediated cross-domain MLS (`hanzo-cross-domain`), edge AI/ML (`hanzo-edge-ai-ml`),
+  counter-exploitation (`hanzo-countermeasures`), full-spectrum cyber
+  (`hanzo-full-spectrum-cyber`), quantum sensing/QKD (`hanzo-quantum-sensing-qkd`),
+  verification & validation (`hanzo-test-evaluation`), and the ZAP protocol
+  (`hanzo-zap-protocol`). Start with the one-pager (`defense/hanzo-overview.pdf`); the
+  full suite is published at **[papers.hanzo.ai](https://papers.hanzo.ai)**.
 - **Production post-quantum cryptography.** All three NIST PQC standards — FIPS 203
   (ML-KEM), 204 (ML-DSA), 205 (SLH-DSA) — integrated into a live consensus system with
   hybrid classical/post-quantum security (`hanzo-full-spectrum-cyber`).

@@ -1,6 +1,8 @@
 import { FileText, ExternalLink } from 'lucide-react'
 import type { PaperConfig } from '@/config/papers'
 
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ''
+
 interface PaperCardProps {
   paper: PaperConfig
 }
@@ -20,7 +22,9 @@ export function PaperCard({ paper }: PaperCardProps) {
         </div>
 
         <h2 className="text-base font-semibold mb-1 text-foreground group-hover:text-foreground/90">
-          {paper.title}
+          <a href={`${basePath}/${paper.id}/`} className="hover:underline">
+            {paper.title}
+          </a>
         </h2>
 
         <h3 className="text-sm text-muted-foreground mb-3">

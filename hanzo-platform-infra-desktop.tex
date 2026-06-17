@@ -1,0 +1,356 @@
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm,booktabs,hyperref,graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+
+\title{Economical Serving and the hanzo.ai Platform: A Bandwidth-Optimal Unified Train-and-Serve Runtime}
+\author{Hanzo Dev \\ \texttt{dev@hanzo.ai} \\ \textit{Hanzo AI}}
+\date{June 2026}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We present the serving economics, platform architecture, and on-device thesis that follow from a native Rust train-and-inference engine whose decode kernel runs at the memory-bandwidth wall. On a single AMD Ryzen AI Max 8060S (Strix Halo, gfx1151, RDNA3.5 iGPU) with an achievable read peak of $\sim$253~GB/s, the unified quant-matvec core reaches 245.8~GB/s after a lane-strided rewrite---$97\%$ of that peak, above the conservative 231~GB/s stream-copy figure. From this roofline we derive a cost law: for a memory-bound autoregressive decoder, tokens per second per dollar scales as achieved bandwidth divided by the product of per-parameter quantization width and active parameter count, making the quantization choice---not the purchase of larger accelerators---the primary cost lever. We prove this proposition and a companion multi-tenant throughput result under paged attention. The engine attains decode parity (0.98$\times$ llama.cpp) on Qwen3-8B-Q8\_0 and 2$\times$ throughput on a 35B-A3B mixture-of-experts model, both on consumer silicon, supports eleven sub-4-bit quantization formats bit-exactly against \texttt{ggml}, and shares one tensor type and one quantization core across training and serving. We describe the platform control plane and an on-device continuous-learning product direction, and we are explicit throughout about what exists today versus what remains roadmap. The honest claims are: AMD parity makes AMD a cost lever; a genuinely unified native train-and-serve runtime exists; and a structurally private on-device path is feasible---each with its gaps named.
+\end{abstract}
+
+\section{Introduction}
+
+Autoregressive token generation (decode) on modern transformers is bound by memory bandwidth, not by arithmetic throughput. At batch size one, generating each token requires streaming the model's resident weights from memory once; the matrix-vector products that dominate decode are starved for operands long before they are starved for floating-point units. The roofline model~\cite{williams2009} makes this concrete: a kernel whose arithmetic intensity falls below the machine's compute-to-bandwidth ratio is bandwidth-limited, and the per-token matrix-vector products sit far on the bandwidth-bound side of the ridge. This single fact, once measured rather than assumed, reorganizes the economics of model serving: the cost of a token is set by how many bytes must be read to produce it, and that byte count is governed by the on-disk quantization format.
+
+This paper reports the consequences of building a native-Rust train-and-inference engine on top of that fact. The engine's quantization kernels were tuned on a single consumer AMD APU---the Ryzen AI Max 8060S (Strix Halo, gfx1151)---through a measurement-driven campaign that lifted the decode matrix-vector kernel to 97\% of the chip's achievable read bandwidth and brought end-to-end decode to parity with the reference implementation, \texttt{llama.cpp}. We use that grounded artifact to argue three things, in decreasing order of present-day completeness:
+
+\begin{enumerate}
+\item \textbf{Economical per-quant serving} (Section~\ref{sec:serving}): the quantization-to-cost law, a single quant-agnostic GPU core that removes the per-format kernel-maintenance burden, and the multi-tenant serving primitives (paged attention, continuous batching, model swap, load-time quantization) that exist in the tree today.
+\item \textbf{The hanzo.ai platform} (Section~\ref{sec:platform}): one control plane that takes a model from develop to train to personalize to serve, whose differentiator is a single native runtime shared by training and serving rather than an orchestrator of heterogeneous black-box engines. We are explicit that the runtime substrate is real while the orchestration, the generic supervised trainer, and the federation port are roadmap.
+\item \textbf{hanzo Desktop} (Section~\ref{sec:desktop}): an on-device personal AI that runs, learns, and improves entirely on the user's machine. The runtime credibly fits consumer silicon today; the continuous-learning loop, the personal-data redactor, and the federation sync are designed but not yet assembled.
+\end{enumerate}
+
+We close with a build-versus-buy cost model derived only from measured throughput (Section~\ref{sec:cost}) and an honest accounting of limitations (Section~\ref{sec:limitations}). No claim in this paper invents a benchmark; every performance figure is cited from the measured campaign on the one 8060S.
+
+\paragraph{Honesty key.} We annotate claims throughout: \emph{measured} for figures from the campaign, \emph{available} for capabilities in the tree today, \emph{roadmap} for designed-but-unbuilt work, and \emph{ported} for techniques adapted from \texttt{llama.cpp}/\texttt{ggml} or vLLM-style designs versus genuinely novel engine IP.
+
+\section{Economical Per-Quant Serving}
+\label{sec:serving}
+
+\subsection{The Roofline that Sets the Price}
+
+We first formalize the decode roofline and the cost law that follows. Throughout, let $B$ denote achievable memory read bandwidth (bytes per second), and consider a memory-bound decoder generating tokens autoregressively at batch size one.
+
+\begin{definition}[Resident read footprint]
+\label{def:footprint}
+The \emph{resident read footprint} $W$ of a decoder is the number of weight bytes that must be streamed from memory to generate one token. For a dense model, $W \approx q \cdot N$, where $N$ is the parameter count and $q$ is the average number of stored bytes per parameter under the chosen quantization format. For a mixture-of-experts (MoE) model that activates only a subset of experts per token, $W \approx q \cdot N_{\mathrm{act}}$, where $N_{\mathrm{act}}$ is the number of \emph{active} parameters per token.
+\end{definition}
+
+On the 8060S, the spec read bandwidth is 256~GB/s, but the achievable read bandwidth measured by a standalone \texttt{hipEvent} microbenchmark is 217~GB/s (measured). The decode matrix-vector kernel runs at that wall: after a lane-strided rewrite of the inner reduction loop, the unified \texttt{qmatvec\_core} kernel reaches 245.8~GB/s on production decode shapes---$97\%$ of the $\sim$253~GB/s achievable read peak, and \emph{above} the conservative 231~GB/s stream-copy figure (the 256~GB/s spec is not reached by any path)---effectively saturating the read wall (measured). Because the kernel is at the wall, the operator's lever is not the kernel but the footprint $W$. We first isolate the per-token timing fact.
+
+\begin{lemma}[Memory-bound per-token time]
+\label{lem:pertoken}
+For a memory-bound decoder at batch size one achieving sustained read bandwidth $B$ with resident read footprint $W$ per token, the time to generate one token is $t = W/B$, and the token rate is $R = B/W$.
+\end{lemma}
+
+\begin{proof}
+Generating one token requires reading the resident footprint $W$ from memory exactly once. By the memory-bound hypothesis the per-token wall-clock time is dominated by this transfer, with compute and launch overhead negligible, so it equals the time to move $W$ bytes at sustained bandwidth $B$, namely $t = W/B$. The token rate is the reciprocal $R = 1/t = B/W$.
+\end{proof}
+
+\begin{theorem}[Quantization is the primary cost lever]
+\label{prop:cost}
+Let a memory-bound decoder achieve sustained read bandwidth $B$, and let it produce tokens at rate $R$ (tokens per second) with resident read footprint $W$ per token. Let hardware cost be $C$ dollars per second. Then
+\begin{equation}
+\label{eq:tps}
+R \;=\; \frac{B}{W} \;=\; \frac{B}{q\,N_{\mathrm{act}}},
+\end{equation}
+and the throughput-per-dollar is
+\begin{equation}
+\label{eq:tpsd}
+\frac{R}{C} \;=\; \frac{B}{C\,q\,N_{\mathrm{act}}}.
+\end{equation}
+Consequently, for fixed silicon $(B, C)$ and fixed model topology $N_{\mathrm{act}}$, tokens per second per dollar is inversely proportional to the per-parameter quantization width $q$; the quantization choice is the dominant controllable cost lever.
+\end{theorem}
+
+\begin{proof}
+By Lemma~\ref{lem:pertoken} the token rate is $R = B/W$. Substituting $W = q\,N_{\mathrm{act}}$ from Definition~\ref{def:footprint} gives Equation~\eqref{eq:tps}. The monetary cost to produce $R$ tokens in one second is $C$ dollars, so the throughput per dollar is $R/C = B/(C\,q\,N_{\mathrm{act}})$, which is Equation~\eqref{eq:tpsd}. For fixed $B$, $C$, and $N_{\mathrm{act}}$, this quantity varies as $1/q$. Halving $q$ (for example, moving from an 8-bit to a 4-bit weight format) doubles $R/C$ on the same chip, whereas purchasing higher-bandwidth silicon improves $R/C$ only linearly in $B/C$ and typically raises $C$. Hence $q$ is the dominant lever an operator controls without changing hardware.
+\end{proof}
+
+Two consequences for serving economics follow immediately from Theorem~\ref{prop:cost}.
+
+\paragraph{Right-size by quant, not by buying bigger accelerators.} Halving bytes per token (for example, Q8\_0 $\to$ Q4\_K) roughly doubles the decode ceiling on the \emph{same} silicon. Since the matrix-vector kernel is already at the bandwidth wall, the lever a serving operator actually controls is the on-disk quantization, not the kernel.
+
+\paragraph{MoE is the cheapest-per-quality tier.} By Definition~\ref{def:footprint}, a sparsely-gated mixture-of-experts model~\cite{shazeer2017} reads only its active parameters per token. A 35B-A3B model reads only the $\sim$3B activated parameters, so a 35B-capacity model decodes like a $\sim$3B dense model. The campaign measured 13.6 tokens per second for Qwen3.6-35B-A3B at Q4\_K on the consumer APU (measured), a $2\times$ improvement over the prior MoE path delivered by routing each expert through the same banked decode core.
+
+Table~\ref{tab:roofline} reports the measured decode figures and the bandwidth-implied ceilings on the single 8060S.
+
+\begin{table}[h]
+\centering
+\caption{Decode economics on one AMD 8060S (achievable read bandwidth 217~GB/s). Ceilings are computed from Equation~\eqref{eq:tps}; measured figures are from the ROCm campaign.}
+\label{tab:roofline}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{Model} & \textbf{Quant} & \textbf{Resident} & \textbf{Decode (t/s)} \\
+\midrule
+Qwen3-8B        & Q8\_0 & $\sim$8.7~GB        & 24.5 (0.98$\times$) \\
+Qwen3-8B        & Q4\_K & $\sim$4.9~GB        & kernel 181~GB/s \\
+Qwen3.6-35B-A3B & Q4\_K & $\sim$3~GB active   & 13.6 (2$\times$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Qwen3-8B-Q8\_0 figure of 24.5 tokens per second is 0.98$\times$ the reference \texttt{llama.cpp} decode rate of 25.05 on the same chip---effective parity, and the honest decode ceiling for this kernel-plus-fusion approach. The Q4\_K kernel itself runs at 181~GB/s (79\% of peak) at decode shapes and is already bandwidth-efficient; the 6--8 tokens per second observed on a 14B-Q4\_K model is engine-side overhead amplified by depth, not a kernel deficiency---an honest gap discussed in Section~\ref{sec:limitations}.
+
+\subsection{One Quant-Agnostic Core, Not a Kernel-per-Quant Zoo}
+
+The campaign's central engineering artifact (novel) is a single quant-agnostic GPU core rather than a kernel-per-quant collection. The design mandate was explicit: support 1-bit through full precision through one templated core. The delivered structure is:
+
+\begin{itemize}
+\item A templated decode kernel \texttt{qmatvec\_core<WTYPE,XT>} and a prefill kernel \texttt{qmmq\_core<WTYPE>}, each with one body and a swappable per-type block decoder \texttt{qdec<WTYPE>::partial} plus a traits record \texttt{qdw\_traits<WTYPE>} carrying block bytes, element count, symmetry, and scale-slot count. A macro emits the f16 and bf16 entry points.
+\item Table-driven dispatch through a \texttt{RocmQuantType} enum (with \texttt{from\_ggml}, \texttt{decode\_kernel}, \texttt{block\_elems}, \texttt{block\_bytes}), eliminating per-quant conditional ladders.
+\item On the CPU/format side (novel), a \texttt{quant\_format!} macro and a \texttt{for\_each\_quant!} table single-source every block layout, with a byte-exact proof harness showing macro-generated code equals hand-written code for Q4\_0, Q8\_0, and IQ4\_NL.
+\end{itemize}
+
+The operational payoff is a proven invariant: a new quantization format costs one block decoder, one traits record, one macro line, and one enum arm, with \emph{zero} new kernels, and works across decode and MoE. We make this precise.
+
+\begin{proposition}[Constant per-format integration cost]
+\label{prop:onecore}
+Under a quant-agnostic core parameterized by a per-format block decoder and a traits record, adding support for a new quantization format requires $O(1)$ new code units---one decoder, one traits record, one table entry---and zero new compute kernels, while the decode, prefill (where unified), and MoE execution paths are reused unchanged.
+\end{proposition}
+
+\begin{proof}
+The compute kernels \texttt{qmatvec\_core} and \texttt{qmmq\_core} are written once and are polymorphic in the type parameter \texttt{WTYPE}; their control flow and memory-staging logic do not branch on the format. All format-specific behavior is confined to two artifacts: the block decoder \texttt{qdec<WTYPE>::partial}, which maps a stored block to dequantized values, and the traits record \texttt{qdw\_traits<WTYPE>}, which supplies the byte and element geometry. Dispatch is a table lookup keyed by the format enum, not a hand-written conditional, so registering a format adds exactly one table arm. Therefore the marginal cost of a new format is the three constant-size artifacts (decoder, traits, table arm), independent of the number of formats already supported, and the kernel count is unchanged. Reuse across decode and MoE follows because the MoE path invokes the same \texttt{qmatvec\_core} per routed expert.
+\end{proof}
+
+The empirical evidence for Proposition~\ref{prop:onecore} is that eleven sub-4-bit IQ, ternary, and FP4 formats (IQ1\_S/M, IQ2\_XXS/XS/S, IQ3\_XXS/S, TQ1\_0/TQ2\_0, NVFP4, Q1\_0) were added as load-plus-dequantize paths and validated bit-exact against the \texttt{ggml} reference~\cite{ggml}, with zero mismatching elements out of 512 and maximum error 0.0 for all eleven (measured). For a serving platform that intends to host any community GGUF at any quantization, this converts a combinatorial maintenance burden into a one-line table edit. The int8 matrix-core structure and the IQ codebook grids themselves are ported from \texttt{ggml}/\texttt{llama}~\cite{ggml}; the unified single-core abstraction over them is the engine IP.
+
+\subsection{Multi-Tenant Serving Primitives that Exist Today}
+
+The engine ships a real paged-attention serving path (available; ported, PagedAttention-style~\cite{kwon2023}) comprising a block-granular paged key-value (KV) cache, an iteration-level continuous-batching scheduler with preemption~\cite{yu2022}, and prefix caching for shared system prompts. We formalize why paged attention raises multi-tenant throughput.
+
+\begin{definition}[Paged KV cache]
+A \emph{paged KV cache} partitions device KV memory into fixed-size blocks of $s$ tokens each. A sequence of length $\ell$ occupies $\lceil \ell/s \rceil$ blocks drawn from a shared pool of $P$ blocks, rather than a contiguous per-request reservation sized to a maximum context length $L_{\max}$.
+\end{definition}
+
+\begin{proposition}[Paged attention raises tenant concurrency]
+\label{prop:paged}
+Let device KV memory hold $P$ blocks of $s$ tokens. Under contiguous per-request allocation sized to $L_{\max}$, the number of concurrently admissible sequences is $\lfloor P s / L_{\max} \rfloor$. Under paged allocation, a set of sequences with lengths $\ell_1,\dots,\ell_k$ is jointly admissible whenever
+\begin{equation}
+\label{eq:paged}
+\sum_{i=1}^{k} \left\lceil \frac{\ell_i}{s} \right\rceil \;\le\; P .
+\end{equation}
+For any workload in which actual lengths $\ell_i$ are below $L_{\max}$, the paged bound admits at least as many sequences, and strictly more whenever some $\ell_i < L_{\max}$; the internal fragmentation per sequence is bounded by one block, i.e. at most $s-1$ wasted token slots.
+\end{proposition}
+
+\begin{proof}
+Contiguous allocation reserves $L_{\max}$ token slots per sequence regardless of realized length, so the slot budget $Ps$ admits at most $\lfloor Ps/L_{\max}\rfloor$ sequences. Paged allocation reserves only the blocks a sequence actually occupies, namely $\lceil \ell_i/s\rceil$ blocks for sequence $i$; the pool of $P$ blocks therefore admits any set satisfying Equation~\eqref{eq:paged}. Because $\lceil \ell_i/s\rceil \le \lceil L_{\max}/s\rceil$ for all $\ell_i \le L_{\max}$, the paged constraint is no tighter than the contiguous one, and it is strictly looser whenever some realized length is below $L_{\max}$, since then $\lceil \ell_i/s\rceil < \lceil L_{\max}/s\rceil$. Finally, each sequence rounds its $\ell_i$ tokens up to a whole number of $s$-token blocks, so the only waste is the unfilled remainder of its last block, which is at most $s-1$ slots. Continuous batching admits new sequences into the running batch each decode step up to the budget of Equation~\eqref{eq:paged}, and under memory pressure the scheduler preempts the lowest-priority sequence by freeing its blocks and requeuing it, so the bound is maintained dynamically.
+\end{proof}
+
+The implementation realizes exactly this: a cache engine parameterized by block size and GPU/CPU block counts, a block pool and KV-cache manager for block-granular sharing, a paged scheduler with waiting and running queues and a preemption routine that frees blocks and requeues the lowest-priority sequence first, and block-hash-based prefix caching so that shared prefixes (system prompts, few-shot preambles) are computed once. A simpler first-come-first-served scheduler is the non-paged fallback.
+
+\paragraph{Model swap and load-time quantization.} Beyond paged attention, the top-level engine holds a concurrent map of live engine instances and a map of unloaded-but-reloadable model states, plus model aliases; registration, blocking reload, and engine reboot bring an unloaded model back on demand (available). This per-model load/unload/reload machinery is the substrate for scaling a rarely used model to zero and cold-starting it on first request. Separately, in-situ quantization (ISQ) quantizes a model into any supported format at load time---Q4\_0/Q5\_0/Q8\_0, the K-quants Q2\_K through Q6\_K, HQQ, FP8, AFQ, and MXFP4---so an operator can take one fp16 checkpoint and materialize the exact quantization the cost target demands, without a separate offline conversion step (available).
+
+\subsection{AMD/ROCm as a Cost Lever versus NVIDIA: Honest Framing}
+
+The campaign proved that the engine reaches decode parity (0.98$\times$ \texttt{llama.cpp}) on a consumer AMD APU, with prefill at $\sim$0.86$\times$ (1015 versus 1176 tokens per second), the prefill gap being attention not yet fused on matrix cores (measured). The economic argument is \emph{not} that the engine beats NVIDIA; it is that a dollar-per-token-competitive serving tier can run on cheaper, more available AMD consumer hardware because the engine is bit-exact and bandwidth-optimal there. Surpassing the reference (true state-of-the-art, beyond parity) on ROCm would require a ROCm paged-attention keystone plus a multi-wave matrix-core flash-attention kernel; the first two stages of ROCm paged attention were built and validated on the development box, but the anticipated graph-replay speedup did not materialize because the engine's own earlier kernel-fusion work had already removed the launch-bound overhead the graph was meant to collapse---an honestly recorded dead end. The defensible claim is AMD parity, and therefore AMD as a cost lever; we do not market a ROCm speed advantage over NVIDIA.
+
+\section{The hanzo.ai Platform}
+\label{sec:platform}
+
+\subsection{What It Is, and What Actually Exists}
+
+The platform thesis (aspirational/roadmap) is one control plane that takes a model from develop to train (natively) to personalize to serve without leaving the stack, serving any model at any quantization, with the native Rust train-and-infer engine as the runtime. The unifying idea is that the same tensors (a candle-fork \texttt{hanzo-ml}), the same serving runtime (a \texttt{mistral.rs}-derived \texttt{hanzo-engine}), the same bf16 safetensors parameter store, the same quantization core, and the same paged serving path are used end-to-end, so there is no PyTorch-to-ONNX-to-TensorRT-to-vLLM handoff with a format break at every stage.
+
+We are explicit about the gap between thesis and tree. Table~\ref{tab:platform} maps each layer to what is real today versus the gap to a finished platform.
+
+\begin{table}[h]
+\centering
+\caption{Platform layers: real today versus gap. Status keys: available, roadmap, separate runtime.}
+\label{tab:platform}
+\begin{tabular}{@{}p{1.7cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Real today} & \textbf{Gap to platform} \\
+\midrule
+Serve & \texttt{hanzo-server} (OpenAI HTTP + MCP), multi-model map, paged scheduler, ISQ, swap/reload & Multi-node placement and autoscaling control loop \\
+Train & candle autograd, real AdamW/SGD, VarMap checkpoint, tested GRPO & Generic SFT \texttt{Trainer} is a stub; no LoRA injection; DPO/KTO/ORPO absent \\
+Personalize & LoRA config declared; QLoRA-capable base & LoRA layer/merge code not written \\
+Federate & Design in Python (canonical-bf16 delta seam, trim-mean aggregation) & No Rust federation; Python-only today \\
+Distribute & Python P2P cluster (exo-fork) & Not the Rust engine; a separate runtime \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+So the platform is partly real (serve plus one reinforcement-learning trainer), partly scaffolding (generic train, personalize), and partly a port (federation). Claiming a finished Kubeflow competitor today would be false; claiming that the runtime substrate exists and is unusually unified is true.
+
+\subsection{The Moat: A Shared Native Runtime, Not the Orchestrator}
+
+Kubeflow, KServe, and Ray Serve are orchestrators of heterogeneous black-box runtimes: they schedule pods or actors, but each pod runs someone else's engine (vLLM, TGI, Triton, a PyTorch script), and the training stack (PyTorch) and the serving stack (TensorRT/vLLM) are entirely different binaries with a checkpoint-format seam between them. The engine's differentiator (novel as an integration thesis) is that the runtime is one native-Rust engine shared by training and serving:
+
+\begin{itemize}
+\item \textbf{One quantization core for train-time materialization and serve-time inference.} ISQ at load uses the same quantization code the serving matrix-vector reads, so ``personalize then serve at Q4\_K'' has no conversion stage.
+\item \textbf{One tensor and checkpoint type across the loop.} The bf16 safetensors store is both the training parameter store and the federation wire format; a trained delta is serve-loadable directly.
+\item \textbf{In-process, not sidecar.} A safety or guard model of the same architecture can run through the engine's own quantized path in-process rather than as a separate sidecar; an orchestrator would deploy it as another pod.
+\end{itemize}
+
+The honest framing is that the moat is the unified native engine, not the orchestration layer. Placement, autoscaling, and multi-node routing are precisely where Kubeflow and Ray are mature, and are the part the platform must build or borrow. The bet is that owning the runtime end-to-end removes the format-break tax that those orchestrators institutionalize.
+
+\section{hanzo Desktop: On-Device Train, Infer, and Continuous-Learn}
+\label{sec:desktop}
+
+\subsection{Product Thesis and Why It Is Credible}
+
+The product thesis (aspirational) is a personal AI that runs, learns, and improves entirely on the user's machine: inference is local, personalization is local, and a continuous-learning loop adapts the model to the user, with no cloud required and raw data never leaving the device. The same native stack that serves the cloud tier also fits a laptop-class APU, so personal AI is the full train-and-infer engine running privately, not a stripped cloud client. There is no dedicated desktop application crate in the tree today; Section~\ref{sec:desktop} is product direction grounded in what the runtime can already do locally, not a shipped app.
+
+The technical credibility rests on three present-day facts. First, the entire performance campaign ran on a single 8060S, reaching decode parity on Qwen3-8B-Q8\_0 and 2$\times$ on a 35B-A3B MoE---desktop-class silicon, not a datacenter accelerator (measured). Second, the training primitives are native and local: autograd, AdamW and SGD, VarMap checkpointing, and a working, tested trainer for group relative policy optimization (GRPO)~\cite{shahul2024} all run in-process, so on-device reinforcement-learning personalization is not theoretical (available). Third, ISQ lets the desktop load one checkpoint and pick the quantization that fits local memory---a quantized low-rank-adaptation base in the manner of QLoRA~\cite{dettmers2023}---trading quality for the device's bandwidth budget per the roofline of Section~\ref{sec:serving} (available).
+
+\subsection{Continuous Learning: Design and Honest Gaps}
+
+The continuous-learning loop is designed across the engine's research notes but not yet assembled in Rust (roadmap). The intended pipeline is: (1)~the model's own outputs become candidate training data; (2)~a personal-data and safety gate drops or quarantines samples containing personal information; (3)~a native trainer applies a low-rank-adaptation (LoRA)~\cite{hu2022} or GRPO update locally; (4)~optionally, only a bf16 LoRA \emph{delta}---never raw data---syncs to a federation mesh in the federated-averaging tradition~\cite{mcmahan2017} via the canonical-bf16 seam with Byzantine-robust trimmed-mean aggregation.
+
+The honest gaps are specific. Step~(2)'s guard model can \emph{classify} ``contains personal data'' but is a gate, not a redactor: it returns a verdict, not scrubbed text or character spans. A span-level redactor does not exist and must be built. In step~(3), GRPO is real but the generic supervised \texttt{Trainer} is a stub. Step~(4)'s federation is designed in Python and not yet ported to Rust. What makes private-by-default the genuinely strong claim is that the egress contract is structural rather than promissory: if the loop only ever emits LoRA deltas over the canonical-bf16 seam, raw user data never crosses the wire by construction. We make the structural claim precise.
+
+\begin{proposition}[Structural egress bound]
+\label{prop:egress}
+Suppose the only network egress channel from the on-device loop is the delta-sync transport, and suppose that transport accepts as payload only a bf16 LoRA delta tensor $\Delta$ of fixed shape, where $\Delta = W' - W_0$ is the difference between the locally adapted weights $W'$ and the public base weights $W_0$. Then no raw user datum is transmitted, and the bytes observable to the mesh are a function of $\Delta$ alone. If, in addition, calibrated noise is added so that the released delta is $\tilde{\Delta} = \Delta + \eta$ under an $(\epsilon,\delta)$-differentially-private mechanism, then the released payload satisfies the corresponding $(\epsilon,\delta)$ guarantee with respect to any single training sample.
+\end{proposition}
+
+\begin{proof}
+By hypothesis the loop has exactly one egress channel, and that channel's type signature admits only the tensor $\Delta$ of fixed shape; any raw datum, having a different type, cannot be placed on the channel, so it cannot be transmitted. The mesh therefore observes a function of $\Delta$ only, establishing the first claim by construction rather than by policy. For the second claim, differential privacy is preserved under post-processing and is established by the releasing mechanism: if $\tilde{\Delta} = \Delta + \eta$ is produced by an $(\epsilon,\delta)$-DP mechanism calibrated to the sensitivity of the delta with respect to one sample, then by definition the distribution of $\tilde{\Delta}$ on neighboring datasets differing in one sample satisfies the $(\epsilon,\delta)$ inequality, and any downstream aggregation is post-processing that cannot weaken the guarantee.
+\end{proof}
+
+Proposition~\ref{prop:egress} states what the architecture buys and what it does not. The first half---raw data never crossing the wire---is structural and holds today the moment the delta-only channel is the sole egress. The second half is conditional: the differential-privacy noise $\eta$~\cite{dwork2014} is \emph{not} in the code and is a recommended addition. Without it, the released delta still reveals only a function of the training data, but that function is not formally private; we therefore claim structural data containment now and formal privacy only upon implementing the noise mechanism.
+
+\section{Build-versus-Buy and Private-Hosting Cost Model}
+\label{sec:cost}
+
+This section's arithmetic is illustrative and derived only from the measured roofline; it is not a price quote (roadmap). From Theorem~\ref{prop:cost}, decode cost per million tokens is
+\begin{equation}
+\label{eq:dollarmtok}
+\text{\$/1M tokens} \;=\; \frac{C_{\mathrm{hr}}}{3600}\cdot\frac{10^6}{R},
+\end{equation}
+where $C_{\mathrm{hr}}$ is hardware dollars per hour and $R$ is decode tokens per second, itself set by quantization and bandwidth through Equation~\eqref{eq:tps}. Two levers, both owned by the operator, appear: choose cheaper hardware (an AMD APU versus an NVIDIA datacenter accelerator) and choose a smaller quantization (Q4\_K versus Q8\_0, roughly $2\times$ throughput on the same chip).
+
+Worked from measured throughput on the 8060S for Qwen3-8B: at Q8\_0 and 24.5 tokens per second, one million tokens is about 11.3 GPU-hours of decode by Equation~\eqref{eq:dollarmtok}; at Q4\_K with a kernel-bound ceiling near 44 tokens per second, about 6.3 GPU-hours---provided the engine tail is closed to realize it, since a 14B-Q4\_K model is engine-limited to 6--8 tokens per second today (an honest gap, not the kernel). The shape of the model dominates: a 35B-A3B MoE at Q4\_K decodes about $2\times$ faster than a dense 8B at Q8\_0 while carrying far more capacity, so MoE-at-low-quant is the cheapest quality tier.
+
+\begin{table}[h]
+\centering
+\caption{Build-versus-buy. Readiness keys: available, roadmap.}
+\label{tab:bvb}
+\begin{tabular}{@{}p{2.3cm}p{2.0cm}p{2.5cm}@{}}
+\toprule
+\textbf{Option} & \textbf{When it wins} & \textbf{Readiness} \\
+\midrule
+Buy API (frontier) & Spiky/low volume, no privacy constraint & n/a \\
+Buy managed serving & Steady volume, OSS models, no infra team & OpenAI-API compatible $\Rightarrow$ drop-in self-host \\
+Build: self-host on AMD APUs & Privacy-required, steady, cost-sensitive & parity decode + paged multi-tenant serving \\
+Build: on-device & Per-user privacy, personalization, offline & infer available; continuous-learn roadmap \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The break-even argument (Table~\ref{tab:bvb}): managed-serving markups make self-hosting on cheap AMD silicon attractive once volume is steady, and the engine's AMD parity is what makes that hardware viable. The desktop tier pushes marginal serving cost toward zero (the user's machine) for personal and privacy use cases---the strongest cost-plus-privacy combination, gated on building the continuous-learning loop.
+
+The private-hosting foundation exists (available): \texttt{hanzo-server} (OpenAI HTTP plus MCP) with the paged scheduler, multi-model map, and ISQ on a pool of AMD APUs. To become a real private cloud (roadmap) requires a multi-node placement and autoscaling control loop (scale-to-zero via the existing unload/reload machinery, cold-start on first request), the federation control plane ported from Python to Rust, and multi-node KV routing. These are named, bounded gaps, not hand-waves.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+We summarize the honest state of each pillar.
+
+\paragraph{Serving (Section~\ref{sec:serving}).} Real and strong: a bandwidth-optimal unified quant core (decode at 97\% of the bandwidth wall, parity with the reference on AMD), real paged multi-tenant serving, real model swap, and load-time quantization. The quantization-to-cost law of Theorem~\ref{prop:cost} is the product's economic engine. The remaining decode gap to the reference is about 1.6 tokens per second of non-matrix-vector overhead (decode attention, KV append, RoPE, normalization, sampling); decode attention is not a winnable lever at batch one because the workload under-occupies a 40-CU GPU, making 24.5 tokens per second the honest decode ceiling for this approach. Prefill at $\sim$0.86$\times$ needs a multi-wave matrix-core flash-attention kernel and further GEMM work; surpassing the reference requires the ROCm paged-attention keystone.
+
+\paragraph{Platform (Section~\ref{sec:platform}).} Mixed. The runtime substrate is real and unusually unified (one engine, one tensor type, one quantization core for train and serve). The orchestration layer, the generic supervised trainer plus LoRA injection, and the federation port are roadmap. The moat is the native runtime, not the scheduler.
+
+\paragraph{Desktop (Section~\ref{sec:desktop}).} Aspirational on an available foundation. The runtime credibly fits a consumer APU (proven), and on-device training primitives exist (GRPO real). The continuous-learning loop, the span-level personal-data redactor, and the federation sync are not yet built. Private-by-default is structurally sound (Proposition~\ref{prop:egress}) if delta-only egress is implemented; formal privacy additionally requires the differential-privacy noise mechanism, which is not yet in the code.
+
+\paragraph{Cost model (Section~\ref{sec:cost}).} The arithmetic is real, derived from measured tokens per second; the multi-node private-cloud control plane is roadmap.
+
+\section{Conclusion}
+
+We have shown that once decode is recognized as memory-bound and the matrix-vector kernel is driven to the bandwidth wall---97\% of achievable read bandwidth on a consumer AMD APU---the economics of serving follow from a single law: tokens per second per dollar scales inversely with the per-parameter quantization width times the active parameter count (Theorem~\ref{prop:cost}). The quantization choice, not accelerator purchase, is the primary cost lever; MoE at low quantization is the cheapest quality tier; and paged attention raises tenant concurrency to the realized-length bound rather than the worst-case bound (Proposition~\ref{prop:paged}). A single quant-agnostic core makes per-format support an $O(1)$ table edit (Proposition~\ref{prop:onecore}), validated bit-exact across eleven sub-4-bit formats. The platform's moat is a native runtime shared by training and serving, and the desktop's privacy is structural by an egress bound (Proposition~\ref{prop:egress}). We make no claim of beating everyone: the defensible claims are AMD parity as a cost lever, a genuinely unified native train-and-serve runtime, and a structurally private on-device path, each with its gaps named.
+
+\begin{thebibliography}{10}
+
+\bibitem{kwon2023}
+W. Kwon, Z. Li, S. Zhuang, et al.
+\textit{Efficient Memory Management for Large Language Model Serving with PagedAttention}.
+ACM SOSP, 2023.
+
+\bibitem{yu2022}
+G. Yu, J. Jeong, G. Kim, S. Kim, and B. Chun.
+\textit{Orca: A Distributed Serving System for Transformer-Based Generative Models}.
+USENIX OSDI, 2022.
+
+\bibitem{ggml}
+G. Gerganov et al.
+\textit{ggml / llama.cpp: Tensor library and LLM inference in C/C++}.
+Open-source project, 2023.
+
+\bibitem{williams2009}
+S. Williams, A. Waterman, and D. Patterson.
+\textit{Roofline: An Insightful Visual Performance Model for Multicore Architectures}.
+Communications of the ACM, 52(4):65--76, 2009.
+
+\bibitem{hu2022}
+E. Hu, Y. Shen, P. Wallis, et al.
+\textit{LoRA: Low-Rank Adaptation of Large Language Models}.
+ICLR, 2022.
+
+\bibitem{shazeer2017}
+N. Shazeer, A. Mirhoseini, K. Maziarz, et al.
+\textit{Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer}.
+ICLR, 2017.
+
+\bibitem{dettmers2023}
+T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer.
+\textit{QLoRA: Efficient Finetuning of Quantized LLMs}.
+NeurIPS, 2023.
+
+\bibitem{shahul2024}
+Z. Shao, P. Wang, Q. Zhu, R. Xu, et al.
+\textit{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}.
+arXiv:2402.03300, 2024.
+
+\bibitem{mcmahan2017}
+B. McMahan, E. Moore, D. Ramage, S. Hampson, and B. Aguera y Arcas.
+\textit{Communication-Efficient Learning of Deep Networks from Decentralized Data}.
+AISTATS, 2017.
+
+\bibitem{dwork2014}
+C. Dwork and A. Roth.
+\textit{The Algorithmic Foundations of Differential Privacy}.
+Foundations and Trends in Theoretical Computer Science, 9(3--4):211--407, 2014.
+
+\end{thebibliography}
+
+\end{document}

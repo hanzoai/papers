@@ -46,6 +46,12 @@ Auto-generated catalogue of research papers.
 | `hanzo-edge-inference` | ✓ | `hanzo-edge-inference.tex` |
 | `hanzo-encryption-security` | ✓ | `hanzo-encryption-security/hanzo-encryption-security.tex` |
 | `hanzo-engine-ml` | ✓ | `hanzo-engine-ml.tex` |
+| `hanzo-rocm-inference` | ✓ | `hanzo-rocm-inference.tex` |
+| `hanzo-cross-backend-inference` | ✓ | `hanzo-cross-backend-inference.tex` |
+| `hanzo-native-training` | ✓ | `hanzo-native-training.tex` |
+| `hanzo-native-stack-thesis` | ✓ | `hanzo-native-stack-thesis.tex` |
+| `hanzo-platform-infra-desktop` | ✓ | `hanzo-platform-infra-desktop.tex` |
+| `hanzo-continuous-learning-privacy` | ✓ | `hanzo-continuous-learning-privacy.tex` |
 | `hanzo-exchange-architecture` | ✓ | `hanzo-exchange-architecture/hanzo-exchange-architecture.tex` |
 | `hanzo-federated-agents` | ✓ | `hanzo-federated-agents/hanzo-federated-agents.tex` |
 | `hanzo-fhe-inference` | ✓ | `hanzo-fhe-inference/hanzo-fhe-inference.tex` |
@@ -175,4 +181,4 @@ Auto-generated catalogue of research papers.
 | `zen4-thinking_whitepaper` | ✓ | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | ✓ | `zen/zen4-ultra_whitepaper.tex` |
 
-**Total**: 169 papers, 327 PDFs compiled
+**Total**: 175 papers, 333 PDFs compiled

@@ -30,6 +30,14 @@ Each claim below is developed in the catalogued papers ([INDEX.md](INDEX.md)):
   verification & validation (`hanzo-test-evaluation`), and the ZAP protocol
   (`hanzo-zap-protocol`). Start with the one-pager (`defense/hanzo-overview.pdf`); the
   full suite is published at **[papers.hanzo.ai](https://papers.hanzo.ai)**.
+- **Engine / AI infrastructure (6 papers, measured on-device).** A native Rust
+  train-and-serve engine benchmarked on real silicon: ROCm decode parity with llama.cpp
+  at 97% of the memory-bandwidth wall (`hanzo-rocm-inference`), measured AMD/NVIDIA/Apple
+  edge inference (`hanzo-cross-backend-inference`), native training inside the inference
+  stack (`hanzo-native-training`), continuously-learning private AI
+  (`hanzo-continuous-learning-privacy`), serving economics (`hanzo-platform-infra-desktop`),
+  and the unifying thesis (`hanzo-native-stack-thesis`). Unusually honest — they name their
+  own stubs and reverted kernels and claim no win over NVIDIA.
 - **Production post-quantum cryptography.** All three NIST PQC standards — FIPS 203
   (ML-KEM), 204 (ML-DSA), 205 (SLH-DSA) — integrated into a live consensus system with
   hybrid classical/post-quantum security (`hanzo-full-spectrum-cyber`).

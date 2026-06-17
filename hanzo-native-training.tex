@@ -1,0 +1,377 @@
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm,booktabs,hyperref,graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+
+\title{Native Training in hanzo-ml/hanzo-engine: One Engine, One Quant Format, One Backend}
+\author{Hanzo Dev \\ \texttt{dev@hanzo.ai} \\ \textit{Hanzo AI}}
+\date{June 2026}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We describe the architecture for training language models natively inside the hanzo Rust inference stack (\texttt{hanzo-ml} / \texttt{hanzo-engine}), eliminating the conversion boundary between a Python training stack and a separate serving engine. The existing engine already ships a reverse-mode autograd (\texttt{hanzo-ml}, a fork of HuggingFace \texttt{candle}; $809$ lines, full matmul/conv/gather rules), bias-corrected AdamW with decoupled weight decay, safetensors checkpoint I/O, and a unified quantization kernel that serves \texttt{Q8\_0} decode at $24.5$ tokens/s, equal to $0.98\times$ llama.cpp ($25.05$ tokens/s) on a gfx1151 / Radeon~8060S (Strix~Halo) device. Two trainers prove the substrate end-to-end: an algorithm-complete, tested GRPO reinforcement-learning loop ported from \texttt{zooai/gym}, and an in-engine AnyMoE (the MoE-distillation trainer inherited from \texttt{mistral.rs}) gate trainer that performs forward, cross-entropy, backward, optimizer step, and checkpoint save over frozen quantized expert weights. We show that the QLoRA primitive---a detached \texttt{dequantize()} of the quantized base plus a trainable \texttt{bf16} adapter pair---is already present in the code, so a model can be quantized once, served by the unified kernel, and trained by attaching adapters over the exact bytes that serve it, with zero dequant-to-train and zero re-quant-to-serve. We formalize the parameter and memory accounting of rank-$r$ QLoRA over a frozen quantized base, and prove that linear LoRA adapters over a shared base compose additively (the ``LoRA-soup'' property). We give an honest accounting of what is real, what needs building, and what is deliberately out of scope.
+\end{abstract}
+
+\section{Introduction}
+
+Production deployment of a fine-tuned language model conventionally crosses an engine boundary. A model is trained in a thick Python stack and then \emph{re-exported and re-quantized} before a separate inference engine can serve it. The result is two engines, two quantization formats, two device backends, and a conversion step at every boundary.
+
+The hanzo stack is positioned to remove that boundary. The Rust inference engine already owns a reverse-mode autograd (\texttt{ml/hanzo-ml/src/backprop.rs}, $809$ lines; \texttt{hanzo-ml} is a fork of HuggingFace \texttt{candle}), real optimizers (\texttt{ml/hanzo-nn/src/optim.rs}), and a unified quantization kernel core that serves \texttt{Q8\_0} decode at $24.5$ tokens/s, equal to $0.98\times$ of llama.cpp on a gfx1151 / Radeon~8060S device~\cite{hanzo-rocm}. If training is built \emph{on the same \texttt{Tensor}/\texttt{Var}/quant substrate} that serves inference, then a model is trained and served by one engine, in one quant format, on one device backend, with \textbf{zero conversion}. The strategic payoff concentrates in QLoRA: \texttt{bf16} adapters can be trained directly over the \emph{exact} quantized weights that the serving kernel reads.
+
+This is partly real today and partly a build plan. The contribution of this paper is to state the split honestly, to identify the single load-bearing finding---that the autograd primitive QLoRA needs is already present in the quantization layer---and to formalize the parameter, memory, and composition properties that make the native-training architecture sound.
+
+\paragraph{Provenance of claims.} Every assertion marked \textsc{Real} cites a file in the hanzo tree. Every performance number is measured on real hardware and cited to the ROCm performance record~\cite{hanzo-rocm}, or else explicitly labelled an estimate. Techniques inherited from Python tooling are marked \textsc{Ported}; the genuinely novel pieces are marked \textsc{Novel}. Build status is marked \textsc{Real}, \textsc{Needs-Building}, or \textsc{Aspirational}.
+
+\paragraph{Contributions.}
+\begin{itemize}
+    \item An architecture that unifies training and serving on a single Rust substrate: \texttt{loss.backward} $\to$ \texttt{GradStore} $\to$ \texttt{AdamW.step} $\to$ \texttt{Var.set} $\to$ safetensors, reusing the exact quantization kernel that serves inference.
+    \item Identification of the QLoRA primitive already present in the code: \texttt{QTensor::dequantize()} emits a detached constant, so a frozen quantized base carries no gradient and a separate adapter pair carries the entire learnable signal.
+    \item A formal parameter and training-memory accounting for rank-$r$ QLoRA~\cite{hu2021lora,dettmers2023qlora} over a frozen quantized base (Proposition~\ref{prop:qlora}), with proof.
+    \item A composition lemma showing that linear LoRA adapters over a shared base compose additively, justifying ``LoRA-soup''~\cite{wortsman2022soups} merging (Lemma~\ref{lem:soup}), with proof.
+    \item An ordered migration plan from the Python \texttt{gym} stack to the native Rust trainer, with risk and effort estimates, and an explicit list of stubs to replace and features deliberately left out of scope.
+\end{itemize}
+
+\section{The Foundation That Already Works}
+\label{sec:foundation}
+
+The following components are not stubs; each is cited and several are covered by passing tests. Collectively they form the training \emph{substrate}.
+
+\paragraph{Autograd (\textsc{Real}).} \texttt{ml/hanzo-ml/src/backprop.rs}. \texttt{Tensor::backward()} returns a \texttt{GradStore} via topological \texttt{sorted\_nodes()}, with full reverse rules including matmul (lhs gradient $= \mathrm{grad} \cdot \mathrm{rhs}^{\top}$, rhs gradient $= \mathrm{lhs}^{\top} \cdot \mathrm{grad}$, lines $457$--$467$), convolution, gather/scatter, \texttt{index\_add}, concatenation, broadcast, and \texttt{CustomOp1/2/3} backward dispatch (lines $662$--$687$). \texttt{GradStore} is a \texttt{HashMap<TensorId, Tensor>} (line $733$).
+
+\paragraph{Var (\textsc{Real}).} \texttt{ml/hanzo-ml/src/variable.rs}. \texttt{Var(Tensor)} is the leaf wrapper; \texttt{is\_variable()} marks gradient leaves; \texttt{set()} performs an autograd-safe in-place update, which is what an optimizer step writes through.
+
+\paragraph{Optimizers (\textsc{Real}).} \texttt{ml/hanzo-nn/src/optim.rs}. An \texttt{Optimizer} trait with \texttt{step(\&GradStore)} and \texttt{backward\_step(\&loss)} (lines $5$--$29$); plain \texttt{SGD} and a full bias-corrected \texttt{AdamW} with decoupled weight decay (lines $152$--$182$). Crucially, \texttt{new()} \emph{filters to float dtypes} (\texttt{var.dtype().is\_float()}, lines $44$--$47$ and $122$--$124$), so quantized or integer leaves are never updated. That filter is exactly the invariant a QLoRA trainer requires.
+
+\paragraph{VarMap and checkpoint I/O (\textsc{Real}).} \texttt{ml/hanzo-nn/src/var\_map.rs}. \texttt{save()}/\texttt{load()} via safetensors (lines $31$--$45$), \texttt{all\_vars()}, and lazy \texttt{get(shape, path, init, dtype, dev)}. This is real persistence for trainable parameters today.
+
+\paragraph{Losses (\textsc{Real}).} \texttt{ml/hanzo-nn/src/loss.rs}. \texttt{nll}, \texttt{cross\_entropy} ($\mathrm{log\_softmax} + \mathrm{nll}$), \texttt{mse}, \texttt{binary\_cross\_entropy\_with\_logit}, and \texttt{huber}, all differentiable.
+
+\paragraph{NN layers (\textsc{Real}).} \texttt{hanzo-nn} provides linear, embedding, the norm family, convolution, RNN, MoE, rotary embedding, activations, and \texttt{ops.rs} ($\mathrm{log\_softmax}$/$\mathrm{softmax}$/$\mathrm{topk}$). All are forward-only structs that ride autograd; no hand-written backward is needed.
+
+\paragraph{Verdict.} The training substrate---$\texttt{loss.backward} \to \texttt{GradStore} \to \texttt{AdamW.step} \to \texttt{Var.set} \to$ safetensors save---is \textsc{Real} and end-to-end. What is missing is the trainer scaffolding on top of it (Sections~\ref{sec:catalogue} and~\ref{sec:migration}).
+
+\section{Two Real Trainers}
+\label{sec:trainers}
+
+\subsection{GRPO reinforcement learning (\textsc{Ported}, tested)}
+
+\texttt{ml/hanzo-training/src/grpo/} contains \texttt{trainer}, \texttt{math}, \texttt{policy}, \texttt{sampler}, \texttt{config}, \texttt{reward}, and \texttt{metrics}. The module is ported from the \texttt{zooai/gym} GRPO~\cite{shao2024grpo} trainer. \texttt{GrpoTrainer::step} (\texttt{trainer.rs:129}) runs the full five-phase update: rollout (\texttt{Policy::sample\_group}); reward (weighted multi-reward sum, \texttt{score()} at \texttt{trainer.rs:119}); group-relative advantages (\texttt{math::batch\_advantages}, unbiased standard deviation with $\mathrm{ddof}=1$, \texttt{math.rs:45--52}); a differentiable, sign-correct, length-normalized policy-gradient loss (\texttt{math::policy\_gradient\_loss}, \texttt{math.rs:87--120}); an optional low-variance \texttt{k3} KL penalty to a frozen reference ($k3 = \exp(\Delta) - \Delta - 1$, \texttt{math.rs:134--166}); and \texttt{AdamW.backward\_step(\&loss)} (\texttt{trainer.rs:228}). It is tested: a smoke test learns a toy reward to ceiling (asserts mean reward rises past $0.6 \cdot \texttt{max\_len}$), a KL-branch test stays finite, and math unit tests verify advantage zero-mean, unit-scale scaling, and policy-gradient sign.
+
+\paragraph{The gap, stated honestly.} The \texttt{Policy} trait (\texttt{policy.rs:33}) requires exactly three methods: \texttt{trainable\_vars()}, \texttt{sample\_group()}, and \texttt{sequence\_logprob()}. The only implementor is \texttt{ToyPolicy}, a \texttt{[max\_len, vocab]} logits bandit in tests and \texttt{examples/grpo\_toy.rs}. No hanzo-engine transformer implements \texttt{Policy} yet; wiring a real model to those three methods is \textsc{Needs-Building} (Section~\ref{sec:migration}).
+
+\subsection{AnyMoE gate trainer (\textsc{Real}, end-to-end in-engine)}
+
+(\texttt{AnyMoE} is a \texttt{mistral.rs} feature inherited by the engine.) \texttt{engine/hanzo-engine/src/pipeline/amoe.rs} and \texttt{engine/hanzo-engine/src/amoe/mod.rs} contain the strongest existing ``train on top of an inference model'' precedent. It builds trainable MoE gating \texttt{Linear}s as \texttt{Var}s, then runs a real per-layer loop (\texttt{amoe.rs:348--516}): build a per-layer \texttt{AdamW} (\texttt{amoe.rs:351}), forward the frozen base model (\texttt{target.forward\_inputs}, \texttt{amoe.rs:483}), collect each gate's logits, take \texttt{hanzo\_nn::loss::cross\_entropy} (\texttt{amoe.rs:507}), \texttt{loss.backward()}, \texttt{optimizer.step(\&gradstore)} (\texttt{amoe.rs:511--512}), log CSV loss, and finally detach the gates and save \texttt{gate.safetensors}. It trains \emph{new} gating parameters on top of frozen quantized expert weights---the exact pattern QLoRA needs: trainable \texttt{Var}s layered over a frozen base, inside the inference engine.
+
+\section{The Quant Stack and the QLoRA Primitive}
+\label{sec:quant}
+
+\subsection{What exists for inference (\textsc{Real})}
+
+\begin{itemize}
+    \item \textbf{candle quant} (\texttt{ml/hanzo-ml/src/quantized/}): \texttt{QTensor}/\texttt{QMatMul}, GGUF k-quants (\texttt{Q2K}--\texttt{Q6K}, \texttt{Q8\_0}, \texttt{MXFP4}), plus $11$ low-bit IQ/ternary/FP4 types added and validated bit-exact against ggml~\cite{hanzo-rocm}.
+    \item \textbf{engine quant} (\texttt{engine/hanzo-quant}): a \texttt{QuantMethod} trait (\texttt{lib.rs:990}) with \texttt{forward}, \texttt{dequantize\_w} (\texttt{lib.rs:995}), \texttt{add\_delta\_w} (\texttt{lib.rs:1056}), and \texttt{apply\_isq}; methods for gguf/gptq/hqq/afq/bitsandbytes/fp8/mxfp4/unquantized; in-situ quantization (ISQ), imatrix, and UQFF serialization.
+    \item \textbf{the unified ROCm core} (\textsc{Novel}, Section~\ref{sec:perf}): one templated \texttt{qmatvec\_core<WTYPE,XT>} decode and \texttt{qmmq\_core<WTYPE>} prefill, one decode function per format, table-driven dispatch. Adding a quant costs one \texttt{qdec}, one traits row, and one macro line; \emph{zero new kernels}.
+\end{itemize}
+
+\subsection{The load-bearing finding}
+
+\texttt{QTensor::dequantize()} (\texttt{quantized/mod.rs:775--778}) constructs its output with \texttt{BackpropOp::none()}:
+
+\begin{lstlisting}[language=Rust]
+pub fn dequantize(&self, device: &Device) -> Result<Tensor> {
+    let storage = self.storage
+        .dequantize(self.shape.elem_count())?;
+    let none = crate::op::BackpropOp::none();
+    crate::tensor::from_storage(
+        storage, self.shape.clone(), none, false)
+        .to_device(device)
+}
+\end{lstlisting}
+
+\texttt{dequantize\_f16} (\texttt{mod.rs:781}) and the \texttt{QMatMul}/\texttt{indexed\_moe\_forward} forwards likewise emit \texttt{BackpropOp::none()}. A dequantized weight is therefore a \emph{detached constant}: no gradient flows into quantized storage. This is not a limitation; it is exactly the correct QLoRA primitive. The frozen quant base is a constant, and a separate \texttt{bf16}/\texttt{f16} LoRA \texttt{Var} pair $(A, B)$, whose matmul backpropagates normally (rules at \texttt{backprop.rs:457--467}), carries the entire learnable signal. The AdamW float-dtype filter (Section~\ref{sec:foundation}) guarantees the quant base is never touched even if it were handed in.
+
+Consequently the \emph{math substrate} for QLoRA exists today. The LoRA layer and the assembly that injects it do not (Section~\ref{sec:catalogue}).
+
+\subsection{What is not a trainer today}
+
+The existing LoRA (\texttt{engine/hanzo-engine/src/lora/loralinear.rs}) loads \texttt{a\_adapters}/\texttt{b\_adapters} as frozen \texttt{Linear}s from a \texttt{ShardedVarBuilder} (\texttt{loralinear.rs:17--18, 34--48}) and supports \texttt{merge\_weights()} via \texttt{QuantMethod::add\_delta\_w} (\texttt{loralinear.rs:145--156}). It is inference-and-merge only: the adapters are constants, not \texttt{Var}s, and there is no backward path into them. Likewise \texttt{hanzo-quant/src/lora/static\_lora.rs} is static. There is no trainable-LoRA path anywhere in the tree yet.
+
+\section{Formal Properties of QLoRA over a Frozen Quantized Base}
+\label{sec:formal}
+
+We now formalize the parameter and memory accounting that motivates QLoRA, and the composition property that justifies adapter merging. Throughout, a linear layer maps $x \in \mathbb{R}^{d_{\text{in}}}$ to $y \in \mathbb{R}^{d_{\text{out}}}$ via a weight matrix $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$.
+
+\begin{definition}[LoRA adapter]
+\label{def:lora}
+A rank-$r$ LoRA adapter for a linear layer with frozen base weight $W_0 \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ is a pair $(A, B)$ with $A \in \mathbb{R}^{r \times d_{\text{in}}}$ and $B \in \mathbb{R}^{d_{\text{out}} \times r}$, together with a fixed scalar $s = \alpha/r$. The adapted layer computes
+\[
+y = W_0 x + s\, B (A x) = \bigl(W_0 + s\, B A\bigr) x .
+\]
+Only $A$ and $B$ are trainable; $W_0$ is held constant.
+\end{definition}
+
+\begin{definition}[Quantized base]
+\label{def:qbase}
+A \emph{quantized base} is a weight tensor $W_0$ stored in a low-bit format $Q$ (e.g.\ \texttt{Q8\_0}, \texttt{Q4\_K}) and exposed to autograd only through a detaching dequantization $\mathrm{deq}_Q(W_0)$, i.e.\ the operation that produces $W_0$ in compute precision carries \texttt{BackpropOp::none()} and contributes no entry to the \texttt{GradStore}.
+\end{definition}
+
+\begin{proposition}[QLoRA trainable-parameter and memory accounting]
+\label{prop:qlora}
+Consider a model whose linear layers carry frozen quantized base weights as in Definition~\ref{def:qbase}, with rank-$r$ LoRA adapters as in Definition~\ref{def:lora} attached to a set $\mathcal{L}$ of layers, where layer $\ell \in \mathcal{L}$ has dimensions $(d^{\ell}_{\text{out}}, d^{\ell}_{\text{in}})$. Then:
+\begin{enumerate}
+    \item The number of trainable parameters contributed by layer $\ell$ is exactly $r\,(d^{\ell}_{\text{out}} + d^{\ell}_{\text{in}})$; in the square case $d^{\ell}_{\text{in}} = d^{\ell}_{\text{out}} = d$ this is $2rd$ per matrix.
+    \item No gradient is ever written to any quantized base weight; the set of optimizer-updated leaves is precisely $\bigcup_{\ell \in \mathcal{L}} \{A_\ell, B_\ell\}$.
+    \item The optimizer state and weight-gradient memory scale as $\Theta\!\bigl(\sum_{\ell \in \mathcal{L}} r(d^{\ell}_{\text{out}} + d^{\ell}_{\text{in}})\bigr)$, independent of the (much larger) base parameter count $\sum_\ell d^{\ell}_{\text{out}} d^{\ell}_{\text{in}}$. Total training memory is therefore the quantized base (read-only) plus adapter weights, adapter gradients, adapter optimizer moments, and the forward activations retained for backward---\emph{not} a full-precision copy of the base weights, their gradients, or their optimizer state.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+\emph{(1)} By Definition~\ref{def:lora}, layer $\ell$ adds the trainable matrices $A_\ell \in \mathbb{R}^{r \times d^{\ell}_{\text{in}}}$ and $B_\ell \in \mathbb{R}^{d^{\ell}_{\text{out}} \times r}$ and no other trainable tensor ($s$ is a fixed scalar, not a parameter). Counting entries gives $r\,d^{\ell}_{\text{in}} + d^{\ell}_{\text{out}}\,r = r(d^{\ell}_{\text{out}} + d^{\ell}_{\text{in}})$, which is $2rd$ when $d^{\ell}_{\text{in}} = d^{\ell}_{\text{out}} = d$.
+
+\emph{(2)} The adapted output is $y = \mathrm{deq}_Q(W_0) x + s\,B(Ax)$. The first term is detached by Definition~\ref{def:qbase}: $\mathrm{deq}_Q(W_0)$ carries \texttt{BackpropOp::none()} and so registers no producer in the backward graph; hence $\partial \mathcal{L} / \partial W_0$ is never accumulated into the \texttt{GradStore}, regardless of downstream loss $\mathcal{L}$. The second term is a composition of standard matmuls, whose reverse rules (\texttt{backprop.rs:457--467}) populate gradients for $A_\ell$ and $B_\ell$. Thus the only leaves receiving gradients are the $\{A_\ell, B_\ell\}$. Independently, the optimizer's construction filter retains only float-dtype leaves (Section~\ref{sec:foundation}); since the quantized base is stored in a non-float quant dtype, it is excluded from the update set even if mistakenly registered. The two mechanisms are independent and each is sufficient, so the optimizer-updated set is exactly $\bigcup_{\ell} \{A_\ell, B_\ell\}$.
+
+\emph{(3)} A first-order adaptive optimizer such as AdamW stores, per trainable scalar, one gradient and a constant number of moment estimates (first and second moment), i.e.\ $\Theta(1)$ memory per trainable scalar. By (2) the trainable scalars number $\sum_{\ell} r(d^{\ell}_{\text{out}} + d^{\ell}_{\text{in}})$, giving optimizer-plus-gradient memory of that same order. The base weights are read-only and contribute no gradient or moment; they reside in their compressed quantized form (Definition~\ref{def:qbase}). Hence the total is the read-only quantized base plus adapter weights, adapter gradients, adapter moments, and retained activations, with the adapter-related terms independent of $\sum_\ell d^{\ell}_{\text{out}} d^{\ell}_{\text{in}}$.
+\end{proof}
+
+\begin{lemma}[Additive composition of linear LoRA adapters; the LoRA-soup property]
+\label{lem:soup}
+Fix a frozen base weight $W_0$ for a linear layer and a common scale $s$. Let $\{(A_i, B_i)\}_{i=1}^{n}$ be $n$ rank-$r_i$ LoRA adapters trained over the \emph{same} $W_0$, with merged increments $\Delta_i = s\, B_i A_i$. For any convex combination weights $\lambda_1, \dots, \lambda_n \ge 0$ with $\sum_i \lambda_i = 1$, define the soup weight
+\[
+W_{\text{soup}} = W_0 + \sum_{i=1}^{n} \lambda_i \Delta_i .
+\]
+Then on every input $x$,
+\[
+W_{\text{soup}}\, x = \sum_{i=1}^{n} \lambda_i \bigl(W_0 + \Delta_i\bigr) x ,
+\]
+i.e.\ applying the merged adapter equals the convex combination of the individually adapted layer outputs. Moreover $W_{\text{soup}} - W_0 = \sum_i \lambda_i \Delta_i$ admits an exact rank-$\bigl(\sum_i r_i\bigr)$ factorization, so the soup is itself representable as a single LoRA adapter.
+\end{lemma}
+
+\begin{proof}
+Each adapted layer is affine in $x$ with the \emph{shared} linear part anchored at $W_0$: by Definition~\ref{def:lora}, $(W_0 + \Delta_i)x = W_0 x + \Delta_i x$. Take the convex combination and use $\sum_i \lambda_i = 1$:
+\[
+\sum_{i=1}^{n} \lambda_i (W_0 + \Delta_i) x
+= \Bigl(\sum_i \lambda_i\Bigr) W_0 x + \sum_i \lambda_i \Delta_i x
+= W_0 x + \Bigl(\sum_i \lambda_i \Delta_i\Bigr) x
+= W_{\text{soup}}\, x .
+\]
+The first equality is linearity of matrix-vector multiplication in the weight; the identity holds for all $x$, establishing the stated equality of maps. For the factorization, define the stacked matrices
+\[
+\widetilde{B} = \bigl[\, s\lambda_1 B_1 \;\big|\; s\lambda_2 B_2 \;\big|\; \cdots \;\big|\; s\lambda_n B_n \,\bigr] \in \mathbb{R}^{d_{\text{out}} \times \sum_i r_i},
+\qquad
+\widetilde{A} = \begin{bmatrix} A_1 \\ A_2 \\ \vdots \\ A_n \end{bmatrix} \in \mathbb{R}^{\sum_i r_i \times d_{\text{in}}} .
+\]
+Then $\widetilde{B}\widetilde{A} = \sum_i s\lambda_i B_i A_i = \sum_i \lambda_i \Delta_i = W_{\text{soup}} - W_0$, exhibiting the increment as a single LoRA factorization of rank at most $\sum_i r_i$ (with scale folded into $\widetilde{B}$).
+\end{proof}
+
+\begin{proof}[Remark on necessity of the shared base]
+The argument uses $\sum_i \lambda_i = 1$ precisely to collapse $\sum_i \lambda_i W_0$ back to $W_0$. If the adapters were trained over \emph{different} bases $W_0^{(i)}$, the cross terms $\sum_i \lambda_i (W_0^{(i)} - W_0)$ would not vanish and additive composition would fail. This is the formal reason hanzo's soup and delta-soup routines (\texttt{model\_delta/soup.rs}, Section~\ref{sec:catalogue}) operate over a common base checkpoint.
+\end{proof}
+
+These two results capture why owning both the trainer and the quant kernel is structurally advantageous: Proposition~\ref{prop:qlora} shows the trainable footprint is the adapter, not the base, even though the base is served at full quantized speed; Lemma~\ref{lem:soup} shows multiple such adapters merge exactly over the shared frozen base, enabling post-hoc model-soup composition without retraining.
+
+\section{The Native Trainer Catalogue}
+\label{sec:catalogue}
+
+Table~\ref{tab:catalogue} maps each trainer onto the autograd engine and records its build status.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Native trainer catalogue and autograd mapping.}
+\label{tab:catalogue}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Trainer} & \textbf{Status} & \textbf{Mechanism} \\
+\midrule
+Full SFT & Needs-building & Weights as \texttt{Var}s; teacher-forced \\
+         & (substrate real) & LM \texttt{cross\_entropy}; \texttt{AdamW}; save. \\
+LoRA & Needs-building & Frozen base $+$ \texttt{Var}s $A,B$; \\
+     &                & $y = W_0 x + s\,B(Ax)$. \\
+QLoRA & Needs-building & As LoRA; base is \texttt{QTensor} via \\
+      & (primitive real) & \texttt{qmatvec\_core}; already detached. \\
+DoRA & Needs-building & LoRA $+$ trainable column- \\
+     &                & magnitude \texttt{Var}; norm op. \\
+BitDelta & Real (compress) & Sign-pack $(W_{\!f}-W_0)$, scale \\
+         & trainer pending  & $\alpha = \mathrm{mean}|\Delta|$; reconstruct. \\
+Soup / delta-soup & Real & Elementwise mean of checkpoints; \\
+                  &      & $W_0 + \mathrm{mean}_i(W_{\!f,i}-W_0)$. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Full fine-tune (SFT).} The substrate is \textsc{Real}; only the scaffolding is missing. The path: build the model with a \texttt{VarBuilder::from\_varmap} so weights are \texttt{Var}s, run a teacher-forced forward, take per-token \texttt{cross\_entropy}, \texttt{AdamW.backward\_step}, and checkpoint with \texttt{VarMap.save}. The blocker is that the roughly $80$ engine model definitions build via \texttt{VarBuilder} into \emph{frozen} \texttt{Tensor}s; SFT needs a \texttt{Var}-backed construction path. The generic \texttt{Trainer} advertised for this is a stub (Section~\ref{sec:stubs}).
+
+\paragraph{LoRA.} A new \texttt{TrainableLoraLinear} holding a frozen base alongside trainable \texttt{Var}s $A,B$ and scale $s$. Forward: \texttt{base.forward(x) + lora\_b(lora\_a(x)) * scale}, with $A,B$ created through a \texttt{VarMap}. Backward flows only into $A,B$ because the base is detached. It reuses the existing adapter math from \texttt{loralinear.rs}, swapping the frozen \texttt{Linear} for \texttt{Var}s.
+
+\paragraph{QLoRA---the synergy that justifies the effort.} Identical to LoRA, but the base is a \texttt{QTensor} served by the unified \texttt{qmatvec\_core} / \texttt{QMatMul} path. Because that path already emits \texttt{BackpropOp::none()} (Section~\ref{sec:quant}), no extra detaching is needed. The model is quantized once, served at the performance of Section~\ref{sec:perf}, and trained by attaching \texttt{bf16} adapter \texttt{Var}s over the very same bytes: zero dequant-to-train, zero re-quant-to-serve. This is the one place where owning both the trainer and the quant kernel yields something the Python stack structurally cannot: bitsandbytes/peft must dequantize a block to \texttt{f16}, run the \texttt{f16} matmul, and serve through a \emph{different} code path; here it is literally the same kernel. Proposition~\ref{prop:qlora} quantifies the resulting memory advantage.
+
+\paragraph{DoRA.} Weight-decomposed LoRA~\cite{liu2024dora}: $W' = m \cdot (W_0 + \Delta W)/\lVert W_0 + \Delta W \rVert_{\text{col}}$, where $m$ is a trainable per-column magnitude vector and $\Delta W = BA$. On the engine: add one magnitude \texttt{Var} of shape $[d_{\text{out}}]$, compute the column norm with existing ops, and scale. All differentiable; no new backward. The only cost is recomputing the directional norm each step, a known DoRA expense, not a hanzo-specific one.
+
+\paragraph{BitDelta and soups (\textsc{Real}).} \texttt{model\_delta/bitdelta.rs} implements the BitDelta~\cite{liu2024bitdelta} $\mathrm{encode}$/$\mathrm{decode\_apply}$: encode is sign-pack$(W_{\!f}-W_0)$ plus a per-tensor scale $\alpha = \mathrm{mean}|\Delta|$; reconstruct is $W_0 + \alpha \cdot \mathrm{sign}(\Delta)$. \texttt{model\_delta/soup.rs} implements $\mathrm{soup}$ (elementwise mean of checkpoints) and $\mathrm{delta\_soup}$ ($W_0 + \mathrm{mean}_i(W_{\!f,i}-W_0)$), both tested. They operate on saved checkpoints, so they compose with any trainer above: train, save \texttt{Var} weights, then \texttt{bitdelta::encode} for 1-bit delta storage or \texttt{delta\_soup} to average several fine-tunes. Lemma~\ref{lem:soup} is the formal justification for the LoRA case of delta-soup. For the patent record: neither BitDelta nor any model-soup/TIES/DARE routine exists anywhere in \texttt{zooai/gym}; these are hanzo-native with no Axolotl analog. The DeltaSoup \emph{federation} variant (trim-mean of LoRA deltas) lives only in the Python \texttt{zen/gym} and is not yet ported to Rust.
+
+\section{Quant-Aware Training and Inherited Performance}
+\label{sec:perf}
+
+The reason to train on hanzo's quant core is that the core is fast and bit-exact, and an adapter trained over it serves with no conversion. Table~\ref{tab:perf} summarizes the measured state on gfx1151 / Radeon~8060S (Strix~Halo), all numbers from the ROCm performance record~\cite{hanzo-rocm}. The real-hardware roofline is $217$ GB/s read bandwidth and $52$ TOPS-i8.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Measured performance on gfx1151 / 8060S (Strix Halo). Roofline: $217$~GB/s read, $52$~TOPS-i8. ``$\times$ llama'' is the ratio to llama.cpp on the same hardware. All quant numbers verified \texttt{nbad}$=0$ against the CPU \texttt{to\_float} oracle.}
+\label{tab:perf}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Path} & \textbf{Before} & \textbf{After} & \textbf{$\times$ llama} \\
+\midrule
+Decode matvec (GB/s) & 103.5 & 245.8 & 0.97 \\
+\quad (\% of BW wall) & 45\% & 97\% & --- \\
+Decode end-to-end (t/s) & 8.5 & 24.5 & 0.98 \\
+MoE decode (t/s) & 0.93 & 13.6 & --- \\
+Prefill end-to-end (t/s) & 39 & 1015 & 0.86 \\
+\quad WMMA GEMM isolated & --- & 1414 & $>1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Decode (\textsc{Real}).} The lane-strided unified core rewrote \texttt{qmatvec\_core} from serial to lane-strided: the isolated matvec went from $103.5$ GB/s ($45\%$ of the bandwidth wall) to $245.8$ GB/s ($97\%$), a $2.37\times$ gain; end-to-end eager decode went from $8.5$ to $24.5$ tokens/s, equal to $0.98\times$ llama.cpp ($25.05$ tokens/s). This is effective parity and the measured honest ceiling: matvec sits at the bandwidth wall, and batch-1 attention is not a winnable lever.
+
+\paragraph{The unified abstraction (\textsc{Novel}).} One templated \texttt{qmatvec\_core<WTYPE,XT>} decode and \texttt{qmmq\_core<WTYPE>} prefill, with \texttt{quant\_format!} / \texttt{for\_each\_quant!} table-driven dispatch (\texttt{quantized/quant\_format.rs}, \texttt{proof.rs}). Adding a quant costs one \texttt{qdec}, one traits row, and one macro line; zero new kernels. It is proven across \texttt{Q8\_0}/\texttt{Q4\_0}/\texttt{Q4\_K}/\texttt{Q6\_K}/\texttt{IQ4\_XS}/\texttt{TQ2\_0}, all with \texttt{nbad}$=0$ against the CPU \texttt{to\_float} oracle. A QLoRA base in any of these formats trains and serves through the same core.
+
+\paragraph{MoE.} The same core powers \texttt{indexed\_moe\_forward} per routed expert; MoE decode went from $0.93$ to $13.6$ tokens/s (about $2\times$, via a resident-bank cache plus the lane-strided core), with \texttt{Q4\_K}$+$\texttt{Q8\_0} MoE at \texttt{nbad}$=0$. This is the path an AnyMoE-style or MoE-QLoRA trainer would ride.
+
+\paragraph{Prefill.} The WMMA int8 GEMM kernel reaches about $1414$ tokens/s in isolation (above llama); end-to-end prefill went from $39$ to $1015$ tokens/s, equal to $0.86\times$ llama.cpp ($1176$ tokens/s). The remaining gap is engine attention, not the matvec; a multi-wave WMMA flash-attention kernel is the open lever (\textsc{Aspirational}, a large rewrite).
+
+\paragraph{Honest framing.} Decode is parity, prefill is $0.86\times$ and improving, and MoE decode is roughly $2\times$. The training value is not ``we are fastest''; it is that the trained artifact is \emph{already} in the served format on the served kernel.
+
+\section{Migration Plan: gym (Python) $\to$ native (Rust)}
+\label{sec:migration}
+
+\paragraph{Reusable as-is (\textsc{Real}, no rewrite).} Autograd; SGD/AdamW; VarMap save/load; the loss module; the roughly $80$ model architecture definitions (as forward graphs); the full quant inference stack with ISQ and UQFF; the GRPO algorithm core; AnyMoE gate training; BitDelta; soups.
+
+\paragraph{Build (\textsc{Needs-Building}), ordered by value/effort.}
+\begin{enumerate}
+    \item \textbf{Trainable LoRA/QLoRA adapter layer} (highest value, low-medium effort). A \texttt{TrainableLoraLinear} with $(A,B)$ \texttt{Var}s over a frozen base; QLoRA variant over \texttt{QTensor}. Risk: \textsc{Low}---the AD primitive is proven (Section~\ref{sec:quant}), AnyMoE proves the train-over-frozen pattern (Section~\ref{sec:trainers}), and the adapter math already exists. Estimate: about one week to a tested LoRA $+$ QLoRA on one architecture (Qwen3), reusing \texttt{qmatvec\_core} for the base.
+    \item \textbf{Real transformer \texttt{Policy} for GRPO} (high value, medium effort). Implement the three trait methods (\texttt{policy.rs:33}) against a hanzo-engine model: \texttt{sample\_group} is the existing generate loop under no-grad; \texttt{sequence\_logprob} is a teacher-forced forward returning $\sum \log p$. Risk: \textsc{Medium}---needs the \texttt{Var}-backed model path (shared with SFT) and careful no-grad/grad separation. Estimate: one to two weeks; pairs naturally with item 1.
+    \item \textbf{Generic SFT trainer $+$ real tokenized dataset} (high value, medium effort). Replace the stub \texttt{Trainer}/\texttt{ModelWrapper}/\texttt{OptimizerWrapper} (Section~\ref{sec:stubs}) with a real epoch/step loop calling \texttt{hanzo\_nn::AdamW} directly, a teacher-forced LM \texttt{cross\_entropy}, and a real \texttt{tokenizers}-backed dataset. Risk: \textsc{Medium}, mostly plumbing. Estimate: one to two weeks.
+    \item \textbf{Preference losses (DPO~\cite{rafailov2023dpo}/KTO/ORPO/SimPO)} (medium value, low effort once item 2 exists). Closed-form differentiable losses over (chosen, rejected) log-probs, using the same \texttt{sequence\_logprob}. Risk: \textsc{Low}. Estimate: a few days each.
+    \item \textbf{Training ergonomics} (medium value, low-medium effort). Real LR schedulers (cosine/linear are toy approximations in the stub, \texttt{optimizer.rs:55--77}), gradient clipping, gradient accumulation, mixed precision, optimizer-state checkpoint/resume (only \texttt{Var} weights save today, not moments), and explicit gradient checkpointing (only the global \texttt{GRAD\_DO\_NOT\_DETACH} toggle exists). Risk: \textsc{Low-Medium}, individually small.
+    \item \textbf{DoRA / BitDelta-trainer / federated DeltaSoup control plane} (\textsc{Aspirational}-roadmap). DoRA is a small extension of item 1. The federated trim-mean DeltaSoup from \texttt{zen/gym} is Python-only today; porting its control plane to Rust over the \texttt{bf16}-safetensors VarMap seam is a separate project.
+\end{enumerate}
+
+\section{Stubs to Replace}
+\label{sec:stubs}
+
+These are advertised in \texttt{hanzo-training} but do not function; a reader must not mistake them for the working pieces above.
+
+\begin{itemize}
+    \item \texttt{ml/hanzo-training/src/optimizer.rs}: \texttt{OptimizerWrapper::step()}/\texttt{zero\_grad()} are no-ops---the comment reads ``Simplified optimizer step - in practice, this would update parameters'' (\texttt{optimizer.rs:82}); it only advances a step counter and an LR number, touching no params or grads. (GRPO and AnyMoE ignore this and use \texttt{hanzo\_nn::AdamW} directly, which is why they work.)
+    \item \texttt{ml/hanzo-training/src/model.rs}: \texttt{ModelWrapper.forward()} returns a constant \texttt{Tensor::new(\&[1.0])}, \texttt{backward()} is a no-op, \texttt{parameters()} returns \texttt{vec![]}, and \texttt{save()} writes only JSON metadata.
+    \item \texttt{ml/hanzo-training/src/trainer.rs}: the generic SFT \texttt{Trainer} is wired to those two stubs, so it ``trains'' nothing; \texttt{train\_qwen.rs}/\texttt{train\_llama.rs}/\texttt{bin/train.rs} all call it.
+    \item \texttt{ml/hanzo-training/src/dataset.rs}: ``simplified tokenization,'' not a real tokenizer.
+\end{itemize}
+
+The migration (items 1--3) replaces all four with the proven \texttt{hanzo\_nn::AdamW} $+$ \texttt{loss.backward} $+$ \texttt{VarMap} substrate.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+We state the boundaries of the present architecture plainly.
+
+\paragraph{The trainers above the substrate are not yet built.} Sections~\ref{sec:trainers} and~\ref{sec:quant} establish that the substrate (autograd, AdamW, VarMap, losses, detached quant base) is real and that two trainers (GRPO, AnyMoE) exercise it end-to-end. But the headline deliverable---trainable LoRA/QLoRA over an arbitrary engine model---is \textsc{Needs-Building}. The proof obligations of Section~\ref{sec:formal} hold for the design; they do not assert that the \texttt{TrainableLoraLinear} type exists today, because it does not.
+
+\paragraph{Var-backed model construction is the shared blocker.} Both full SFT and a real GRPO \texttt{Policy} require building the roughly $80$ engine models with \texttt{Var} parameters rather than frozen \texttt{Tensor}s. This is a construction-path change, not a kernel change, but it is a prerequisite for two of the three highest-value items.
+
+\paragraph{Performance is parity, not dominance.} Decode is $0.98\times$ llama.cpp and prefill $0.86\times$ (Section~\ref{sec:perf}); the matvec is at the bandwidth wall and is not a further lever, while the prefill gap is in engine attention and awaits a WMMA flash-attention kernel (\textsc{Aspirational}). The training argument is the absence of a conversion boundary, not raw speed.
+
+\paragraph{Single-device scope.} We deliberately do not replicate FSDP/DeepSpeed-scale multi-node sharding, tensor/sequence/context parallelism, fused Liger/Unsloth kernels, or Mamba/diffusion trainers. These are \texttt{gym} breadth, not the personalization core. The first deliverable is single-device LoRA/QLoRA $+$ SFT $+$ GRPO, which covers the dominant fine-tune and RL use cases.
+
+\paragraph{Optimizer-state durability.} Only \texttt{Var} weights are checkpointed today, not optimizer moments; resumable training requires the ergonomics work in item 5 of Section~\ref{sec:migration}.
+
+\paragraph{Future work.} In priority order: ship \texttt{TrainableLoraLinear} and its QLoRA variant; add the \texttt{Var}-backed model path; wire a real transformer \texttt{Policy}; replace the SFT stub; add preference losses; then DoRA, a BitDelta trainer, and a Rust port of the federated DeltaSoup control plane.
+
+\section{Conclusion}
+
+The hanzo training substrate is real: a \texttt{candle}-derived autograd, AdamW/SGD, VarMap checkpointing, a differentiable loss family, and a unified quant core that serves \texttt{Q8\_0} decode at parity ($24.5$ tokens/s, $0.98\times$ llama.cpp) and prefill at $0.86\times$. Two trainers prove it trains end-to-end: the GRPO RL loop (algorithm-complete, tested, ported from \texttt{zooai/gym}) and the AnyMoE in-engine gate trainer. The QLoRA primitive---a detached \texttt{dequantize()} base plus trainable \texttt{bf16} adapter \texttt{Var}s---is present in the code; only the adapter \emph{layer} is missing. We formalized the consequences: the trainable footprint is the adapter, not the base (Proposition~\ref{prop:qlora}), and linear adapters over a shared base compose additively (Lemma~\ref{lem:soup}). The build order is clear: \texttt{TrainableLoraLinear} $+$ QLoRA over \texttt{qmatvec\_core}; a real-transformer \texttt{Policy} to unlock GRPO; a real SFT loop with a tokenized dataset; then preference losses and ergonomics. The end state is to train and serve a model in one Rust engine, one quant format, one device backend---with QLoRA adapters learned over the exact kernel that serves them.
+
+\begin{thebibliography}{10}
+
+\bibitem{hanzo-rocm}
+Hanzo AI Research. (2026).
+\textit{Native ROCm Inference on gfx1151 / Radeon 8060S: Unified Quantization Kernels and the Path to Bandwidth-Wall Decode}.
+Hanzo Industries Research. Performance record, workflows \texttt{wl14hz0o7} and \texttt{wsvtp8gru}.
+
+\bibitem{hu2021lora}
+Hu, E.~J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., \& Chen, W. (2021).
+\textit{LoRA: Low-Rank Adaptation of Large Language Models}.
+arXiv:2106.09685.
+
+\bibitem{dettmers2023qlora}
+Dettmers, T., Pagnoni, A., Holtzman, A., \& Zettlemoyer, L. (2023).
+\textit{QLoRA: Efficient Finetuning of Quantized LLMs}.
+NeurIPS 2023.
+
+\bibitem{liu2024dora}
+Liu, S.-Y., Wang, C.-Y., Yin, H., Molchanov, P., Wang, Y.-C.~F., Cheng, K.-T., \& Chen, M.-H. (2024).
+\textit{DoRA: Weight-Decomposed Low-Rank Adaptation}.
+ICML 2024.
+
+\bibitem{shao2024grpo}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., et al. (2024).
+\textit{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}.
+arXiv:2402.03300. (Group Relative Policy Optimization.)
+
+\bibitem{wortsman2022soups}
+Wortsman, M., Ilharco, G., Gadre, S.~Y., Roelofs, R., Gontijo-Lopes, R., et al. (2022).
+\textit{Model Soups: Averaging Weights of Multiple Fine-Tuned Models Improves Accuracy Without Increasing Inference Time}.
+ICML 2022.
+
+\bibitem{liu2024bitdelta}
+Liu, J., Xiao, G., Li, K., Lee, J.~D., Han, S., Dao, T., \& Cai, T. (2024).
+\textit{BitDelta: Your Fine-Tune May Only Be Worth One Bit}.
+NeurIPS 2024.
+
+\bibitem{rafailov2023dpo}
+Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C.~D., \& Finn, C. (2023).
+\textit{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}.
+NeurIPS 2023.
+
+\end{thebibliography}
+
+\end{document}

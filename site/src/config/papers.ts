@@ -39,7 +39,7 @@ export const siteConfig: SiteConfig = {
   accentColor: '#00D9FF',
   logo: '/logos/hanzo-logo.svg',
   papers: [
-    // --- Defense / Reindustrialization Papers ---
+    // --- Sovereign AI, Security & Infrastructure ---
     {
       id: 'hanzo-security',
       title: 'Hanzo AI for Security',
@@ -50,7 +50,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Security', 'Agentic AI', 'Audit'],
+      tags: ['Sovereign AI', 'Security', 'Agentic AI', 'Audit'],
     },
     {
       id: 'hanzo-compliance',
@@ -62,19 +62,19 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Compliance', 'SOC 2', 'ATO'],
+      tags: ['Sovereign AI', 'Compliance', 'SOC 2', 'ATO'],
     },
     {
       id: 'hanzo-vs-claude',
       title: 'Sovereign vs. Closed',
-      subtitle: 'Hanzo AI versus Centralized Cloud AI for Defense and Regulated Workloads',
+      subtitle: 'Hanzo AI versus Centralized Cloud AI',
       abstract: 'Owned, self-hostable AI versus a metered cloud chat — on deployment and control, not benchmark scores. Includes a measured productivity case: on a regulated build where every engineer had the same frontier model (Claude), the client\'s own audit found one engineer on Hanzo\'s agentic stack shipped more than three contractor pods combined at ~250x-900x lower cost per line — the differentiator being the owned agentic stack, not the model. Covers data residency, air-gapped operation, provenance, post-quantum security, and cost at scale.',
       pdfUrl: '/pdfs/hanzo-vs-claude.pdf',
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/defense/hanzo-vs-claude.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Sovereign AI', 'Post-Quantum', 'Open Weights'],
+      tags: ['Sovereign AI', 'Post-Quantum', 'Open Weights'],
     },
     {
       id: 'hanzo-agentic-prowess',
@@ -86,7 +86,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Agentic AI', 'FHE', 'Post-Quantum'],
+      tags: ['Sovereign AI', 'Agentic AI', 'FHE', 'Post-Quantum'],
     },
     {
       id: 'hanzo-cloud-economics',
@@ -98,7 +98,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Cloud Economics', 'Sovereign Stack', 'OSS'],
+      tags: ['Sovereign AI', 'Cloud Economics', 'Sovereign Stack', 'OSS'],
     },
     {
       id: 'hanzo-fhe-native',
@@ -110,7 +110,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'FHE', 'Confidential Computing', 'Post-Quantum'],
+      tags: ['Sovereign AI', 'FHE', 'Confidential Computing', 'Post-Quantum'],
     },
     {
       id: 'hanzo-zap-protocol',
@@ -122,7 +122,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Protocol', 'Post-Quantum', 'Edge'],
+      tags: ['Sovereign AI', 'Protocol', 'Post-Quantum', 'Edge'],
     },
     {
       id: 'hanzo-full-spectrum-cyber',
@@ -134,7 +134,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Post-Quantum', 'FIPS', 'Cryptography'],
+      tags: ['Sovereign AI', 'Post-Quantum', 'FIPS', 'Cryptography'],
     },
     {
       id: 'hanzo-formal-verification',
@@ -146,7 +146,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Formal Verification', 'Lean 4', 'Post-Quantum'],
+      tags: ['Sovereign AI', 'Formal Verification', 'Lean 4', 'Post-Quantum'],
     },
     {
       id: 'hanzo-agentic-ai',
@@ -158,7 +158,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Agentic AI', 'Cyber Operations', 'Intelligence'],
+      tags: ['Sovereign AI', 'Agentic AI', 'Cyber Operations', 'Intelligence'],
     },
     {
       id: 'hanzo-edge-ai-ml',
@@ -170,7 +170,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Edge AI', 'Quantization', 'Offline'],
+      tags: ['Sovereign AI', 'Edge AI', 'Quantization', 'Offline'],
     },
     {
       id: 'hanzo-cross-domain',
@@ -182,7 +182,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Cross-Domain', 'FHE', 'Zero-Trust'],
+      tags: ['Sovereign AI', 'Cross-Domain', 'FHE', 'Zero-Trust'],
     },
     {
       id: 'hanzo-assured-networking',
@@ -194,7 +194,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Mesh Networking', 'Post-Quantum', 'Maritime'],
+      tags: ['Sovereign AI', 'Mesh Networking', 'Post-Quantum', 'Maritime'],
     },
     {
       id: 'hanzo-countermeasures',
@@ -206,7 +206,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Counter-Exploitation', 'Post-Quantum', 'FHE'],
+      tags: ['Sovereign AI', 'Counter-Exploitation', 'Post-Quantum', 'FHE'],
     },
     {
       id: 'hanzo-quantum-sensing-qkd',
@@ -218,7 +218,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'QKD', 'Quantum Sensing', 'Post-Quantum'],
+      tags: ['Sovereign AI', 'QKD', 'Quantum Sensing', 'Post-Quantum'],
     },
     {
       id: 'hanzo-test-evaluation',
@@ -230,7 +230,7 @@ export const siteConfig: SiteConfig = {
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
       authors: ['Zach Kelling'],
-      tags: ['Defense', 'Test & Evaluation', 'Digital Twin', 'Observability'],
+      tags: ['Sovereign AI', 'Test & Evaluation', 'Digital Twin', 'Observability'],
     },
 
     // --- Engine / AI Infrastructure (measured, on-device) ---

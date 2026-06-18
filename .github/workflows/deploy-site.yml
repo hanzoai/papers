@@ -1,15 +1,12 @@
-name: Deploy papers.hanzo.ai
+name: Build papers.hanzo.ai image
 
-# Build + deploy the static papers site entirely on Hanzo's own infrastructure:
-#   build  → self-hosted arcd pool (no GitHub-hosted builders, no Pages quota)
-#   push   → ghcr.io/hanzoai/papers
-#   deploy → roll the image onto the operator-managed `papers` Service CR in
-#            hanzo-k8s, served via hanzoai/ingress + hanzoai/static.
-#
-# Replaces the old GitHub Pages deploy, which had been failing since 2026-04-10
-# on the org-wide GitHub Actions artifact-storage quota (only the artifact
-# upload was blocked; the self-hosted build itself was fine). This path never
-# touches that quota and never uses a GitHub-hosted builder.
+# Build the static papers-site image on Hanzo's own infrastructure: the
+# self-hosted arcd pool (no GitHub-hosted builders, no Pages artifact quota),
+# pushed to GHCR. DEPLOY is handled natively by platform.hanzo.ai (operator
+# rollout onto the `papers` Service CR) — CI never touches DOKS directly.
+# The build→deploy handoff is wired via the Hanzo Platform GitHub App +
+# .platform.yml (see PLATFORM_CI). Until that webhook is live this workflow
+# just publishes the image; the platform performs the rollout.
 
 on:
   push:
@@ -20,7 +17,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: papers-deploy
+  group: papers-build
   cancel-in-progress: true
 
 env:
@@ -51,25 +48,3 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:main
-
-  deploy:
-    needs: build
-    runs-on: hanzo-deploy-linux-amd64       # self-hosted arcd deploy pool (kubectl)
-    steps:
-      - uses: actions/checkout@v4
-      - name: Auth to DOKS hanzo-k8s
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-      - name: Save kubeconfig
-        run: doctl kubernetes cluster kubeconfig save hanzo-k8s --expiry-seconds 600
-      - name: Roll image onto operator Service CR
-        run: |
-          set -euo pipefail
-          sed "s|__TAG__|${GITHUB_SHA}|g" site/deploy/papers.service.yaml | kubectl apply -f -
-          # operator reconciles the CR into a Deployment named `papers`
-          for _ in $(seq 1 30); do
-            kubectl -n hanzo get deploy/papers >/dev/null 2>&1 && break
-            sleep 2
-          done
-          kubectl -n hanzo rollout status deploy/papers --timeout=180s

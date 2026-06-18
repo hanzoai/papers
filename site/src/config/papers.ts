@@ -31,7 +31,7 @@ export interface SiteConfig {
 export const siteConfig: SiteConfig = {
   name: 'Hanzo AI',
   fullName: 'Hanzo AI Inc (Techstars \'17)',
-  description: 'AI compute infrastructure and market mechanisms for decentralized AI workloads',
+  description: 'Owned, self-hostable AI and post-quantum cryptography — sovereign infrastructure for regulated industries, critical infrastructure, and government. Technical papers, measured case studies, and formal proofs.',
   website: 'https://hanzo.ai',
   github: 'https://github.com/hanzoai',
   primaryColor: '#FF6B35',

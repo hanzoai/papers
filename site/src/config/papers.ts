@@ -68,7 +68,7 @@ export const siteConfig: SiteConfig = {
       id: 'hanzo-vs-claude',
       title: 'hanzo.ai vs. claude.ai',
       subtitle: 'Owned, self-hostable AI versus a centralized cloud chat',
-      abstract: 'Owned, self-hostable AI versus a metered cloud chat — on deployment and control, not benchmark scores. Includes a measured productivity case: on a regulated build where every engineer had the same frontier model (Claude), the client\'s own audit found one engineer on Hanzo\'s agentic stack shipped more than three contractor pods combined at ~250x-900x lower cost per line — the differentiator being the owned agentic stack, not the model. Covers data residency, air-gapped operation, provenance, post-quantum security, and cost at scale.',
+      abstract: 'The headline: on a regulated build where every engineer had the same model (Claude), one engineer using hanzo.ai out-shipped 30 engineers on claude.ai combined — at ~250x-900x lower cost per line. Same model; the difference was the agentic stack. Plus the deeper case for owned, self-hostable AI: data residency, air-gapped operation, post-quantum security, and cost at scale.',
       pdfUrl: '/pdfs/hanzo-vs-claude.pdf',
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/defense/hanzo-vs-claude.tex',
       githubUrl: 'https://github.com/hanzoai/papers',

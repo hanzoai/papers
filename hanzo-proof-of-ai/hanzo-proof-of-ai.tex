@@ -1,0 +1,659 @@
+% Proof of AI: Native Execution Proofs in the Hanzo Engine
+\documentclass[11pt]{article}
+\usepackage{../shared/hanzocover}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{multirow}
+\usepackage{listings}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{black!25},
+  showstringspaces=false,
+}
+
+\newcommand{\Fp}{\ensuremath{\mathbb{F}_p}}
+\newcommand{\keccak}{\ensuremath{\mathrm{keccak}}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{PROOF OF AI\\[0.3em]
+{\large Native Execution Proofs in the Hanzo Engine}}
+\author{
+    Hanzo AI \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    \texttt{research@hanzo.ai}
+}
+\date{June 2026}
+
+\begin{document}
+
+\hanzocoverpage
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+A decentralized AI network must pay operators for work they actually performed.
+A digital signature proves \emph{authorship} of a message; a plurality vote
+proves \emph{agreement} among reporters; neither proves \emph{computation} ---
+that the claimed model was run on the claimed input to produce the claimed
+output. The cheapest robbery of such a network is therefore a one-bit modal
+guess that joins the quorum and is minted alongside honest work. We present
+Proof of AI (PoAI): the proof is not a separate artifact bolted onto inference,
+it is emitted \emph{as a side-effect of execution by the Hanzo engine itself}.
+The engine is the native inference, training, and embedding execution layer;
+because $\sim$95\% of a forward pass is matrix multiplication $C = A\cdot B$,
+each layer can be verified in $O(n^2)$ instead of recomputed in $O(n^3)$ using
+Freivalds' algorithm over a prime field $\Fp$, $p = 2^{61}-1$, applied to the
+\emph{exact} \code{int8} integer accumulator. Integer arithmetic is bit-exact
+across CPU, GPU, and backends, so the check has \emph{zero} false-reject ---
+the load-bearing determinism on which the whole scheme rests. We describe the
+four proofs that compose over this one primitive (Proof of Embedding, Inference,
+Training, and Compute), the streaming activation-trace Merkle Mountain Range
+that lets an operator commit now and be challenged later, the
+\code{reportData} binding that ties a proof to a specific model, prompt, and
+output, and the by-tier treatment of floating point that avoids the unsoundness
+of naive tolerance-based checking. We state honestly what is proven and tested
+today and what remains the next slice: the verifier core and determinism
+prerequisites ship and are tested; the chain enforces no-proof-no-mint;
+end-to-end proof \emph{emission} from a running model is designed and merged but
+not yet live.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction: what a proof of AI must prove}
+\label{sec:intro}
+
+Consider a network where operators run AI models and are minted tokens for the
+work. Three properties are easy to confuse, and only one of them is the thing
+that must be secured.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item A \textbf{signature} proves \emph{authorship}: this party committed to
+        this message. It says nothing about whether any computation occurred.
+  \item A \textbf{plurality} (a quorum, a majority vote over reported outputs)
+        proves \emph{agreement}: $m$ reporters submitted the same answer. It is
+        only as honest as the reporters, and it rewards consensus, not work.
+  \item A \textbf{proof of computation} proves the load-bearing fact: this
+        operator ran \emph{this} model on \emph{this} input and obtained
+        \emph{this} output.
+\end{itemize}
+
+The gap between the first two and the third is an economic vulnerability, not a
+theoretical nicety. Suppose minting requires only a signed output that matches
+the quorum. The cheapest attack is then a $\sim$1-bit \emph{modal guess}: an
+operator that never loads the model, predicts the most likely token (or copies
+a neighbor), signs it, joins the plurality, and is paid. No matmul is performed;
+the marginal cost of the ``work'' is a coin flip. Any network that settles on
+signatures-plus-agreement is robbed by exactly this strategy, and the robbery is
+indistinguishable from honest participation at the level of signatures and
+votes.
+
+PoAI closes the gap by making the proof a \emph{property of execution} rather
+than a property of reporting. The Hanzo engine is the native execution layer
+for inference, training, and embedding across the zen model family. When it runs
+a model it can, at near-zero overhead, emit a commitment to the computation it
+performed; a verifier later challenges a small random part of that commitment
+and checks it for asymptotically less than the cost of redoing the work. A
+modal-guess operator has no committed activations to open and is caught
+immediately. This paper grounds that claim in the shipped engine code
+(\code{hanzo-engine/src/poi.rs}) and its canonical chain-side mirror
+(\code{luxfi/crypto/poi}), folds in the product-of-experts settlement material
+from the earlier PoAI fragment, and is explicit about what is live versus
+designed.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=1.4em]
+  \item The framing above: signature $\neq$ plurality $\neq$ computation, and
+        the modal-guess attack that the distinction exposes
+        (\S\ref{sec:intro}).
+  \item The Freivalds core over the exact \code{int8} accumulator in $\Fp$, with
+        zero false-reject, grounded line-for-line in \code{poi.rs}
+        (\S\ref{sec:freivalds}).
+  \item The four proofs (PoE/PoI/PoT/PoC) that compose over the single matmul
+        primitive via a \code{workloadType} discriminant (\S\ref{sec:four}).
+  \item The determinism prerequisites that make exact verification possible at
+        all (\S\ref{sec:determinism}), the commit-now/verify-later
+        activation-trace MMR and interactive bisection (\S\ref{sec:mmr}), and
+        the \code{reportData} binding (\S\ref{sec:binding}).
+  \item The by-tier floating-point treatment that avoids tolerance-corridor
+        unsoundness (\S\ref{sec:fp}) and the architecture-family coverage table
+        for the whole zen zoo (\S\ref{sec:coverage}).
+  \item An honest implementation-status section (\S\ref{sec:status}).
+\end{itemize}
+
+% ============================================================================
+\section{The Freivalds core: verifying a forward pass}
+\label{sec:freivalds}
+
+A transformer forward pass is dominated by matrix multiplication: the
+attention projections, the MLP/expert GEMMs, and the output head are all of the
+form $C = A\cdot B$, and together they are $\sim$95\% of the floating (here,
+integer) operations. This is the lever. To \emph{recompute} a layer
+$A\in\mathbb{Z}^{t\times k}$, $B\in\mathbb{Z}^{k\times n}$, giving
+$C\in\mathbb{Z}^{t\times n}$, costs $O(t\,k\,n)$ --- the same work the prover
+did. To \emph{verify} it, we do not need to redo it.
+
+\begin{theorem}[Freivalds, 1977, over $\Fp$]
+\label{thm:freivalds}
+Let $p$ be prime, $A,B,C$ integer matrices of conforming shape reduced into
+$\Fp$, and let $r \in \Fp^{\,n}$ be drawn uniformly at random. If
+$C = A\cdot B$ then $A\,(B\,r) = C\,r$ \emph{always}. If $C \neq A\cdot B$ then
+\[
+  \Pr_{r}\!\big[A\,(B\,r) = C\,r\big] \;\le\; \frac{1}{p}.
+\]
+Computing $B\,r$, then $A\,(B\,r)$, and $C\,r$ costs $O(t k + k n + t n) = O(n^2)$
+matrix--vector work, one order below the $O(n^3)$ of the multiply.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Let $D = C - A\cdot B \neq 0$ over $\Fp$, so some row $D_i \neq 0$. The event
+$D\,r = 0$ forces $\langle D_i, r\rangle = 0$, a single non-trivial linear
+constraint on $r$; its solution set is a hyperplane containing a $1/p$ fraction
+of $\Fp^{\,n}$. An honest $C$ gives $D = 0$ and passes for every $r$, which is
+why there is no false-reject.
+\end{proof}
+
+Running $k$ independent challenge vectors multiplies the per-vector soundness
+error, giving a tampered $C$ a survival probability of at most $(1/p)^k$.
+
+\paragraph{Why integers, and why $p = 2^{61}-1$.}
+The engine's \code{int8} quantized path multiplies signed 8-bit operands into a
+32-bit accumulator ($i8\cdot i8 \to i32$, the \code{f8q8} path in
+\code{hanzo-quant}). That accumulator is an \emph{exact integer}; it is identical
+on every backend that respects the reduction, because integer addition and
+multiplication carry no rounding. Verifying over $\Fp$ with the Mersenne prime
+$p = 2^{61}-1$ keeps every intermediate inside 61 bits, so a single 128-bit
+multiply (\code{fmul}) and a conditional subtract (\code{fadd}) suffice and never
+overflow. The result is the property the rest of PoAI depends on:
+\textbf{zero false-reject across CPU/GPU/backends}. Soundness error is
+$1/p \approx 2^{-61}$ per challenge vector; $k = 2$ vectors give $\le 2^{-122}$.
+
+\paragraph{The shipped API.}
+The core lives in \code{hanzo-engine/src/poi.rs}: dependency-free, backend-agnostic,
+unit-tested in isolation. The surface is small and is mirrored byte-for-byte by
+the Go verifier the chain consumes (\code{luxfi/crypto/poi}, with
+\code{NewMat}/\code{Verify}/\code{VerifyMulti}/\code{DeriveChallenges} and the
+same $p = (1\ll 61)-1$).
+
+\begin{lstlisting}[language={}]
+pub const P: u64 = (1u64 << 61) - 1;       // Mersenne prime field modulus
+
+pub struct Mat { rows, cols, data: Vec<i64> }  // exact i32/i64 accumulators
+
+// Verify C == A*B for ONE challenge r:  A*(B*r) == C*r over F_p, O(tk+kn+tn).
+pub fn freivalds_verify(a, b, c: &Mat, r: &[u64]) -> bool;
+
+// Verify against k challenges; honest C passes ALL, tampered C fails w.p. >= 1-(1/p)^k.
+pub fn freivalds_verify_multi(a, b, c: &Mat, challenges: &[Vec<u64>]) -> bool;
+
+// Derive k challenge vectors of length n from a seed (prod: keccak(beacon || ...)).
+pub fn derive_challenges(seed: u64, n: usize, k: usize) -> Vec<Vec<u64>>;
+\end{lstlisting}
+
+The reduction \code{to\_field} uses \code{rem\_euclid} so signed \code{int8}
+weights and activations map correctly into $[0,p)$. The module ships eight unit
+tests covering an honest $2\times 2$ product, a single tampered entry being
+caught, negative-entry reduction, deterministic challenge derivation, a
+fail-closed shape mismatch, and a $16{\times}24\cdot 24{\times}16$ product where
+flipping one deep entry off-by-one is still caught --- the sparse-cheat case that
+motivates challenging every layer.
+
+\paragraph{The challenge must come after the commitment.}
+Soundness in Theorem~\ref{thm:freivalds} assumes $r$ is unpredictable to the
+prover. If the prover knew $r$ in advance it could craft $A,B,C$ with
+$D\,r = 0$ yet $C\neq A\cdot B$. The production derivation therefore draws the
+seed from an on-chain beacon \emph{after} the prover has committed
+(\S\ref{sec:mmr}); \code{derive\_challenges} is the reproducible expansion both
+sides apply to that seed. The unit tests use a \code{splitmix64} stream for the
+same reproducibility --- identical soundness, only the unpredictability source
+differs.
+
+% ============================================================================
+\section{Four proofs over one primitive}
+\label{sec:four}
+
+PoAI is not four mechanisms; it is one matmul-verification primitive applied to
+four \code{workloadType}s. The operands $(A, B, C)$ and the I/O commitment differ
+by workload, but the verifier, the field, and the soundness argument are shared.
+
+\begin{description}[leftmargin=0pt,style=nextline]
+  \item[Proof of Embedding (PoE).] The embedding tower (and any ViT/audio
+        encoder feeding it) is a stack of GEMMs producing a vector. Freivalds
+        verifies the projection layers; the input commitment fixes what was
+        embedded. Settlement uses the embedding as the unit of paid work.
+  \item[Proof of Inference (PoI).] A decode step is the attention and MLP/expert
+        GEMMs plus the output head. The transcript commits the per-layer
+        operands; a challenged layer is opened and Freivalds-checked. This is the
+        canonical case and the one the modal-guess attacker cannot fake.
+  \item[Proof of Training (PoT).] A training step is a forward pass plus a
+        backward pass; the backward pass is again matmuls (the transposed
+        GEMMs of the gradient). The same primitive verifies that a claimed
+        gradient update corresponds to real backpropagation, not a fabricated
+        delta.
+  \item[Proof of Compute (PoC).] The general case: any committed GEMM workload
+        (a kernel an operator claims to have run for hire) is verifiable by the
+        identical $A\,(B\,r) = C\,r$ check. PoE/PoI/PoT are PoC specialized by
+        what the operands mean and what I/O is bound.
+\end{description}
+
+This is deliberate orthogonal design: one primitive at one slot, four payoffs.
+A network that wants to pay for embeddings, inference, training, or raw compute
+does not need four verifiers --- it needs one, parameterized by
+\code{workloadType}.
+
+\paragraph{Settlement: closed-form expert weights from PoAI (folded from the
+prior fragment).} Once work is \emph{verified}, it can be \emph{weighted}. For
+each expert (operator) $m$, let $q_m \in [0,1]$ be the Bayesian reliability
+estimated from its historical attestations. Under a product-of-experts
+combination the optimal mixing weight is closed-form,
+\begin{equation}\label{eq:poai-weights}
+  \eta_m \;\propto\; \frac{q_m}{1 - q_m},
+\end{equation}
+i.e. precision-weighted aggregation, with no manual tuning. At decode time this
+is the product-of-experts rule
+\begin{equation}\label{eq:poe-main}
+  \log \pi_*(y\mid x) \;=\; \eta_0 \log \pi_0(y\mid x)
+   \;+\; \sum_{i=1}^{K} \eta_i \log \phi_i(y\mid x) \;-\; \log Z,
+\end{equation}
+where $\pi_0 = p_\theta$ is the base model, $\{\phi_i\}$ are expert factors, and
+$Z$ is the per-token partition function. PoAI supplies the reliabilities $q_m$
+that make Eq.~\eqref{eq:poai-weights} trustworthy: a weight derived from
+\emph{verified} work, not from self-reported agreement.
+
+% ============================================================================
+\section{Determinism is the load-bearing property}
+\label{sec:determinism}
+
+Exact Freivalds needs an exactly reproducible $C$. If two honest runs of the
+same model on the same input could produce different outputs, there would be no
+canonical $C$ to commit to, and an honest prover could be false-rejected. Exact
+verification is therefore \emph{impossible} without bit-level determinism. Two
+sources of nondeterminism are silently present in ordinary inference, and both
+are closed in the shipped engine (\code{hanzoai/engine} v1.2.5).
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Argmax ties.} Greedy decode takes $\arg\max$ over logits; when
+        two logits are equal, the winner is implementation-defined (it depends on
+        reduction order on the device). The engine pins a \textbf{lowest-id
+        tie-break}: among tied maxima the smallest token index wins, on every
+        backend.
+  \item \textbf{MoE expert selection.} A Mixture-of-Experts router picks the
+        top-$k$ experts by score; ties and unstable sort order change \emph{which
+        experts run}, changing $C$ entirely. The engine pins a \textbf{canonical
+        top-$k$}: sort by score descending, breaking ties by expert index
+        ascending (the \code{deterministic\_topk\_indices} selection).
+\end{enumerate}
+
+\begin{remark}
+Determinism is not a performance feature here; it is the precondition for
+soundness. Only because the int8 accumulator and these two tie-breaks are
+reproducible can the verifier assert that an honest operator's $C$ matches
+bit-for-bit, and hence that \emph{any} Freivalds failure is real cheating rather
+than hardware drift. Proof-bearing runs additionally set
+\code{set\_moe\_proof\_deterministic(true)} and pin temperature-0 greedy decode.
+\end{remark}
+
+% ============================================================================
+\section{Commit now, verify later}
+\label{sec:mmr}
+
+A forward pass over a large model at hundreds of tokens produces terabytes of
+activations; retaining them is infeasible, and forcing synchronous verification
+would serialize the network. PoAI instead has the operator \emph{commit} to its
+activations cheaply during execution and be \emph{challenged} later on a small
+random part --- the optimistic bargain: cheap in the happy path, partial
+re-execution only under challenge.
+
+\paragraph{ActivationTraceMMR.} A streaming \textbf{Merkle Mountain Range}
+accumulates one leaf per $(\text{layer}, \text{token}, \text{tap})$ in execution
+order and keeps only $O(\log N)$ peak hashes --- a frontier of roughly 768 bytes.
+Activations are hashed as the kernel produces them and then dropped. The hash is
+\code{keccak}, with leaf/node domain separation:
+\begin{align*}
+\text{leaf} &= \keccak(\text{\small DOMAIN\_POI\_ACT} \,\|\, \text{layer}
+   \,\|\, \text{token} \,\|\, \text{tap} \,\|\, \text{dtype} \,\|\,
+   \text{shape} \,\|\, \text{tensor bytes}),\\
+\text{node} &= \keccak(\text{\small DOMAIN\_POI\_NODE} \,\|\, \text{left}
+   \,\|\, \text{right}),
+\end{align*}
+where $\text{tap} \in \{\code{matmul\_in}, \code{matmul\_out},
+\code{block\_out}\}$ --- exactly the operands a Freivalds check (or a non-matmul
+recompute) will open, no more. Lone nodes on odd levels use \textbf{RFC-6962
+promotion}, \emph{not} Bitcoin duplicate-last: the duplicate-last construction is
+the CVE-2012-2459 malleability (a forged tree can collide a root), so it is
+deliberately avoided. The MMR closes by binding the leaf count,
+$\text{activationTraceRoot} = \keccak(\text{\small DOMAIN\_POI} \,\|\,
+n_{\text{leaves}} \,\|\, \text{mmr root})$, so a subtree cannot be reinterpreted
+as the whole tree.
+
+\paragraph{Zero overhead when off.} The commitment is threaded as an
+\code{Option<\&mut ProofTranscript>} through the forward context, not a boolean
+checked in hot loops. When the option is \code{None}, each commit site is a
+single not-taken branch --- no hashing, no allocation, no tensor copy. When it is
+\code{Some}, the per-matmul hook commits the int8 activation view and the i32
+accumulator by borrow (no copy); the weight $B$ is committed once at load into
+the weights root, never re-hashed per token.
+
+\paragraph{Challenge, open, bisect.} A verifier derives a layer index
+$\ell$ and challenge $r$ from a beacon \emph{after} commitment, opens that
+layer's $A$ (\code{matmul\_in}), $B$ (a reference under the weights root), and
+$C$ (\code{matmul\_out}) with $O(\log N)$ MMR inclusion proofs, and runs
+\emph{windowed} Freivalds over a random token sub-range to keep the opened
+payload small. The verifier recomputes the leaf hashes, checks the inclusions
+against the committed roots, re-derives $r$, and checks $A\,(B\,r) = C\,r$ ---
+total cost $O(t k + k n + t n + \log N)$, about $\min(t,k,n)\times$ cheaper than
+recomputing the layer. A mismatch slashes the operator. To localize a
+\emph{sparse} cheat (a single bad layer among many) the protocol runs interactive
+\textbf{bisection} to the first divergent layer in $O(\log L)$ rounds, so
+soundness is independent of how many layers are sampled.
+
+% ============================================================================
+\section{Binding: a proof points at exactly one (model, input, output)}
+\label{sec:binding}
+
+A correct matmul check is worthless if the attestation can be replayed, spliced
+across tasks, or pointed at a different model. PoAI binds the proof with two
+hash chains whose constants match the chain side byte-for-byte. The challenge is
+derived from immutable task context:
+\begin{multline*}
+\text{challenge} = \keccak\big(\text{\small DOMAIN\_CHALLENGE} \,\|\,
+  \text{taskId} \,\|\, \text{intentID} \,\|\, \text{modelSpecHash} \\
+  \|\; \text{promptHash} \,\|\, \text{openBlockHash} \,\|\, \text{operator}\big),
+\end{multline*}
+and the attested result commits to that challenge:
+\begin{multline*}
+\text{reportData} = \keccak\big(\text{\small DOMAIN\_REPORT} \,\|\,
+  \text{challenge} \,\|\, \text{modelSpecHash} \\
+  \|\; \text{promptHash} \,\|\, \text{outputHash}
+  \,\|\, \text{runtimeMeasurement}\big).
+\end{multline*}
+The chain consumes \code{reportData}; because it folds in the challenge (which
+already folds in \code{taskId}, \code{intentID}, and \code{openBlockHash}), a
+transcript is task-scoped and cannot be reused.
+
+\paragraph{\code{modelSpecHash} is measured, not labelled.} The model identity
+is a \keccak{} Merkle root over the \emph{quantized weight bytes the engine
+actually loaded} (the per-layer \code{QuantizedSerde} serialization, with the
+quant-type discriminant in each leaf). It is not a name string. Re-quantizing the
+same weights to a different scheme yields a different root; a genuinely different
+model yields a different root. Combined with a \code{runtimeMeasurement} that
+folds in the kernel build id, reduction mode, and sampler/seed, the decoding
+regime becomes part of identity: the same weights decoded at temperature 2.0, or
+under a different reduction order, are rejected. The full transcript root chains
+these together,
+\begin{multline*}
+\text{transcriptRoot} = \keccak\big(\text{\small DOMAIN\_POI} \,\|\,
+  \text{modelID} \,\|\, \text{inputCommitment} \,\|\,
+  \text{quantizationSpec} \\
+  \|\; \text{kernelVersion} \,\|\,
+  \text{activationTraceRoot} \,\|\, \text{outputCommitment}\big),
+\end{multline*}
+so the binding runs challenge $\to$ model $\to$ input $\to$ output and an
+attestation cannot be detached from any link in the chain.
+
+% ============================================================================
+\section{Floating point: by tier, not by tolerance}
+\label{sec:fp}
+
+The natural temptation is to run Freivalds directly on floating-point GEMMs with
+a tolerance: accept if $\lVert A(Br) - Cr\rVert < \varepsilon$. This is both
+\textbf{unsound} and \textbf{false-rejecting}, and PoAI rejects it.
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \emph{Unsound:} a tolerance corridor of width $\varepsilon$ is an
+        attacker's budget. A cheater can perturb $C$ anywhere inside the corridor
+        --- a non-trivial space of fabricated outputs --- and pass. The clean
+        $1/p$ soundness of Theorem~\ref{thm:freivalds} holds only in an exact
+        field.
+  \item \emph{False-rejecting:} floating-point reduction order is not fixed
+        across hardware, so two honest runs differ in the low bits. Any
+        $\varepsilon$ small enough to be sound is small enough to reject honest
+        operators on a different GPU.
+\end{itemize}
+
+PoAI therefore selects the verification regime by numeric tier:
+
+\begin{table}[H]
+\centering
+\caption{Verification regime by numeric tier.}
+\label{tab:fp-tiers}
+\begin{tabular}{lll}
+\toprule
+\textbf{Tier} & \textbf{Mechanism} & \textbf{Soundness basis} \\
+\midrule
+\code{int8} / quantized & exact Freivalds over $\Fp$ & software-only, zero false-reject \\
+fp16 / bf16 / fp8       & deterministic-fp (RepOps): & bit-reproducible by pinned \\
+                        & pin reduction order        & reduction; or TEE/CC attestation \\
+small / niche           & zkML circuit               & succinct cryptographic proof \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the quantized path the check is exact and software-only --- no special
+hardware, the common case for the deployed zen models. For native low-precision
+floating point, the fix is not a tolerance but \textbf{determinism}: pin the
+reduction order (RepOps / deterministic-fp) so the GEMM is bit-reproducible, then
+the exact equality check applies again; where that is impractical, fall back to a
+trusted-execution / confidential-compute attestation of the kernel. For small or
+unusual workloads a zkML circuit gives a succinct proof directly.
+
+\begin{remark}
+A floating-point value \emph{is} an integer --- a sign bit, an exponent, and a
+mantissa. A GEMM executed in a \emph{pinned} reduction order is therefore an
+exact, reproducible computation over those integers; ``deterministic-fp'' is not
+an approximation but a commitment to a specific, replayable order of exact
+operations. The unsoundness of naive fp-Freivalds comes entirely from
+\emph{unpinned} order, not from floating point being inherently fuzzy.
+\end{remark}
+
+% ============================================================================
+\section{Coverage across the zen architecture families}
+\label{sec:coverage}
+
+The matmul primitive plus two extensions covers the entire zen model zoo. The
+two extensions are a \emph{routing proof} (for sparse/MoE models) and
+\emph{sequential state-chaining} (for recurrent and multi-step models); every
+other family is base Freivalds plus a deterministic input commitment.
+
+\begin{table}[H]
+\centering
+\caption{Architecture-family coverage. ``Beyond base'' marks the two extensions
+over plain dense-matmul Freivalds.}
+\label{tab:coverage}
+\begin{tabular}{p{3.4cm} p{6.2cm} p{2.4cm}}
+\toprule
+\textbf{Family} & \textbf{How PoAI verifies it} & \textbf{Beyond base} \\
+\midrule
+Dense transformer &
+  Freivalds on every layer's GEMMs; activation-trace MMR. &
+  --- \\
+\addlinespace
+Mixture-of-Experts &
+  Commit router logits + selected expert indices per token; verify the
+  \emph{canonical} top-$k$ chose the same experts, then Freivalds the selected
+  experts' GEMMs only (sparse). &
+  routing proof \\
+\addlinespace
+Linear-recurrent / SSM / Gated DeltaNet &
+  Per-step Freivalds, with consecutive states bound in the commitment (step
+  $t$'s output is step $t{+}1$'s input). &
+  state-chaining \\
+\addlinespace
+Multimodal (ViT + audio) &
+  Vision/audio towers are GEMMs $\to$ Freivalds; commit the preprocessed input
+  by hash; pin preprocessing (resize/normalize; FFT$\to$mel is
+  commit-and-recompute). &
+  input commitment \\
+\addlinespace
+Diffusion / Transfusion &
+  Multi-step: per-step Freivalds plus binding consecutive latents in the
+  commitment, exactly the recurrent chaining payoff reused. &
+  state-chaining \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+One primitive, two extensions, full coverage --- the recurrent state-chaining
+mechanism serves both linear-recurrent models and diffusion, so there is no
+separate diffusion verifier.
+
+% ============================================================================
+\section{Ownership: whose data, whose compute}
+\label{sec:ownership}
+
+PoAI is the technical substrate for an ownership model. Users own their data and
+own the AI they run --- the proof lets them prove a computation was performed
+without surrendering control of the model or the inputs to a trusted middleman.
+Compute is \emph{selectable}: a user may have a trusted DAO node perform the work
+(convenient, with the proof guaranteeing they were not short-changed) or run a
+user-operated node themselves (sovereign, with the same proof format settling on
+the same chain). The verification is identical in both cases; what differs is
+only who holds the keys to the executing node. The proof, not the operator's
+reputation, is what gets minted against.
+
+% ============================================================================
+\section{Implementation status}
+\label{sec:status}
+
+We state plainly what exists, what is enforced, and what is not yet live.
+
+\begin{table}[H]
+\centering
+\caption{Component status. ``Proven+tested'' means shipped with green tests;
+``enforced'' means the chain rejects non-compliant claims; ``designed'' means
+the spec is merged but no running model emits it yet.}
+\label{tab:status}
+\begin{tabular}{p{4.6cm} p{2.6cm} p{4.4cm}}
+\toprule
+\textbf{Component} & \textbf{Where} & \textbf{State} \\
+\midrule
+Go Freivalds verifier (chain-consumed) &
+  \code{luxfi/crypto/poi} v1.19.23 &
+  Proven + tested (canonical mirror) \\
+\addlinespace
+Rust Freivalds core (prover mirror) &
+  \code{hanzo-engine/src/poi.rs} v1.2.5 &
+  Proven + tested (8 tests green) \\
+\addlinespace
+Determinism prerequisites &
+  \code{hanzoai/engine} v1.2.5 &
+  Shipped (lowest-id argmax; canonical MoE top-$k$) \\
+\addlinespace
+No-proof-no-mint enforcement &
+  \code{luxdao/contracts} v2.1.0 &
+  Enforced (230/230 forge tests) \\
+\addlinespace
+Soundness companion &
+  \code{zooai/proofs} &
+  Written (tolerance-vs-exact analysis) \\
+\addlinespace
+Prover-side core in node binaries &
+  \code{hanzod} 1.1.20 (embeds engine) &
+  Available via path-dep on \code{hanzo-engine} v1.2.5 \\
+\addlinespace
+Verifier in Go node binaries &
+  \code{luxd}, \code{zood} &
+  \code{crypto/poi} v1.19.23 builds in-module (\code{zood} graph-sync pending) \\
+\addlinespace
+End-to-end proof \emph{emission} from a running zen model &
+  forward-pass commitment slice &
+  \textbf{Designed + merged, NOT yet live} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+To be unambiguous: the verification core is \textbf{proven and tested} in both
+Rust (the engine prover mirror) and Go (the chain verifier), the determinism
+prerequisites are shipped, and the chain \textbf{enforces} that no mint occurs
+without a proof. What is \emph{not} yet live is the end-to-end emission: threading
+the \code{ActivationTraceMMR} and the per-layer commit hooks through the engine's
+forward pass so that a real zen model (e.g. an \code{int8} MoE) produces a
+transcript that a challenger opens and verifies. That slice is designed and its
+wire constants are merged, but no running model emits a proof today. The first
+true ``live'' is a green end-to-end test in which an honest int8 zen inference
+emits a transcript, a beacon-derived layer is challenged, the open verifies ---
+and a faked, cheap-model, or mis-routed run is caught. That is the next slice,
+not a present claim.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+A network that pays for AI must verify computation, not authorship or agreement.
+The decisive observation is that a forward pass is almost entirely matmuls, that
+a matmul can be \emph{verified} an order of magnitude below the cost of
+\emph{performing} it, and that on the engine's exact integer accumulator this
+verification is bit-exact with zero false-reject. PoAI builds directly on the
+Hanzo engine: the engine is the native execution layer, and the proof is emitted
+as a side-effect of that execution --- one Freivalds primitive over $\Fp$,
+specialized into four proofs (embedding, inference, training, compute), made
+sound by determinism, made asynchronous by a streaming Merkle Mountain Range with
+interactive bisection, and made unforgeable by a measured-weights binding into
+\code{reportData}. The core is proven and tested and the chain already refuses to
+mint without a proof; emitting that proof end-to-end from a running zen model is
+the next, designed, slice.
+
+% ============================================================================
+\begin{thebibliography}{10}
+
+\bibitem{freivalds1977}
+R. Freivalds. Probabilistic machines can use less running time.
+\textit{IFIP Congress}, 1977.
+
+\bibitem{poiengine}
+Hanzo AI. \code{hanzo-engine/src/poi.rs} --- Proof-of-Inference Freivalds core.
+\texttt{hanzoai/engine} v1.2.5.
+
+\bibitem{poigo}
+Lux. \code{crypto/poi} --- canonical Go Freivalds verifier
+(\code{NewMat}, \code{Verify}, \code{VerifyMulti}, \code{DeriveChallenges}).
+\texttt{luxfi/crypto} v1.19.23.
+
+\bibitem{fpcommit}
+Hanzo AI. Proof-of-Inference: forward-pass commitment design.
+\code{hanzo-engine/docs/proof-of-inference/}, 2026.
+
+\bibitem{poisoundness}
+Zoo. Proof-of-Inference soundness: exact field versus tolerance corridor.
+\texttt{zooai/proofs}, 2026.
+
+\bibitem{computeproof}
+Lux DAO. \code{ComputeProofLib} --- on-chain \code{reportData} binding and
+no-proof-no-mint enforcement. \texttt{luxdao/contracts} v2.1.0.
+
+\bibitem{rfc6962}
+B. Laurie, A. Langley, E. Kasper. Certificate Transparency. RFC 6962, 2013.
+(Lone-node promotion; avoids CVE-2012-2459 duplicate-last malleability.)
+
+\bibitem{hanzoconsensus}
+Hanzo AI. Hanzo Consensus AI: Consensus Mechanisms for Distributed AI Training
+and Inference. \texttt{hanzoai/papers}, 2026.
+
+\end{thebibliography}
+
+\end{document}

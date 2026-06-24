@@ -1,4 +1,5 @@
-% Proof of AI: Native Execution Proofs in the Hanzo Engine
+% Proof of AI: Native Execution Proofs in the Hanzo Engine,
+% and the Hamiltonian Market Maker for Verified Compute
 \documentclass[11pt]{article}
 \usepackage{../shared/hanzocover}
 \usepackage{amsmath, amssymb, amsthm}
@@ -39,9 +40,17 @@
 \newcommand{\Fp}{\ensuremath{\mathbb{F}_p}}
 \newcommand{\keccak}{\ensuremath{\mathrm{keccak}}}
 \newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\ensuremath{\mathbb{R}}}
+\newcommand{\Rpos}{\ensuremath{\mathbb{R}_{>0}}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Cstar}{\ensuremath{C^{*}}}
+\newcommand{\inner}[2]{\ensuremath{\langle #1, #2\rangle}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\dom}{dom}
 
 \title{PROOF OF AI\\[0.3em]
-{\large Native Execution Proofs in the Hanzo Engine}}
+{\large Native Execution Proofs and the Hamiltonian Market Maker
+for Verified Compute}}
 \author{
     Hanzo AI \\
     \textit{Hanzo Industries Inc (Techstars '17)} \\
@@ -57,40 +66,73 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-A decentralized AI network must pay operators for work they actually performed.
-A digital signature proves \emph{authorship} of a message; a plurality vote
-proves \emph{agreement} among reporters; neither proves \emph{computation} ---
-that the claimed model was run on the claimed input to produce the claimed
-output. The cheapest robbery of such a network is therefore a one-bit modal
-guess that joins the quorum and is minted alongside honest work. We present
-Proof of AI (PoAI): the proof is not a separate artifact bolted onto inference,
-it is emitted \emph{as a side-effect of execution by the Hanzo engine itself}.
-The engine is the native inference, training, and embedding execution layer;
-because $\sim$95\% of a forward pass is matrix multiplication $C = A\cdot B$,
-each layer can be verified in $O(n^2)$ instead of recomputed in $O(n^3)$ using
-Freivalds' algorithm over a prime field $\Fp$, $p = 2^{61}-1$, applied to the
-\emph{exact} \code{int8} integer accumulator. Integer arithmetic is bit-exact
-across CPU, GPU, and backends, so the check has \emph{zero} false-reject ---
-the load-bearing determinism on which the whole scheme rests. We describe the
-four proofs that compose over this one primitive (Proof of Embedding, Inference,
-Training, and Compute), the streaming activation-trace Merkle Mountain Range
-that lets an operator commit now and be challenged later, the
-\code{reportData} binding that ties a proof to a specific model, prompt, and
-output, and the by-tier treatment of floating point that avoids the unsoundness
-of naive tolerance-based checking. We state honestly what is proven and tested
-today and what remains the next slice: the verifier core and determinism
-prerequisites ship and are tested; the chain enforces no-proof-no-mint;
-end-to-end proof \emph{emission} from a running model is designed and merged but
-not yet live.
+A decentralized AI network must do two things a token network does not: it must
+\emph{prove} that operators performed the AI work they are paid for, and it must
+\emph{price} that work into a coin without a trusted oracle. We give a complete
+treatment of both, joined at a single seam.
+
+For the proof: a digital signature proves \emph{authorship} of a message; a
+plurality vote proves \emph{agreement} among reporters; neither proves
+\emph{computation} --- that the claimed model was run on the claimed input to
+produce the claimed output. The cheapest robbery of such a network is therefore a
+one-bit modal guess that joins the quorum and is minted alongside honest work. We
+present Proof of AI (PoAI): the proof is not a separate artifact bolted onto
+inference, it is emitted \emph{as a side-effect of execution by the Hanzo engine
+itself}. Because $\sim$95\% of a forward pass is matrix multiplication
+$C = A\cdot B$, each layer is verified in $O(n^2)$ instead of recomputed in
+$O(n^3)$ using Freivalds' algorithm over a prime field $\Fp$, $p = 2^{61}-1$,
+applied to the \emph{exact} \code{int8} integer accumulator. Integer arithmetic
+is bit-exact across CPU, GPU, and backends, so the check has \emph{zero}
+false-reject. PoAI proves that an entire computation \emph{graph} ran --- inference,
+embedding, and training are all graphs, verified by one proof system --- and its
+soundness is information-theoretic, hence post-quantum.
+
+For the price: we develop the \textbf{Hamiltonian Market Maker (HMM)}, an
+automated market maker for the one asset PoAI makes well-defined --- a unit of
+\emph{cryptographically verified} compute, settled in AICoin. We define the market
+state $(q,p)$ (inventory of proven-compute units and their marginal price), a
+conserved quantity $H$ (the Hamiltonian, the maker's bonded value), and trades as
+the canonical flow that holds $H$ on its level set. We prove the properties this
+buys: \emph{path-independence} (the cost of a trade depends only on its endpoints),
+\emph{bounded round-trip} (a closed loop costs zero before fees, strictly positive
+after, so no in-curve arbitrage exists), a \emph{bounded worst-case
+market-maker subsidy} (the LMSR bound $b\ln N$, recovered as the entropic special
+case, and the divergence-loss bound for constant-function makers), and a
+\emph{monotone price--supply law} that ties price to verified-compute supply. We
+show LMSR (Hanson) and constant-function AMMs (Uniswap's $x\cdot y=k$ is a
+degenerate conserved quantity) are two potentials of one framework, with HMM the
+principled Legendre-duality generalization. The supply side is honest by
+construction: only miners bonded in proportion to declared capacity
+(\code{MinerStakeRegistry}) feed the curve, and a network-wide no-double-mint
+ledger (\code{AIComputeRegistry}) guarantees each inventory increment is a distinct
+verified unit.
+
+We state plainly what is live: the verifier core, the typed graph-composition, and
+the determinism prerequisites ship and are tested in Rust and Go; the chain
+enforces no-proof-no-mint; end-to-end proof \emph{emission} from a running model is
+designed and merged but not yet live. The HMM is a protocol-design contribution:
+every claim is a theorem with a proof, and we report no empirical benchmark we did
+not measure.
 \end{abstract}
 
+\tableofcontents
+
 % ============================================================================
-\section{Introduction: what a proof of AI must prove}
+\section{Introduction: prove the work, then price it}
 \label{sec:intro}
 
-Consider a network where operators run AI models and are minted tokens for the
-work. Three properties are easy to confuse, and only one of them is the thing
-that must be secured.
+A network that pays operators to run AI faces two questions that are usually
+answered badly. \emph{Did the operator do the work?} and \emph{what is the work
+worth?} The first is a soundness question; the second is a market-design question.
+This paper answers both, and the answers meet at a single object: the
+\emph{proven-compute unit} (PCU), a quantum of work that has been verified to be
+real AI computation. Part~I (\S\S\ref{sec:freivalds}--\ref{sec:status}) builds the
+proof that makes a PCU well-defined. Part~II
+(\S\S\ref{sec:hmm-intro}--\ref{sec:hmm-poai}) builds the market maker that prices
+it.
+
+\paragraph{The proof question.} Three properties are easy to confuse, and only one
+is the thing that must be secured.
 
 \begin{itemize}[leftmargin=1.4em]
   \item A \textbf{signature} proves \emph{authorship}: this party committed to
@@ -103,48 +145,65 @@ that must be secured.
         \emph{this} output.
 \end{itemize}
 
-The gap between the first two and the third is an economic vulnerability, not a
-theoretical nicety. Suppose minting requires only a signed output that matches
-the quorum. The cheapest attack is then a $\sim$1-bit \emph{modal guess}: an
-operator that never loads the model, predicts the most likely token (or copies
-a neighbor), signs it, joins the plurality, and is paid. No matmul is performed;
-the marginal cost of the ``work'' is a coin flip. Any network that settles on
-signatures-plus-agreement is robbed by exactly this strategy, and the robbery is
-indistinguishable from honest participation at the level of signatures and
-votes.
+The gap between the first two and the third is an economic vulnerability. If
+minting requires only a signed output that matches the quorum, the cheapest attack
+is a $\sim$1-bit \emph{modal guess}: an operator that never loads the model,
+predicts the most likely token (or copies a neighbor), signs it, joins the
+plurality, and is paid. No matmul is performed; the marginal cost of the ``work''
+is a coin flip. PoAI closes the gap by making the proof a \emph{property of
+execution} rather than a property of reporting.
 
-PoAI closes the gap by making the proof a \emph{property of execution} rather
-than a property of reporting. The Hanzo engine is the native execution layer
-for inference, training, and embedding across the zen model family. When it runs
-a model it can, at near-zero overhead, emit a commitment to the computation it
-performed; a verifier later challenges a small random part of that commitment
-and checks it for asymptotically less than the cost of redoing the work. A
-modal-guess operator has no committed activations to open and is caught
-immediately. This paper grounds that claim in the shipped engine code
-(\code{hanzo-engine/src/poi.rs}) and its canonical chain-side mirror
-(\code{luxfi/crypto/poi}), folds in the product-of-experts settlement material
-from the earlier PoAI fragment, and is explicit about what is live versus
-designed.
+\paragraph{The price question.} Once work is provably real, a decentralized market
+must convert it into coin. An order book needs matched counterparties and deep
+liquidity that a young compute market lacks; an oracle reintroduces the trusted
+third party the proof just removed. Automated market makers (AMMs) solve this for
+fungible tokens, but a unit of compute is not a token: it is supplied
+continuously, its supply is gated by a cryptographic proof, and the market maker
+must subsidize price discovery with a \emph{bounded} worst-case loss the way Hanson's
+LMSR does for prediction markets. We give the AMM that fits: the Hamiltonian
+Market Maker, whose conserved quantity ties the AICoin price of compute directly to
+the supply of \emph{verified} PCUs.
+
+\paragraph{Why they belong in one paper.} The honesty of the price rests entirely
+on the honesty of the supply. An AMM that prices unverified ``compute'' prices a
+modal guess; the curve is only as sound as the unit feeding it. PoAI is what makes
+the HMM's inventory axis $q$ mean something: every increment of $q$ is a distinct,
+verified, non-replayable PCU. Conversely, the HMM is what gives PoAI an economic
+endpoint: a proof that settles into a fairly-priced coin rather than a flat
+subsidy. The seam between them is the \code{MinerStakeRegistry} (bonded supply) and
+the \code{AIComputeRegistry} (no double mint), grounded in \S\ref{sec:hmm-poai}.
 
 \paragraph{Contributions.}
 \begin{itemize}[leftmargin=1.4em]
-  \item The framing above: signature $\neq$ plurality $\neq$ computation, and
-        the modal-guess attack that the distinction exposes
-        (\S\ref{sec:intro}).
-  \item The Freivalds core over the exact \code{int8} accumulator in $\Fp$, with
-        zero false-reject, grounded line-for-line in \code{poi.rs}
-        (\S\ref{sec:freivalds}).
-  \item The four proofs (PoE/PoI/PoT/PoC) that compose over the single matmul
-        primitive via a \code{workloadType} discriminant (\S\ref{sec:four}).
-  \item The determinism prerequisites that make exact verification possible at
-        all (\S\ref{sec:determinism}), the commit-now/verify-later
-        activation-trace MMR and interactive bisection (\S\ref{sec:mmr}), and
-        the \code{reportData} binding (\S\ref{sec:binding}).
-  \item The by-tier floating-point treatment that avoids tolerance-corridor
-        unsoundness (\S\ref{sec:fp}) and the architecture-family coverage table
-        for the whole zen zoo (\S\ref{sec:coverage}).
-  \item An honest implementation-status section (\S\ref{sec:status}).
+  \item \textbf{(Part I, proof.)} The framing signature $\neq$ plurality $\neq$
+        computation and the modal-guess attack it exposes (\S\ref{sec:intro}); the
+        Freivalds core over the exact \code{int8} accumulator in $\Fp$ with zero
+        false-reject, grounded line-for-line in \code{poi.rs}
+        (\S\ref{sec:freivalds}); the four proofs PoE/PoI/PoT/PoC over one matmul
+        primitive (\S\ref{sec:four}); typed \emph{graph} composition that lifts
+        per-matmul soundness to whole-forward-pass soundness
+        (\S\ref{sec:graph}); the determinism prerequisites
+        (\S\ref{sec:determinism}); the commit-now/verify-later activation-trace MMR
+        with interactive bisection (\S\ref{sec:mmr}); the \code{reportData} binding
+        (\S\ref{sec:binding}); the by-tier floating-point treatment
+        (\S\ref{sec:fp}); the post-quantum argument (\S\ref{sec:pq}); and an honest
+        implementation-status section (\S\ref{sec:status}).
+  \item \textbf{(Part II, price.)} The Hamiltonian Market Maker:
+        a full phase-space formulation of compute pricing
+        (\S\ref{sec:hmm-formulation}); five proved results --- path
+        independence (Thm.~\ref{thm:path}), bounded round-trip / no in-curve
+        arbitrage (Thm.~\ref{thm:roundtrip}), bounded market-maker subsidy
+        (Thm.~\ref{thm:bounded-loss}, recovering LMSR's $b\ln N$), the monotone
+        price--supply law (Thm.~\ref{thm:monotone}), and slippage convexity
+        (Prop.~\ref{prop:slippage}) --- in \S\ref{sec:hmm-conservation};
+        the demonstration that LMSR and Uniswap are two potentials of the one
+        framework (\S\ref{sec:hmm-unify}); the multi-asset generalization over
+        heterogeneous compute (\S\ref{sec:hmm-multi}); and the binding of the curve
+        to PoAI's verified supply through the bond and no-double-mint registries
+        (\S\ref{sec:hmm-poai}).
 \end{itemize}
+
+\begin{center}\rule{0.5\linewidth}{0.4pt}\\[-0.2em]\textsc{Part I --- The Proof}\end{center}
 
 % ============================================================================
 \section{The Freivalds core: verifying a forward pass}
@@ -170,12 +229,13 @@ Computing $B\,r$, then $A\,(B\,r)$, and $C\,r$ costs $O(t k + k n + t n) = O(n^2
 matrix--vector work, one order below the $O(n^3)$ of the multiply.
 \end{theorem}
 
-\begin{proof}[Proof sketch]
+\begin{proof}
 Let $D = C - A\cdot B \neq 0$ over $\Fp$, so some row $D_i \neq 0$. The event
-$D\,r = 0$ forces $\langle D_i, r\rangle = 0$, a single non-trivial linear
-constraint on $r$; its solution set is a hyperplane containing a $1/p$ fraction
-of $\Fp^{\,n}$. An honest $C$ gives $D = 0$ and passes for every $r$, which is
-why there is no false-reject.
+$D\,r = 0$ forces $\inner{D_i}{r} = 0$, a single non-trivial linear
+constraint on $r$; its solution set is a hyperplane, an affine subspace of
+codimension one, containing exactly $p^{\,n-1}$ of the $p^{\,n}$ points of
+$\Fp^{\,n}$, i.e. a $1/p$ fraction. An honest $C$ gives $D = 0$ and passes for
+every $r$, which is why there is no false-reject.
 \end{proof}
 
 Running $k$ independent challenge vectors multiplies the per-vector soundness
@@ -212,24 +272,31 @@ pub fn freivalds_verify(a, b, c: &Mat, r: &[u64]) -> bool;
 pub fn freivalds_verify_multi(a, b, c: &Mat, challenges: &[Vec<u64>]) -> bool;
 
 // Derive k challenge vectors of length n from a seed (prod: keccak(beacon || ...)).
-pub fn derive_challenges(seed: u64, n: usize, k: usize) -> Vec<Vec<u64>>;
+pub fn derive_challenges_keccak(seed: &[u8], n: usize, k: usize) -> Vec<Vec<u64>>;
 \end{lstlisting}
 
 The reduction \code{to\_field} uses \code{rem\_euclid} so signed \code{int8}
-weights and activations map correctly into $[0,p)$. The module ships eight unit
+weights and activations map correctly into $[0,p)$. The module ships seven unit
 tests covering an honest $2\times 2$ product, a single tampered entry being
 caught, negative-entry reduction, deterministic challenge derivation, a
-fail-closed shape mismatch, and a $16{\times}24\cdot 24{\times}16$ product where
-flipping one deep entry off-by-one is still caught --- the sparse-cheat case that
-motivates challenging every layer.
+fail-closed shape mismatch, a $16{\times}24\cdot 24{\times}16$ product where
+flipping one deep entry off-by-one is still caught (the sparse-cheat case that
+motivates challenging every layer), and a \emph{cross-language golden-parity}
+test: \code{derive\_challenges\_keccak} is asserted against a pinned hex value the
+Go verifier (\code{crypto/poi}) emits and asserts in turn, so a Rust-emitted
+challenge is guaranteed to reproduce on the chain side. The Go mirror carries 22
+test functions across its \code{freivalds}, \code{wire}, \code{transcript},
+\code{scale}, and \code{adversarial} suites.
 
 \paragraph{The challenge must come after the commitment.}
 Soundness in Theorem~\ref{thm:freivalds} assumes $r$ is unpredictable to the
 prover. If the prover knew $r$ in advance it could craft $A,B,C$ with
 $D\,r = 0$ yet $C\neq A\cdot B$. The production derivation therefore draws the
 seed from an on-chain beacon \emph{after} the prover has committed
-(\S\ref{sec:mmr}); \code{derive\_challenges} is the reproducible expansion both
-sides apply to that seed. The unit tests use a \code{splitmix64} stream for the
+(\S\ref{sec:mmr}); \code{derive\_challenges\_keccak} is the reproducible expansion
+both sides apply to that seed, computing for each $(j,i)$ the field element
+$\keccak(\text{seed}\,\|\,\mathrm{BE}_{32}(j)\,\|\,\mathrm{BE}_{64}(i))[0{:}8]
+\bmod p$. The unit tests additionally exercise a \code{splitmix64} stream for the
 same reproducibility --- identical soundness, only the unpredictability source
 differs.
 
@@ -266,11 +333,11 @@ A network that wants to pay for embeddings, inference, training, or raw compute
 does not need four verifiers --- it needs one, parameterized by
 \code{workloadType}.
 
-\paragraph{Settlement: closed-form expert weights from PoAI (folded from the
-prior fragment).} Once work is \emph{verified}, it can be \emph{weighted}. For
-each expert (operator) $m$, let $q_m \in [0,1]$ be the Bayesian reliability
-estimated from its historical attestations. Under a product-of-experts
-combination the optimal mixing weight is closed-form,
+\paragraph{Settlement: closed-form expert weights from PoAI.}
+Once work is \emph{verified}, it can be \emph{weighted}. For each expert
+(operator) $m$, let $q_m \in [0,1]$ be the Bayesian reliability estimated from its
+historical attestations. Under a product-of-experts combination the optimal
+mixing weight is closed-form,
 \begin{equation}\label{eq:poai-weights}
   \eta_m \;\propto\; \frac{q_m}{1 - q_m},
 \end{equation}
@@ -286,6 +353,60 @@ that make Eq.~\eqref{eq:poai-weights} trustworthy: a weight derived from
 \emph{verified} work, not from self-reported agreement.
 
 % ============================================================================
+\section{From matmuls to a graph: typed composition}
+\label{sec:graph}
+
+Theorem~\ref{thm:freivalds} secures one matmul. A forward pass is many matmuls
+glued by non-matmul operations (residual adds, activations, integer rescales, MoE
+routing). A prover could commit \emph{correct} matmuls computed on \emph{unrelated}
+inputs --- a valid-looking transcript that is not a real forward pass on the actual
+prompt. PoAI closes this with a typed computation trace (the
+\code{poi\_graph} module, nine tests), lifting per-op soundness to whole-graph
+soundness.
+
+\begin{definition}[Graph trace]
+A \emph{graph trace} is a finite sequence of typed operations
+$o_1,\dots,o_L$ over hash-identified activations. Each $o_\ell$ commits the tuple
+$\big(\text{kind}\,\|\,\text{input commitments}\,\|\,\text{params}\,\|\,
+\text{output commitment}\big)$, where every commitment is a \keccak{} digest of
+the exact-integer activation tensor (with domain separation \code{DOM\_ACT} for
+activations and \code{DOM\_OP} for op leaves).
+\end{definition}
+
+Two checks compose. A trace is \emph{well-formed} (chaining) if every op's input
+commitment is the output commitment of a prior op or the trace's declared input; a
+break --- an op reading an activation no prior op produced --- is visible from the
+committed leaves alone. A trace is \emph{locally correct} if, when opened, each op
+recomputes its output from its inputs (a \code{MatMul} via Freivalds; a
+deterministic glue op --- residual add, activation, integer scale, MoE top-$k$
+route, expert gather, weighted combine --- by direct exact recomputation) and the
+result's commitment equals the committed output.
+
+\begin{theorem}[Graph soundness]
+\label{thm:graph}
+If a graph trace is well-formed and every op is locally correct, then the
+committed final output equals the deterministic forward pass applied to the
+committed input.
+\end{theorem}
+
+\begin{proof}
+Induct over a topological order of the ops. Base: the declared input commitment is
+the true input by definition. Step: consider $o_\ell$ in order. By well-formedness
+each of its input commitments is either the declared input or the output
+commitment of some $o_{j}$, $j<\ell$; by the inductive hypothesis those equal the
+true intermediate values of the deterministic forward pass. By local correctness
+$o_\ell$'s committed output is the exact function of its committed inputs that the
+op computes. Hence $o_\ell$'s committed output equals the true value of the
+forward pass at that node. Taking $\ell = L$ gives the claim. Everything is exact
+integer, so equality of commitments is equality of values with zero false-reject.
+\end{proof}
+
+The practical payoff: attention's $QK^\top/AV$ and a full MoE block (router
+$\to$ top-$k$ $\to$ gather $\to$ expert matmuls $\to$ combine) are expressible in
+the trace with \emph{no} floating-point reduction, so the glue is exactly
+recomputable and the only probabilistic step is Freivalds on the GEMMs.
+
+% ============================================================================
 \section{Determinism is the load-bearing property}
 \label{sec:determinism}
 
@@ -294,7 +415,7 @@ same model on the same input could produce different outputs, there would be no
 canonical $C$ to commit to, and an honest prover could be false-rejected. Exact
 verification is therefore \emph{impossible} without bit-level determinism. Two
 sources of nondeterminism are silently present in ordinary inference, and both
-are closed in the shipped engine (\code{hanzoai/engine} v1.2.5).
+are closed in the shipped engine.
 
 \begin{enumerate}[leftmargin=1.6em]
   \item \textbf{Argmax ties.} Greedy decode takes $\arg\max$ over logits; when
@@ -394,7 +515,11 @@ and the attested result commits to that challenge:
 \end{multline*}
 The chain consumes \code{reportData}; because it folds in the challenge (which
 already folds in \code{taskId}, \code{intentID}, and \code{openBlockHash}), a
-transcript is task-scoped and cannot be reused.
+transcript is task-scoped and cannot be reused. This \code{reportData} is
+recomputed on-chain from the receipt's own merkle-proven fields by
+\code{ComputeProofLib.expectedReportData} and re-checked by the verifier in
+\code{AICoinMiner.mine} (\S\ref{sec:hmm-poai}), so the binding is enforced at the
+mint, not merely asserted in prose.
 
 \paragraph{\code{modelSpecHash} is measured, not labelled.} The model identity
 is a \keccak{} Merkle root over the \emph{quantized weight bytes the engine
@@ -471,70 +596,60 @@ operations. The unsoundness of naive fp-Freivalds comes entirely from
 \emph{unpinned} order, not from floating point being inherently fuzzy.
 \end{remark}
 
-% ============================================================================
-\section{Coverage across the zen architecture families}
-\label{sec:coverage}
-
-The matmul primitive plus two extensions covers the entire zen model zoo. The
-two extensions are a \emph{routing proof} (for sparse/MoE models) and
-\emph{sequential state-chaining} (for recurrent and multi-step models); every
-other family is base Freivalds plus a deterministic input commitment.
-
-\begin{table}[H]
-\centering
-\caption{Architecture-family coverage. ``Beyond base'' marks the two extensions
-over plain dense-matmul Freivalds.}
-\label{tab:coverage}
-\begin{tabular}{p{3.4cm} p{6.2cm} p{2.4cm}}
-\toprule
-\textbf{Family} & \textbf{How PoAI verifies it} & \textbf{Beyond base} \\
-\midrule
-Dense transformer &
-  Freivalds on every layer's GEMMs; activation-trace MMR. &
-  --- \\
-\addlinespace
-Mixture-of-Experts &
-  Commit router logits + selected expert indices per token; verify the
-  \emph{canonical} top-$k$ chose the same experts, then Freivalds the selected
-  experts' GEMMs only (sparse). &
-  routing proof \\
-\addlinespace
-Linear-recurrent / SSM / Gated DeltaNet &
-  Per-step Freivalds, with consecutive states bound in the commitment (step
-  $t$'s output is step $t{+}1$'s input). &
-  state-chaining \\
-\addlinespace
-Multimodal (ViT + audio) &
-  Vision/audio towers are GEMMs $\to$ Freivalds; commit the preprocessed input
-  by hash; pin preprocessing (resize/normalize; FFT$\to$mel is
-  commit-and-recompute). &
-  input commitment \\
-\addlinespace
-Diffusion / Transfusion &
-  Multi-step: per-step Freivalds plus binding consecutive latents in the
-  commitment, exactly the recurrent chaining payoff reused. &
-  state-chaining \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-One primitive, two extensions, full coverage --- the recurrent state-chaining
-mechanism serves both linear-recurrent models and diffusion, so there is no
-separate diffusion verifier.
+\paragraph{Coverage across the zen families.} The matmul primitive plus two
+extensions --- a \emph{routing proof} (commit router logits and selected expert
+indices, verify the canonical top-$k$ chose the same experts, then Freivalds the
+selected experts only) and \emph{sequential state-chaining} (bind step $t$'s
+output to step $t{+}1$'s input in the commitment) --- covers dense transformers,
+Mixture-of-Experts, linear-recurrent/SSM/Gated-DeltaNet, multimodal ViT+audio
+towers, and diffusion/Transfusion. The recurrent chaining serves both linear
+recurrence and diffusion, so there is no separate diffusion verifier: one
+primitive, two extensions, full coverage.
 
 % ============================================================================
-\section{Ownership: whose data, whose compute}
-\label{sec:ownership}
+\section{Post-quantum by construction}
+\label{sec:pq}
 
-PoAI is the technical substrate for an ownership model. Users own their data and
-own the AI they run --- the proof lets them prove a computation was performed
-without surrendering control of the model or the inputs to a trusted middleman.
-Compute is \emph{selectable}: a user may have a trusted DAO node perform the work
-(convenient, with the proof guaranteeing they were not short-changed) or run a
-user-operated node themselves (sovereign, with the same proof format settling on
-the same chain). The verification is identical in both cases; what differs is
-only who holds the keys to the executing node. The proof, not the operator's
-reputation, is what gets minted against.
+PoAI's soundness does not rest on any computational hardness assumption, so it
+does not degrade under a quantum adversary.
+
+\begin{proposition}[Information-theoretic soundness]
+\label{prop:itsound}
+Conditioned on the challenge $r$ being drawn uniformly and independently of the
+prover's committed $(A,B,C)$, the bound $\Pr_r[\,A(Br)=Cr \mid C\neq AB\,]\le 1/p$
+of Theorem~\ref{thm:freivalds} holds against a computationally unbounded prover.
+\end{proposition}
+
+\begin{proof}
+The proof of Theorem~\ref{thm:freivalds} is a counting argument over the finite
+set $\Fp^{\,n}$: the bad event is confinement of $r$ to a fixed hyperplane, of
+density $1/p$, regardless of the prover's running time. No problem is assumed
+hard.
+\end{proof}
+
+The only cryptographic ingredient is the commitment/transcript hash. We instantiate
+it with \keccak{} (modelled as a random oracle for the domain-separated inputs of
+\S\ref{sec:mmr}--\ref{sec:binding}); its collision and preimage resistance against
+a quantum adversary degrade only by the generic Grover/BHT factors
+($2^{128}$ preimage, $2^{85}$ collision at a 256-bit output), which is why the
+transcript binds at a 256-bit width. The unpredictability of $r$ comes from an
+on-chain beacon, not from a trapdoor. Consequently the part of the system an
+attacker would target with a quantum computer --- forging a proof of work never
+done --- is governed by Proposition~\ref{prop:itsound}, which a quantum computer
+does not help with.
+
+\paragraph{Post-quantum at the signing and key-exchange layers.} Where the
+surrounding protocol does use public-key cryptography --- authenticating operators,
+sealing prompts, carrying attestations across chains --- it uses post-quantum
+primitives, so the \emph{envelope} matches the information-theoretic \emph{core}:
+ML-DSA (FIPS~204, parameter sets 44/65/87) and SLH-DSA (FIPS~205) for signatures
+exposed as precompiles; an X-Wing hybrid KEM (X25519 + ML-KEM-768) for prompt
+sealing, implemented as a pure-Go HPKE library rather than a precompile; the P3Q
+verifier precompile at slot \code{0x012205}; and \code{luxfi/warp} carrying an
+\code{MLDSACertSet} so cross-chain attestations are quantum-safe end to end. The
+network's security claim is thus uniform: \emph{public, leaderless, decentralized,
+operator-safe, and nation-state-proof}, with no classical-only link in the chain
+from execution to settlement.
 
 % ============================================================================
 \section{Implementation status}
@@ -552,33 +667,37 @@ the spec is merged but no running model emits it yet.}
 \toprule
 \textbf{Component} & \textbf{Where} & \textbf{State} \\
 \midrule
-Go Freivalds verifier (chain-consumed) &
-  \code{luxfi/crypto/poi} v1.19.23 &
-  Proven + tested (canonical mirror) \\
-\addlinespace
 Rust Freivalds core (prover mirror) &
-  \code{hanzo-engine/src/poi.rs} v1.2.5 &
-  Proven + tested (8 tests green) \\
+  \code{hanzo-engine/src/poi.rs} &
+  Proven + tested (7 tests green) \\
+\addlinespace
+Typed graph composition &
+  \code{poi\_graph.rs}, \code{poi\_transcript.rs} &
+  Proven + tested (9 + 8 tests; Thm.~\ref{thm:graph}) \\
+\addlinespace
+Go Freivalds verifier (chain-consumed) &
+  \code{luxfi/crypto/poi} &
+  Proven + tested (22 test funcs; golden parity) \\
 \addlinespace
 Determinism prerequisites &
-  \code{hanzoai/engine} v1.2.5 &
+  \code{hanzoai/engine} &
   Shipped (lowest-id argmax; canonical MoE top-$k$) \\
 \addlinespace
 No-proof-no-mint enforcement &
-  \code{luxdao/contracts} v2.1.0 &
-  Enforced (230/230 forge tests) \\
+  \code{AICoinMiner.sol} &
+  Enforced (fail-closed; 12 forge tests) \\
 \addlinespace
-Soundness companion &
-  \code{zooai/proofs} &
-  Written (tolerance-vs-exact analysis) \\
+Bonded supply / slashing &
+  \code{MinerStakeRegistry.sol} &
+  Enforced (8 forge tests) \\
 \addlinespace
-Prover-side core in node binaries &
-  \code{hanzod} 1.1.20 (embeds engine) &
-  Available via path-dep on \code{hanzo-engine} v1.2.5 \\
+Network-wide no-double-mint &
+  \code{AIComputeRegistry.sol} &
+  Enforced (6 forge tests) \\
 \addlinespace
-Verifier in Go node binaries &
-  \code{luxd}, \code{zood} &
-  \code{crypto/poi} v1.19.23 builds in-module (\code{zood} graph-sync pending) \\
+Capped halving emission &
+  \code{AICoin.sol} &
+  Enforced (11 forge tests) \\
 \addlinespace
 End-to-end proof \emph{emission} from a running zen model &
   forward-pass commitment slice &
@@ -587,36 +706,707 @@ End-to-end proof \emph{emission} from a running zen model &
 \end{tabular}
 \end{table}
 
-To be unambiguous: the verification core is \textbf{proven and tested} in both
-Rust (the engine prover mirror) and Go (the chain verifier), the determinism
-prerequisites are shipped, and the chain \textbf{enforces} that no mint occurs
-without a proof. What is \emph{not} yet live is the end-to-end emission: threading
-the \code{ActivationTraceMMR} and the per-layer commit hooks through the engine's
-forward pass so that a real zen model (e.g. an \code{int8} MoE) produces a
-transcript that a challenger opens and verifies. That slice is designed and its
-wire constants are merged, but no running model emits a proof today. The first
-true ``live'' is a green end-to-end test in which an honest int8 zen inference
-emits a transcript, a beacon-derived layer is challenged, the open verifies ---
-and a faked, cheap-model, or mis-routed run is caught. That is the next slice,
-not a present claim.
+To be unambiguous: the verification core and the typed graph composition are
+\textbf{proven and tested} in both Rust (the engine prover mirror) and Go (the
+chain verifier), the determinism prerequisites are shipped, and the chain
+\textbf{enforces} that no mint occurs without a proof. What is \emph{not} yet live
+is the end-to-end emission: threading the \code{ActivationTraceMMR} and the
+per-layer commit hooks through the engine's forward pass so that a real zen model
+(e.g. an \code{int8} MoE) produces a transcript that a challenger opens and
+verifies. That slice is designed and its wire constants are merged, but no running
+model emits a proof today. The first true ``live'' is a green end-to-end test in
+which an honest int8 zen inference emits a transcript, a beacon-derived layer is
+challenged, the open verifies --- and a faked, cheap-model, or mis-routed run is
+caught. That is the next slice, not a present claim.
+
+\begin{center}\rule{0.5\linewidth}{0.4pt}\\[-0.2em]\textsc{Part II --- The Price}\end{center}
+
+% ============================================================================
+\section{The market for verified compute}
+\label{sec:hmm-intro}
+
+Part~I makes a \emph{proven-compute unit} (PCU) a well-defined good: one unit of AI
+work that has been Freivalds-verified, bound to a measured model and input, and
+not double-claimed. Part~II prices it. We want a market maker --- an always-on
+counterparty that quotes a price for PCUs against AICoin --- with four properties:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{No oracle.} The price is endogenous, a function of the maker's own
+        state, not of an external feed (which would reintroduce a trusted party).
+  \item \textbf{Path independence.} The cost of acquiring or releasing inventory
+        depends only on the start and end states, not on the order or
+        fragmentation of the trades; otherwise the maker leaks value to order
+        manipulation.
+  \item \textbf{Bounded subsidy.} Like Hanson's Logarithmic Market Scoring Rule
+        (LMSR), the maker may run at a loss to bootstrap a thin market, but that
+        loss is bounded by a constant the maker chooses in advance.
+  \item \textbf{Supply coupling.} The price must rise with the supply of
+        \emph{verified} compute and be insensitive to unverified claims --- the
+        link to PoAI.
+\end{enumerate}
+
+We obtain all four from a single structural choice: the market's price one-form is
+\emph{exact}, i.e. it is the differential of a scalar potential we call the
+Hamiltonian. This is the abstraction that contains LMSR and constant-function AMMs
+as special cases and that yields the bounds above as theorems rather than
+parameters.
+
+% ============================================================================
+\section{The Hamiltonian formulation}
+\label{sec:hmm-formulation}
+
+\subsection{State, potential, price}
+
+We begin scalar; \S\ref{sec:hmm-multi} lifts to a vector of heterogeneous compute
+classes. The market state is a point $(q,p)$ in phase space
+$\Gamma = \R \times \Rpos$, where $q\in\R$ is the maker's net inventory of PCUs
+(positive: the maker has sold PCUs into the market and holds the AICoin; we let
+$q$ range over $\R$ so the maker can be long or short) and $p\in\Rpos$ is the
+marginal AICoin price of one PCU. We equip $\Gamma$ with the canonical symplectic
+form $\omega = \dd p \wedge \dd q$ and the Poisson bracket
+\begin{equation}
+\{F,G\} \;=\; \frac{\partial F}{\partial q}\frac{\partial G}{\partial p}
+            - \frac{\partial F}{\partial p}\frac{\partial G}{\partial q}.
+\label{eq:bracket}
+\end{equation}
+
+The maker is specified by a single object: a \emph{cost potential}.
+
+\begin{definition}[Cost potential]
+\label{def:cost}
+A \emph{cost potential} is a function $C:\R\to\R$ that is $C^2$, strictly convex
+($C''(q)>0$ for all $q$), with $C(0)=0$, and superlinear
+($C(q)/|q|\to\infty$ as $|q|\to\infty$, so the price range $C'(\R)$ is all of $\R$
+and the conjugate below is finite everywhere with $(\Cstar)'=(C')^{-1}$). The
+\emph{marginal price} the maker quotes at inventory $q$ is
+\begin{equation}
+p(q) \;=\; C'(q),
+\label{eq:price}
+\end{equation}
+and the \emph{cash a trader pays} to move the maker's inventory from $q_0$ to $q_1$
+is the path integral of the price one-form,
+\begin{equation}
+\mathrm{Cost}(q_0\!\to q_1) \;=\; \int_{q_0}^{q_1} p\,\dd q
+   \;=\; C(q_1) - C(q_0).
+\label{eq:cost}
+\end{equation}
+\end{definition}
+
+Strict convexity makes $p(q)=C'(q)$ strictly increasing, hence invertible; write
+its inverse (the \emph{inventory at price $p$}) as $q(p) = (C')^{-1}(p)$.
+Buying PCUs from the maker decreases the maker's inventory and (since $C''>0$)
+\emph{raises} the marginal price; selling does the reverse. This is the AMM
+slippage law, here derived from convexity.
+
+\subsection{The Hamiltonian and the equations of motion}
+
+The conserved quantity --- the ``energy'' invariant along a trade --- is the maker's
+\emph{bonded value}: the AICoin it must escrow to back its quotes. We define it as
+the Legendre (convex) conjugate of the cost potential.
+
+\begin{definition}[HMM Hamiltonian]
+\label{def:ham}
+Let $C$ be a cost potential with conjugate
+$\Cstar(p) = \sup_{q\in\R}\{pq - C(q)\}$. The \emph{Hamiltonian} is the bonded
+value as a function of state,
+\begin{equation}
+H(q,p) \;=\; p\,q - C(q).
+\label{eq:ham}
+\end{equation}
+\end{definition}
+
+On the \emph{quote manifold} $\Sigma = \{(q,p): p = C'(q)\}$ --- the states the
+maker actually occupies --- the supremum in the conjugate is attained at the
+operating $q$, so $H$ restricted to $\Sigma$ equals the conjugate evaluated at the
+quoted price:
+\begin{equation}
+H\big(q, C'(q)\big) \;=\; C'(q)\,q - C(q) \;=\; \Cstar\big(C'(q)\big),
+\qquad q(p) = (\Cstar)'(p).
+\label{eq:conj}
+\end{equation}
+The second identity is the standard Legendre relation: the inventory is the
+derivative of the conjugate potential. Equation~\eqref{eq:conj} is the heart of the
+construction --- it is what makes $H$ a clean function of price alone on $\Sigma$.
+
+Two distinct motions live on $\Gamma$, and it is worth separating them cleanly. A
+\emph{trade} is a controlled displacement \emph{along} the quote manifold $\Sigma$:
+the trader names a new inventory and pays the potential difference
+\eqref{eq:cost}; the maker stays on its own curve $p=C'(q)$ throughout, so a trade
+is parametrized by inventory, not by a clock. \emph{Arbitrage relaxation} is the
+off-$\Sigma$ motion that restores the quote when an external price diverges from
+it, and \emph{this} is what the Hamiltonian flow describes. Hamilton's equations
+with respect to \eqref{eq:bracket} are
+\begin{equation}
+\dot q \;=\; \{q,H\} \;=\; \frac{\partial H}{\partial p} \;=\; q,
+\qquad
+\dot p \;=\; \{p,H\} \;=\; -\frac{\partial H}{\partial q}
+          \;=\; -\big(p - C'(q)\big).
+\label{eq:eom}
+\end{equation}
+The $\dot p$ equation is the meaningful one: it is a \emph{restoring force toward
+the quote manifold}. Off $\Sigma$ (where $p\neq C'(q)$) it pushes the price back to
+the quoted value $C'(q)$; on $\Sigma$ the restoring term vanishes and the maker
+rests. (The $\dot q=q$ equation is a parametrization artifact of the bonded-value
+generator and carries no economic content --- inventory is moved by trades along
+$\Sigma$, Eq.~\eqref{eq:cost}, not by this flow time; this is why we never integrate
+$\dot q$ to draw an economic conclusion.) The arbitrage gap
+\begin{equation}
+\Phi(q,p) \;=\; p - C'(q)
+\label{eq:gap}
+\end{equation}
+is therefore the natural ``displacement'' coordinate, with $\Sigma = \{\Phi = 0\}$
+its equilibrium. The invariant of the relaxation that matters is the bonded value
+$H$ itself: along $\Sigma$ it equals the collateral $\Cstar(p)$
+(Eq.~\eqref{eq:conj}), a state function, so no closed trade cycle changes it
+(Thm.~\ref{thm:roundtrip}). We will see that $\Sigma$ is exactly the no-arbitrage
+manifold.
+
+\begin{remark}[Why this $H$, and not a hand-built energy]
+\label{rem:why}
+One could write down many Hamiltonians; only one earns the name here. The bonded
+value $H=pq-C(q)$ is forced by two requirements: (i) its $q$-gradient must vanish
+on the quote manifold (so the maker is at rest exactly when it quotes its own cost
+curve), which forces $\partial_q H = -(p-C'(q))$ and hence $H = pq - C(q) + h(p)$;
+and (ii) on $\Sigma$ it must equal the collateral the maker has to hold, the
+conjugate $\Cstar(p)$, which by \eqref{eq:conj} forces $h\equiv 0$. There is no
+free functional choice left. This is the discipline the earlier ``harmonic
+potential'' formulations lacked: a term added to $H$ for stability that has no
+collateral interpretation also has no conservation theorem behind it.
+\end{remark}
+
+% ============================================================================
+\section{Conservation laws and the four guarantees}
+\label{sec:hmm-conservation}
+
+\subsection{Path independence}
+
+\begin{theorem}[Path independence]
+\label{thm:path}
+For any cost potential $C$, the cash a trader pays to move the maker between two
+inventory levels depends only on the endpoints:
+\begin{equation}
+\mathrm{Cost}(q_0\!\to q_1) \;=\; C(q_1) - C(q_0),
+\end{equation}
+independently of how the move is decomposed into intermediate trades. Equivalently,
+the price one-form $p\,\dd q = C'(q)\,\dd q = \dd C$ is exact.
+\end{theorem}
+
+\begin{proof}
+By Eq.~\eqref{eq:price}, $p\,\dd q = C'(q)\,\dd q = \dd C(q)$, an exact one-form.
+For any partition $q_0 = x_0, x_1, \dots, x_m = q_1$ the total cost telescopes:
+$\sum_{j=1}^m \big(C(x_j)-C(x_{j-1})\big) = C(q_1)-C(q_0)$. Because the integrand
+is a total differential, the line integral \eqref{eq:cost} is independent of the
+intermediate points and of any subdivision.
+\end{proof}
+
+Path independence is the property that defeats trade-splitting and ordering games:
+a trader who breaks one large order into many, or interleaves buys and sells, pays
+exactly what a single net trade would cost. It is the discrete-market analogue of a
+\emph{conservative force field} in mechanics, and it holds for \emph{every} HMM
+because every HMM is built from a potential.
+
+\subsection{Bounded round-trip and no in-curve arbitrage}
+
+\begin{theorem}[Zero-cost round-trip; no arbitrage]
+\label{thm:roundtrip}
+Let the maker charge a proportional fee at rate $\gamma\ge 0$ on the gross cash of
+each trade. Then:
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+  \item With $\gamma=0$, any closed trajectory (one returning the maker to its
+        starting inventory $q_0$) has net trader cost exactly $0$.
+  \item With $\gamma>0$, any closed trajectory that involves at least one trade of
+        nonzero size has net trader cost strictly positive; equivalently, no trader
+        can extract value by a round trip against the curve.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(a) By Theorem~\ref{thm:path} the fee-free cost of $q_0\!\to\cdots\to q_0$ is
+$C(q_0)-C(q_0)=0$; the conservative one-form integrates to zero around any loop.
+(b) The fee on a single trade $x_{j-1}\!\to x_j$ is
+$\gamma\,|C(x_j)-C(x_{j-1})|\ge 0$, and is strictly positive whenever
+$x_j\neq x_{j-1}$ because $C$ is strictly monotone in price and hence injective.
+The net cost of the loop is the fee-free part (zero, by (a)) plus
+$\gamma\sum_j |C(x_j)-C(x_{j-1})| > 0$ as soon as one step is nontrivial.
+\end{proof}
+
+\begin{corollary}[$\Sigma$ is the no-arbitrage manifold]
+\label{cor:noarb}
+A price $p$ admits no instantaneous arbitrage against the maker if and only if
+$p = C'(q)$, i.e. $(q,p)\in\Sigma$ (the gap $\Phi=0$). Off $\Sigma$, buying at the
+quoted $C'(q)<p$ and reselling at $p$ (or the reverse) yields a strictly positive
+profit equal to $|p - C'(q)|$ per unit; on $\Sigma$ that profit is zero.
+\end{corollary}
+
+\begin{proof}
+The marginal price the maker quotes is $C'(q)$ by Eq.~\eqref{eq:price}. If an
+external price $p\neq C'(q)$ exists, the gap $\Phi = p-C'(q)\neq 0$ is exactly the
+per-unit profit of trading with the maker and against the external price; arbitrage
+exists. If $p=C'(q)$ the gap is zero and no costless profit exists. The dynamics
+\eqref{eq:eom} drive $\Phi\to 0$, i.e. arbitrage closes the gap and restores
+$\Sigma$, consistent with the restoring force interpretation.
+\end{proof}
+
+This is the economic content of energy conservation: the Hamiltonian flow has no
+``free energy'' to give away around a cycle, so the only way the maker pays out is
+through deliberate subsidy (next) and the only way a trader profits from a cycle is
+by supplying fees.
+
+\subsection{Bounded market-maker subsidy}
+
+A market maker that quotes a finite price for the first unit of a brand-new market
+necessarily subsidizes price discovery: early trades move inventory cheaply, and if
+the ``true'' price later settles far away the maker realizes a loss. Hanson's LMSR
+famously bounds this loss by a constant. The HMM bounds it by the \emph{range of
+the conjugate potential}, and LMSR's bound falls out as the entropic instance.
+
+\begin{theorem}[Bounded subsidy]
+\label{thm:bounded-loss}
+Suppose the market opens at inventory $q_0$ with $C(q_0)=0$ (the maker has taken in
+no cash yet) and that admissible inventories are confined to a set
+$\mathcal{Q}\subseteq\R$ on which $C$ is bounded below by $C_{\min} =
+\inf_{q\in\mathcal{Q}} C(q)$. Then over \emph{any} sequence of trades that ends at
+some terminal inventory $q_T\in\mathcal{Q}$, the maker's net payout (cash out minus
+cash in) is at most
+\begin{equation}
+\mathrm{Subsidy} \;=\; C(q_0) - C(q_T) \;\le\; -\,C_{\min} \;=\; C(q_0) - C_{\min}.
+\label{eq:subsidy}
+\end{equation}
+In particular the worst-case subsidy is the constant $C(q_0)-C_{\min}$, independent
+of the path and of the number of trades.
+\end{theorem}
+
+\begin{proof}
+By Theorem~\ref{thm:path} the total cash the maker has \emph{received} from traders
+between open and close is $C(q_T)-C(q_0)$ (negative when it has paid out on net).
+The maker's net payout is the negative of its receipts, $C(q_0)-C(q_T)$. Since
+$q_T\in\mathcal{Q}$, $C(q_T)\ge C_{\min}$, hence
+$C(q_0)-C(q_T)\le C(q_0)-C_{\min}$. With $C(q_0)=0$ this is $-C_{\min}$. The bound
+references only endpoints, so it is path- and count-independent.
+\end{proof}
+
+\begin{corollary}[LMSR is the entropic HMM, with subsidy $b\ln N$]
+\label{cor:lmsr}
+Let the market have $N$ exclusive outcomes with inventory vector
+$\bm{q}\in\R^N$ and take the entropic cost potential (the log-partition function)
+\begin{equation}
+C(\bm{q}) \;=\; b\,\ln\!\sum_{i=1}^N e^{q_i/b}, \qquad b>0,
+\label{eq:lmsr}
+\end{equation}
+whose gradient $p_i = \partial C/\partial q_i = e^{q_i/b}/\sum_j e^{q_j/b}$ is the
+LMSR price (a probability on the simplex). Open at $\bm{q}_0=\bm 0$, so
+$C(\bm{q}_0)=b\ln N$. At resolution to outcome $i^\star$ the maker pays out
+$q_{i^\star}\le\max_i q_i$ per share held against the cash $C(\bm q)-C(\bm 0)$ it
+took in. Then the maker's worst-case net loss is the constant
+\begin{equation}
+\mathrm{Subsidy}_{\max}
+   \;=\; \sup_{\bm q}\Big(\max_i q_i - \big(C(\bm q)-C(\bm 0)\big)\Big)
+   \;=\; b\ln N,
+\end{equation}
+recovering Hanson's bound exactly.
+\end{corollary}
+
+\begin{proof}
+$C(\bm 0)=b\ln\sum_i e^0 = b\ln N$. The maker's net loss at state $\bm q$ is the
+payout minus the receipts, $\max_i q_i - \big(C(\bm q)-C(\bm 0)\big)$. Since
+$C(\bm q)=b\ln\sum_i e^{q_i/b}\ge b\ln e^{\max_i q_i/b}=\max_i q_i$, we have
+$\max_i q_i - C(\bm q)\le 0$, with the bound approached ($\to 0$) as one coordinate
+dominates. Hence the supremum of the net loss equals $C(\bm 0)=b\ln N$. This is the
+standard LMSR worst-case-loss computation, here read off the general HMM bound
+\eqref{eq:subsidy}: $C(\bm 0)=b\ln N$ is the open value and $\sup(\max_i q_i - C)=0$
+plays the role of $-C_{\min}$.
+\end{proof}
+
+Corollary~\ref{cor:lmsr} is the payoff of putting LMSR inside the Hamiltonian
+frame: its celebrated bounded loss is not special to the logarithm, it is the
+general HMM subsidy bound \eqref{eq:subsidy} instantiated at the entropic potential.
+A compute market chooses the liquidity parameter $b$ (or, in the scalar compute
+case, the curvature of $C$) to trade off depth against the constant subsidy it is
+willing to spend to bootstrap price discovery.
+
+\subsection{The monotone price--supply law (the PoAI coupling)}
+
+\begin{theorem}[Monotone price--supply law]
+\label{thm:monotone}
+Let $s\ge 0$ denote the cumulative supply of \emph{verified} PCUs the maker has
+absorbed (each a distinct, Freivalds-verified, non-double-claimed unit; see
+\S\ref{sec:hmm-poai}), and let inventory track supply, $q = q_0 - s$ (absorbing
+supply lowers the maker's net short position). Then the quoted price
+$p(s) = C'(q_0 - s)$ is strictly decreasing in $s$ on the buy side and, dually, the
+price a \emph{consumer} pays per PCU is strictly increasing in demand pressure; in
+both cases the sensitivity is governed by the curvature:
+\begin{equation}
+\frac{\dd p}{\dd s} \;=\; -\,C''(q_0 - s) \;<\; 0,
+\qquad
+\Big|\frac{\dd p}{\dd s}\Big| \;=\; C''(q) \;>\; 0.
+\label{eq:supplylaw}
+\end{equation}
+Consequently the price moves \emph{only} in response to changes in \emph{verified}
+supply: an unverified claim never reaches $q$ (it is rejected before the inventory
+update, \S\ref{sec:hmm-poai}), so $\dd p/\dd s = 0$ along it.
+\end{theorem}
+
+\begin{proof}
+$p(s)=C'(q_0-s)$; differentiate, $\dd p/\dd s = -C''(q_0-s)<0$ by strict
+convexity, with magnitude $C''(q)$. The second clause is structural rather than
+analytic: the inventory update $q\mapsto q-1$ that drives the price is executed by
+the mint path \emph{only after} the PoAI compute proof and the no-double-mint claim
+succeed (Eq.~\eqref{eq:mintgate} below), so a claim that fails verification leaves
+$q$, and hence $p$, unchanged: $\dd p/\dd s\big|_{\text{unverified}}=0$.
+\end{proof}
+
+Theorem~\ref{thm:monotone} is the formal statement of ``the market prices
+\emph{verified} useful work, not raw tokens.'' The curvature $C''$ is the single
+knob: large $C''$ means a deep, slow-moving price (much verified supply needed to
+move it); small $C''$ means a shallow, responsive price.
+
+\subsection{Slippage is convex}
+
+\begin{proposition}[Convex slippage / quote-width]
+\label{prop:slippage}
+The average price paid for a block trade of size $\delta$ starting at inventory
+$q$,
+\begin{equation}
+\bar p(q,\delta) \;=\; \frac{C(q+\delta)-C(q)}{\delta},
+\end{equation}
+is increasing in $\delta$ for $\delta>0$, and
+$\bar p(q,\delta)\to C'(q)$ as $\delta\to 0$. The realized slippage
+$\bar p(q,\delta)-C'(q)$ is nonnegative and convex in $\delta$.
+\end{proposition}
+
+\begin{proof}
+$\bar p$ is the average of $C'$ over $[q,q+\delta]$; since $C'$ is increasing
+(strict convexity of $C$), this average increases with $\delta$ and tends to the
+left endpoint value $C'(q)$ as $\delta\to0$. Slippage
+$\bar p - C'(q) = \tfrac1\delta\int_q^{q+\delta}(C'(u)-C'(q))\,\dd u\ge 0$;
+its convexity in $\delta$ follows from $C'$ increasing (the second difference of
+$C$ is nonnegative).
+\end{proof}
+
+This is the standard depth guarantee: large trades pay strictly more per unit, by
+an amount the maker controls through $C''$, and the marginal quote is recovered in
+the small-trade limit.
+
+% ============================================================================
+\section{LMSR and Uniswap are two potentials of one framework}
+\label{sec:hmm-unify}
+
+The Hamiltonian frame is not a new market maker bolted next to the known ones; it
+is the genus of which they are species. A market maker is an HMM precisely when its
+price one-form is exact --- when it has a potential. We make the two canonical cases
+explicit.
+
+\paragraph{LMSR (Hanson): the entropic potential.} Take
+$C(\bm q)=b\ln\sum_i e^{q_i/b}$ (Eq.~\eqref{eq:lmsr}). The price is the softmax,
+$p_i = \mathrm{softmax}(\bm q/b)_i$, a point on the probability simplex; the
+Hamiltonian $H=\inner{\bm p}{\bm q}-C(\bm q)$ restricted to the quote manifold is
+the negative Shannon entropy scaled by $b$ (the conjugate of log-sum-exp is the
+negative entropy on the simplex). Bounded subsidy $b\ln N$ is
+Corollary~\ref{cor:lmsr}. This is the right maker for an \emph{outcome} market ---
+which model wins, which answer is correct --- where prices must be a probability
+distribution.
+
+\paragraph{Uniswap (constant function): the logarithmic-reserve potential.} A
+constant-function market maker holds reserves $(x,y)\in\Rpos^2$ and keeps an
+invariant $\varphi(x,y)=\kappa$ fixed across every trade. For Uniswap,
+$\varphi(x,y)=x\,y$, so $H_{\mathrm{cf}}(x,y) = x\,y = \kappa$ is \emph{literally}
+the conserved Hamiltonian --- the constant-function invariant \emph{is} an energy.
+The marginal price of $x$ in units of $y$ along the curve is
+$p = -\dd y/\dd x = y/x$ (differentiate $xy=\kappa$). One can recover these quotes
+from a scalar generator: parametrizing by $u=\ln x$ and setting
+$g(u) = -\kappa e^{-u} = -y$ gives $g'(u)=\kappa e^{-u}=y$, so the quoted price is
+$g'(u)/x = y/x$. We call $x\cdot y=k$ a \emph{degenerate} conserved quantity for two
+reasons. First, the generator $g$ is concave rather than strictly convex, so it is
+not a cost potential in the sense of Definition~\ref{def:cost}; the
+constant-function maker conserves the invariant $\varphi=xy$ directly, and it is
+this invariant (not a convex cost) that plays the Hamiltonian role. Second, unlike
+LMSR's potential, the constant-product invariant is a single hypersurface with no
+liquidity parameter $b$ separating depth from subsidy --- depth and price-impact are
+locked together by $\kappa$ alone. The shared structure that makes both HMMs is
+still the same: the price one-form is exact (here $p\,\dd x = -\dd y$ along
+$\varphi=\kappa$). This is the right maker for a \emph{fungible-pair} market with
+two-sided reserves.
+
+\begin{table}[H]
+\centering
+\caption{Two market makers as two potentials in the one Hamiltonian frame. ``Exact
+one-form'' is the defining property; the rest follow from \S\ref{sec:hmm-conservation}.}
+\label{tab:unify}
+\begin{tabular}{p{2.5cm} p{3.5cm} p{3.5cm}}
+\toprule
+ & \textbf{LMSR (Hanson)} & \textbf{Uniswap (CFMM)} \\
+\midrule
+Potential $C$        & $b\ln\sum_i e^{q_i/b}$ (entropic) & $-\kappa e^{-u}$, $u=\ln x$ (log-reserve) \\
+\addlinespace
+Conserved $H$        & $-b\cdot$entropy on $\Sigma$ & $x\,y=\kappa$ (the invariant itself) \\
+\addlinespace
+Price                & softmax $\in$ simplex & $y/x$ \\
+\addlinespace
+Liquidity knob       & $b$ (separates depth / subsidy) & $\kappa$ only (depth $\equiv$ price-impact) \\
+\addlinespace
+Bounded subsidy      & $b\ln N$ (Cor.~\ref{cor:lmsr}) & divergence loss $2\sqrt r/(1{+}r)-1$ \\
+\addlinespace
+Natural market       & exclusive outcomes & fungible pair \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{proposition}[Constant-function divergence-loss bound]
+\label{prop:uniloss}
+For the Uniswap potential, an LP whose position experiences a price ratio
+$r = p_1/p_0$ between deposit and withdrawal suffers value ratio
+\begin{equation}
+\frac{V_{\text{pool}}}{V_{\text{hold}}} \;=\; \frac{2\sqrt r}{1+r} \;\le\; 1,
+\end{equation}
+with equality iff $r=1$; the loss $1 - 2\sqrt r/(1+r)$ is the constant-function
+analogue of the bounded subsidy and is itself bounded on any bounded price range.
+\end{proposition}
+
+\begin{proof}
+Along $xy=\kappa$ with price $p=y/x$ we have $x=\sqrt{\kappa/p}$ and
+$y=\sqrt{\kappa p}$. The pool value (in the numéraire $y$) is
+$V_{\text{pool}}=p\,x+y = \sqrt{\kappa p}+\sqrt{\kappa p}=2\sqrt{\kappa p}
+= 2\sqrt{\kappa p_0}\,\sqrt r$, using $p=r p_0$. Holding the initial basket
+$(x_0,y_0)=(\sqrt{\kappa/p_0},\sqrt{\kappa p_0})$ gives
+$V_{\text{hold}} = p\,x_0+y_0 = r p_0\sqrt{\kappa/p_0}+\sqrt{\kappa p_0}
+= \sqrt{\kappa p_0}\,(r+1)$. Hence
+$V_{\text{pool}}/V_{\text{hold}} = 2\sqrt r/(1+r)$. By AM--GM $1+r\ge 2\sqrt r$, so
+the ratio is $\le 1$ with equality iff $r=1$.
+\end{proof}
+
+The unification is the point: \emph{path independence, no-arbitrage, and a bounded
+maker loss are not features one bolts onto a market maker; they are automatic
+consequences of the price one-form being exact.} LMSR and Uniswap are the two
+potentials practitioners already use; the HMM names the structure they share and
+lets a compute market choose a potential fit to its own good --- which for PCUs is a
+strictly convex scalar (or weighted multi-asset) $C$ with a tunable curvature.
+
+% ============================================================================
+\section{Multi-asset HMM over heterogeneous compute}
+\label{sec:hmm-multi}
+
+Compute is not one good. A PCU on an H100 at \code{int8}, a PCU on consumer
+silicon at \code{fp16}, a long-context decode, and a training step are different
+resources with different scarcity. We lift the scalar HMM to a vector of $n$
+compute classes with a \emph{separable weighted} potential, which keeps every
+theorem of \S\ref{sec:hmm-conservation} and adds cross-class structure only where
+wanted.
+
+\begin{definition}[Weighted multi-asset HMM]
+\label{def:multi}
+Let $\bm q=(q_1,\dots,q_n)\in\R^n$ be inventories of $n$ compute classes with
+weights $\bm w$, $w_i>0$, $\sum_i w_i=1$, and per-class strictly-convex potentials
+$c_i$. The pool potential is
+\begin{equation}
+C(\bm q) \;=\; \sum_{i=1}^n w_i\, c_i(q_i),
+\qquad
+p_i \;=\; \frac{\partial C}{\partial q_i} \;=\; w_i\, c_i'(q_i),
+\label{eq:multic}
+\end{equation}
+and the Hamiltonian is $H(\bm q,\bm p)=\inner{\bm p}{\bm q}-C(\bm q)$ with the
+canonical bracket $\{F,G\}=\sum_i(\partial_{q_i}F\,\partial_{p_i}G -
+\partial_{p_i}F\,\partial_{q_i}G)$.
+\end{definition}
+
+\begin{proposition}[Multi-asset guarantees]
+\label{prop:multi}
+For the weighted multi-asset HMM of Definition~\ref{def:multi}:
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+  \item (Path independence) $\sum_i p_i\,\dd q_i = \dd C$ is exact; the cost of
+        moving $\bm q_0\to\bm q_1$ is $C(\bm q_1)-C(\bm q_0)$, route-independent.
+  \item (No arbitrage) The no-arbitrage manifold is
+        $\{\bm p = \nabla C(\bm q)\}$; off it, the gap $\bm p - \nabla C(\bm q)$ is
+        the per-unit arbitrage profit vector.
+  \item (Bounded subsidy) The worst-case subsidy is
+        $C(\bm q_0)-\inf_{\bm q\in\mathcal Q}C(\bm q)$, the multi-asset form of
+        \eqref{eq:subsidy}.
+  \item (Permutation symmetry / no preferred class) If $w_i=w_j$ and $c_i=c_j$,
+        the potential $C$ is invariant under the inventory swap
+        $\sigma:(q_i,q_j)\mapsto(q_j,q_i)$, so the maker quotes the two classes by
+        the \emph{same} curve: $p_i = p_j$ whenever $q_i=q_j$, and the equal-inventory
+        diagonal $\{q_i=q_j\}$ is invariant under the symmetric two-class flow. No
+        class is systematically cheaper to drain than its identical twin.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+(a)--(c) are the gradient-field versions of Theorems~\ref{thm:path},
+\ref{thm:roundtrip}, and~\ref{thm:bounded-loss}: a separable sum of exact
+one-forms is exact, and the endpoint accounting is unchanged. For (d): with
+$w_i=w_j=:w$ and $c_i=c_j=:c$ the summand $w_i c_i(q_i)+w_j c_j(q_j)
+=w(c(q_i)+c(q_j))$ is symmetric in $(q_i,q_j)$, and the other summands do not
+involve these two coordinates, so $C\circ\sigma=C$. Hence the quoted prices
+$p_i=w\,c'(q_i)$ and $p_j=w\,c'(q_j)$ are the \emph{same} function of the
+respective inventory, giving $p_i=p_j$ exactly when $q_i=q_j$. By Noether's theorem
+the discrete symmetry $\sigma$ maps trajectories to trajectories; in particular the
+fixed-point set $\{q_i=q_j\}$ of $\sigma$ is invariant under the
+$\sigma$-symmetric flow generated by $H$ (a trajectory starting on the diagonal
+maps to itself under $\sigma$ and so cannot leave it). Thus the maker has no
+curve-level bias between identical classes.
+\end{proof}
+
+\begin{remark}[Why not an ``angular momentum'']
+\label{rem:noL}
+One is tempted to claim a conserved $L_{ij}=q_i p_j-q_j p_i$ by analogy with
+rotational symmetry. For the cost-function maker this is \emph{false} in general:
+a direct computation gives $\{L_{ij},H\}=w\,(q_i\,c'(q_j)-q_j\,c'(q_i))$, which
+vanishes only on the diagonal $q_i=q_j$, not identically. We therefore claim only
+the genuine discrete permutation symmetry above. A continuous rotational symmetry
+would require a rotationally invariant $C$ (e.g. $C$ a function of $\lVert\bm
+q\rVert$ alone), which is not the separable potential a heterogeneous compute
+market wants; importing the conserved $L_{ij}$ without that hypothesis is exactly
+the kind of unforced ``physics'' the construction is built to avoid
+(Remark~\ref{rem:why}).
+\end{remark}
+
+\begin{remark}[No spurious dynamics]
+\label{rem:nokinetic}
+We deliberately do \emph{not} add a kinetic term $\frac12\sum_i\mu_i p_i^2$ to
+$H$. Such a term makes ``mass'' nonzero and yields oscillatory price dynamics, but
+those oscillations have no market meaning --- a market maker is not a pendulum, and
+a momentum that carries price past its quote is precisely the value leak
+path-independence is meant to forbid. The clean conservation laws above hold
+because $H$ is the bonded value and nothing else (Remark~\ref{rem:why}). Heterogeneity
+is expressed through the weights $\bm w$ and the per-class curvatures $c_i''$,
+which is where it belongs.
+\end{remark}
+
+% ============================================================================
+\section{Binding the curve to verified supply}
+\label{sec:hmm-poai}
+
+The HMM's guarantees are only as meaningful as the inventory axis $q$. If $q$ could
+be incremented by an unverified claim --- a modal guess --- the maker would price
+fiction. PoAI is precisely what makes each unit of $q$ a distinct, verified,
+non-replayable PCU. Three on-chain mechanisms, all read in
+\S\S\ref{sec:freivalds}--\ref{sec:status}, enforce this, and we state the
+composite mint gate.
+
+\paragraph{(1) Bonded supply: \code{MinerStakeRegistry}.} A miner that supplies
+compute must publicly bond capital in proportion to the capacity it declares. The
+contract holds, for each miner, \code{bonded} wei and \code{capacity} units, and
+exposes the single read the mint path needs:
+\begin{equation}
+\code{eligible}(m) \;\Longleftrightarrow\;
+\neg\code{blacklisted}(m)\ \wedge\ \code{unbondAt}(m)=0\ \wedge\
+\code{bonded}(m)\ \ge\ \max\!\big(\code{minBond},\ \code{capacity}(m)\cdot
+\code{bondPerUnit}\big).
+\label{eq:eligible}
+\end{equation}
+Three authorities are kept orthogonal (one per concern): the \emph{miner} controls
+its own bond with a withdrawal cooldown; the \emph{slasher} --- the compute-proof
+fraud verifier --- slashes the bond on a \emph{proven} discrepancy, no vote; and
+\emph{governance} may blacklist for off-protocol harm. The cooldown is the fraud
+window: a miner cannot dodge a fraud proof by exiting first, because \code{slash}
+works during the cooldown. Economically, the bond is the supply-side honesty
+guarantee feeding the curve: producing a PCU puts real capital at risk against the
+Freivalds check of \S\ref{sec:freivalds}, so the expected value of a fabricated
+unit is negative.
+
+\paragraph{(2) No-proof-no-mint: \code{AICoinMiner}.} The increment of $q$ (the
+mint of the subsidy that pays for one PCU) is gated, in pure Solidity that runs on
+any EVM, on a valid \code{ComputeProof}. The contract fails \emph{closed}: if no
+verifier is wired it reverts \code{ProofGateUnavailable}; when wired, it recomputes
+the expected \code{reportData} from the receipt's own merkle-proven fields and
+requires
+\begin{equation}
+\code{verifier.verify}\big(\code{computeProof},\
+  \code{ComputeProofLib.expectedReportData}(\dots),\ \code{runtimeMeasurement}\big)
+  \;=\;\texttt{true}.
+\label{eq:mintgate}
+\end{equation}
+A forged receipt root alone (the ``C3'' hole) no longer mints: inclusion under a
+root proves the chain committed the receipt, and the compute proof proves the
+output is real computation. This is the on-chain face of the
+signature/plurality/computation distinction of \S\ref{sec:intro}.
+
+\paragraph{(3) Network-wide no double mint: \code{AIComputeRegistry}.} A prover
+could do the work once and submit distinct, chain-bound proofs of the \emph{same}
+computation to many chains, minting $N$ times for one unit. The registry keys on
+the \emph{chain-independent} commitment
+\begin{equation}
+\code{computationKey} \;=\;
+\keccak\big(\text{\small DOMAIN}\,\|\,\code{modelSpec}\,\|\,\code{promptHash}
+  \,\|\,\code{outputHash}\big),
+\end{equation}
+records the first claimant, and reverts \code{AlreadyClaimed} for any second claim
+from any miner on any chain. First-correct-proof wins; redundant recomputation
+earns nothing. This guarantees the inventory increments are \emph{distinct} units,
+so $q$ counts each PCU once.
+
+\paragraph{The composite supply axiom.} Together, \eqref{eq:eligible},
+\eqref{eq:mintgate}, and the registry give the property
+Theorem~\ref{thm:monotone} assumes:
+
+\begin{proposition}[Verified-supply integrity]
+\label{prop:supply}
+Every increment $q\mapsto q-1$ on the buy side of the HMM corresponds to a unit of
+compute that is (i) produced by a miner satisfying \eqref{eq:eligible}, hence bonded
+and slashable; (ii) accompanied by a \code{ComputeProof} satisfying
+\eqref{eq:mintgate}, hence Freivalds-verified and bound to a measured
+$(\code{modelSpec},\code{promptHash},\code{outputHash})$; and (iii) claimed once
+network-wide via a unique \code{computationKey}. No other transition increments
+$q$.
+\end{proposition}
+
+\begin{proof}
+The only path that mints the subsidy (and thereby moves inventory) is
+\code{AICoinMiner.mine}, which in sequence: checks the receipt shape and finality;
+proves merkle inclusion under an accepted root; requires \eqref{eq:mintgate} or
+reverts (fail-closed); claims the \code{computationKey} on the registry, reverting
+on a duplicate; and only then calls \code{mintSubsidy}, which is itself restricted
+to contract minters (the god-key defense) and clamped to the halving allowance.
+Each conjunct of the claim is one of these gates; the absence of any other minter
+of the coin (enforced by \code{setMinter} requiring contract code and the
+single \code{mintSubsidy} entry point) gives the ``no other transition'' clause.
+\end{proof}
+
+\paragraph{Coupling to issuance.} The coin the HMM denominates is itself bounded:
+\code{AICoin} is a capped, halving, fair-launch subsidy with
+$\code{MAX\_SUBSIDY}=10^9$ and a four-year halving period, vesting
+\begin{equation}
+\code{cumulativeAllowance}(t) \;=\; \mathrm{MAX}\big(1-2^{-k}\big)
+   + \big(\mathrm{MAX}\cdot 2^{-(k+1)}\big)\cdot\frac{t \bmod T}{T},
+   \qquad k=\Big\lfloor \tfrac{t}{T}\Big\rfloor,\ T = 4\ \text{years},
+\label{eq:emission}
+\end{equation}
+with \code{emissionAllowance}$(t)=\code{cumulativeAllowance}(t)-\code{mintedSubsidy}$
+clamped at zero, so cumulative mint can never exceed the cap. There is a clean
+duality here: the \emph{issuance} side bounds how much coin can ever enter
+(Eq.~\eqref{eq:emission}, a geometric sum to $\mathrm{MAX}$), and the \emph{market}
+side bounds how much the maker can ever subsidize price discovery
+(Eq.~\eqref{eq:subsidy}, the conjugate range). Both are constants chosen in
+advance; neither is an oracle. The HMM prices PoAI-verified compute into this
+fixed-supply coin, and every quantity in the loop --- the proof, the bond, the
+double-mint guard, the curve, the cap --- is a mechanism we read in the shipped
+code, not a parameter we wished for.
 
 % ============================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
-A network that pays for AI must verify computation, not authorship or agreement.
-The decisive observation is that a forward pass is almost entirely matmuls, that
-a matmul can be \emph{verified} an order of magnitude below the cost of
+A network that pays for AI must do two hard things, and we have done both with one
+honest seam. It must \emph{verify computation}, not authorship or agreement: the
+decisive observation is that a forward pass is almost entirely matmuls, that a
+matmul can be \emph{verified} an order of magnitude below the cost of
 \emph{performing} it, and that on the engine's exact integer accumulator this
-verification is bit-exact with zero false-reject. PoAI builds directly on the
-Hanzo engine: the engine is the native execution layer, and the proof is emitted
-as a side-effect of that execution --- one Freivalds primitive over $\Fp$,
-specialized into four proofs (embedding, inference, training, compute), made
-sound by determinism, made asynchronous by a streaming Merkle Mountain Range with
-interactive bisection, and made unforgeable by a measured-weights binding into
-\code{reportData}. The core is proven and tested and the chain already refuses to
-mint without a proof; emitting that proof end-to-end from a running zen model is
-the next, designed, slice.
+verification is bit-exact with zero false-reject and information-theoretically
+sound, hence post-quantum. PoAI builds directly on the Hanzo engine: one Freivalds
+primitive over $\Fp$, specialized into four proofs, lifted to whole-graph
+soundness by typed composition, made sound by determinism, made asynchronous by a
+streaming Merkle Mountain Range with interactive bisection, and made unforgeable by
+a measured-weights binding into \code{reportData}. And it must \emph{price} that
+verified work without an oracle: the Hamiltonian Market Maker is the principled
+generalization of LMSR and constant-function AMMs --- a market maker whose conserved
+bonded value gives path independence, no in-curve arbitrage, and a bounded
+subsidy as \emph{theorems}, and whose monotone price--supply law ties the AICoin
+price of compute to the supply of \emph{verified} PCUs. The bond and the
+no-double-mint registry are what make that supply axis honest; the capped halving
+coin is what the curve denominates. The proof core, the graph composition, the
+determinism, and all four supply-side contracts are proven, tested, and enforced
+today; emitting the proof end-to-end from a running zen model is the next, designed
+slice. The economics are complete on paper because they are theorems; the systems
+are complete in code because we cite where they live.
 
 % ============================================================================
 \begin{thebibliography}{10}
@@ -625,30 +1415,72 @@ the next, designed, slice.
 R. Freivalds. Probabilistic machines can use less running time.
 \textit{IFIP Congress}, 1977.
 
+\bibitem{hanson2003}
+R. Hanson. Combinatorial information market design.
+\textit{Information Systems Frontiers}, 5(1):107--119, 2003.
+(Logarithmic Market Scoring Rule; bounded loss $b\ln N$.)
+
+\bibitem{hanson2007}
+R. Hanson. Logarithmic market scoring rules for modular combinatorial information
+aggregation. \textit{Journal of Prediction Markets}, 1(1):3--15, 2007.
+
+\bibitem{adams2020}
+H. Adams, N. Zinsmeister, D. Robinson. Uniswap v2 Core. 2020.
+(Constant-product $x\cdot y = k$.)
+
+\bibitem{angeris2020}
+G. Angeris, T. Chitra. Improved price oracles: constant function market makers.
+\textit{ACM Conf.\ on Advances in Financial Technologies (AFT)}, 2020.
+
+\bibitem{arnold1989}
+V.\,I. Arnold. \textit{Mathematical Methods of Classical Mechanics}, 2nd ed.
+Springer, 1989. (Symplectic geometry; Hamilton's equations; Liouville's theorem.)
+
+\bibitem{rockafellar1970}
+R.\,T. Rockafellar. \textit{Convex Analysis}. Princeton University Press, 1970.
+(Legendre--Fenchel conjugacy; $C^{*}(p)=\sup_q\{pq-C(q)\}$.)
+
 \bibitem{poiengine}
-Hanzo AI. \code{hanzo-engine/src/poi.rs} --- Proof-of-Inference Freivalds core.
-\texttt{hanzoai/engine} v1.2.5.
+Hanzo AI. \code{hanzo-engine/src/poi.rs}, \code{poi\_graph.rs},
+\code{poi\_transcript.rs}, \code{poi\_forward.rs} --- Proof-of-AI Freivalds core
+and typed graph composition. \texttt{hanzoai/engine}.
 
 \bibitem{poigo}
 Lux. \code{crypto/poi} --- canonical Go Freivalds verifier
 (\code{NewMat}, \code{Verify}, \code{VerifyMulti}, \code{DeriveChallenges}).
-\texttt{luxfi/crypto} v1.19.23.
-
-\bibitem{fpcommit}
-Hanzo AI. Proof-of-Inference: forward-pass commitment design.
-\code{hanzo-engine/docs/proof-of-inference/}, 2026.
-
-\bibitem{poisoundness}
-Zoo. Proof-of-Inference soundness: exact field versus tolerance corridor.
-\texttt{zooai/proofs}, 2026.
+\texttt{luxfi/crypto}.
 
 \bibitem{computeproof}
-Lux DAO. \code{ComputeProofLib} --- on-chain \code{reportData} binding and
-no-proof-no-mint enforcement. \texttt{luxdao/contracts} v2.1.0.
+Lux. \code{AICoinMiner.sol}, \code{ComputeProofLib.sol},
+\code{ComputeWitnessLib.sol} --- on-chain \code{reportData} binding and
+no-proof-no-mint enforcement. \code{luxfi/standard contracts/ai/thinking}
+(BSD-3-Eco), consumed via \code{@luxfi/standard/ai/thinking}.
+
+\bibitem{minerstake}
+Lux. \code{MinerStakeRegistry.sol} --- bonded, slashable compute supply.
+\code{luxfi/standard contracts/ai/thinking}.
+
+\bibitem{computeregistry}
+Lux. \code{AIComputeRegistry.sol} --- network-wide no-double-mint computation
+ledger. \code{luxfi/standard contracts/ai/thinking}.
+
+\bibitem{aicoin}
+Lux. \code{AICoin.sol} --- capped halving fair-launch subsidy
+($\mathrm{MAX}=10^9$, four-year halving). \code{luxfi/standard contracts/ai/thinking}.
 
 \bibitem{rfc6962}
 B. Laurie, A. Langley, E. Kasper. Certificate Transparency. RFC 6962, 2013.
 (Lone-node promotion; avoids CVE-2012-2459 duplicate-last malleability.)
+
+\bibitem{fips204}
+NIST. FIPS 204: Module-Lattice-Based Digital Signature Standard (ML-DSA), 2024.
+
+\bibitem{fips205}
+NIST. FIPS 205: Stateless Hash-Based Digital Signature Standard (SLH-DSA), 2024.
+
+\bibitem{xwing}
+M. Barbosa et al. X-Wing: The Hybrid KEM You've Been Looking For. 2024.
+(X25519 + ML-KEM-768 hybrid; used for prompt sealing.)
 
 \bibitem{hanzoconsensus}
 Hanzo AI. Hanzo Consensus AI: Consensus Mechanisms for Distributed AI Training

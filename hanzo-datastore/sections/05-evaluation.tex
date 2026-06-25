@@ -1,0 +1,93 @@
+\section{Evaluation}
+\label{sec:eval}
+
+All measurements are on a single Grace-class AArch64 host (Cortex-X925,
+$20$ cores, $121$\,GB RAM, Linux). Each server is driven over its native
+protocol against a $10$M-row \texttt{MergeTree} table
+(\texttt{id UInt64, user\_id UInt32, ts DateTime, value Float64, category
+LowCardinality(String)}). We report steady-state resident set (RSS, from
+\texttt{/proc/<pid>/status}) and queries-per-second. ``Official'' is the
+upstream binary, which ships PGO+LTO+BOLT.
+
+\subsection{The fork costs nothing}
+
+Built with identical flags ($-O3$, no PGO/LTO), Datastore and upstream are
+statistically indistinguishable: RSS within $1$\,MB ($143$ vs $144$\,MB) and
+throughput within noise across aggregation, top-$k$, and filter at concurrencies
+$1$ through $64$. This establishes that every subsequent gain is attributable to
+the optimization pipeline, not to the fork.
+
+\subsection{Effect of each optimization stage}
+
+Table~\ref{tab:stages} reports resident set and binary size as the pipeline is
+applied. ThinLTO alone already brings the resident set below the official
+binary's; PGO halves it again via hot/cold splitting; removing XRay and applying
+BOLT delivers the final size and a further locality gain.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Configuration & RSS & Binary \\
+\midrule
+Datastore $-O3$            & $143$\,MB & $709$\,MB \\
+\quad + ThinLTO            & $113$\,MB & $684$\,MB \\
+\quad + PGO                & $53$\,MB  & --- \\
+\quad + no-XRay, + BOLT    & $\mathbf{49}$--$\mathbf{50}$\,MB & $\mathbf{648}$\,MB \\
+\midrule
+Official (PGO+LTO+BOLT)    & $116$\,MB & --- \\
+\bottomrule
+\end{tabular}
+\caption{Resident set and binary size by optimization stage. ThinLTO alone
+($113$\,MB) already beats the official binary's $116$\,MB; the full pipeline
+reaches $49$--$50$\,MB, $\sim\!57\%$ below official.}
+\label{tab:stages}
+\end{table}
+
+\subsection{Throughput at parity memory}
+
+At equal correctness the optimized Datastore matches or beats upstream on the
+read mix. On the stable mid-concurrency point ($c{=}4$, $10$M rows) the
+no-XRay PGO+LTO+BOLT build leads upstream on filters by $25$--$40\%$
+($397$ vs $284$ QPS), on top-$k$ by $10$--$30\%$, and tracks or exceeds it on
+aggregation, while using less than half the resident memory. We caution that
+single-shot QPS on a shared host carries contention noise; the memory result,
+by contrast, is invariant to load and reproduces on every run.
+
+\subsection{Memory is flat in connection count}
+
+To isolate per-connection cost we issue a trivial query across $10$ to
+$10{,}000$ concurrent clients (Table~\ref{tab:scale}). Resident set is flat:
+$10{,}000$ connections cost the same memory as $10$. This is the bounded-state
+connection model --- the server pools threads and holds negligible per-connection
+state --- and Datastore is $\sim\!15$\,MB leaner than upstream at every point.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Concurrent clients & Datastore RSS & Official RSS \\
+\midrule
+$10$      & $114$\,MB & $129$\,MB \\
+$100$     & $113$\,MB & $129$\,MB \\
+$1{,}000$ & $113$\,MB & $128$\,MB \\
+$10{,}000$& $\mathbf{113}$\,MB & $128$\,MB \\
+\bottomrule
+\end{tabular}
+\caption{Resident set vs.\ concurrent connection count. Per-connection memory is
+effectively zero; $10{,}000$ clients cost the same as $10$. (Measured on an
+LTO build before the PGO/BOLT stages of Table~\ref{tab:stages}.)}
+\label{tab:scale}
+\end{table}
+
+\subsection{ZAP pipelining flattens dependent-chain latency}
+
+We measure end-to-end latency of a dependent chain of $n$ calls --- each input
+the previous output --- at a $0.5$\,ms round trip, comparing ZAP promise
+pipelining against a request-response baseline. The baseline grows linearly in
+$n$; ZAP is flat, since the whole chain resolves in one logical round trip. At
+depth $64$ this is a $63\times$ reduction in latency. This is the property that
+motivates ZAP for analytics clients that issue dependent queries (build a
+filtered view, then aggregate it, then top-$k$ it) rather than independent ones.

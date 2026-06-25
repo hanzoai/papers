@@ -1,0 +1,69 @@
+\section{Architecture}
+\label{sec:arch}
+
+Datastore retains the ClickHouse execution core --- the vectorized,
+block-at-a-time query pipeline over \texttt{MergeTree} storage --- and changes
+three surfaces: branding, transport, and the build. We summarize the first two
+here; the build is the subject of Sections~\ref{sec:build} and~\ref{sec:xray}.
+
+\subsection{Compatibility-preserving rebrand}
+
+The fork renames the product across symbols, strings, on-disk paths, wire
+headers, and binary names (\texttt{datastore-server}, \texttt{datastore-client},
+\texttt{datastore-local}) while preserving the \texttt{DB::} C++ namespace and
+every externally observable protocol. The native TCP protocol (port~9000), the
+HTTP interface (port~8123), and the SQL dialect are byte-for-byte compatible
+with upstream, so an existing client or driver connects unchanged and a
+deployment migrates by changing an image reference. This compatibility is a
+hard requirement: it is what makes the optimization work in later sections
+\emph{drop-in} rather than a migration project.
+
+\subsection{Removing gRPC}
+
+Upstream exposes an optional gRPC interface and an Arrow Flight endpoint, both
+of which pull in gRPC, protobuf, and the associated code generation and
+re-encoding machinery. Datastore removes them entirely: the \texttt{contrib/grpc}
+submodule, \texttt{GRPCServer}, the \texttt{ServerType::GRPC} adapter, the
+\texttt{USE\_GRPC} paths, and the Flight server (which is itself gRPC-based and
+was gated behind \texttt{ENABLE\_ARROW\_FLIGHT}). The motivation is twofold:
+gRPC contributes materially to binary size and dependency surface, and its
+request-response model is a poor fit for the dependent-call patterns analytics
+clients actually issue. After removal, \texttt{grpc::} symbols are absent from
+the binary.
+
+\subsection{ZAP transport and the opaque-block decision}
+
+In place of gRPC we introduce \emph{ZAP}, an RPC derived from Cap'n
+Proto~\cite{capnproto}. ZAP provides two properties we want: zero-copy access to
+wire-resident structures, and \emph{promise pipelining} --- the ability to
+issue a call against the (not-yet-returned) result of a previous call, so that
+a dependent chain of $n$ requests costs one network round trip rather than $n$.
+
+A naive ZAP integration would re-encode each result row as a ZAP message. We
+deliberately do not do this. ClickHouse's native format is already a compact,
+typed, columnar \emph{block}; re-encoding it as a richly-typed ZAP structure
+would (i) inflate memory, since zero-copy messages are materialized in an arena
+whose size tracks the largest in-flight result, and (ii) risk the Cap'n Proto
+traversal-limit and amplification guards on wide results. Instead, ZAP carries
+the native columnar block as an \emph{opaque, streamed payload}: the transport
+provides framing, flow control, and pipelining, while the block itself remains
+the engine's own bounded, streamable representation. This keeps the memory
+behavior of a query identical to the native protocol (Section~\ref{sec:eval}
+shows resident memory flat to $10{,}000$ connections) while exposing
+pipelining to clients that want it.
+
+We are explicit about scope: at the time of writing, ZAP is wired as a
+transport and the pipelining benefit is measured at the transport layer
+(Section~\ref{sec:eval}), but the full SQL-over-ZAP service is not yet the
+primary query path --- the native TCP handler remains primary. ZAP-native query
+execution and a ZAP-native coordination layer are future work.
+
+\subsection{Coordination}
+
+Replication and distributed DDL are coordinated by the embedded Keeper, a
+ZooKeeper-API-compatible service built on the NuRaft Raft library. This is a
+crash-fault-tolerant, strongly-consistent (CP) coordinator for trusted nodes;
+it is distinct from, and should not be conflated with, the Byzantine,
+DAG-native consensus families used in blockchain settings. Keeper is not on the
+data-scan path --- it manages metadata, replica state, and merge/mutation
+assignment --- and it retains NuRaft's own transport.

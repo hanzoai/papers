@@ -1,0 +1,57 @@
+\section{Build Optimization}
+\label{sec:build}
+
+Datastore's binary is built with three composable techniques: profile-guided
+optimization (PGO), ThinLTO, and the BOLT post-link optimizer. We describe the
+pipeline and the constraints that order it; Section~\ref{sec:eval} reports the
+effect of each stage.
+
+\subsection{Pipeline}
+
+The canonical optimized build (\texttt{utils/pgo-build/build-optimized.sh})
+proceeds in three phases:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Instrumented build.} Compile with clang IR instrumentation
+  (\texttt{-fprofile-generate}). Because IR-level PGO instrumentation is
+  incompatible with ThinLTO, this phase runs with LTO disabled.
+  \item \textbf{Profile collection.} Run a representative OLAP workload ---
+  inserts into a \texttt{MergeTree} table followed by aggregation, top-$k$,
+  filter, time-bucketing, join, window, array, and sub-query reads --- against
+  the instrumented binary, then merge the raw counters with
+  \texttt{llvm-profdata}.
+  \item \textbf{Optimized build.} Recompile with \texttt{-fprofile-use} and
+  ThinLTO enabled. Functions whose control-flow hash no longer matches the
+  recorded profile (expected, since instrumentation ran without LTO) are
+  demoted from \texttt{-Werror} to a warning so the build does not abort on
+  benign profile staleness.
+\end{enumerate}
+
+The resulting binary is optionally passed to BOLT, which re-lays-out hot code
+using a branch profile, separating hot and cold basic blocks and reordering
+functions for instruction-cache locality. BOLT requires the linker to emit
+relocations (\texttt{-Wl,--emit-relocs}), which we gate behind a build flag.
+
+\subsection{A subtle thread-pool deadlock in instrumented collection}
+
+A practical obstacle: running the \emph{instrumented} binary against a
+large insert deadlocked. The \texttt{-fprofile-generate} runtime serializes
+access to per-function counters, and this serialization interacts badly with
+the engine's background merge thread pools under a high-volume
+\texttt{MergeTree} insert. We resolve this by collecting the profile with
+bounded threads (\texttt{max\_insert\_threads=1},
+\texttt{background\_pool\_size=1}) over a smaller but representative row count.
+PGO requires that the profile cover the hot \emph{code paths}, not a
+production-scale data volume, so this does not degrade profile quality; it
+completes in seconds rather than deadlocking.
+
+\subsection{Profile representativeness and matched comparison}
+
+A PGO build is only as good as its profile. For a fair comparison we hold the
+profile fixed across the fork and upstream, and --- crucially --- we regenerate
+the profile against the \emph{same} build configuration the binary will ship
+with. An early result used a profile collected from an XRay-instrumented build
+to optimize a non-XRay binary; the control-flow-hash mismatch on hot functions
+silently discarded counts for exactly the aggregation kernels we cared about,
+understating the aggregation result. The shipped recipe collects the profile
+from the final, XRay-free configuration, eliminating the mismatch.

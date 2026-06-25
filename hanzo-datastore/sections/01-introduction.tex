@@ -1,0 +1,55 @@
+\section{Introduction}
+
+Columnar analytics engines such as ClickHouse~\cite{clickhouse} deliver
+high scan and aggregation throughput, but a production deployment is
+dominated by two operational costs that the literature on query execution
+rarely addresses: the resident memory of an idle-to-moderately-loaded server,
+and the size and start-up cost of the binary itself. In a multi-tenant hosting
+setting --- where the operator runs thousands of small-to-medium instances
+rather than a handful of large ones --- these constants, not asymptotic query
+complexity, determine density and therefore unit economics.
+
+\emph{Datastore} is Hanzo's analytics database. It is a fork of ClickHouse,
+which is distributed under the permissive Apache~2.0 license, re-branded and
+re-engineered with three goals: (i) a substantially smaller resident footprint
+and binary at equal or better query throughput; (ii) a transport layer free of
+the gRPC/protobuf stack; and (iii) a build that is reproducible and
+self-hosted end to end. This paper reports the engineering and the
+measurements behind those goals.
+
+Our contributions are:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item A build pipeline combining profile-guided optimization (PGO),
+  ThinLTO, and the BOLT~\cite{bolt} post-link optimizer that produces a
+  server binary with $49$--$53$\,MB resident set --- less than half the
+  $\sim\!116$\,MB of the upstream official binary (which itself ships
+  PGO+LTO+BOLT) --- while matching or exceeding its throughput on
+  aggregation and filter workloads (Section~\ref{sec:eval}).
+
+  \item A root-cause analysis (Section~\ref{sec:xray}) showing that the
+  decade-old difficulty of running BOLT on AArch64 ClickHouse binaries is, in
+  our case, not a deficiency of \texttt{llvm-bolt} per se but a consequence of
+  default-enabled XRay instrumentation. XRay emits composed
+  \texttt{R\_AARCH64\_PREL64} relocations (we observe a single group of
+  $62{,}692$ entries in \texttt{xray\_instr\_map}) whose lowering is
+  unimplemented on the AArch64 path, surfacing downstream as an invalid OAuth
+  signature on the self-hosted runner rather than as a BOLT error. Disabling
+  XRay --- the correct choice for a release binary --- removes
+  $\sim\!45$\,MB of sled sections \emph{and} unblocks BOLT.
+
+  \item A transport substitution (Section~\ref{sec:arch}) that removes gRPC,
+  protobuf, and ArrowFlight and carries ClickHouse-native columnar blocks as
+  opaque payloads over ZAP, a Cap'n-Proto-derived RPC with promise
+  pipelining. On dependent-call chains, end-to-end latency becomes flat in
+  chain depth: a $63\times$ improvement at depth~64 over a request-response
+  baseline at $0.5$\,ms round-trip.
+\end{itemize}
+
+A guiding constraint throughout is that Datastore must remain wire- and
+SQL-compatible with ClickHouse, so that the migration of an existing
+deployment is a change of image reference rather than a change of client.
+Section~\ref{sec:eval} confirms apples-to-apples parity: built with identical
+flags, the fork and upstream are statistically indistinguishable in memory and
+throughput, isolating every reported gain to the optimization pipeline rather
+than to the fork.

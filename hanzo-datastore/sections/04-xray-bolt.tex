@@ -1,0 +1,68 @@
+\section{The XRay--BOLT Interaction on AArch64}
+\label{sec:xray}
+
+Running BOLT on an AArch64 ClickHouse-derived binary has a reputation for
+fragility. We present a root-cause analysis that reframes the problem: the
+failure we observed is not, at bottom, a defect of \texttt{llvm-bolt}, but a
+consequence of an instrumentation feature that a release binary should not
+carry in the first place.
+
+\subsection{Symptom}
+
+On AArch64, BOLT-processed binaries failed at run time. In our deployment the
+failure surfaced indirectly: ephemeral CI runners launched from such binaries
+reported \texttt{VssOAuthTokenRequestException: The signature is not valid}
+during the broker handshake and never came online --- a misleading symptom
+several layers removed from the true cause. Direct BOLT invocation, when forced,
+failed earlier with \texttt{error: expected relocatable expression} during
+emission, and an assertion build of \texttt{llvm-bolt} (v22.1.1) pinpointed the
+failure to
+\begin{center}
+\texttt{Relocation::getComposeOpcodeFor():}\\
+\texttt{assert(Arch == Triple::riscv64 \&\& "only implemented for RISC-V")}
+\end{center}
+
+\subsection{Root cause}
+
+The function that BOLT uses to \emph{compose} paired relocations into a single
+MC expression is implemented only for RISC-V. On AArch64 it is reached by
+composed \texttt{R\_AARCH64\_PREL64} relocations --- PC-relative 64-bit data
+references of the form $S + A - P$. Instrumenting the binary revealed that the
+overwhelming majority of these composed groups, including one pathological group
+of \textbf{$62{,}692$ relocations sharing a single offset}, lived in the
+\texttt{xray\_instr\_map} section. In other words, the relocations BOLT could
+not lower were emitted by \textbf{XRay instrumentation}, which was enabled by
+default.
+
+XRay~\cite{xray} is a function-call tracing facility: it inserts entry/exit
+``sleds'' at every function and a side table (\texttt{xray\_instr\_map},
+\texttt{xray\_fn\_idx}) of PC-relative pointers into them. We measured these
+sections at $\sim\!45$\,MB in the datastore binary. A release database server
+has no business carrying always-on tracing sleds; the feature is appropriate
+for a profiling build, opt-in, and nowhere else.
+
+\subsection{Fix}
+
+The defect upstream was a default: \texttt{ENABLE\_XRAY} was \texttt{ON}.
+Turning it off (with the coverage build that legitimately needs XRay
+re-enabling it locally) has three effects:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item The \texttt{xray\_instr\_map} section disappears, taking the
+  unlowerable composed \texttt{R\_AARCH64\_PREL64} relocations with it. BOLT
+  then emits cleanly on AArch64 and the resulting binary runs correctly.
+  \item The binary shrinks from $945$\,MB to $648$\,MB after BOLT --- a $31\%$
+  reduction --- before any other consideration.
+  \item Per-function sled overhead is removed from the hot path.
+\end{enumerate}
+
+A residual, genuinely-upstreamable robustness fix remains --- teaching
+\texttt{getComposeOpcodeFor} the AArch64 cases so that \emph{any} future
+composed \texttt{PREL64} (not only XRay's) lowers correctly --- but it is not
+required for Datastore, because Datastore should not emit those relocations at
+all. Two operational notes for reproducing BOLT on the large AArch64 binary:
+\texttt{llvm-bolt} recurses deeply during veneer insertion and overflows the
+default $8$\,MB stack, so it must run under a raised stack limit
+(\texttt{ulimit -s 2{,}097{,}152}); and the GB10 firmware we tested does not
+expose the SPE table, so branch profiles are collected with cycle sampling and
+\texttt{perf2bolt --nl} rather than via LBR/SPE.

@@ -1,0 +1,86 @@
+\section{Toward a Blockchain-Native Datastore}
+\label{sec:chain}
+
+The optimizations of Sections~\ref{sec:build}--\ref{sec:eval} make Datastore a
+better single-node engine. This section sketches a more ambitious trajectory:
+operating Datastore as a member of a permissioned-validator blockchain network,
+with storage and compute separated over a shared, chain-native substrate. We
+report a working proof-of-concept for the foundational layer and the validated
+integration path for the rest.
+
+\subsection{Separation of storage and compute}
+
+The dominant cloud-analytics architecture (Snowflake, Databricks, ClickHouse
+Cloud) separates a durable object-storage tier from stateless, elastic compute.
+ClickHouse's \texttt{ReplicatedMergeTree} already factors cleanly along this
+line: a small ordered \emph{replication log} and large, content-addressed
+\emph{data parts}. We exploit this by pointing Datastore's MergeTree storage
+policy at an S3-compatible object store --- here SeaweedFS, the storage engine
+behind the network's ``S-Chain.''
+
+\paragraph{Proof of concept.} We loaded a $5$M-row MergeTree table whose
+storage policy targets SeaweedFS over S3. Verified outcome: all five parts
+report disk \texttt{seaweed}; the local data directory holds $24$\,KB of
+metadata; SeaweedFS holds $101$ content-addressed objects; and queries execute
+correctly against the object-backed table (aggregation $25$\,ms, filter
+$7$\,ms over $5$M rows). Resident memory was $68$\,MB versus $130$\,MB for an
+upstream binary on local disk.
+
+\paragraph{Honest cost.} Object storage loses a warm-cache drag race to local
+disk by $2$--$4\times$ on single queries --- a round trip versus a page-cache
+hit. The win is not raw warm latency; it is (i) a stateless compute tier
+($24$\,KB local vs.\ $99$\,MB), enabling $N$ disposable compute nodes over one
+copy of data --- which a local-disk engine structurally cannot do --- and (ii)
+roughly half the resident memory. A local filesystem cache over the object disk
+(the ClickHouse-Cloud technique) recovers most of the warm-latency gap.
+
+\subsection{Replacing Raft with leaderless post-quantum consensus}
+
+Coordination of the replication log is performed today by an embedded
+Keeper on NuRaft (Raft): crash-fault-tolerant, leader-based, classical
+cryptography. Replacing the Raft backend with the network's leaderless
+consensus (Quasar) yields three properties at once: leaderless resilience (no
+single writer to fail over), Byzantine fault tolerance over a bonded validator
+set, and --- because Quasar finalizes with ML-DSA --- \emph{post-quantum
+finality}. This is not speculative: a sibling system already runs SQLite under
+the same leaderless Quasar coordination (writer-pin, all nodes equal
+validators), establishing the pattern. The realistic integration is a
+coordination service that speaks the ZooKeeper API Datastore already expects but
+backs the ordered log with Quasar, so the engine itself is unchanged. The result
+is, to our knowledge, the first \emph{post-quantum-native} columnar OLAP engine.
+
+\subsection{The data-system-as-a-chain pattern}
+
+Two existing VMs in the network bound the implementation. A read-only
+``database-as-a-chain'' VM serves queries over an HTTP handler while its blocks
+carry only commitments (schema updates, query-result hashes, index roots) ---
+never bulk data; and a separate VM binds a C++ execution engine behind a Go
+chain VM via FFI, with a pure-Go fallback, ``valid as long as state roots
+match.'' Datastore-as-a-chain composes these: a Go chain VM wraps the C++
+Datastore engine, blocks carry only part-manifest roots and DDL (well under the
+$2$\,MB block ceiling that makes putting columnar data through consensus
+infeasible), the columnar parts live off-chain in S-Chain storage addressed by
+the on-chain hash, and reads are served over the VM's HTTP handler. The VM
+plug-in transport is itself the Cap'n-Proto-derived ZAP described in
+Section~\ref{sec:arch} --- so the engine's transport and the network's VM bus
+are the same substrate.
+
+\subsection{Permissionless operation with confidential compute}
+
+Open, untrusted query execution is the residual hard problem: a serving node's
+\texttt{SELECT} result is not verifiable by re-execution for arbitrary SQL, and
+ZK-SQL is not practical at OLAP scale. The pragmatic resolution is
+attestation rather than proof: run compute inside a hardware trusted execution
+environment (e.g.\ confidential-compute GPUs), so a remote party verifies an
+attestation of the enclave rather than re-deriving the query. Combined with
+content-addressed parts (integrity) and Quasar-ordered manifests (a verifiable
+write history), this yields a system that is open to read and use, bonded to
+write and serve, and private under attestation --- without requiring verifiable
+arbitrary-query mathematics.
+
+\paragraph{Phasing.} The product engine ships today (Sections~\ref{sec:build}--%
+\ref{sec:eval}); storage/compute separation over S-Chain is demonstrated above;
+the Raft$\rightarrow$Quasar coordination swap and the chain VM are the
+near-term build, each with an on-disk precedent; verifiable/attested
+permissionless reads are the research frontier. Each phase preserves
+compatibility and pays only for what the workload uses.

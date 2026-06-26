@@ -3,10 +3,17 @@
 
 The optimizations of Sections~\ref{sec:build}--\ref{sec:eval} make Datastore a
 better single-node engine. This section sketches a more ambitious trajectory:
-operating Datastore as a member of a permissioned-validator blockchain network,
-with storage and compute separated over a shared, chain-native substrate. We
-report a working proof-of-concept for the foundational layer and the validated
-integration path for the rest.
+operating Datastore as a self-hosted service that \emph{extends S-Chain} --- the
+network's decentralized object-storage substrate --- co-located on the very same
+nodes that serve S-Chain, with storage and compute separated over that shared
+substrate. We are deliberate about what this is \emph{not}: Datastore is not a
+new public chain with its own letter and validator economy (the network's chain
+letters are otherwise assigned, e.g.\ the DEX). It is a query/compute engine
+layered on S-Chain, using S-Chain for durable storage and the nodes' existing
+Quasar consensus for coordination --- a permissioned, operator-run (or
+LLM-consensus-node-run) service, not a permissionless chain. We report a working
+proof-of-concept for the foundational layer and the validated integration path
+for the rest.
 
 \subsection{Separation of storage and compute}
 
@@ -34,6 +41,18 @@ copy of data --- which a local-disk engine structurally cannot do --- and (ii)
 roughly half the resident memory. A local filesystem cache over the object disk
 (the ClickHouse-Cloud technique) recovers most of the warm-latency gap.
 
+\paragraph{Elastic scale-out, verified.} The stateless-compute claim is the one
+a local-disk engine cannot make, so we verified it directly. With a
+\texttt{ReplicatedMergeTree} over the S-Chain object store and zero-copy
+replication enabled, we ran two independent compute nodes coordinated by Keeper:
+node~1 inserted $5$M rows; node~2, started afterward, served the identical
+$5{,}000{,}000$ rows. Critically, the object count in S-Chain rose from $101$ to
+$102$ --- a single manifest object, \emph{not} a second copy of the data ---
+confirming that the two replicas share one physical copy via zero-copy. Two
+compute nodes, one copy of data on decentralized storage: the elastic-compute
+property, demonstrated. (The single non-obvious requirement was configuring the
+inter-node part-transfer endpoint; see Section~\ref{sec:zapnative}.)
+
 \subsection{Replacing Raft with leaderless post-quantum consensus}
 
 Coordination of the replication log is performed today by an embedded
@@ -49,21 +68,29 @@ coordination service that speaks the ZooKeeper API Datastore already expects but
 backs the ordered log with Quasar, so the engine itself is unchanged. The result
 is, to our knowledge, the first \emph{post-quantum-native} columnar OLAP engine.
 
-\subsection{The data-system-as-a-chain pattern}
+\subsection{Extending S-Chain, not minting a new chain}
 
-Two existing VMs in the network bound the implementation. A read-only
-``database-as-a-chain'' VM serves queries over an HTTP handler while its blocks
-carry only commitments (schema updates, query-result hashes, index roots) ---
-never bulk data; and a separate VM binds a C++ execution engine behind a Go
-chain VM via FFI, with a pure-Go fallback, ``valid as long as state roots
-match.'' Datastore-as-a-chain composes these: a Go chain VM wraps the C++
-Datastore engine, blocks carry only part-manifest roots and DDL (well under the
-$2$\,MB block ceiling that makes putting columnar data through consensus
-infeasible), the columnar parts live off-chain in S-Chain storage addressed by
-the on-chain hash, and reads are served over the VM's HTTP handler. The VM
-plug-in transport is itself the Cap'n-Proto-derived ZAP described in
-Section~\ref{sec:arch} --- so the engine's transport and the network's VM bus
-are the same substrate.
+Co-locating Datastore with S-Chain rather than standing up a separate chain is
+the simpler and more honest design: bulk columnar data is far too large to pass
+through consensus (the network caps a gossiped block at $2$\,MB), so a
+``datastore chain'' would in any case put \emph{only} small commitments on-chain
+and keep the data off-chain --- which is exactly what running beside S-Chain
+already gives us, without a new validator set or chain letter. The division of
+labor is therefore: the columnar \emph{parts} are content-addressed objects in
+S-Chain storage; the small \emph{commitments} (part-manifest roots, DDL,
+schema/version pointers) are ordered by the nodes' existing Quasar consensus; and
+reads are served by the co-located Datastore compute engine. Two on-disk
+precedents make the engine integration concrete without inventing anything: a
+sibling component already binds a C++ execution engine behind a thin Go shim via
+FFI (``valid as long as state roots match''), and another already serves a
+read-only query surface over a handler while keeping bulk state out of blocks.
+Datastore reuses both shapes as a \emph{service on S-Chain nodes} --- the C++
+engine for execution, a query surface for reads --- with ZAP
+(Section~\ref{sec:arch}) as the wire throughout. Should a workload genuinely want
+a public, permissionless analytics chain later (an LLM-consensus quorum
+publishing verifiable aggregates, say), the same commitments-on-chain /
+parts-off-chain split promotes to a first-class chain unchanged; but that is an
+option, not the default.
 
 \subsection{Permissionless operation with confidential compute}
 
@@ -78,9 +105,53 @@ write history), this yields a system that is open to read and use, bonded to
 write and serve, and private under attestation --- without requiring verifiable
 arbitrary-query mathematics.
 
+\subsection{One transport: ZAP-native, end to end}
+\label{sec:zapnative}
+
+A conventional analytics deployment carries three distinct wire protocols: a
+client protocol, a gRPC service surface, an inter-node replication transport
+(HTTP), and a ZooKeeper wire for coordination. Our objective is to collapse all
+of these onto one substrate --- ZAP, the Cap'n-Proto-derived transport with
+zero-copy framing and promise pipelining (Section~\ref{sec:arch}). The current
+state and the remaining work:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Wire & Today & ZAP-native target \\
+\midrule
+gRPC service     & \textbf{removed}      & --- (gone) \\
+Inter-node parts & HTTP (DataPartsExch.) & ZAP \\
+Coordination log & ZooKeeper / Keeper    & Quasar (ZAP) \\
+Client query     & native TCP / ZAP stub & SQL-over-ZAP \\
+\bottomrule
+\end{tabular}
+\caption{Collapsing four wires onto ZAP. gRPC is already gone; the inter-node
+HTTP part-transfer and the ZooKeeper coordination wire are the remaining
+targets.}
+\label{tab:zapnative}
+\end{table}
+
+The gRPC surface and ArrowFlight are already deleted: the binary contains no
+\texttt{GRPCServer} and no \texttt{USE\_GRPC} code paths. The inter-node
+part-transfer --- the \texttt{InterserverIOHTTPHandler}/\texttt{DataPartsExchange}
+that the scale-out result above relies on --- runs over HTTP today and is the
+first migration to ZAP, since part fetch is exactly the kind of large,
+streamable, pipelineable transfer ZAP's opaque-payload model was designed for.
+The coordination wire (the $17$-file ZooKeeper client talking to Keeper) is the
+second: replaced by the Quasar-backed coordination service of
+Section~\ref{sec:chain}, ``ZooKeeper'' disappears as a wire while the engine's
+expectations are preserved. When both land, alongside the SQL-over-ZAP query
+path, the platform is one transport deep --- no HTTP, no gRPC, no ZooKeeper ---
+which is also precisely the precondition for the unified two-engine platform of
+Section~\ref{sec:twoengine}.
+
 \paragraph{Phasing.} The product engine ships today (Sections~\ref{sec:build}--%
-\ref{sec:eval}); storage/compute separation over S-Chain is demonstrated above;
-the Raft$\rightarrow$Quasar coordination swap and the chain VM are the
-near-term build, each with an on-disk precedent; verifiable/attested
+\ref{sec:eval}); storage/compute separation \emph{and elastic scale-out with
+zero-copy} over S-Chain are demonstrated above; the Raft$\rightarrow$Quasar
+coordination swap, the inter-node-HTTP$\rightarrow$ZAP migration, and the chain
+VM are the near-term build, each with an on-disk precedent; verifiable/attested
 permissionless reads are the research frontier. Each phase preserves
 compatibility and pays only for what the workload uses.

@@ -1,0 +1,103 @@
+\section{The S-Chain Storage Market}
+\label{sec:economics}
+
+A decentralized storage substrate needs an economic model, both to price the
+service to customers and to compensate the operators who physically store and
+serve bytes. S-Chain needs two pricing models, because it serves two kinds of
+data with opposite lifetimes, and a provider market underneath both.
+
+\subsection{Two demand curves: metered and perpetual}
+
+\paragraph{Metered (operational).} Hot, mutable, operational data --- a
+Datastore tenant's active parts, a project's live SQLite file --- is priced
+pay-as-you-go. This model exists today: the platform meters storage at a
+per-gigabyte-month rate (with finer per-second and per-hour granularity) plus
+egress, billed against a prepaid organization wallet, comparable to commodity
+object-store pricing. It suits data whose value tracks its recency and whose
+owner expects a recurring bill.
+
+\paragraph{Perpetual (archival).} A second class of data should be stored
+\emph{once} and kept \emph{forever} --- audit logs, published datasets, the
+verifiable analytics commitments of Section~\ref{sec:chain}, content a user
+wants to outlive their subscription. Recurring billing is the wrong instrument
+here: it makes permanence contingent on an unbroken payment stream. The
+Arweave-style alternative is an \emph{endowment}: the writer pays a single
+upfront fee, a conservative fraction is reserved to cover immediate storage, and
+the remainder capitalizes an endowment whose yield funds storage in perpetuity.
+The model is solvent under one empirical assumption --- that the real cost of
+storing a byte declines over time (the historical $\sim\!30\%$/year decline in
+\$/GB) faster than the endowment is drawn down. Concretely, for a one-time fee
+$F$, an annual real storage cost $c_0$ per byte declining at rate $r$, and an
+endowment real return $\rho$, perpetual storage is funded when
+\[
+F \;\ge\; c_0 \sum_{t=0}^{\infty} \frac{(1-r)^t}{(1+\rho)^t}
+\;=\; c_0\,\frac{1+\rho}{\rho + r},
+\]
+a finite sum precisely because $r>0$. Pricing $F$ at a deliberately pessimistic
+$r$ (and re-pricing new writes as hardware costs fall) is what makes
+``pay once, stored for two centuries'' actuarially sound rather than a promise.
+This endowment does not exist yet and is the concrete economic build for S-Chain.
+
+\subsection{The provider market underneath}
+
+Both demand curves pay into a supply side: independent operators who run S-Chain
+storage nodes (the Hanzo S3 / SeaweedFS volume servers) and earn for storing and
+serving content-addressed objects. The accountability surface is already modeled
+--- the network's service-node registry carries provider registrations, service
+endpoints, and SLA/uptime records --- so the missing piece is the incentive
+layer that turns those records into payments and penalties:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Bonded providers.} An operator stakes a bond to join a storage
+  pool, consistent with the network's bonded-signer model elsewhere; this gates
+  a permissioned-but-open supply set rather than fully anonymous storage.
+  \item \textbf{Proof of storage / availability.} Providers periodically prove
+  they still hold the objects they are paid for (a challenge--response over
+  content-addressed chunks), recorded as the registry's uptime/SLA proofs.
+  \item \textbf{Payout and slashing.} The metered revenue and the endowment
+  yield flow to providers in proportion to proven, served storage; failed
+  availability proofs slash the bond. This is the same accounting that the
+  platform's existing usage-metering and wallet rails perform for compute,
+  extended to storage providers.
+\end{itemize}
+
+\subsection{A permissionless public good, paid in any currency}
+
+The market above is deliberately \emph{not} operator-run or
+us-in-control: S-Chain is intended as permissionless public-goods
+infrastructure that web3 applications build on with no central leader, the way
+one builds on a base layer rather than on a vendor. Two mechanisms make that
+economically coherent.
+
+\paragraph{Multi-currency fees routed through the DEX.} Applications should not
+be forced to hold the network's base asset to pay for storage and compute. The
+network's native DEX (the D-Chain) is the exchange layer: any L2/L3 lists its
+coin into the DEX, and its applications pay infrastructure fees in \emph{their
+own} currency, which is swapped natively --- through the relevant liquidity pool
+(e.g.\ a ZOO/LUX pool) --- back into LUX to settle operator payouts. A storage
+or compute provider is thus paid in the base asset while a tenant spends the
+token it already holds; the DEX absorbs the currency conversion as a routine
+swap. The fee economy is multi-currency at the edge and single-currency at
+settlement.
+
+\paragraph{Bootstrap inflation, then fees.} A storage market has a cold-start
+problem: providers must be paid before fee volume exists. The resolution is a
+\emph{temporary} inflation subsidy to seed provider rewards, tapering to zero as
+fee revenue grows --- explicitly temporary because the base asset is
+deflationary and cannot subsidize forever. Steady state is fee-funded: metered
+leases and endowment yield, denominated in any listed currency and settled in
+LUX, pay the bonded providers. Inflation is the on-ramp, not the engine.
+
+\subsection{Why this closes the platform}
+
+The economics complete the architecture rather than decorate it. The two query
+engines of Section~\ref{sec:twoengine} both reduce, at the storage layer, to
+content-addressed objects on S-Chain --- Datastore parts and encrypted SQLite
+pages alike --- so a single market prices and endows \emph{all} platform data
+uniformly: meter the hot working set, endow the permanent record, pay the
+bonded providers who hold it, and let the same Quasar consensus that orders the
+data's commitments also order the market's payments. A customer buys ``storage''
+once; the platform decides per-object whether that is a recurring lease or a
+perpetual endowment; and neither Datastore nor the decentralized SQL engine
+needs its own billing system, because both are tenants of the one S-Chain
+market.

@@ -1,0 +1,98 @@
+\section{A Two-Engine Decentralized Data Platform}
+\label{sec:twoengine}
+
+The blockchain-native trajectory of Section~\ref{sec:chain} addresses analytics.
+But analytics is only half of a data platform: the other half is the
+transactional, per-user, per-project record store. These two workloads have
+opposite shapes --- columnar scan-and-aggregate versus row-oriented
+point-read-and-write --- and, crucially, opposite \emph{trust} requirements.
+Aggregate analytics can run server-side (fast, shared, TEE-attested); a user's
+own per-project records should be private end-to-end, visible to no operator at
+all. We therefore propose two complementary engines over one decentralized
+storage substrate, both native to the Lux network and both speaking ZAP.
+
+\subsection{Engine 1: Datastore --- scalable analytics (OLAP)}
+
+Datastore is the columnar engine of this paper: horizontally-scalable,
+\emph{server-side} compute over the shared S-Chain object store
+(Section~\ref{sec:chain}), demonstrated to scale out to multiple stateless
+compute replicas sharing a single zero-copy copy of data
+(Section~\ref{sec:eval}). Its privacy model is \emph{attestation}: compute runs
+in a hardware trusted execution environment, so a client verifies an enclave
+attestation rather than trusting the operator. This is the right model for
+operational and aggregate analytics, where throughput and elastic scale dominate
+and the data is the tenant's own aggregate.
+
+\subsection{Engine 2: Decentralized SQL --- private per-user records (OLTP)}
+
+The second engine is a SQLite-based transactional store --- one database file
+per user or per project, the file being the unit of tenancy --- already running
+under leaderless Quasar coordination in the sibling base-ha system. To this
+foundation we add three primitives, each backed by an existing Lux chain, to
+make it a \emph{decentralized, end-to-end-private} SQL engine:
+
+\begin{description}[leftmargin=1.2em,style=nextline]
+  \item[Client-held keys (K-Chain KEM).] Each user/project is issued a
+  post-quantum key-encapsulation keypair from the K-Chain. The SQLite database
+  --- at page or WAL granularity --- is encrypted under a data key wrapped by
+  the user's KEM public key. The operator stores only ciphertext on S-Chain;
+  \emph{decryption happens only on the client}. No operator, validator, or
+  storage provider ever observes plaintext.
+  \item[Compute on ciphertext (Z-Chain FHE).] To answer queries without
+  decrypting, predicates and aggregates evaluate homomorphically against the
+  encrypted pages using the Z-Chain's FHE/ZK primitives. The server returns an
+  encrypted result the client alone can open. Where full FHE is too costly, the
+  same chain's ZK path proves a result was computed correctly over committed
+  ciphertext.
+  \item[Coordinator-free merge (CRDTs).] Multi-device and multi-writer updates
+  reconcile through conflict-free replicated data types, so concurrent writes
+  merge deterministically without a consensus round on the write path. Quasar is
+  used only for the coarse coordination (key rotation, file-version commitments
+  on S-Chain), not for every row write.
+\end{description}
+
+The result is ``decentralized SQL'': a per-user record store that is private by
+construction (E2E encryption), available without a trusted server (content on
+S-Chain, keys on the client), and writable offline (CRDT merge), with the chain
+providing only what chains are good at --- ordered commitments, key custody, and
+verifiable compute.
+
+\subsection{Why both, and how they compose}
+
+The two engines are not redundant; they are the OLAP/OLTP split re-cast along the
+trust axis (Table~\ref{tab:twoengine}). Datastore answers ``what are the
+aggregate trends across the fleet'' at scale; Decentralized SQL holds ``this
+user's project data'' privately. They share one substrate and one transport:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Datastore} & \textbf{Decentralized SQL} \\
+\midrule
+Shape      & columnar OLAP        & row OLTP (SQLite) \\
+Scope      & aggregate / fleet    & per-user / project \\
+Compute    & server-side (TEE)    & client + FHE on server \\
+Privacy    & attested enclave     & E2E, keys client-held \\
+Scale      & horizontal compute   & per-file, CRDT merge \\
+Consensus  & Quasar (manifests)   & Quasar (keys/versions) \\
+\bottomrule
+\end{tabular}
+\caption{Two engines, one platform: the OLAP/OLTP split re-cast along the trust
+axis. Both ride S-Chain storage, K-Chain keys, and ZAP transport.}
+\label{tab:twoengine}
+\end{table}
+
+\paragraph{The shared stack.} \textbf{S-Chain} (the Hanzo S3 / SeaweedFS fork)
+is the decentralized storage tier for \emph{both} engines --- Datastore parts and
+encrypted SQLite files are both content-addressed objects. \textbf{K-Chain}
+custodies the post-quantum keys. \textbf{Z-Chain} provides FHE/ZK compute.
+\textbf{Quasar} provides post-quantum, leaderless finality for the commitments of
+both. And \textbf{ZAP} --- the Cap'n-Proto-derived transport that already
+replaced gRPC --- is the single wire for client-to-engine queries, engine-to-S3
+part transfer, and engine-to-consensus coordination, so the entire platform is
+one transport deep rather than the usual stack of HTTP, gRPC, and a ZooKeeper
+wire. The endpoint of the program in this paper is precisely that: no internal
+HTTP, no gRPC, no ZooKeeper --- ZAP and Quasar, end to end, over decentralized
+S-Chain storage.

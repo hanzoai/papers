@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="papers" width="880"></p>
+
 # Hanzo AI Research Papers
 
 Technical papers covering Hanzo AI compute infrastructure, agent frameworks, ML inference, platform services, and defense applications. Includes the Zen model family co-developed with Zoo Labs Foundation.

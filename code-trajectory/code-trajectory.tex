@@ -1,0 +1,329 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ============================================================================
+% The Trajectory of Code — self-contained preamble (no external .sty needed)
+% ============================================================================
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\setlist{itemsep=2pt,topsep=3pt}
+
+\newcommand{\doctitle}[1]{{\LARGE\bfseries #1\par}\vspace{0.6em}}
+\newcommand{\survival}{\ensuremath{S}}
+\newcommand{\shape}{\ensuremath{\sigma}}
+
+\begin{document}
+
+% ---- Cover ------------------------------------------------------------------
+\begin{titlepage}
+\vspace*{2cm}
+\begin{center}
+\doctitle{The Trajectory of Code}
+{\Large Survival-Weighted Learning from Version-Control History\\for Agentic Software Models}\par
+\vspace{2cm}
+{\large Zach Kelling}\par
+\vspace{0.3em}
+{Hanzo Industries Inc \quad(Techstars '17)}\par
+{\small zach@hanzo.ai \quad ORCID: --- \quad @zeekay}\par
+\vspace{2cm}
+{\small HAI-2026-014 \quad\textbullet\quad Version 0.1 (Draft) \quad\textbullet\quad \textsc{Internal / Private}}\par
+\vspace{1cm}
+\end{center}
+\begin{abstract}
+\noindent We argue that the most valuable training signal for agentic software
+models is not the agent's transcript nor the final source tree, but the
+\emph{longitudinal history of the code itself}. A version-control graph is a
+record of natural selection: every line, hunk, and structural \emph{shape} that
+an author commits is subsequently either preserved, rewritten, or deleted by the
+future. Survival therefore constitutes a time-validated, annotation-free quality
+label at massive scale. We formalize \emph{code survival} $\survival$ (the
+duration a unit of code persists before it is changed or removed), extend it from
+lines to abstract structural shapes ($\shape$), and show that survival-weighted
+objectives let a model learn to generate code that \emph{lasts} rather than code
+that merely parses or passes a single test. We describe a decomplected extraction
+pipeline that fuses three co-registered layers---agent \emph{trajectories}
+($\sim$5{,}190 Claude Code sessions), verified \emph{diffs} (file-history and git),
+and \emph{outcomes} (survival, test status, and a per-commit \textsc{human}/\textsc{ai}
+label)---across a heterogeneous fleet of developer machines, with mandatory secret
+redaction and provenance versioning. The result is a corpus of the form
+\textit{(instruction $\to$ agent trajectory $\to$ verified diff $\to$ survival
+outcome)}, which supports supervised, preference, and outcome-verified
+reinforcement objectives, and a novel evaluation regime---\emph{survival
+holdout}---that scores a model on whether its generated changes would have endured.
+\end{abstract}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ============================================================================
+\section{Thesis: time is the annotator}
+% ============================================================================
+
+Public code datasets are overwhelmingly \emph{cross-sectional}: a snapshot of a
+repository at one instant, scraped and tokenized. Agentic benchmarks add the
+task dimension (an instruction plus a repository state), and instruction-tuned
+corpora add human preference labels. All three ask the same implicit question:
+\emph{what code was written?} None asks the question that a working engineer
+actually cares about: \emph{what code should have been written---and how do we
+know?}
+
+A version-control history answers that question for free, because it contains
+the future. Every unit of code an author commits is, over the following weeks
+and years, subjected to a merciless empirical test: it is kept, edited, or
+deleted by real subsequent work. Code that survives dozens of refactors was
+\emph{validated by time}; code rewritten the next morning is a labeled negative.
+No annotator, rubric, or reward model produced these labels---the history did,
+and it did so at the scale of every commit ever made.
+
+This paper develops that observation into a training methodology. Our central
+claims are:
+
+\begin{enumerate}
+\item \textbf{Survival is a quality signal.} The persistence of a unit of code
+is a time-validated, annotation-free proxy for its quality, correctness, and
+architectural fit.
+\item \textbf{Shapes, not lines, are the unit of interest.} Line survival is
+noisy; the durable signal lives at the level of \emph{shapes}---function
+signatures, module boundaries, abstractions, and interfaces. Some shapes last
+far longer than others, and those are the good bones.
+\item \textbf{Trajectory beats snapshot.} A model should learn how code
+\emph{moves}---the ordered sequence of states a file passes through---not merely
+its terminal form.
+\item \textbf{The three layers must be co-registered.} Agent reasoning (the
+\textsc{how}), the verified diff (the \textsc{what}), and the survival outcome
+(the \textsc{result}) are individually useful and jointly transformative: they
+yield grounded tuples \textit{(instruction $\to$ trajectory $\to$ diff $\to$
+outcome)} that no single-layer corpus can express.
+\end{enumerate}
+
+% ============================================================================
+\section{Formalism: code survival}
+% ============================================================================
+
+\subsection{Line and hunk survival}
+
+Let a repository's history be an ordered sequence of commits
+$c_0, c_1, \dots, c_T$. For a unit of code $u$ (a line, a hunk, or a shape)
+introduced at commit $c_b$ (\emph{birth}) and first modified or removed at
+commit $c_d$ (\emph{death}), define its survival as the wall-clock duration
+
+\[
+\survival(u) \;=\; t(c_d) - t(c_b),
+\qquad
+E(u) \;=\; d - b,
+\]
+
+where $E(u)$ is the number of intervening commits the unit \emph{survived
+through} (its edit-distance longevity). A unit still present at the head commit
+$c_T$ is right-censored; we treat it as alive with a lower bound
+$\survival(u) \ge t(c_T) - t(c_b)$ and handle censoring with standard
+survival-analysis estimators (Kaplan--Meier for population curves; Cox models
+when conditioning on features).
+
+Line survival is recoverable from \texttt{git} via incremental blame reconstruction
+(equivalently, the machinery behind code half-life analyses): replay the diff
+stream, assign every added line a birth, and record its death when a later diff
+deletes or replaces it. The output is a per-line record
+$\langle \text{repo}, \text{path}, \text{birth}, \text{death}, \survival, E,
+\text{author\_type}\rangle$.
+
+\subsection{From lines to shapes}
+
+Line survival is high-variance: reformatting, renaming, and mechanical edits
+kill lines without killing \emph{ideas}. The load-bearing signal is the survival
+of \emph{shapes}---structural units recovered from the abstract syntax tree:
+function signatures, type/class definitions, module and package boundaries,
+public interfaces, and recurring design patterns. A shape $\shape$ is identified
+across commits by a stable structural key (e.g.\ a normalized signature or an
+interface hash) rather than by text, so it can survive an internal rewrite that
+replaces every one of its lines. We then measure $\survival(\shape)$ exactly as
+above.
+
+The empirical claim is that the distribution of $\survival(\shape)$ is heavy-tailed
+and \emph{informative}: a small fraction of shapes---clean abstractions,
+well-chosen interfaces---persist across the entire visible history, while the
+majority churn. Training a generator to prefer the long-lived tail is training
+it toward durable architecture, which is precisely the competence that
+cross-sectional corpora fail to teach.
+
+\subsection{Durability label}
+
+Given a survival distribution we define a per-unit durability label by upper and
+lower quantiles $q_{\text{hi}}, q_{\text{lo}}$ of $\survival$ (computed
+within-repository and within-language to control for base rates):
+
+\[
+\ell(u) =
+\begin{cases}
+\textsc{durable} & \survival(u) \ge q_{\text{hi}}\\
+\textsc{ephemeral} & \survival(u) \le q_{\text{lo}}\\
+\textsc{neutral} & \text{otherwise.}
+\end{cases}
+\]
+
+\textsc{ephemeral} units are not discarded---they are the negative class, and
+they are as valuable as the positives.
+
+% ============================================================================
+\section{The three co-registered layers}
+% ============================================================================
+
+The corpus fuses three sources, each answering a different question, joined on a
+common \emph{(repo, commit, timestamp)} key.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Layer} & \textbf{Source} & \textbf{Teaches} \\
+\midrule
+\textsc{How} (reasoning + tools) & Claude Code session transcripts & the agent trajectory:\\
+& ($\sim$5{,}190 sessions, $\sim$4.3\,GB) & task $\to$ think $\to$ tool call $\to$ observe \\[4pt]
+\textsc{What} (verified change) & file-history + git diffs & the actual before$\to$after code \\[4pt]
+\textsc{Result} (label + reward) & survival $+$ CI $+$ human/ai tag & did it last? did it pass? who wrote it? \\
+\bottomrule
+\end{tabular}
+\caption{The three data layers. Individually useful; jointly, they yield grounded
+\textit{(instruction $\to$ trajectory $\to$ diff $\to$ outcome)} tuples.}
+\end{table}
+
+The join is the value. Public agentic datasets have the \textsc{how} or the
+\textsc{what}; almost none carry the \textsc{result} at the granularity of
+survival, and none is additionally labeled by author type. Because our
+transcripts and commits are co-located on the same machines, each agent
+trajectory can be linked to the commit(s) it produced (by timestamp proximity,
+repository, and the version-control tool calls embedded in the trajectory), and
+each resulting hunk inherits a survival outcome. We can therefore ask, and
+learn from, the question no other corpus can pose: \emph{which agent decisions
+produce code that lasts?}
+
+\subsection{The human/ai axis}
+
+Every commit carries an author-type label---\textsc{human} (the developer's own
+hands, including historical corporate identities) or \textsc{ai} (an autonomous
+agent account). This axis is not decoration; it lets survival be conditioned on
+authorship, quantifying (for example) whether AI-authored abstractions survive
+at human rates, and isolating the trajectory features that predict durability
+regardless of author. In the reference dataset the \textsc{ai} account first
+appears in late 2024 and, within eighteen months, produces contributions at
+several times the \textsc{human} rate---so the corpus also documents, in real
+data, the transition of authorship from human to agent.
+
+% ============================================================================
+\section{Construction pipeline}
+% ============================================================================
+
+The pipeline is deliberately decomplected---one directed path, one artifact per
+stage, one canonical implementation:
+
+\[
+\textbf{extract} \to \textbf{normalize} \to \textbf{link} \to \textbf{redact}
+\to \textbf{format} \to \textbf{version/store}.
+\]
+
+\begin{description}[leftmargin=1.2em]
+\item[Extract.] Two collectors. (i) A \emph{session} collector reads
+\texttt{\textasciitilde/.claude/projects/*.jsonl} into structured trajectories.
+(ii) A \emph{history} collector replays each repository's git graph into the
+per-line/per-shape survival records of Section~2.
+\item[Fleet aggregation.] Development is spread across a heterogeneous fleet of
+machines, each holding a partial \texttt{\textasciitilde/.claude} and partial
+working copies. The session collector runs \emph{per host} and ships its
+sanitized shard to a central store; shards are deduplicated by session id and
+content hash so re-runs are idempotent and no machine is a single point of
+truth.
+\item[Normalize.] One canonical schema:
+\texttt{trajectory\{task, turns[\{think, tool\_calls, tool\_results\}], outcome\}}
+and \texttt{unit\{repo, path, kind, birth, death, survival, edits, author\_type,
+durable\}}.
+\item[Link.] Join trajectory $\leftrightarrow$ commit $\leftrightarrow$ survival
+on \emph{(repo, commit, time)}.
+\item[Redact.] \textbf{Mandatory and non-negotiable.} Session transcripts and git
+history are known to contain live credentials (private keys, cloud and service
+tokens). Redaction runs before any artifact leaves its host: secret scanning,
+key/token/\texttt{BEGIN}-block scrubbing, PII removal, and a private/public
+license gate. Failed or aborted sessions are \emph{labeled}, not dropped.
+\item[Format.] Emit SFT, preference, trajectory, and evaluation splits
+(Section~5).
+\item[Version/store.] All artifacts and metadata land in a single versioned
+dataset (\texttt{zen-agentic-dataset}); large blobs are held out of git and
+backed up to a hub (HuggingFace), with a private repository for the full corpus
+and a public repository for the redacted, license-clean subset. The survival and
+authorship metadata form the provenance layer for every record.
+\end{description}
+
+% ============================================================================
+\section{Training and evaluation formulations}
+% ============================================================================
+
+Survival is not merely a filter; it is an objective.
+
+\begin{description}[leftmargin=1.2em]
+\item[Supervised (durable targets).] Standard next-token / next-action loss,
+with examples weighted by $w(u) = f(\survival(u))$ so the model imitates
+long-lived code more strongly than churn.
+\item[Preference / DPO.] Pairs $(\textsc{durable}, \textsc{ephemeral})$ drawn
+from the same file and neighborhood give a natural preference signal:
+\emph{prefer the change that would have survived}.
+\item[Outcome-verified RL.] The reward is the join of \emph{did it pass}
+(CI/test status) and \emph{did it last} (survival), yielding a dense,
+non-gameable signal for policies that act over tool-use trajectories.
+\item[Trajectory modeling.] Train directly on state transitions
+$s_t \to s_{t+1}$ (how a file evolves), teaching refactoring and growth rather
+than one-shot synthesis.
+\item[Survival-holdout evaluation.] A benchmark that scores a model on whether
+its generated change matches (or would plausibly survive as well as) the change
+that historically endured at that point in the file's trajectory. Unlike
+single-test pass/fail, this rewards durable design, not merely green pipelines.
+\end{description}
+
+% ============================================================================
+\section{Why survival-weighting produces better agents}
+% ============================================================================
+
+Imitation learning on cross-sectional code teaches a model to reproduce the
+average of what was written---including the large fraction that was immediately
+undone. Outcome-verified benchmarks improve on this but reward only the narrow
+target of passing a fixed test, which is gameable and silent about architecture.
+Survival-weighting adds the missing axis: it rewards code that continued to be
+\emph{correct enough, clear enough, and well-factored enough that future work
+built on it rather than around it}. That is the closest available analogue to a
+natural-selection objective for software, and it is obtainable at the scale of a
+career's version-control history rather than the scale of hand-written rubrics.
+Because the same corpus carries the agent's reasoning and the author-type label,
+it uniquely supports the question that matters for building coding agents:
+\emph{which patterns of agent behavior yield durable code?}
+
+% ============================================================================
+\section{Privacy, provenance, and ethics}
+% ============================================================================
+
+The corpus is derived from private development history and therefore carries real
+obligations. Secret redaction is a hard gate, enforced before egress and verified
+in tests. Private-repository code is segregated under the private dataset with
+license controls; only redacted, license-clean records enter the public split.
+Every record retains provenance---source host, session id, commit, author type,
+and pipeline version---so any datum can be traced, re-derived, or withdrawn. The
+methodology stores \emph{all} exported data and metadata under one versioned home
+with fleet-wide backup, so the corpus is durable, auditable, and reproducible.
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+The history of code is a longitudinal experiment that has already been run, at
+enormous scale, with time as the annotator. Reading survival as a label---and
+elevating the unit of interest from lines to the shapes that last---turns a
+developer's version-control graph into a uniquely valuable training corpus for
+agentic software models: one that teaches not what code was written, but what
+code deserved to endure. Co-registered with agent trajectories and an
+author-type axis, it lets us train and measure agents against the only judge
+that ever mattered, which is the future.
+
+\end{document}

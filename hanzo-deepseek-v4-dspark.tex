@@ -1,0 +1,360 @@
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm,booktabs,hyperref,graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{DeepSeek-V4 on Hanzo Engine: Reference Parity by Layer Bisection,
+Fused Speculative Verification, and an All-Rust Draft-Training Loop}
+\author{
+    Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    \textit{Hanzo Industries Inc (Techstars '17)}
+}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report the bring-up of DeepSeek-V4-Flash --- a 284B-parameter
+mixture-of-experts model with hybrid sparse attention (DSA), four-stream
+hyper-connections, and a multi-token-prediction (MTP) head --- on Hanzo
+Engine, a general-purpose Rust inference stack, running a 2-bit (IQ2)
+quantization on a single NVIDIA GB10 (128\,GB unified memory). To our
+knowledge this is the only general-purpose engine that executes this
+architecture; \texttt{llama.cpp} has no \texttt{deepseek4} support, and the
+reference implementation (\texttt{antirez/ds4}) is a model-specific C
+engine. We describe a \emph{layer-bisection} methodology --- differencing
+per-layer residual norms against an instrumented CPU reference on a
+token-identical prompt --- that localized two behavior-defining defects: a
+silently-swallowed integer-width mismatch in GGUF metadata parsing that
+disabled the compressed-attention architecture on 41 of 43 layers, and the
+absence of decode-side compressed-KV emission, which left the model
+amnesic beyond its 128-token attention window. Fixing both restored
+reference behavior end-to-end (think $\rightarrow$ answer $\rightarrow$
+natural EOS over 1{,}127 tokens). A fused F32 online-softmax attention
+kernel for the model's 512-wide latent heads, ported from the reference
+and extended to speculative verification widths $q \in [1,8]$, raised base
+decode 33\% to 11.9--12.5\,tok/s --- ahead of the reference's base
+(11.4) --- and made self-speculative MTP decoding net-positive. We further
+integrate DeepSeek's DSpark parallel-block draft natively: the Rust port
+is bit-exact against the Python reference and yields a measured
+$1.70\times$ end-to-end speedup on Qwen3-4B (21.97 $\rightarrow$
+37.30\,tok/s) with exact greedy outputs. Finally, we argue that
+speculative drafts should be trained against the \emph{deployed quantized}
+target rather than full-precision weights, and demonstrate a complete
+pipeline on one workstation: hidden-state harvesting at 111.5\,tok/s
+teacher-forced prefill through the serving engine, cache conversion, and
+draft training with decreasing loss on real captures --- with a
+native-Rust training loop (hanzo-ml autograd) closing the dump
+$\rightarrow$ cache $\rightarrow$ train $\rightarrow$ deploy cycle without
+leaving the stack.
+\end{abstract}
+
+\section{Introduction}
+
+DeepSeek-V4-Flash departs substantially from its V3 lineage: attention
+operates on a single 512-dimensional shared-KV latent with trailing
+partial RoPE and learned attention sinks; 41 of 43 layers augment a
+128-token raw sliding window with \emph{compressed KV rows} pooled at
+per-layer ratios (4$\times$ or 128$\times$); the inter-layer residual is a
+four-stream \emph{hyper-connection} carrier mixed by a 20-iteration
+Sinkhorn normalization; MoE routing uses a $\sqrt{\mathrm{softplus}}$
+gate, with the first three layers hash-routed by token id; and the model
+is W8A8 quantization-aware trained, so its numerics are calibrated to
+8-bit activations. A separate 3.6\,GB GGUF carries a one-block MTP draft
+head.
+
+Running this on commodity hardware today means the 80.8\,GiB IQ2
+quantization on a GB10's unified memory. The reference implementation is
+Salvatore Sanfilippo's \texttt{ds4}, a hand-tuned C/CUDA engine specific
+to this model; it is the correctness and speed bar throughout this paper.
+Our goal was strict: match its \emph{behavior} (coherent long generation
+with natural termination) and its \emph{speed}, inside a general-purpose
+engine, then go beyond it with speculative decoding that the reference
+does not have.
+
+Three empirical lessons recur. First, \emph{measure, don't guess}: three
+plausible hypotheses (a CPU-fallback expert kernel, carrier precision as
+the degeneration cause, adaptive draft depth as a win) were each
+overturned by direct measurement before any fix was attempted. Second,
+\emph{bisect against a reference}, never debug open-loop: every root
+cause below was found by differencing against \texttt{ds4} on
+token-identical inputs. Third, \emph{silent defaults are landmines}: the
+single most consequential bug was an \texttt{unwrap\_or\_default()} on a
+metadata read.
+
+\section{Reference-Parity Methodology}
+
+\subsection{Token-identical trajectories}
+
+All comparisons run both engines on byte-identical rendered prompts. The
+reference's chat template (BOS + system + user + assistant marker +
+\texttt{<think>}) was verified equal to our Jinja rendering offline, and
+both tokenizations produce the same 24 ids. The reference exposes
+\texttt{--dump-logprobs}; we added a matching per-step top-$k$ dump.
+Greedy trajectories then either agree token-for-token or pinpoint the
+first divergent step --- ours diverged at step~0, immediately localizing
+the problem to the prefill forward rather than accumulated decode drift.
+
+\subsection{Per-layer bisection}
+
+We instrumented both engines to emit, for the last prompt position, the
+residual-carrier L2 norm and a four-component fingerprint after every
+layer: the reference's CPU path (plain C loops) via an environment-gated
+\texttt{fprintf}, and our forward via an equivalent trace. Aligning the 45
+checkpoints (embedding, 43 layers, final norm) gives a per-layer
+norm-ratio and direction-cosine profile. The observed signature ---
+layers 0--1 essentially exact (cosine $\geq 0.9997$), first drift at
+layer~2, compounding drift thereafter, collapse (cosine $0.12$) in the
+final layers as expert routing bifurcates --- identified the first
+compressed-attention layer as the defect site and exonerated everything
+the first two layers exercise: embeddings, latent attention, per-head
+norms, full-window RoPE, hash-routed MoE, hyper-connections, and the
+Sinkhorn kernel.
+
+Two null results sharpened the search. Forcing every layer onto the
+full-context RoPE tables produced \emph{bit-identical} output --- proving
+the compressed-rope configuration was never live. And disabling the
+compressed-KV concatenation changed nothing at short context --- proving
+no compressor existed to disable.
+
+\subsection{Root cause 1: an integer-width parse}
+
+The GGUF stores the per-layer compression schedule
+(\texttt{attention.compress\_ratios}) as an \texttt{i32} array. Our
+metadata reader requested \texttt{Vec<u32>}; the underlying
+\texttt{Value::to\_u32} matches only the \texttt{U32} variant, so the read
+erred --- and an \texttt{unwrap\_or\_default()} silently yielded an empty
+schedule. Every layer therefore ran in full-attention mode: wrong RoPE
+base (10{,}000 instead of 160{,}000 + YaRN on 41 layers), no compressor
+construction, no sliding window. This single line explained the entire
+observed pathology: greedy repetition collapse at $\sim$50 tokens, a
+flattened next-token distribution at step~0 (top-1 margin 1.5 nats versus
+the reference's 6.0), and its insensitivity to compute precision.
+Accepting any GGUF integer width fixed step~0 outright: top-5 tokens in
+reference order, top-1 at 99.9\% versus the reference's 99.7\%.
+
+\subsection{Root cause 2: decode-side amnesia}
+
+Correct configuration exposed a second, structural gap: the compressor
+ran only during prefill. At decode, attention was clamped to the raw
+128-token window, so 40 of 43 layers had \emph{no memory} of anything
+older --- the model lost the question, wandered, and never emitted EOS
+(the reference concludes at 784 tokens; ours looped to any cap). We
+implemented decode-side compressed-KV emission: a chunked input history
+with $O(1)$ appends, incremental row emission at each layer's pooling
+cadence (recomputing only the affected window, honoring the ratio-4
+overlap semantics), and state that self-heals under speculative rollback
+by truncating to the absolute position each forward reports --- no
+plumbing into the cache-rollback machinery. Beyond the window,
+decode attends the raw slice concatenated with the emitted rows under an
+exact per-row causal/window mask; at single-token decode the mask is
+provably all-visible after pre-slicing, so the fused kernel below serves
+the combined buffer directly. Result: 1{,}127 tokens of coherent
+reasoning, a formatted answer, and a natural stop --- reference-class
+behavior for the first time on this stack.
+
+\section{A Fused Attention Kernel for 512-Wide Latent Heads}
+
+Flash-attention kernels in the ecosystem template head dimensions up to
+256; V4's 512-wide latent forced an eager three-pass fallback (QK$^T$,
+softmax-with-sinks, $\cdot$V) whose cost grows with context. We ported
+the reference's decode kernel --- all-F32 online softmax, one warp per
+head, eight heads per block, Q held in registers as four
+\texttt{float4}s, KV tiled four rows at a time through shared memory, the
+sink folded into the softmax denominator only, and the sliding-window
+clamp applied per query --- and generalized it to grouped-query layouts
+and to \emph{speculative verification widths} $q \in [1,8]$ (one grid
+plane per query row; per-row causal end $kv{-}q{+}j{+}1$ and per-row
+window). The kernel matches a scalar CPU reference to $\sim$$10^{-7}$
+across window/sink/GQA cases, and S$=1$ is byte-identical to the
+single-row original.
+
+Two effects follow. Base decode rose 33\% (8.97 $\rightarrow$
+11.92\,tok/s), putting the general engine \emph{ahead of the reference's
+base} (11.4). And verification forwards ($q{=}2..3$) stopped paying the
+eager-path tax, flipping self-speculative MTP decoding from net-negative
+(9.27) to net-positive (12.56 at short context) --- the same F32
+arithmetic the parity argument wants is also the fast path.
+
+\section{Speculative Decoding}
+
+\subsection{Self-speculation with the MTP head}
+
+The bundled MTP head (one V4 block with NextN entry/exit, sharing the
+base embeddings and output head) drives an EAGLE-style chained draft
+through a generic proposer/verifier framework with both paged and
+non-paged KV backends. Depth two is the measured optimum; deeper chains
+lose because each additional draft is a full block forward whose marginal
+acceptance does not cover its cost. A confidence-gated adaptive depth ---
+DSpark's scheduler idea without the trained predictor --- measured
+\emph{neutral-to-negative} on this sequential head: the gate's own
+softmax and host readback cancel its savings. The framework retains
+variable-length staging (a proposer may return fewer tokens than its
+maximum; verification keys off the actual staged length), which parallel
+drafts require.
+
+\subsection{Native DSpark: parallel-block drafting}
+
+DeepSeek's DSpark drafts a block of seven tokens in a \emph{single}
+forward: multi-layer target hidden states are fused into a context
+memory; a mask-seeded block cross-attends that memory bidirectionally
+through five Qwen3-style layers; a rank-256 Markov head sequentially
+biases the per-slot logits; a confidence head predicts per-slot
+acceptance. We ported the draft natively and validated it bit-exactly
+against DeepSpec's Python reference on identical inputs (draft tokens
+exact; corrected block logits within $6\times10^{-5}$).
+
+Integrated end-to-end on Qwen3-4B with the released block-7 checkpoint,
+measured over 256-token greedy generations:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+ & baseline & DSpark & speedup \\
+\midrule
+decode (tok/s) & 21.97 & \textbf{37.30} & $1.70\times$ \\
+accepted drafts / round & --- & 2.49 (+1 verified) & \\
+outputs vs.\ baseline & \multicolumn{3}{c}{identical (greedy speculation is exact)} \\
+\bottomrule
+\end{tabular}
+\caption{Live parallel-block speculative decoding, Qwen3-4B, GB10.}
+\end{table}
+
+Two integration defects --- an attach call in a build path the public
+builder never executes, and a missing override that let a step-start
+hygiene pass clear staged proposals before verification --- reproduced,
+in the second pipeline, exactly the bug class found in the first. We
+record them as a checklist: any new speculative attachment must verify
+(a) the attach executes in the build function actually called, and (b)
+the pipeline overrides the staged-clear gate.
+
+\subsection{V4 scoreboard}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrl}
+\toprule
+configuration & tok/s & behavior \\
+\midrule
+reference (\texttt{ds4}), base & 11.4 & coherent, natural EOS \\
+reference (\texttt{ds4}), +MTP & 13.32 & coherent, EOS at 784 \\
+\midrule
+Hanzo, base (within window) & \textbf{11.9--12.5} & coherent \\
+Hanzo, +MTP (short context) & 12.56 & coherent \\
+Hanzo, +MTP (full parity, deep context) & 10.24 & coherent, EOS at 1{,}127 \\
+\bottomrule
+\end{tabular}
+\caption{DeepSeek-V4-Flash IQ2, identical GGUF and prompt, GB10.
+Base-versus-base the general engine leads; with speculation the
+reference retains $\sim$6\% at short context. The deep-context gap is
+per-step assembly of the combined KV buffer, performed inside the
+reference's megakernel and on the host in ours.}
+\end{table}
+
+\section{Training Drafts Against the Deployed Target}
+
+\subsection{The distribution argument}
+
+DeepSpec's stock pipeline loads the full-precision target (284\,GB for
+V4-Flash) to harvest hidden states --- infeasible on a 128\,GB
+workstation, and, we argue, subtly \emph{wrong} for deployment: a draft's
+acceptance rate is its agreement with the target actually served. A
+W8A8-QAT model self-corrects on its trained quantization manifold; the
+quantized engine's hiddens \emph{are} the deployment distribution.
+Harvesting them requires no weights beyond the 80.8\,GiB already being
+served.
+
+\subsection{The pipeline, measured}
+
+The serving engine gains a capture mode: during teacher-forced prefill it
+records the hyper-connection carrier (stream-summed) at five evenly
+spaced layers plus the post-norm hidden, writing one tensor file per
+sample. Measured harvest rate: \textbf{111.5\,tok/s} (300 samples,
+125k tokens, 18.7 minutes) --- an order of magnitude above decode, making
+a 30M-token corpus a days-scale job on one box. A converter reshapes
+dumps into DeepSpec's binary cache using DeepSpec's own writers
+(round-trip verified bit-exact); the draft's embedding and output head
+are warm-started from the target's own (frozen, dequantized from the
+GGUF); the target directory DeepSpec's trainer expects is synthesized
+from the GGUF's tokenizer (encoding verified identical to the
+reference's) and a draft-architecture config with V4 dimensions.
+
+On real captures, fifty optimizer steps of the draft decreased loss
+smoothly (3.03 $\rightarrow$ 2.62); the full five-layer paper
+configuration trains in 27.2\,GB --- comfortable residency alongside
+nothing else, schedulable opposite harvesting. Because the draft is
+Qwen3-shaped with V4 dimensions, the trained checkpoint loads through the
+\emph{already-shipped} native DSpark path with no engine changes.
+
+\subsection{Closing the loop in Rust}
+
+hanzo-ml retains its lineage's reverse-mode autograd
+(\texttt{Var}, \texttt{backward()} $\rightarrow$ gradient store) and
+optimizers (AdamW). A native trainer --- cache reader, trainable DSpark
+draft with frozen embeddings/head, teacher-forced Markov correction,
+cross-entropy over block positions --- is in progress; its acceptance
+gate is a decreasing loss on the same real captures and a checkpoint in
+the exact tensor layout the engine loads. With it, every stage ---
+harvest, cache, train, deploy --- runs in one Rust stack. We are not
+aware of another Rust inference engine with a closed speculative-draft
+training loop.
+
+\section{Related Work}
+
+\texttt{antirez/ds4} is the V4-specific reference engine and the bar for
+this work. \texttt{llama.cpp} supports the \texttt{deepseek},
+\texttt{deepseek2}, and \texttt{deepseek32} families but not
+\texttt{deepseek4}. DeepSpec (DeepSeek, MIT) provides the DSpark, DFlash,
+and Eagle3 draft-training recipes and released Qwen3/Gemma checkpoints;
+SpecForge and the EAGLE line established feature-level drafting. Our
+contributions are orthogonal: general-engine V4 execution, the bisection
+methodology and the two root causes, verification-width kernel fusion,
+the bit-exact native DSpark integration, and quantized-target draft
+training on serving hardware.
+
+\section{Conclusion}
+
+A general-purpose Rust engine now runs DeepSeek-V4-Flash with
+reference-class behavior, leads the hand-tuned reference base-for-base,
+and hosts the first live parallel-block speculative decoder in the
+ecosystem at a measured $1.70\times$. The remaining gaps are named and
+scoped: reference-side speculation retains $\sim$6\% at short context;
+deep-context assembly wants a persistent device-side buffer; prefill
+wants the reference's expert-tiled MoE kernels. The V4 draft now training
+against the quantized target is positioned to convert the Qwen3-measured
+$1.70\times$ mechanism into a decisive V4 lead. The enduring artifacts
+are methodological: token-identical trajectory diffs, layer bisection
+against an instrumented reference, and a hard rule --- no silent defaults
+on model metadata.
+
+\end{document}

@@ -475,6 +475,7 @@ bf16               & 7  & \texttt{exp2f} & \texttt{"needle needle\dots"} \\
 f16                & 10 & \texttt{exp2f} & \texttt{"0123456789\dots"} \\
 split $P_{hi}{+}P_{lo}$ & $\sim$20 & \texttt{exp2f} & \texttt{".matmat.matmat\dots"} \\
 split $P_{hi}{+}P_{lo}$ & $\sim$20 & \texttt{expf} (exact) & \texttt{"1)2)3)4)5)\dots"} \\
+split $P_{hi}{+}P_{mid}{+}P_{lo}$ & $\sim$33 ($>$ f32) & \texttt{exp2f} & \texttt{"PostScriptScript\dots"} \\
 eager (reference)  & 23 (f32), single-pass & \texttt{expf} & \texttt{"\dots Paris\dots"} (coherent) \\
 \bottomrule
 \end{tabular}
@@ -493,13 +494,21 @@ $2^{-8}$ bf16-$P$ error already shown non-curative --- and this last one was \em
 empirically: exact \texttt{expf} atop f32-class $P$ still degenerates at both seeds (into a fresh
 \texttt{"1)2)3)\dots"} attractor), exhausting the precision-and-transcendental hypothesis space.
 
-\paragraph{The boundary.} What remains after all eliminations is a lone variable: $P$ is
-$\sim$20-bit on the tensor-core path versus true 23-bit f32 in eager. Because tensor cores
-\emph{require} $\le$tf32/f16/bf16 inputs, a genuinely f32 $P\!\cdot\!V$ \emph{is} the eager
-(CUDA-core) path --- so on this hardware \textbf{fusion and f32-precision $P\!\cdot\!V$ are mutually
-exclusive}. The shipped fix routes bf16 attention to the eager kernel; it is not a stopgap but the
-\emph{correct} answer, and it is essentially optimal: any stable variant must carry f32 $P\!\cdot\!V$,
-which forgoes tensor cores and thus lands at eager's throughput regardless. Its only cost is
+\paragraph{The boundary --- and the decisive over-shoot.} To settle whether the lone remaining
+variable was $P$ precision (the tensor-core path's $\sim$20-bit vs eager's 23-bit f32), we pushed a
+\emph{three}-term split $P_{hi}{+}P_{mid}{+}P_{lo}$ to $\sim$\textbf{33 mantissa bits --- beyond full
+f32}, more $P$ precision than eager itself carries. It \emph{still} degenerates (into a fresh
+\texttt{"PostScript\dots"} attractor). This is conclusive: raising $P$ precision \emph{past eager's
+own} does not cure it, so the collapse is \textbf{not a $P$-precision phenomenon at all}. With $P$
+over-shot, $V$ identical (bf16) in both paths, scores f32-identical, single-tile (no rescale), and
+\texttt{exp} eliminated, the sole surviving difference is the \emph{fused tiled computation venue}
+itself: the flash structure converges to a different, degenerate numerical fixpoint than eager's
+single materialized pass, and \emph{no precision knob closes it}. The stable attention \emph{is} the
+eager (materialized, single-pass) computation --- not because tensor cores lack f32, but because the
+fused structure is inherently on the wrong side of this model's repetition bifurcation. The shipped
+fix routes bf16 attention to eager; it is not a stopgap but the \emph{only} stable structure, and it
+is essentially optimal on speed as well: any fused stable variant would have to abandon the tiled
+tensor-core venue that causes the collapse. Its only cost is
 long-context prefill ($2.66\x$ at 2409 tokens; short prompts and \emph{all} decode are unaffected,
 since decode attention is a single query against the cache), and that cost is intrinsic to stability.
 The methodological point echoes the rest of this paper: the result was reachable only by

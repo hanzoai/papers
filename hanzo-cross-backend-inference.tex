@@ -1,5 +1,5 @@
 \documentclass[11pt]{article}
-\usepackage{shared/hanzocover}
+\usepackage[margin=1in]{geometry}
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{graphicx}
@@ -8,17 +8,18 @@
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
 \usepackage{enumitem}
 
-\title{Edge LLM Inference Across Commodity Accelerators: Measured AMD, NVIDIA, and Apple Performance, and hanzo-engine at llama.cpp Decode Parity on Every Backend}
-\author{Hanzo Dev \\ \texttt{dev@hanzo.ai} \\ \textit{Hanzo AI}}
-\date{June 2026}
+\title{\textbf{Edge LLM Inference Across Commodity Accelerators:\\
+Measured AMD, NVIDIA, and Apple Performance, and\\
+hanzo-engine at llama.cpp Decode Parity on Every Backend}}
+\author{Hanzo AI --- hanzo-engine technical white paper, 05}
+\date{Measurement pass: 2026-06-17}
 
 \begin{document}
-
-\hanzocoverpage
+\maketitle
 
 \begin{abstract}
 This paper reports \emph{measured} single-GPU inference performance for one model
-(\textbf{an 8B dense transformer at Q8\_0}) across three commodity edge accelerators --- AMD Ryzen AI Max+ 395
+(\textbf{Qwen3-8B-Q8\_0}) across three commodity edge accelerators --- AMD Ryzen AI Max+ 395
 ``Strix Halo'' (Radeon 8060S iGPU, gfx1151), NVIDIA GB10 ``Grace Blackwell'' (sm\_121), and
 Apple M4 Max --- comparing \textbf{hanzo-engine} against \texttt{llama.cpp} on each, same model,
 same metric (512-token prefill throughput \texttt{pp512}; single-stream decode throughput).
@@ -53,7 +54,7 @@ win one regime and lose the other; this paper shows exactly that.
 \end{itemize}
 
 \section{Method}
-One model throughout: \textbf{an 8B dense transformer at Q8\_0} (36 layers, $n_\text{embd}$ 4096, $n_\text{ff}$ 12288,
+One model throughout: \textbf{Qwen3-8B-Q8\_0} (36 layers, $n_\text{embd}$ 4096, $n_\text{ff}$ 12288,
 32 query / 8 KV heads, head dim 128; $\approx$8.11 GiB resident). The 8-bit quant is the honest
 ``no accuracy excuse'' point --- it is the largest of the common quants, so decode is
 bandwidth-bound and the comparison is purely about kernel/streaming efficiency, not about a
@@ -76,7 +77,7 @@ cheaper format hiding a slower engine.
 \section{Results}
 \begin{table}[h]
 \centering
-\caption{The 8B model at Q8\_0, single GPU. Prefill = \texttt{pp512} t/s; Decode = single-stream t/s.
+\caption{Qwen3-8B-Q8\_0, single GPU. Prefill = \texttt{pp512} t/s; Decode = single-stream t/s.
 AMD from paper~01 (2026-06-08); NVIDIA + Apple measured 2026-06-17.}
 \begin{tabular}{l rr c rr c}
 \toprule
@@ -116,9 +117,25 @@ Metal (0.91$\times$) and largest on NVIDIA (0.76$\times$), where \texttt{llama.c
 is most heavily tuned. The prefill gap is real engineering work (matrix-core GEMM scheduling),
 not a rounding error --- the same honest conclusion paper~01 reached on AMD.
 
+\paragraph{4. A cross-backend \emph{correctness} finding: attention kernel choice, not just speed.}
+Speed parity is not the only cross-backend variable --- numerical \emph{behaviour} is too, and it
+bites hardest where the kernels differ most. Qwen3-8B-Q4\_K\_M generates coherently on Metal and
+under an eager attention on CUDA, but \emph{collapses into token repetition} under CUDA
+flash-attention-2 (byte-identical weights, same sampler; only the attention kernel differs). We
+traced it to the reduced-precision $P\!\cdot\!V$ tensor-core matmul and, by an exhaustive
+proved-by-build precision ladder (bf16 $\to$ f16 $\to$ f32-class split-$P$, each verified on the
+running model), showed that raising precision only \emph{moves} the repetition attractor rather than
+clearing it: the fused low-precision path and a numerically-f32 path are mutually exclusive on tensor
+cores, so the stable attention \emph{is} the eager (CUDA-core, f32) kernel. The shipped fix routes
+bf16 CUDA attention to eager --- coherent in production, with the only cost being long-context
+prefill (short prompts and all decode are unaffected). The lesson generalizes the paper's thesis:
+a multi-backend engine must hold one \emph{numerically-vetted} implementation per operation, because
+``the same op, a different kernel per backend'' is a correctness hazard, not merely a perf one. (The
+full bisection is paper~06, \S\,``A correctness boundary''.)
+
 \section{The edge/commodity angle: smaller models}
 For latency-sensitive on-device use the 4B tier is the sweet spot. Measured \texttt{llama.cpp}
-(2026-06-17), a 4B dense transformer at Q8\_0:
+(2026-06-17), Qwen3-4B-Q8\_0:
 \begin{table}[h]
 \centering
 \begin{tabular}{l rr}
@@ -157,7 +174,7 @@ what is roadmap.
 \end{itemize}
 
 \section{What this paper does \emph{not} claim}
-Single model (the 8B model at Q8\_0) at a single quant; single-stream decode (no concurrency/batching
+Single model (Qwen3-8B-Q8\_0) at a single quant; single-stream decode (no concurrency/batching
 sweep); \texttt{pp512}/128-token decode only (no long-context or KV-pressure regime); AMD numbers
 carried from paper~01 rather than re-measured on this pass; and \texttt{llama.cpp} taken as the
 stock build (not re-tuned per box). Accuracy is not evaluated here --- Q8\_0 is bit-faithful to
@@ -212,7 +229,8 @@ native Windows + ROCm 7.1); NVIDIA GB10 (Grace-Blackwell, sm\_121, CUDA 13, 121 
 aarch64); Apple M4 Max (137 GB unified, Metal / \texttt{BLAS,MTL}).\\
 \textbf{Software.} \texttt{llama.cpp} stock HIP/CUDA/Metal builds; hanzo-engine built \texttt{--release}
 per box (git \texttt{8c50abb32}). Measurement passes: AMD 2026-06-08 (paper~01), NVIDIA + Apple 2026-06-17.\\
-\textbf{Models.} an 8B dense transformer at Q8\_0 (8.11 GiB) and a 4B dense transformer at Q8\_0 (3.98 GiB), GGUF.\\
+\textbf{Models.} \texttt{Qwen3-8B-Q8\_0} (8.11 GiB) and \texttt{Qwen3-4B-Q8\_0} (3.98 GiB), GGUF, from the
+public Qwen3 releases.\\
 \textbf{Commands.} Baseline: \texttt{llama-bench -m <model>.gguf -ngl 99 -p 512 -n 128}. hanzo:
 \texttt{hanzo bench auto -m <dir> --format gguf -f <model>.gguf} (512-token prefill, 128-token decode,
 1 warmup + 3 timed iterations).\\

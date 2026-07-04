@@ -1,0 +1,608 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{array}
+
+\definecolor{kw}{rgb}{0.13,0.29,0.53}
+\definecolor{cmt}{rgb}{0.40,0.40,0.40}
+\definecolor{str}{rgb}{0.16,0.50,0.16}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+}
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,trait,enum,match,if,else,for,while,loop,return,use,mod,crate,self,super,async,await,where,type,const,static,unsafe,ref,move,dyn,as,true,false},
+  morecomment=[l]{//}, morecomment=[s]{/*}{*/}, morestring=[b]", sensitive=true,
+}
+\lstdefinelanguage{CUDAC}{
+  morekeywords={int,float,half,char,void,for,if,else,return,const,struct,template,typename,constexpr,__global__,__device__,__constant__,__shared__,if,unsigned,auto,using},
+  morecomment=[l]{//}, morecomment=[s]{/*}{*/}, morestring=[b]", sensitive=true,
+}
+
+\newcommand{\x}{\ensuremath{\times}}
+\newcommand{\dpa}{\texttt{dp4a}}
+
+\title{\textbf{When Does a Kernel Win Surface? A Cross-Backend Catalog of\\
+Proven Levers, Measured Dead-Ends, and a Bottleneck Taxonomy for\\
+Quantized LLM Decode and Prefill}}
+\author{Hanzo AI --- hanzo-engine / hanzo-ml technical white paper, 06}
+\date{Consolidation pass: kernel work measured 2026-06}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Companion paper~05 established the \emph{model-level} result: hanzo-engine reaches
+\texttt{llama.cpp} decode parity (0.98--1.04\x) and a bounded prefill gap (0.76--0.91\x) on
+AMD, NVIDIA, and Apple from one multi-backend build. This paper documents the
+\emph{kernel-level} engineering underneath that result --- the optimizations we wrote,
+measured, and \emph{kept} in hanzo-ml/hanzo-engine, and, just as importantly, the ones we
+wrote, measured, and \emph{reverted}. We organize roughly thirty controlled experiments
+(ROCm/gfx1151, CUDA/GB10, Vulkan/gfx1151, Metal/M4~Max) into a four-regime
+\textbf{bottleneck taxonomy} --- bandwidth-roofline decode, compute-bound prefill,
+host/launch-bound decode, and GPU-busy-bound decode --- and show that the taxonomy
+\emph{predicts} whether a given kernel win surfaces end-to-end. The strongest evidence for the
+taxonomy is that the \emph{same} optimization is a real lever in one (platform, regime) and a
+measured non-lever in another: int8 \dpa{} lifts ROCm i-quant decode 2.27\x{} (compute-bound) but
+is end-to-end flat on GB10 (host-bound); a fused router gives ROCm $+13\%$ but CUDA $0\%$ (no
+expensive sort to eliminate); a fused-coopmat tensor-core prefill is correct but $3.8\x$ slower
+than int8-ALU \dpa{} on gfx1151 (decode-bound). The governing rule, stated once and tested
+repeatedly: \emph{a fusion or kernel change helps end-to-end only if it eliminates work in the
+binding resource; cutting launches or FLOPs in a non-binding resource is flat at best and
+negative if it injects redundant work.} Every win we report is gated bit-exact against a CPU
+reference; every A/B is device-map-controlled or kernel-isolated. We close with the one frontier
+this program has fully characterized but not yet closed --- Vulkan \emph{decode}, which we show
+by profiling is op-count-serialization-bound (1336 dispatches / 903 global barriers / 143~ms
+GPU fence-wait per token, with CPU recording effectively free) --- and the fusion roadmap that
+the ROCm path already validates.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction: one engine, every backend, and a measurement question}
+hanzo-engine runs CUDA, ROCm, Metal, Vulkan, and CPU behind one model loader; hanzo-ml is the
+tensor/kernel layer beneath it. The portability thesis is only credible if the \emph{same} code
+is competitive with the hand-tuned, single-vendor baseline (\texttt{llama.cpp}) on each backend.
+Paper~05 showed it is, at the model level. The engineering question this paper answers is the one
+that actually consumes the work: \textbf{given a kernel that is provably faster in isolation, will
+it make the end-to-end token rate go up?}
+
+The naive assumption --- faster kernel $\Rightarrow$ faster model --- is wrong often enough to be
+the central hazard of inference optimization. A 9\x{} matmul can be flat end-to-end; a $5\x$ i-quant
+kernel can fully surface on one GPU and vanish on another; cutting half the launches can lose
+$22\%$. The difference is always \emph{which resource is binding}. We therefore present the work
+not as a list of tricks but as a taxonomy that tells you, before you write the kernel, whether the
+win can possibly surface --- and we validate it on the cases where it predicted ``no'' and we
+measured ``no.''
+
+\paragraph{What this paper contributes.}
+\begin{enumerate}[noitemsep]
+  \item A \textbf{bottleneck taxonomy} (\S\ref{sec:taxonomy}) for single-stream quantized
+        inference, with a falsifiable surfacing rule.
+  \item A \textbf{catalog of kept levers} (\S\ref{sec:rocm}--\ref{sec:vulkan}) per backend, each
+        with its bit-exact gate and a device-map-controlled or kernel-isolated A/B.
+  \item A \textbf{catalog of measured dead-ends} (\S\ref{sec:deadends}) --- the negatives are the
+        contribution: each one is explained by, and so confirms, the taxonomy.
+  \item The \textbf{Vulkan-decode frontier} (\S\ref{sec:frontier}): a profile-backed diagnosis and
+        the fusion roadmap that ROCm has already walked.
+\end{enumerate}
+
+\section{Architecture: three orthogonal axes and a bit-exact invariant}
+\label{sec:arch}
+The kernel surface is a product of three axes that we keep deliberately orthogonal, because
+collapsing them is what produces an unmaintainable $N\times M\times K$ explosion of hand-written
+kernels:
+\begin{itemize}[noitemsep]
+  \item \textbf{Quant format} (the \emph{value}): the GGUF block layout --- how 1--8 bits/weight
+        plus per-block scales reconstruct a float. 22 families are wired
+        (Q8\_0/Q4\_0/Q4\_K/Q5\_K/Q6\_K/Q2\_K/Q3\_K, the IQ1/IQ2/IQ3 codebook quants, the TQ
+        ternary quants, etc.).
+  \item \textbf{Contraction} (the \emph{operation}): mat-vec (decode, $M{=}1$), GEMM (prefill,
+        $M{>}1$), and their indexed-MoE twins (gather/scatter over routed experts).
+  \item \textbf{Backend} (the \emph{functor}): how a contraction lowers to ROCm/CUDA/Metal/Vulkan
+        instructions and memory.
+\end{itemize}
+On ROCm this is already decomplected to one generic contraction with the type injected as a
+trait: \texttt{qmatvec\_core<WTYPE,XT>} (decode) and \texttt{qmmq\_core<WTYPE,MOE,NWAVE\_M>}
+(prefill), each instantiated per format, with the MoE variant differing only by an
+\texttt{if constexpr (MOE)} gather/scatter so the dense path codegens byte-identically. The same
+22 formats decode through one core; the int8-\dpa{} fast path is a second core selected by a single
+trait predicate \texttt{RocmQuantType::dp4a\_active()}. The forward graph never branches on
+``is this Q4\_K'' --- dispatch is by kernel-name string, so adding a format is additive.
+
+\paragraph{The invariant that makes aggressive kernels safe.} Every kernel --- every \dpa{}
+reinterpretation, every fusion, every tiling --- is gated against a CPU \texttt{to\_float} oracle
+to \texttt{nbad=0} (bit-exact, modulo documented f32 reorder / f16-rounding tolerances). This is
+not a test suite bolted on after; it is the precondition for shipping a kernel at all. The reason
+the catalog below can be this aggressive (reinterpreting a 6-bit asymmetric quant as signed int8,
+folding a residual-add into an RMS reduction, quantizing activations to int8 mid-GEMM) is that
+each transform is proven equivalent before it is allowed to matter for performance. The oracles
+are named inline (\texttt{qmatvec\_unified\_numeric}, \texttt{moe\_qmmq\_numeric},
+\texttt{add\_rmsnorm\_numeric}, \texttt{qk\_rms\_norm\_rope\_numeric}, \texttt{moe\_route\_numeric},
+\dots) and are the reusable gate for every follow-up.
+
+\section{A bottleneck taxonomy for single-stream quantized inference}
+\label{sec:taxonomy}
+Single-stream decode and prefill bind on different resources, and within decode the binding
+resource differs by platform and by whether HIP/CUDA graphs are active. We name four regimes.
+
+\begin{table}[h]
+\centering
+\caption{The four regimes. ``Surfacing condition'' is what a kernel change must do to move the
+end-to-end token rate.}
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{2.8cm} >{\raggedright\arraybackslash}p{4.3cm} >{\raggedright\arraybackslash}p{6.0cm}}
+\toprule
+Regime & Binding resource & Surfacing condition \\
+\midrule
+\textbf{Bandwidth-roofline decode} & weight bytes / memory BW & Only fewer weight bytes moved (a smaller quant). Kernel arithmetic changes are flat once at roofline. \\
+\textbf{Compute-bound prefill} & matrix/tensor-core FLOPs & Higher effective FLOP/s: better tiling, tensor cores, higher M-tile fill. \\
+\textbf{Host/launch-bound decode} (eager, or graph-less) & per-token CPU dispatch / kernel launch & Fewer launches, or graph capture that hides launch latency. GPU-time cuts are flat. \\
+\textbf{GPU-busy-bound decode} (graphs on) & sum of small-kernel GPU time & Eliminating GPU work (a true fusion). Repackaging the same work is flat. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The surfacing rule (falsifiable).}
+\begin{quote}\itshape
+A kernel change improves the end-to-end token rate only if it reduces consumption of the
+\emph{binding} resource. Reducing a non-binding resource is flat; reducing a non-binding resource
+\emph{while adding} work to the binding one is negative.
+\end{quote}
+Three corollaries drive the rest of the paper. (i) On a bandwidth-roofline decode, the matvec is
+already at the memory ceiling, so faster arithmetic is flat --- the only decode lever is reducing
+\emph{kernel count} (in the launch- or busy-bound sub-regimes), not making any one kernel faster.
+(ii) ``Fewer launches'' helps only in the launch/busy-bound regimes, and only if the launch you
+removed was not already free (under graphs it is). (iii) The same kernel can flip regime across
+platforms: a GPU with more launch overhead relative to memory bandwidth is launch-bound where
+another is bandwidth-bound, so a launch-cut surfaces on one and not the other.
+
+\section{Kept levers: ROCm (gfx1151, Strix Halo)}
+\label{sec:rocm}
+ROCm is the most mature backend and the one where the taxonomy was first forced on us. All decode
+A/Bs use the device-map pin \texttt{-n 0:48} (the auto-mapper otherwise mis-reads unified memory
+and offloads $\sim 1/3$ of layers to CPU, which silently corrupts the comparison --- a measurement
+hazard worth more than any single lever).
+
+\subsection{Unified \dpa{} decode cores (the K-quant and i-quant families)}
+The decode matvec for K-quants reinterprets the block as int8 and uses the RDNA3.5 dot-product
+builtin (\texttt{\_\_builtin\_amdgcn\_sudot4}; the plain \texttt{sdot4} does not compile on gfx1151,
+which lacks the dot1-insts feature). The win is per-format and depends entirely on the regime:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Q6\_K \dpa{}}: a $4.9\x$ \emph{kernel} win (260$\to$53\,$\mu$s per call) by reading
+        the 16-element scale group as four packed int reads and reconstructing 4 weights/int, one
+        branch per group not per element. The q6 centering ($q-32$) is handled as a bias term
+        $\sum(q-32)u = \dpa(q,u) - 32\,\dpa(\mathbf{1},u)$ because gfx1151 has no per-byte
+        \texttt{\_\_vsubss4}. Total GPU kernel time $-48\%$. \textbf{Model-level: $+17\%$}
+        ($28.2\to33.0$ T/s) --- it surfaces because eager MoE decode here is partly compute-bound
+        on the slow Q6\_K (output.weight + attn\_v + ffn\_down experts $=37.7\%$ of GPU work).
+  \item \textbf{IQ codebook \dpa{} (IQ2\_XXS/XS/S, IQ3\_XXS/S, IQ1\_S/M)}: $2.27\x$ \emph{end-to-end}
+        ($30.4\to 67.7$ T/s on Qwen3-30B-A3B-IQ3\_XXS), \emph{beating} \texttt{llama.cpp}-HIP
+        (67.6). The grid coords land in int8 and \dpa{} against the once-quantized activation; signs
+        without \texttt{\_\_vsub4} use $\sum(-1)^s g\,u = \dpa(g,u) - 2\,\dpa(g\,\&\,\text{mask}(s),u)$.
+        Unlike Q6\_K, this win fully surfaces \emph{and} is graph-flat --- i-quant decode was
+        \emph{compute-bound} (per-element f32 dequant + MAC), so the kernel \emph{was} the wall.
+        This is the textbook ``compute-bound decode'' case of the taxonomy.
+\end{itemize}
+
+\noindent The contrast between Q6\_K (kernel $4.9\x$, model $+17\%$) and IQ3 (kernel $2.27\x$, model
+$2.27\x$) is the taxonomy in one comparison: the i-quant decode was compute-bound so the kernel win
+\emph{is} the model win; the K-quant decode is mostly bandwidth-bound so only its compute-bound
+fraction surfaces.
+
+\subsection{Capture-clean strided ops $\to$ HIP-graph decode}
+The single highest-leverage ROCm change was not a matmul. Decode under HIP graphs hides per-launch
+host latency, but capture kept failing on the first strided op: each \texttt{Map/Reduce/cast/copy}
+uploaded its tiny dims/strides metadata array host$\to$device every op every token, which is an
+implicit capture violation (HIP 906). The fix rides the metadata \emph{inline by value} in the
+kernel param block (\texttt{\#[repr(C)] DimsStrides \{ v: [usize; 32] \}}, 256~B), so zero
+\texttt{clone\_htod} fires on the strided path. This both enabled graph capture \emph{and}, by
+removing a blocking H2D from the eager hot path, lifted eager decode from $\sim$11 to $\sim$16--30
+T/s on its own. It is the enabling lever beneath every launch-bound decode win.
+
+\subsection{Indexed-MoE decode without a host round-trip}
+MoE decode batches all routed slots into one launch over \texttt{grid.y}; the expert id is read
+\emph{on device} (the kernel takes \texttt{ids: \&RocmStorage}, not \texttt{\&[u32]}), so no
+\texttt{to\_vec1}/\texttt{copy\_from\_host} round-trip fires per token. This eliminated the
+per-expert host launch loop for mixed-precision GGUF (Qwen3-30B-A3B has Q6\_K ffn\_down experts
+inside a Q4\_K model), $10.22\to12.07$ T/s.
+
+\subsection{The MoE graph bug: a position-refresh root-cause, not a buffer bug}
+MoE decode under graphs produced garbage from $\sim$token~12 (``Let. Let. 1 1 1''). The
+prior hypothesis (recycled routing buffer) was disproven by an env-gated replay-vs-eager
+\texttt{max\_abs\_diff} probe: dense paths diffed $0.0$, MoE diffed $4$--$16$ from token~0, and
+bisecting the MoE forward (even forcing the experts to identity) still diverged --- proving the
+divergence was in the \emph{shared attention path}. The MoE model baked the decode RoPE position
+from the host offset at capture and never refreshed it, so every replayed token rotated at the
+frozen warmup position. The dense path already read RoPE off a stable device tensor
+(\texttt{metadata.rope\_positions}) refreshed in place each token; the MoE model simply never got
+that fix. Threading \texttt{positions: \&Tensor} through \texttt{forward\_attn} made MoE graphs
+replay bit-identically ($340$-token coherent, $\times 3$). The lesson is methodological: a
+replay-vs-eager numeric probe localizes a graph bug faster than any amount of staring at buffers.
+
+\subsection{Fused indexed-MoE prefill GEMM: the $2.58\x$ prefill lever}
+MoE prefill was the \emph{entire} deficit versus \texttt{llama.cpp}-HIP (0.34\x{} while dense was
+already 1.12\x). Root cause (\texttt{rocprofv3}): routed prefill went through the per-\emph{slot}
+decode matvec, so every routed token re-read its expert's whole weight and ran \emph{no} matrix
+cores --- $70.7\%$ of GPU time on MoE matvecs. The fix is an expert-grouped WMMA GEMM
+(\texttt{qmmq\_core<WTYPE,true>}, the same 16-warp/128$\times$128 int8-WMMA prefill machine with
+\texttt{if constexpr (MOE)} gather/scatter): tokens are counting-sorted by expert host-side
+(prefill is never captured, so the ids DtoH is free) into $\le$128-row tiles, and each block stages
+\emph{one} expert's weight and amortizes it over all that expert's tokens (llama's
+\texttt{mul\_mat\_id}). \textbf{Result: $366\to944.7$ T/s ($2.58\x$), $0.89\x$ of llama};
+GPU MoE-matmul time $-78\%$. The A/B (\texttt{HANZO\_MOE\_QMMQ\_FALLBACK=1} $\Rightarrow$ 365.8)
+confirms the kernel is the \emph{sole} lever.
+
+\paragraph{Dynamic M-tile (the bandwidth/compute balance point).} At $\sim$64 tokens/expert a
+128-row WMMA tile is half-empty. Parametrizing the core on the M-wave count
+(\texttt{qmmq\_core<WTYPE,MOE,NWAVE\_M>}, TILE\_M 128/64/32 with thread-count-agnostic staging
+loops so the dense path stays byte-identical) and picking TILE\_M by routed fill lifts M-fill
+$49.9\to68.2\%$ but throughput only $+2.4\%$ --- because the full-prefill MoE GEMM is
+\emph{weight-bandwidth-bound}, not WMMA-compute-bound, \emph{proven} by the A/B: TILE\_M=32 (even
+less empty WMMA work) is \emph{slower} because it re-reads each expert weight in two tiles. TILE\_M=64
+(one tile per $\sim$64-token expert, minimal weight re-reads) is the balance point. The residual gap
+to llama is irreducible expert-weight fetch, not tile fill. This is a clean instance of the
+surfacing rule: more compute headroom is flat when bandwidth binds.
+
+\subsection{Fused MoE routing: \texttt{moe\_route} ($+13\%$)}
+One kernel (one block/token: shared-mem softmax $\to$ top-$k$ $\to$ normalize) replaces the
+softmax$\to$sort$\to$narrow$\to$sum$\to$div chain ($\sim$6 launches/layer $\times 48 \approx 240$
+fewer kernels/token). \textbf{$52.9\to59.9$ T/s ($+13\%$), $0.90\x$ llama}; long-context run-loop
+$+15\%$. This is the launch/busy-bound decode lever the bandwidth-wall analysis pointed to, and it
+surfaces on ROCm precisely because the amdgcn \texttt{gpu-sort} it eliminates is disproportionately
+expensive (a fact that, foreshadowing \S\ref{sec:deadends}, makes the \emph{same} fusion flat on
+CUDA).
+
+\subsection{Decode op-fusion that eliminates work ($+2.8\%$ each, stacked)}
+\texttt{rocprofv3} of the shipped decode showed it is \textbf{GPU-busy-bound} under graphs
+($12.17$~ms busy $=94.5\%$ of the $12.87$~ms wall), with non-matvec busy time spread across
+\texttt{quantize\_q8\_1} (378\,$\mu$s), \texttt{rmsnorm} (330), \texttt{route} (297), casts (377),
+etc. Two fusions that \emph{eliminate} work (not just launches) each surfaced:
+\begin{itemize}[noitemsep]
+  \item \textbf{gate+up shared-quantize} (\texttt{moe\_matvec\_pair}): gate and up consume the same
+        routed token, so broadcast + quantize it \emph{once} and \dpa{} both banks. $-48$ quantize,
+        $-48$ ucopy per token.
+  \item \textbf{add\_rmsnorm}: $s = x + \text{residual}$ then $\text{rmsnorm}(s)\cdot\alpha$ in one
+        reduce launch, vs.\ a separate \texttt{badd} then \texttt{rmsnorm}.
+  \item \textbf{fused q/k RMSNorm + positions-RoPE} (\texttt{rope\_norm\_positions}, one block per
+        head-vector): one kernel replaces two standalone norms + RoPE \emph{and} the q/k
+        intermediate write+read. Same f32 math, no redundant work. $+2.8\%$ ($77.4\to79.5$ T/s),
+        the true-elimination twin of \texttt{moe\_route}.
+\end{itemize}
+Stacked, $1702\to1558$ kernels/token; decode past llama-HIP. Each is bit-exact. The discipline:
+fuse only when the fusion \emph{removes} GPU work --- which is exactly what the next section's
+biggest dead-end violated.
+
+\section{Kept levers: CUDA (GB10, Grace-Blackwell sm\_121)}
+\label{sec:cuda}
+\subsection{i-quant completeness: IQ1\_S MMQ prefill, TQ1/TQ2 \dpa{} decode}
+Two correctness/coverage gaps closed, both bit-exact (\texttt{cuda\_iquant\_tests} 13/13). IQ1\_S had
+native \dpa{} decode but was MMQ-excluded at prefill only because its GPU grid table was a zeroed
+stub mis-sized at $[512]$ (the indexer needs 11 bits $=2048$); filling the real
+\texttt{iq1s\_grid\_gpu[2048]} verbatim from llama.cpp enabled the whole int8-WMMA prefill machine
+that was already ported. TQ1\_0/TQ2\_0 ternary got native \dpa{} decode --- symmetric $\{-1,0,1\}$
+packs straight to signed int8 with \emph{no} bias-sum term; notably \texttt{llama.cpp} has no CUDA
+ternary path at all, so this is pioneering and the ROCm scalar \texttt{qdec} is the layout oracle.
+
+\subsection{\texttt{unpack\_ksigns}: the real GB10 i-quant kernel wall ($1.71\x$)}
+The i-quant decode matvec was $\sim$75\% of GB10 i-quant decode GPU-time. Diffing against
+\texttt{llama.cpp}'s \texttt{vec\_dot\_iq2\_xxs\_q8\_1} found a ROCm-port artifact: the sign
+codebook was a \emph{divergent} \texttt{\_\_constant\_\_} gather (each lane a different index,
+serialized through the constant cache). llama computes it table-free --- the 7-bit index's 8th sign
+is the popcount-parity of the other 7:
+\begin{lstlisting}[language=CUDAC]
+// bit-identical to KSIGNS_IQ2XS_D[v], no constant-cache gather:
+unpack_ksigns(v) = (v ^ ((__popc(v & 127) & 1) << 7)) * 0x01010101;
+\end{lstlisting}
+\textbf{Kernel A/B (4096$^2$, GB10): IQ2\_XXS $84.67\to49.49\,\mu$s $=1.71\x$} ($51\to87$ GB/s);
+IQ3\_XXS $1.40\x$; IQ2\_XS $1.25\x$. The control types that have no gather to kill (IQ2\_S/IQ3\_S,
+raw-byte signs) stay \emph{flat} --- which \emph{isolates} the gather as the cause and corrects an
+earlier ``47 GB/s VALU wall'' conclusion that had measured the baseline and mislabeled it.
+
+\paragraph{The honest model-level result: a GB10 non-lever.} Same-engine A/B on
+Qwen3-4B-UD-IQ2\_XXS: \textbf{flat} both graphs-on ($66.1$ vs $66.2$ T/s) and eager ($60.2$ vs
+$60.2$). The $1.71\x$ kernel win does not surface because GB10 hanzo i-quant decode is
+\textbf{host/launch-overhead-bound, not matvec-bound} --- the GPU finishes the faster matvec and
+stalls on per-token host work. This is the same kernel ($\dpa$/codebook decode) that fully surfaced
+on ROCm-eager (\S\ref{sec:rocm}); the regime flip across platforms is the taxonomy's sharpest
+prediction. We ship it anyway: bit-exact, it drops a 128-entry table and a divergent gather, it
+matches llama, and it is a latent win for genuinely matvec-bound regimes. The actual GB10 decode
+lever is launch reduction (the dense decode-graph gate, $+6.8\%$).
+
+\section{Kept levers: Vulkan (gfx1151) --- the prefill GEMM arc}
+\label{sec:vulkan}
+Vulkan is the youngest backend and the one where we walked the full optimization arc on a single
+kernel (Q4\_K prefill GEMM) in the open, keeping every rung --- including the negative ones --- as
+a documented ladder. This is the most complete single-kernel case study in the program.
+
+\subsection{The deadlock: a missing uniform GEMM, surfaced as a liveness bug}
+hanzo-Vulkan \emph{hung} at the first long prefill of any GGUF on gfx1151, while llama.cpp-Vulkan
+and hanzo's own ROCm ran fine. \texttt{gdb} of the live hung process put the engine thread in the
+kernel at \texttt{DRM\_IOCTL\_AMDGPU\_GEM\_CREATE} $\leftarrow$ \texttt{QTensor::dequantize}
+$\leftarrow$ prefill. The prefill \texttt{else} branch dequantized each weight to a fresh
+$\sim$100--235~MB f32 buffer; under the deferred single command batch \emph{none} free until the
+end-of-forward flush, so a dense prefill re-expands the whole model to f32 ($\sim$32~GB for an 8B)
+in fresh allocations --- on a unified-memory carveout this exhausts memory and \texttt{GEM\_CREATE}
+blocks on a free that can only happen \emph{after} the still-recording batch flushes: a
+self-deadlock. ROCm never hit it because ROCm prefill rides the int8-WMMA GEMM and never
+dequantizes --- exactly the asymmetry that pointed at the fix. \texttt{vulkan\_prefill\_gemm\_max\_rows}
+now returns \texttt{usize::MAX} for every dtype that \emph{has} a native quantized GEMM, so prefill
+always uses the GEMM and never the f32-dequant fallback. The gate is now effectively a ``has a GEMM
+kernel?'' predicate; the real cleanup (\S\ref{sec:vulkan-roadmap}) is to give all 22 formats a GEMM
+so the fallback --- and the bug --- become impossible by construction.
+
+\subsection{The L1 GEMM ladder: 1D dead-end $\to$ 2D-f32 $2.06\x$ $\to$ \dpa{}-2D $9.35\x$}
+We measured each rung kernel-isolated (\texttt{bench\_matmul\_q4k}: upload operands once, loop the
+GPU GEMM, one final synchronize --- the host-wrapper bench's per-iter 8~MB upload+readback
+otherwise masks the kernel). Numbers are $m{=}512,\,n_{\text{out}}{=}k{=}4096$ (17.2 GFLOP).
+
+\begin{table}[h]
+\centering
+\caption{Vulkan Q4\_K prefill GEMM ladder, kernel-isolated (gfx1151). Default = the legacy
+column-per-invocation kernel.}
+\small
+\begin{tabular}{l r r l}
+\toprule
+Kernel & Time (ms) & vs.\ default & Verdict \\
+\midrule
+Legacy column-per-invocation & 38.5 & 1.0\x & baseline \\
+1D weight-only LDS stage & 223.7 & 0.21\x & \textbf{dead-end} (\S\ref{sec:deadends}) \\
+2D-tiled f32 (64$\times$64, BK=32) & 19.0 & 2.06\x & kept (universal fallback) \\
+\textbf{2D-tiled int8 \dpa{}} & \textbf{3.4} & \textbf{9.35\x} & \textbf{shipped default} \\
+Naive coopmat (tensor cores) & 17.4--19 & 0.26\x vs \dpa{} & \textbf{dead-end} (\S\ref{sec:deadends}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The shipped kernel (\texttt{mul\_mm\_q4k\_tiled\_dp4a.comp}) stages a 64$\times$64 output tile:
+per K-step (BK=32, one Q4\_K sub-block) it stages the $n$-cols' 32 q4 codes + per-block $d_1/m_1$
+and the $m$-rows' int8 activation $xq$ + $xs/xsum$ into LDS, and each of 256 threads \dpa{}s its
+4$\times$4 sub-tile via the Q4\_K$\times$q8\_1 affine identity
+\[
+\text{acc} \mathrel{+}= d_1[\text{col}]\cdot xs[\text{row}]\cdot \dpa(q4, xq) \;-\; m_1[\text{col}]\cdot xsum[\text{row}].
+\]
+Activations are quantized to q8\_1 once per prefill. It is gated
+\texttt{vulkan\_q4k\_dp4a2d\_matches\_default} (rel $<1.5\!\times\!10^{-2}$; the q8\_1 activation
+quant adds $\sim$0.5--1\% on top of f32 reorder, a decode bug would be $\gg$ that). The default-flip
+ships it for dense ($w_{\text{off}}{=}0$, $m{>}1$) where the device advertises integer dot-product
+(queried via \texttt{PhysicalDeviceShaderIntegerDotProductFeatures}); otherwise the universal f32
+2D tile. A gfx1151 engine now gets $\sim$224 T/s Vulkan prefill by default, up from $\sim$24.
+
+\paragraph{The practical ceiling, pinned by a tile sweep.} At 5056 GFLOP/s the \dpa{}-2D kernel is
+$\sim$34\% of the $\sim$14.8 TFLOP f32 peak. A tile sweep pins the bottleneck as \emph{occupancy},
+not VRAM/LDS traffic: register-blocking the inner \dpa{} is flat (the compiler already did it / added
+VGPRs that cost occupancy); BM=128 (half the weight re-read) is $3\x$ \emph{slower} (register spill
+/ occupancy collapse); BM=32 is slightly slower (re-read + barrier overhead). 64$\times$64 is the
+sweet spot. The residual gap to f32-peak is the \emph{inherent} Q4\_K cost (per-sub-block scale
+application + in-kernel decode + the q8\_1 activation pass), not a tiling defect --- closing it
+needs a structurally different kernel (decode-amortized coopmat), not more tuning. This is the
+honest statement of where blind kernel-tuning ends on this GPU.
+
+\section{Measured dead-ends: the boundary map}
+\label{sec:deadends}
+The negatives are load-bearing: each is explained by the surfacing rule, and together they fence
+off the regimes. We report them because an inference team that does not know these boundaries will
+spend weeks re-discovering them.
+
+\begin{table}[h]
+\centering
+\caption{Things that were correct (bit-exact) but did not help, with the regime that explains why.}
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{3.9cm} >{\raggedright\arraybackslash}p{2.2cm} >{\raggedright\arraybackslash}p{6.7cm}}
+\toprule
+Change (bit-exact) & Result & Why (taxonomy) \\
+\midrule
+Fold \texttt{quantize\_q8\_1} into the \dpa{} matvec (ROCm) & \textbf{$-22\%$} ($77.4\to59$) & Each matvec \emph{block} re-quantizes the full activation into its own LDS (256$\times$ for a 2048-row proj) + a \texttt{\_\_syncthreads}: redundant serialized work \emph{injected} into a bandwidth-bound matvec. Under graphs the separate quantize launch was already free. \emph{Violates the rule.} \\
+Naive coopmat tensor-core prefill (Vulkan) & 0.26\x{} vs \dpa{} & Re-decodes the weight to f16 every K=16 step ($k/16$ passes); Q4\_K decode swamps the fast \texttt{coopMatMulAdd}s. Decode-bound, not tensor-core-bound. \\
+1D weight-only LDS tiling (Vulkan) & 0.21\x & Weight re-read was not the bottleneck; few-heavy-workgroups lose to many-light register-tiled invocations. The lever was 2D (stage \emph{both} operands), not 1D. \\
+TILE\_M=32 MoE GEMM (ROCm) & slower than 64 & Less empty WMMA work but re-reads each expert weight in 2 tiles; the GEMM is weight-bandwidth-bound. \\
+\dpa{} i-quant decode, model-level (GB10) & flat & Host/launch-bound decode: GPU finishes the faster matvec and stalls on host work. (Same kernel is $2.27\x$ on ROCm-eager.) \\
+\texttt{moe\_route} fusion, model-level (CUDA) & flat & Repackages routing into one block-serial launch; CUDA decode is not router-launch-bound and CUDA has no expensive \texttt{gpu-sort} to eliminate (ROCm's $+13\%$ came from that sort). \emph{Repackaging, not eliminating.} \\
+f32-native cast cut (ROCm) & flat & The casts are dtype-tangled around the F32-residual/F16-KV boundary; removing one shifts cost across the boundary. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Two of these are the \emph{same kernel} as a kept win elsewhere (\dpa{} i-quant: ROCm
+$2.27\x$ / GB10 flat; \texttt{moe\_route}: ROCm $+13\%$ / CUDA flat). That is the cleanest possible
+confirmation of the taxonomy: the kernel did not change, the \emph{binding resource} did. We keep
+both on the flat platforms anyway --- bit-exact, decomplecting (one selector, fewer tables, matches
+llama), and latent for the regime where they bind --- which is the right call precisely \emph{because}
+the taxonomy says they cost nothing and may surface on the next model (e.g.\ a 256-expert router
+doubles the routing math).
+
+\section{The cross-backend law and model-level dilution}
+\label{sec:law}
+Stacking the per-backend work yields the model-level result of paper~05, restated as a law:
+\begin{itemize}[noitemsep]
+  \item \textbf{Decode is bandwidth-roofline parity} on every backend (0.98--1.04\x): once the
+        matvec streams weights at the memory ceiling, all engines converge, because decode
+        throughput \emph{is} memory bandwidth / model bytes. hanzo's per-format decode matvec is at
+        88--99\% of the measured roofline (\texttt{rocprofv3} FETCH\_SIZE), so there is nothing left
+        to win there --- and indeed every decode \emph{kernel} win above surfaced only through
+        \emph{launch/work elimination}, never through faster matvec arithmetic.
+  \item \textbf{Prefill is the frontier} (0.76--0.91\x): it is compute-bound, so it rewards the
+        matrix/tensor-core GEMM scheduling that llama.cpp has most heavily tuned. Every prefill
+        lever in this paper (MoE qmmq $2.58\x$, dynamic M-tile, Vulkan \dpa{}-2D $9.35\x$) closes a
+        chunk of this gap; the residual is real engineering (decode-amortized coopmat on Vulkan,
+        the last $\sim$10\% of GEMM efficiency on CUDA), not a rounding error.
+\end{itemize}
+
+\paragraph{Model-level dilution.} A kernel win of factor $\kappa$ surfaces as
+$\approx 1 + f\,(\,1 - 1/\kappa\,)$ end-to-end, where $f$ is the fraction of \emph{binding-resource}
+time the kernel occupied. The Vulkan \dpa{}-2D $9.35\x$ kernel lifts engine prefill $\sim 24\to224$
+T/s ($f$ large, prefill is GEMM-dominated) but would be flat on decode ($f\approx 0$, decode is not
+the GEMM). The ROCm Q6\_K $4.9\x$ kernel gives $+17\%$ ($f\approx 0.38$, its compute-bound
+fraction). The GB10 i-quant $1.71\x$ gives $0\%$ ($f\approx 0$, host-bound). The law is just
+Amdahl's law with the binding resource as the denominator --- but the discipline it enforces is to
+\emph{measure $f$ before writing the kernel}.
+
+\section{A correctness boundary: the flash-attention repetition bifurcation}
+\label{sec:flash-bifurcation}
+The sharpest result of this work is not a speed lever but a \emph{correctness} one, and it maps the
+exact limit of fused attention on tensor cores. Qwen3-8B-Q4\_K\_M generates coherently under an
+eager attention (materialized \texttt{softmax}$(QK^\top/\sqrt d)V$ in f32) but \emph{collapses into
+token repetition} under flash-attention-2 on CUDA --- byte-identical weights, same sampler, same
+box; only the attention kernel differs. The collapse is deterministic and appears at the first
+generated token.
+
+\paragraph{The precision ladder, exhausted.} Flash-attention-2 casts the f32 softmax probabilities
+$P=\mathrm{softmax}(S)$ to the kernel element type before the $P\!\cdot\!V$ tensor-core matmul
+(\texttt{flash\_fwd\_kernel.h}: \texttt{convert\_type<Element>(acc\_s)}). We raised that precision in
+three proved-by-build steps, each verified on the running model at two seeds:
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+$P$ representation & mantissa bits & \texttt{exp} & bare-trigger continuation \\
+\midrule
+bf16               & 7  & \texttt{exp2f} & \texttt{"needle needle\dots"} \\
+f16                & 10 & \texttt{exp2f} & \texttt{"0123456789\dots"} \\
+split $P_{hi}{+}P_{lo}$ & $\sim$20 & \texttt{exp2f} & \texttt{".matmat.matmat\dots"} \\
+split $P_{hi}{+}P_{lo}$ & $\sim$20 & \texttt{expf} (exact) & \texttt{"1)2)3)4)5)\dots"} \\
+eager (reference)  & 23 (f32), single-pass & \texttt{expf} & \texttt{"\dots Paris\dots"} (coherent) \\
+\bottomrule
+\end{tabular}
+\end{center}
+More precision only \emph{moves the attractor token} (needle $\to$ digits $\to$ matmat); it never
+clears it. This is the signature of a knife-edge numerical bifurcation, not a localizable bug.
+
+\paragraph{Everything else, eliminated.} For the bare trigger ($\sim$7 tokens) the remaining
+flash-vs-eager differences are ruled out by structure, not guesswork: (i) the $QK^\top$ score MMA
+already accumulates in f32 (CUTLASS default), so $S$ is f32-identical to eager; (ii) $V$ is bf16 in
+the KV cache for \emph{both} paths, so the bf16-input/f32-accumulate MMA is numerically the eager
+matmul --- there are no low bits of $V$ to recover; (iii) with $\texttt{kBlockN}=128$ the trigger is
+a \emph{single} K-tile, so the cross-tile online-softmax rescale executes zero times yet the collapse
+still appears; (iv) the \texttt{exp2f}-vs-\texttt{expf} gap is $\lesssim 2^{-23}$, orders below the
+$2^{-8}$ bf16-$P$ error already shown non-curative --- and this last one was \emph{also} confirmed
+empirically: exact \texttt{expf} atop f32-class $P$ still degenerates at both seeds (into a fresh
+\texttt{"1)2)3)\dots"} attractor), exhausting the precision-and-transcendental hypothesis space.
+
+\paragraph{The boundary.} What remains after all eliminations is a lone variable: $P$ is
+$\sim$20-bit on the tensor-core path versus true 23-bit f32 in eager. Because tensor cores
+\emph{require} $\le$tf32/f16/bf16 inputs, a genuinely f32 $P\!\cdot\!V$ \emph{is} the eager
+(CUDA-core) path --- so on this hardware \textbf{fusion and f32-precision $P\!\cdot\!V$ are mutually
+exclusive}. The shipped fix routes bf16 attention to the eager kernel; it is not a stopgap but the
+\emph{correct} answer, and it is essentially optimal: any stable variant must carry f32 $P\!\cdot\!V$,
+which forgoes tensor cores and thus lands at eager's throughput regardless. Its only cost is
+long-context prefill ($2.66\x$ at 2409 tokens; short prompts and \emph{all} decode are unaffected,
+since decode attention is a single query against the cache), and that cost is intrinsic to stability.
+The methodological point echoes the rest of this paper: the result was reachable only by
+\emph{verifying against the running model} --- five kernel edits that ``compiled and committed''
+were disproved by the generated tokens before the boundary came into focus.
+
+\section{The characterized-but-open frontier: Vulkan decode}
+\label{sec:frontier}
+Paper~05's parity claim is decode-on-AMD-via-ROCm. The Vulkan \emph{decode} path is the one place
+hanzo is far from llama (8B Q4\_K: 3.3 vs 41 T/s, $\sim$0.08\x), and this program has now diagnosed
+it precisely rather than left it as ``slow.'' A \texttt{VK\_PROFILE} breakdown of one decode token:
+\begin{lstlisting}
+[VK_PROFILE] flush: dispatch=1336 barriers=903 record=0.766ms submit=1.406ms fence_wait=142.827ms
+\end{lstlisting}
+The diagnosis: it is \textbf{not} recording-bound (CPU record $=0.77$~ms, so command-buffer/graph
+reuse would buy nothing) --- it is \textbf{GPU-execution-bound on op-count serialization}. 1336
+tiny $M{=}1$ dispatches chained through \textbf{903 global memory barriers} (\texttt{vk::MemoryBarrier},
+full \texttt{SHADER\_WRITE}$\to$\texttt{READ}, on \emph{true} data dependencies) serialize the GPU at
+$\sim$107~$\mu$s/op on compute that is only $\sim$$\mu$s. Per the taxonomy this is GPU-busy-bound
+decode, so the lever is \emph{eliminating ops}, and the barriers are correct (real dependencies) ---
+the only way to remove them is to fuse the dependent ops so the dependency lives \emph{inside} a
+kernel.
+
+\subsection{Roadmap: the campaign ROCm already validated}
+\label{sec:vulkan-roadmap}
+This is not speculative: it is the exact campaign that took ROCm decode from launch/busy-bound to
+parity (\S\ref{sec:rocm}), ported to Vulkan.
+\begin{enumerate}[noitemsep]
+  \item \textbf{Fuse the attention epilogue} --- q/k RMSNorm + RoPE + KV-cache write into one
+        kernel (ROCm's \texttt{rope\_norm\_positions} twin), and residual-add + RMSNorm
+        (\texttt{add\_rmsnorm}). These \emph{eliminate} per-op barriers, not just launches.
+  \item \textbf{Fuse the FFN} --- gate+up shared-quantize, silu+mul.
+  \item \textbf{Fuse routing} --- the \texttt{moe\_route} kernel (already proven $+13\%$ on ROCm,
+        where the eliminated sort is expensive --- and Vulkan, like ROCm, pays for the sort).
+  \item \textbf{Uniform Vulkan GEMM for all 22 formats} --- deletes the dequant fallback and the
+        deadlock gate by construction (\S\ref{sec:vulkan}), the structural endpoint.
+\end{enumerate}
+The honest status: \textbf{ROCm is at parity; Vulkan decode is the open frontier}, characterized
+down to the dispatch/barrier counts, with a roadmap whose every step has a measured ROCm precedent.
+The decomplection endpoint (axes \S\ref{sec:arch}) is a kernel DSL (CubeCL/Triton/MLIR-class) that
+writes the contraction once and lowers it to every backend, collapsing the
+backends$\times$formats$\times$ops product to backends$+$formats$+$ops --- at which point a fusion is
+written once and surfaces on whichever backend's regime it binds.
+
+\section{Verification methodology (so the numbers mean something)}
+\label{sec:method}
+Every claim in this paper rests on three controls, because inference benchmarks are unusually easy
+to corrupt:
+\begin{itemize}[noitemsep]
+  \item \textbf{Bit-exact gates.} A kernel ships only after \texttt{nbad=0} versus a CPU
+        \texttt{to\_float} oracle (documented f32-reorder / f16-rounding tolerances). Correctness is
+        the precondition for a performance claim, not a follow-up.
+  \item \textbf{Controlled A/B.} Decode A/Bs are device-map-pinned (\texttt{-n 0:48} on ROCm; all
+        layers resident) and run in-binary via a fallback env toggle (\texttt{HANZO\_*\_FALLBACK}),
+        so the \emph{only} variable is the kernel. The headline ``$+28\%$'' that an earlier pass
+        reported was a measurement artifact --- the auto-mapper offloading $1/3$ of layers --- and
+        the controlled A/B showed the real number was $+1.3\%$. We report the controlled number.
+  \item \textbf{Kernel-isolated bench.} GEMM ladders use operands resident on-GPU and one final
+        synchronize, because a per-iteration host upload/readback otherwise dominates and masks the
+        kernel (the difference between the column kernel looking 1.2\x{} and 9\x{} slower).
+\end{itemize}
+\paragraph{Contamination caveat (stated, not hidden).} The first evo Vulkan matrix in this pass was
+run under load~59 (a concurrent ROCm build + a model download + a browser) and is discarded; the
+numbers in \S\ref{sec:vulkan}--\ref{sec:frontier} are from the idle box (load $<0.5$). A benchmark
+on a contended box is not a slow benchmark, it is a wrong one.
+
+\section{What this paper does \emph{not} claim}
+Single-stream only (no batched/serving throughput); the model-level numbers are paper~05's
+single-model/single-quant pass, not re-swept here; Metal kernel-level work is summarized from its
+own audit, not re-derived; and the Vulkan-decode roadmap (\S\ref{sec:vulkan-roadmap}) is
+characterized and precedented but \emph{not yet shipped} --- we label it frontier, not result. Every
+performance figure is a measured throughput or a kernel-isolated microbench on the named hardware;
+derived quantities (effective GB/s, M-fill \%) are computed from measured values and labelled. No
+number here was invented or projected without the label ``projection.''
+
+\section{Conclusion}
+The portable-engine thesis survives contact with the kernels: from one multi-backend codebase,
+hanzo-engine is at \texttt{llama.cpp} decode parity and within a bounded, well-understood prefill
+margin, and every step of that was a \emph{measured} lever gated bit-exact. The transferable result
+is not any single kernel but the \textbf{surfacing rule and its taxonomy}: decode is
+bandwidth-roofline (win by moving fewer bytes or eliminating launches/work, never by faster
+arithmetic), prefill is compute-bound (win by tensor-core scheduling and tile fill), and the
+\emph{same} kernel surfaces or vanishes depending on which resource binds on a given (platform,
+regime). The dead-ends prove the rule as sharply as the wins --- the $-22\%$ quantize-fold, the
+$0.26\x$ naive coopmat, the GB10 i-quant flat that is $2.27\x$ on ROCm. The one fully-characterized
+open frontier, Vulkan decode, is op-count-serialization-bound by profile, and its fix is the exact
+fusion campaign ROCm has already validated to parity. Optimize the binding resource; prove it
+bit-exact; measure $f$ before you write the kernel.
+
+\appendix
+\section{Reproducibility}
+\textbf{Hardware.} AMD Ryzen AI Max+ 395 ``Strix Halo'' (Radeon 8060S, gfx1151, RDNA3.5, 40 CU,
+$\approx$231 GB/s); NVIDIA GB10 (Grace-Blackwell, sm\_121, CUDA 13, 121 GB unified, Linux aarch64);
+Apple M4 Max (137 GB unified, Metal). \textbf{Software.} hanzo-ml (the catalog spans the 0.11.x
+series) / hanzo-engine, built \texttt{--release} per box; \texttt{llama.cpp} stock HIP/CUDA/Metal/Vulkan
+builds as the baseline. \textbf{Models.} Qwen3 family GGUF (0.6B/4B/8B dense, 30B-A3B MoE) at
+Q8\_0/Q4\_K\_M and the UD i-quants. \textbf{A/B protocol.} In-binary fallback env toggles
+(\texttt{HANZO\_*\_FALLBACK}) so the kernel is the only variable; ROCm decode device-map-pinned
+\texttt{-n 0:NLAYERS}; GEMM ladders via the kernel-isolated \texttt{bench\_matmul\_q4k} /
+\texttt{bench\_iquant\_decode}; bit-exact gates via the named \texttt{*\_numeric} oracles in
+hanzo-cli. \textbf{Profilers.} \texttt{rocprofv3} (ROCm GPU-busy + FETCH\_SIZE roofline),
+\texttt{nsys} (CUDA), \texttt{VK\_PROFILE=1} (the in-engine per-batch dispatch/barrier/fence-wait
+breakdown). GPU-safety: ROCm/HIP processes are run strictly serially (concurrent kfd init on
+gfx1151 can wedge the driver), benches background-only.
+
+\end{document}

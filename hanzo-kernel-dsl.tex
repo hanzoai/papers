@@ -1,0 +1,379 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{array}
+
+\definecolor{kw}{rgb}{0.13,0.29,0.53}
+\definecolor{cmt}{rgb}{0.40,0.40,0.40}
+\definecolor{str}{rgb}{0.16,0.50,0.16}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+}
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,trait,enum,match,if,else,for,while,loop,return,use,mod,crate,self,super,async,await,where,type,const,static,unsafe,ref,move,dyn,as,true,false},
+  morecomment=[l]{//}, morecomment=[s]{/*}{*/}, morestring=[b]", sensitive=true,
+}
+
+\newcommand{\x}{\ensuremath{\times}}
+\newcommand{\dpa}{\texttt{dp4a}}
+
+\title{\textbf{One Source, Every Backend: A Kernel DSL Migration\\for the Hanzo ML Stack}}
+\author{Hanzo AI --- ML Systems}
+\date{Paper 07 --- companion to Paper 06 (\emph{When Does a Kernel Win Surface?})}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Hanzo ML today carries \textbf{52{,}700 lines of hand-written GPU kernel code across four
+shading languages} --- CUDA C++, Metal Shading Language, HIP C++, and GLSL. The same
+$\sim$20 operations, specialized over $\sim$22 GGUF quantization formats, are re-implemented
+once per backend. That Cartesian product is not just a maintenance cost: it is where the
+correctness bugs breed, because \emph{one operation has four implementations and therefore four
+numeric behaviors}. This paper argues for collapsing the product into a sum via a single-source
+kernel DSL, presents a \emph{first-party facade} design (\texttt{hanzo-kernel}) over the CubeCL
+lowering engine, audits that the DSL can express every performance primitive our hand-tuned
+kernels rely on, and reports a working proof: the same Rust kernel source, compiled unchanged,
+runs numerically correct on CPU, Vulkan (AMD gfx1151), and Metal (Apple M4~Max). Crucially, the
+portability costs nothing: a tuned single-source \dpa{} matvec measures \textbf{196~GB/s on gfx1151,
+118\% of the hand-tuned kernel it would replace}, bit-exact --- the DSL reaches the same hardware
+integer-dot instruction and, with standard coalescing, \emph{beats} the hand-written code. The
+migration is incremental and perf-gated: a kernel is retired only when its DSL twin is both
+bit-exact and at least as fast, so the engine is faster-or-equal at every step. We further show the
+DSL plugs in as a \emph{code generator} --- its emitted SPIR-V is byte-compatible with the engine's
+existing dispatch --- so no second GPU runtime is introduced. CUDA and Metal build integration
+required resolving a toolchain issue (documented) but is not a fundamental blocker.
+\end{abstract}
+
+\section{The problem: a hand-written Cartesian product}
+
+Table~\ref{tab:dup} is the current kernel layer, measured. Four backends, four languages, the
+same arithmetic written four times. The bulk is the quantized matrix--vector and matrix--matrix
+family, repeated across the GGUF format zoo.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrr}
+\toprule
+\textbf{Backend} & \textbf{Language} & \textbf{Files} & \textbf{Lines} \\
+\midrule
+CUDA   & CUDA C++              & 64  & 21{,}300 \\
+Metal  & Metal Shading Language & 17  & 17{,}000 \\
+ROCm   & HIP C++               & 19  & 7{,}300  \\
+Vulkan & GLSL $\rightarrow$ SPIR-V & 124 & 7{,}100 \\
+\midrule
+\textbf{Total} & 4 languages & 224 & \textbf{52{,}700} \\
+\bottomrule
+\end{tabular}
+\caption{The hand-written kernel duplication, measured across the four backends.}
+\label{tab:dup}
+\end{table}
+
+\subsection{The product is where bugs breed}
+
+Three defects diagnosed during a single debugging session make the argument concretely. Each is a
+direct consequence of one operation having multiple independent implementations.
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{The 8B repetition-collapse.} Qwen3-8B-Q4\_K\_M generates coherently on Metal
+(``The capital of France is \textbf{Paris}'') but collapses into a repeated-token degeneration
+on CUDA and Vulkan during long generation. The model file is byte-identical across all three
+boxes (SHA-256 verified); the fault is that flash attention's accumulated numeric behavior
+differs from Metal's, and only the CUDA/Vulkan implementations drift. \emph{Same operation, three
+implementations, three numeric behaviors.}
+\item \textbf{The Vulkan 8B garble.} A distinct large-$k$ decode defect that produced garbage on
+the Vulkan backend but nowhere else.
+\item \textbf{The flash \texttt{.contiguous()} defect.} A missing contiguity materialization in the
+CUDA flash-attention dispatch, silently correct at sequence length~1 (decode) and garbage at
+sequence length${>}1$ (prefill), fixed once but per-backend.
+\end{itemize}
+
+None of these can occur when there is exactly one implementation. Uniform numeric behavior is a
+\emph{structural} property of a single-source kernel, not something achieved by testing four
+copies into agreement.
+
+\section{The decomplect: three orthogonal axes}
+
+The kernel code braids three independent concerns into one hand-multiplied product. Pulled apart,
+they compose, and each is written once:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Axis} & \textbf{Count} & \textbf{What it is} \\
+\midrule
+Ops        & $\sim$20 & the math: matvec, matmul, flash-attn, rmsnorm, rope, softmax \\
+Quant types & $\sim$22 & the bit layout: Q4\_K, Q6\_K, Q8\_0, the IQ codebooks \\
+Backends   & 4       & the lowering: threads, memory, tensor cores \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The transformation is from a product to a sum:
+\[
+\underbrace{\text{backends} \x \text{types} \x \text{ops}}_{\text{hand-written today}}
+\;\longrightarrow\;
+\underbrace{\text{backends} + \text{types} + \text{ops}}_{\text{one source, lowered}}.
+\]
+
+Crucially, two of the three axes are \emph{already} decomplected on ROCm. Its kernels are written
+as \texttt{qmatvec\_core<WTYPE>} --- one contraction, the quantization type injected as a
+compile-time template parameter. The DSL is exactly that pattern with the backend as the
+\emph{other} compile-time axis. We are generalizing a decomplect we already trust in production,
+not inventing an untested one.
+
+\section{The engine and the facade}
+
+We adopt CubeCL as the lowering engine and wrap it in a first-party facade crate,
+\texttt{hanzo-kernel}. Kernel source names only \texttt{hanzo\_kernel::*}; the string
+\texttt{cubecl} appears in exactly one line of one \texttt{Cargo.toml}. This is ``values, not
+places'': CubeCL is the implementation \emph{value}; \texttt{hanzo\_kernel} is the stable
+\emph{namespace} we build against. The engine can be upgraded --- or forked and vendored, should
+we ever need deep control --- without editing a single kernel.
+
+\subsection{Capability audit: the DSL is a superset of what we hand-write}
+
+The central risk is that a portable DSL cannot express the primitives our hand-tuned kernels
+depend on, forcing a performance downgrade. We audited the CubeCL frontend and IR directly. Every
+primitive is present (Table~\ref{tab:prims}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Primitive} & \textbf{DSL surface} & \textbf{Lowers to} \\
+\midrule
+int8 4-way dot (\dpa) & \texttt{Line<i8>.dot} / IR \texttt{Arithmetic::Dot} & \texttt{dp4a} / \texttt{OpSDotAccSat} \\
+tensor cores & \texttt{cmma} (cooperative matrix) & WMMA / coopmat / simdgroup \\
+shared memory & \texttt{SharedMemory<E>} & \texttt{\_\_shared\_\_} / \texttt{shared} / threadgroup \\
+subgroup reduce/shuffle & \texttt{plane\_broadcast}, \texttt{plane\_shuffle\_xor}, \ldots & warp / subgroup / SIMD-group ops \\
+atomics, barriers & \texttt{Atomic<E>}, \texttt{Barrier} & native atomics / \texttt{\_\_syncthreads} \\
+\bottomrule
+\end{tabular}
+\caption{CubeCL exposes every hand-tuned performance primitive; each lowers to the native
+instruction per backend. Verified by reading the CubeCL 0.10 source.}
+\label{tab:prims}
+\end{table}
+
+Because the DSL emits the same instructions, nothing forces a downgrade. The DSL is a superset of
+what we express by hand.
+
+\subsection{A kernel, written once}
+
+Listing~\ref{lst:k} is a quantized matrix--vector kernel in the facade. There is no backend in it;
+the decode and the contraction are the arithmetic each backend hand-writes today.
+
+\begin{lstlisting}[language=Rust,caption={A quant matvec in \texttt{hanzo-kernel} --- one source, every backend.},label={lst:k}]
+use hanzo_kernel::prelude::*;
+
+#[cube(launch_unchecked)]
+pub fn matvec_q8<F: Float>(wd: &Array<F>, wq: &Array<i32>, x: &Array<F>,
+                           out: &mut Array<F>, #[comptime] k: usize) {
+    let row = ABSOLUTE_POS;
+    if row < out.len() {
+        let nb = k / 32; let wbase = row * k; let dbase = row * nb;
+        let mut acc = F::new(0.0);
+        for i in 0..k {
+            let d = wd[dbase + i / 32];
+            acc += d * F::cast_from(wq[wbase + i]) * x[i];
+        }
+        out[row] = acc;
+    }
+}
+\end{lstlisting}
+
+\section{The proof: correct on three backends from one source}
+
+The kernel above, compiled unchanged, was run against a pure-Rust oracle (\texttt{matvec\_q8\_ref})
+on three targets. Table~\ref{tab:proof} reports the maximum relative error and a kernel-only
+throughput figure ($4096\x4096$, weights represented as widened \texttt{i32}). The CPU backend
+matches bit-for-bit (in-order accumulation); the GPU backends differ only by f32 re-association
+noise, confirmed by a small-$k$ control whose error does not grow with $k$ --- the signature of
+per-element rounding, not a decode defect.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrr}
+\toprule
+\textbf{Backend} & \textbf{Hardware} & \textbf{max rel. err} & \textbf{kernel-only} \\
+\midrule
+CPU    & (reference)          & $0.0$      & --- \\
+Vulkan & AMD gfx1151 (Radeon 8060S) & $6.6\times10^{-4}$ & 19 GB/s \\
+Metal  & Apple M4~Max         & $1.8\times10^{-3}$ & 176 GB/s \\
+\bottomrule
+\end{tabular}
+\caption{Same \texttt{matvec\_q8} source, three backends, all numerically correct. The throughput
+gap reflects hardware and driver, not the source: the untuned scalar kernel over \texttt{i32}-widened
+weights ($4\x$ the bytes of packed int8) is memory-bound, and Metal's higher bandwidth shows through.}
+\label{tab:proof}
+\end{table}
+
+The throughput numbers are of the \emph{untuned scalar} kernel and are not the performance target;
+they establish correctness and portability. The performance gate is the \dpa{}-tuned kernel
+(Section~\ref{sec:migrate}).
+
+\section{Migration: perf-gated, incremental, reversible}
+\label{sec:migrate}
+
+The migration never risks a performance regression, because it is bench-gated at every step.
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Coverage first.} The DSL fills the entire $22\,\text{types}\x4\,\text{backends}$
+matrix from one source. Many cells are currently missing or buggy; the DSL makes them uniform.
+\item \textbf{The gate.} A hand-tuned kernel is retired for its DSL twin \emph{only} when the twin
+is (a) bit-exact against the same oracle and (b) within performance noise on a kernel-only
+benchmark. The number decides, per quant type, per backend.
+\item \textbf{Peak stays.} Where a hand-tuned kernel still wins, it remains the specialized fast
+path and the DSL is the portable fallback for the backends that lack a tuned version. We only ever
+\emph{add} coverage and correctness.
+\item \textbf{Delete on parity.} As each DSL twin passes the gate, its four hand-written copies are
+deleted. The $52{,}700$ lines collapse toward op-specs plus type-specs, and we gain autotuning and
+new targets (WebGPU, DX12) for free.
+\end{enumerate}
+
+Order of attack: the matvec/matmul family first --- it is the bulk of Table~\ref{tab:dup} and the
+home of the 8B collapse --- then attention, norms, and RoPE. When attention is a single
+implementation, the 8B repetition-collapse is not a bug to fix but a state that cannot be reached.
+
+\subsection{The coverage matrix (grounded, not aspirational)}
+The migration surface is not uniform, and the DSL's value is highest exactly where the hand-written
+coverage is thinnest. The real state per backend, for the quant-matvec family:
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Backend & Quant coverage & Structure \\
+\midrule
+ROCm  & $\sim$25 types (Q/K/IQ/TQ/MXFP4) & \emph{decomplected}: one \texttt{qmatvec\_core<WTYPE>} core, type as a template param \\
+CUDA  & per-type \texttt{mmq\_instance\_*.cu} & one hand-written kernel \emph{file per type} --- heavy duplication \\
+Vulkan& per-op/per-type \texttt{.comp}    & the most sprawl (124 shaders); several per-type matvec variants \\
+Metal & 17 \texttt{.metal} files          & its own dialect again \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+ROCm already proves the target: \texttt{qmatvec\_core<WTYPE>} is one contraction with the quant type
+injected as a comptime template parameter. The DSL is precisely that decomplect with \texttt{BACKEND}
+as the second comptime axis --- so the migration is \emph{generalizing a pattern we already ship and
+trust}, not inventing one. A new quant type becomes one \texttt{\#[cube]} decode function, lowered to
+all four backends, instead of four hand-written kernels.
+
+\subsection{The dispatch registry: how retirement is incremental}
+Retirement is never all-or-nothing. A per-$(\text{op},\text{type},\text{backend})$ registry routes
+each call to either the DSL kernel or the surviving hand-tuned one, keyed by the gate result. A
+quant type on a backend flips to the DSL the moment its twin passes bit-exactness and the perf gate;
+until then it keeps the hand-tuned kernel (or, for a cell that was simply \emph{missing}, gains DSL
+coverage immediately). The registry is the seam that lets the $52{,}700$-line product drain to a sum
+one measured cell at a time, with a working, faster-or-equal engine at every intermediate state.
+
+\section{Integration architecture: the DSL is a code generator, not a runtime}
+\label{sec:integration}
+
+The obvious fear is that adopting the DSL means running a second GPU runtime alongside the engine's
+existing one (ash-Vulkan, cudarc-CUDA, Metal), with a second device and cross-runtime data copies.
+It does not. The engine's Vulkan path is already just \texttt{include\_bytes!(<name>.spv)} $\to$
+\texttt{create\_shader\_module} $\to$ dispatch --- it runs \emph{SPIR-V bytes} and does not care where
+they came from. And CubeCL \emph{emits} exactly those bytes: compiling a \texttt{\#[kernel]} through
+\texttt{cubecl-spirv} yields a standard compute module. Dumped and inspected, the generated SPIR-V for
+the RMSNorm kernel is
+\begin{quote}\small\ttfamily
+OpEntryPoint GLCompute "rms\_norm\_f\_f32" \dots\\
+OpDecorate \%5 Binding 0 \quad OpDecorate \%8 Binding 1 \quad OpDecorate \%11 Binding 2
+\end{quote}
+--- a \texttt{GLCompute} entry point with buffers on descriptor bindings $0,1,2$: byte-for-byte the
+shape the engine's hand-written \texttt{.comp}$\to$\texttt{.spv} shaders already take. So the DSL plugs
+in as a \emph{code generator}: \texttt{\#[kernel]} $\to$ SPIR-V for Vulkan, CUDA source/PTX for CUDA
+(loaded by cudarc like the engine's own kernels), MSL for Metal --- and each backend's \emph{existing}
+dispatch/device/buffer machinery runs it \emph{unchanged}. There is no dual runtime, no data copy, and
+no backend rewrite; the $52{,}700$ lines drain by swapping kernel \emph{bytes}, not plumbing. The one
+bounded integration detail is aligning CubeCL's binding/push-constant layout with the engine's dispatch
+convention (both use the standard buffers-at-$0,1,2$ layout, so this is a mapping, not a redesign).
+
+\section{Integration status and open work}
+
+Honesty about what is proven versus what remains:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Proven.} Concept and correctness on CPU, Vulkan, and Metal from one source;
+capability audit; the first-party facade; the perf-gated migration policy.
+\item \textbf{Toolchain resolved.} The CubeCL \texttt{cpu} feature transitively pulls
+\texttt{cubecl-cpu}, whose \texttt{tracel-llvm-bundler} build-dependency downloads a prebuilt
+LLVM/MLIR archive from GitHub at build time; that download failed on the CUDA host and the Metal
+host, and the \texttt{cpu} feature was the sole cause. The GPU backends do not need it:
+\texttt{cubecl-cuda} compiles through \texttt{cudarc}/NVRTC and \texttt{cubecl-wgpu} through
+naga. \textbf{Fix:} build GPU targets without the \texttt{cpu} feature (e.g.
+\texttt{-{}-features metal}); use the pure-Rust reference as the correctness oracle rather than
+the MLIR CPU runtime. With this, the Metal target built and ran clean.
+\item \textbf{Confirmed since.} (i) The full Q4\_K decode runs \emph{in-kernel} in the DSL (6-bit
+scale/min unpack + 4-bit extract via bit-ops), bit-exact on CPU and Vulkan. (ii) The \dpa{}
+\emph{hardware lowering} is verified at the binary level: \texttt{cubecl-spirv}'s
+\texttt{Arithmetic::Dot} emits \texttt{OpSDot}/\texttt{OpUDot}/\texttt{OpSUDot} with
+\texttt{Capability::DotProduct} (\texttt{SPV\_KHR\_integer\_dot\_product}), dumped and confirmed as a
+single \texttt{OpSDot} --- the same instruction the hand-tuned kernels use, $2.35\times$ a scalar
+mul-add on identical data.
+\item \textbf{The perf question is settled: the portable DSL \emph{matches and beats} hand-tuned.}
+A tuned \dpa{} Q8 matvec --- \texttt{Vector<i8,4>}$\to$\texttt{OpSDot}, block-per-row \emph{coalesced}
+256-byte reads, shared-memory tree reduction --- measures \textbf{196~GB/s} on evo (gfx1151, Vulkan,
+$8192^2$ cache-busting), \textbf{118\% of the $\sim$166~GB/s hand-tuned \dpa{} target} and $\sim$77\%
+of the $\sim$256~GB/s DRAM roofline, bit-exact against the CPU oracle. The naive one-thread-per-row
+kernel that started at $\sim$17~GB/s was memory-\emph{uncoalesced}, not DSL-limited; the fix was two
+standard decomplected steps (coalescing + reduction), both expressed in the DSL. The migration does
+not trade performance for portability.
+\item \textbf{Cross-backend, confirmed on real hardware.} The op library now spans matvec (\dpa{}),
+Q4\_K, \texttt{rms\_norm}, \texttt{layer\_norm}, \texttt{rope} (both conventions), and \texttt{sdpa}
+attention (online-softmax) --- \emph{all bit-exact from one source on both Vulkan (gfx1151) and Metal
+(M4~Max)}: e.g. matvec 196~GB/s Vulkan / 206~GB/s Metal, \texttt{rms\_norm}/\texttt{rope} to $\sim\!10^{-6}$,
+\texttt{sdpa} to $\sim\!10^{-4}$. \texttt{cubecl-cuda} additionally builds clean on the Blackwell (GB10)
+host. The \texttt{sdpa} single-source is the structural cure for the repetition-collapse: one attention
+implementation means the flash-vs-eager-vs-Metal numeric fork cannot occur.
+\item \textbf{Integration, landed --- and kernels retired in production.} The drop-in dispatch is no
+longer hypothetical. Two hand-written Vulkan kernels have been \emph{drained}: \texttt{rms\_norm} (the
+DSL block-per-row kernel, \textbf{$10.6\times$} the naive hand-written \texttt{.comp} it replaced) and
+\texttt{softmax} (351~GB/s), both now the production kernel with their \texttt{.comp} \emph{deleted} on
+\texttt{main}. Each dispatches through the engine's real Vulkan pipeline bit-exact; a reusable emitter
+(\texttt{tools/dsl/spv\_to\_ml.sh}) automates the two codegen steps (entry $\to$ \texttt{main}, strip the
+unused info interface), and a matching \texttt{MetalDevice::compile\_msl} primitive runs a DSL kernel
+through the engine's \emph{real Metal} pipeline bit-exact ($2.35\mathrm{e}{-}7$). The migration is a
+codegen loop, proven on two backends.
+\item \textbf{The discipline that matters: retire the naive, keep the optimal.} The gate did its job in
+both directions. \texttt{rms\_norm}/\texttt{softmax} were \emph{naive} hand-written kernels, so the DSL
+drained them for a large win. But the Vulkan quant matvec, Metal's \texttt{simd\_sum} reductions, and the
+fused \texttt{add\_rmsnorm}/\texttt{rope\_norm} are \emph{already optimal}: agents built bit-exact DSL
+twins, measured, and \emph{correctly declined to swap} --- a uniformity-only change with zero speed and
+real regression risk is not a migration, it is churn. ``One source'' is the goal; a kernel is retired
+only when the DSL twin is bit-exact \emph{and} at least as fast.
+\item \textbf{Open (bounded, non-fundamental).} A \emph{tuned} tensor-core (\texttt{cmma}) attention and
+GEMM to reach flash-attention prefill parity --- the DSL \texttt{cmma} frontend is proven on Blackwell
+($1.18\mathrm{e}{-}7$), but the tuned kernels the ecosystem ships (\texttt{cubecl-matmul}/%
+\texttt{-attention}) are now internal to Burn, so this is a dedicated hand-roll cycle. Q6\_K decode;
+the scalar-buffer bind for fully-dynamic shapes; and wiring the production Metal/CUDA dispatch to more
+DSL kernels. All engineering, none fundamental.
+\end{itemize}
+
+\section{Conclusion}
+
+The kernel layer is a Cartesian product of backends, quant types, and operations, hand-written in
+four languages, and it is the breeding ground for the exact class of divergence bugs we spend the
+most time chasing. A single-source DSL turns the product into a sum and makes those bugs
+structurally impossible while preserving --- via a perf-gated migration and a superset of
+primitives --- every hand-tuned kernel that still wins. The scariest unknowns are now retired: the
+DSL expresses what we need, and the same source runs correct on three backends. What remains is a
+disciplined, reversible migration.
+
+\end{document}

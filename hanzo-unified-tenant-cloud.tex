@@ -38,10 +38,14 @@ The answer: \textbf{an open, actively-served tenant costs $\approx$\,0.25\,MB of
 2\,MB figure the design was previously budgeted against --- and an \emph{idle} tenant costs
 essentially zero live RAM (it is a file on disk plus an encrypted object). The tuned
 \texttt{cache\_size} cap is a \emph{ceiling}, not a footprint: for realistic tenants the working
-set, not the cap, sets the cost. From this one measured constant we build a capacity model: at
-1\% peak concurrency, \textbf{one billion registered tenants} is served by
-$\approx$\,103 32\,GB nodes ($\approx$\,2.5\,TB cluster RAM); at 0.1\% concurrency, 11 nodes.
-Memory scales with \emph{concurrency}, not with registrations. We contrast this against the
+set, not the cap, sets the cost. From this one measured constant we build a capacity model: on the standard
+128\,GB unified-memory node, at 1\% peak concurrency, \textbf{one billion registered tenants} is
+served by $\approx$\,20 nodes ($\approx$\,2.5\,TB cluster RAM); at 0.1\% concurrency, the 3-node
+HA floor. Memory scales with \emph{concurrency}, not with registrations. Because a 128\,GB box is
+\emph{unified}-memory, one such box also hosts the shared model weights for GPU inference in the
+same address space: a single \$3{,}200 commodity box --- the very class of hardware these numbers
+were measured on --- runs the entire cloud (per-tenant SQLite \emph{and} inference) and serves
+tens of millions of registered users from one self-installing binary (\S\ref{sec:box}). We contrast this against the
 default industry shape --- shared Postgres behind a microservice mesh --- and quantify the
 penalties it pays that the unified design does not: a global write bottleneck, a hard
 connection ceiling, and an $N$-runtime plus sidecar memory tax we measure at
@@ -264,60 +268,149 @@ headroom. Then
 \text{cluster RAM} \;=\; \text{nodes}\cdot b \;+\; \frac{A\cdot m}{1024}\ \text{GB}.
 \label{eq:model}
 \end{equation}
-We use 32\,GB nodes with $U = 24$\,GB (75\% usable), $b = 0.19$\,GB, and the measured
-$m = 0.25$\,MB, giving a per-node density of $\approx$97{,}500 active tenants; we also report the
-conservative $m = 1.0$\,MB envelope (larger/hotter tenants, multiple resident connections,
-extra headroom), which yields $\approx$24{,}400 active/node. Disk is $R \times 0.38$\,MB total,
-object-tiered. Table~\ref{tab:cap} gives the model at 1\% peak concurrency;
-Table~\ref{tab:conc} shows concurrency sensitivity at the extremes.
+The standard Hanzo node is a \textbf{128\,GB} unified-memory box (\S\ref{sec:box}); we use
+$U = 125$\,GB usable, $b = 0.19$\,GB, and the measured $m = 0.25$\,MB, giving a per-node density
+of $\approx$511{,}000 active tenants; we also report the conservative $m = 1.0$\,MB envelope
+(larger/hotter tenants, multiple resident connections, extra headroom), which yields
+$\approx$128{,}000 active/node. A 128\,GB node holds $\approx$4$\times$ the active tenants of a
+32\,GB node, so the fleet is $\approx$1/4 the size at the same load: $10^9$ registered tenants
+at 1\% concurrency is $\approx$20 128\,GB nodes versus $\approx$103 32\,GB nodes (both from the
+\emph{measured} $m$, not a 2\,MB assumption). Disk is $R \times 0.38$\,MB total, object-tiered.
+Table~\ref{tab:cap} gives the model at 1\% peak concurrency; Table~\ref{tab:conc} shows
+concurrency sensitivity at the extremes.
 
 \begin{table}[h]
 \centering
-\caption{Capacity at \textbf{1\% peak concurrency}, 32\,GB nodes, from Eq.~\ref{eq:model} with the
-\meas{} $m=0.25$\,MB constant (and the \modeled{} $m=1.0$\,MB conservative envelope). ``Cluster
-RAM'' is consumed RAM per Eq.~\ref{eq:model}, not provisioned. Node counts are floored at 3 for HA.}
+\caption{Capacity at \textbf{1\% peak concurrency}, \textbf{128\,GB} nodes ($U=125$\,GB), from
+Eq.~\ref{eq:model} with the \meas{} $m=0.25$\,MB constant (and the \modeled{} $m=1.0$\,MB
+conservative envelope). ``Cluster RAM'' is consumed RAM per Eq.~\ref{eq:model}, not provisioned.
+Node counts are floored at 3 for HA.}
 \label{tab:cap}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{r r r r r r}
 \toprule
 Registered $R$ & Active @1\% & Nodes ($m{=}0.25$) & Cluster RAM & Nodes ($m{=}1.0$) & Disk (total, tiered) \\
 \midrule
-100            & 1          & 3   & 0.57\,GB  & 3    & 40\,MB  \\
-1{,}000        & 10         & 3   & 0.57\,GB  & 3    & 400\,MB \\
-10{,}000       & 100        & 3   & 0.59\,GB  & 3    & 4\,GB   \\
-100{,}000      & 1{,}000    & 3   & 0.81\,GB  & 3    & 40\,GB  \\
-1{,}000{,}000  & 10{,}000   & 3   & 3.01\,GB  & 3    & 400\,GB \\
-10{,}000{,}000 & 100{,}000  & 3   & 24.98\,GB & 5    & 4\,TB   \\
-100{,}000{,}000& 1{,}000{,}000 & 11 & 246.2\,GB & 42 & 40\,TB  \\
-1{,}000{,}000{,}000 & 10{,}000{,}000 & \textbf{103} & \textbf{2.46\,TB} & 411 & 400\,TB \\
+100            & 1          & 3   & 0.6\,GB   & 3    & 38\,MB  \\
+1{,}000        & 10         & 3   & 0.6\,GB   & 3    & 380\,MB \\
+10{,}000       & 100        & 3   & 0.6\,GB   & 3    & 4\,GB   \\
+100{,}000      & 1{,}000    & 3   & 0.8\,GB   & 3    & 38\,GB  \\
+1{,}000{,}000  & 10{,}000   & 3   & 3.0\,GB   & 3    & 380\,GB \\
+10{,}000{,}000 & 100{,}000  & 3   & 25.0\,GB  & 3    & 4\,TB   \\
+100{,}000{,}000& 1{,}000{,}000 & 3 & 244.7\,GB & 8 & 38\,TB  \\
+1{,}000{,}000{,}000 & 10{,}000{,}000 & \textbf{20} & \textbf{2.45\,TB} & 79 & 380\,TB \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
 \begin{table}[h]
 \centering
-\caption{Concurrency sensitivity for $R = 10^9$ registered tenants ($m=0.25$\,MB, 32\,GB nodes).
+\caption{Concurrency sensitivity for $R = 10^9$ registered tenants ($m=0.25$\,MB, 128\,GB nodes).
 Memory scales with \emph{concurrency}, not registrations: a 50$\times$ swing in peak concurrency
 is a 50$\times$ swing in fleet size, while $R$ is held fixed. \meas{}-grounded.}
 \label{tab:conc}
 \begin{tabular}{r r r r}
 \toprule
-Peak concurrency & Active tenants & Nodes & Cluster RAM \\
+Peak concurrency & Active tenants & Nodes (128\,GB) & Cluster RAM \\
 \midrule
-0.1\% & 1{,}000{,}000  & 11  & 246\,GB \\
-1.0\% & 10{,}000{,}000 & 103 & 2.46\,TB \\
-5.0\% & 50{,}000{,}000 & 513 & 12.3\,TB \\
+0.1\% & 1{,}000{,}000  & 3   & 245\,GB \\
+1.0\% & 10{,}000{,}000 & 20  & 2.45\,TB \\
+5.0\% & 50{,}000{,}000 & 98  & 12.2\,TB \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The shape of Table~\ref{tab:cap} is the thesis in numbers. Up to 10\,million registered tenants
-at 1\% concurrency, the fleet is the 3-node HA floor --- the platform is base-RSS-bound, not
-tenant-bound, and the tenants are ``free'' relative to the fixed cost of running at all. Only
-past $\sim$$10^8$ registrations does tenant memory dominate, and there it grows \emph{linearly}:
-$10^9$ tenants is $103$ nodes, $10^{10}$ would be $\sim$1030. There is no knee, no bottleneck
-tier, and no rewrite between the 3-node and the 103-node regime --- the same binary and the same
-per-tenant file, more of them.
+The shape of Table~\ref{tab:cap} is the thesis in numbers. Up to \emph{one hundred million}
+registered tenants at 1\% concurrency, the fleet is the 3-node HA floor --- the platform is
+base-RSS-bound, not tenant-bound, and the tenants are ``free'' relative to the fixed cost of
+running at all. Only past $\sim$$10^8$ registrations does tenant memory dominate, and there it
+grows \emph{linearly}: $10^9$ tenants is 20 128\,GB nodes, $10^{10}$ would be $\sim$200. There is
+no knee, no bottleneck tier, and no rewrite between the 3-node and the 20-node regime --- the
+same binary and the same per-tenant file, more of them.
+
+\section{The two scaling axes: tenant state vs.\ GPU inference}
+\label{sec:axes}
+The capacity model of \S\ref{sec:capacity} sizes \emph{one} resource: per-tenant SQLite state,
+which is CPU/RAM/IO. A GPU-enabled build of the same binary adds a \emph{second}, orthogonal
+axis --- inference --- and it scales by a completely different law. Conflating the two is the
+standard modeling error; separating them is the point.
+
+The inference engine, hanzo-engine (Rust), is FFI-embeddable into the cloud binary through a
+stable C ABI (\texttt{hanzo\_engine\_ffi.h}, present in the engine tree), so a GPU node runs
+inference and embeddings \emph{in the same process} as the app subsystems and the tenant stores
+--- no separate model service, no network hop to a model server (the co-location is the cloud
+``bring-your-gpu'' path). The two axes then scale as follows.
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Axis A --- tenant state (CPU/RAM).} Resident memory is $A\cdot m$ with $A=cR$: it
+grows with the number of \emph{active} tenants, and each tenant's state is private
+(shared-nothing). This is \S\ref{sec:capacity}, measured at $m\approx0.25$\,MB.
+\item \textbf{Axis B --- inference (GPU/VRAM).} GPU memory holds \emph{model weights}, which are
+\emph{shared across all tenants}: one resident copy of a model serves one tenant or one million
+at the same VRAM cost. Inference memory is therefore $O(\text{distinct models hosted})$, \emph{not}
+$O(\text{tenants})$. Adding tenants adds no weight memory --- only queue depth, absorbed by request
+\emph{batching}. Axis B scales by (i) model-hosting: VRAM $=$ weights $+$ KV-cache
+(\cited{} $\approx$8.11\,GiB resident for Qwen3-8B-Q8\_0), and (ii) throughput: tokens/sec, bounded
+by memory bandwidth (\cited{} $\approx$231\,GB/s and single-stream decode $\approx$25\,t/s on the
+measured Strix Halo box; an NVIDIA GB10 Grace-Blackwell offers 121\,GB unified~\cite{xbench}).
+\end{itemize}
+
+Because the axes are independent, a deployment sizes them independently: tenant-state nodes by
+Eq.~\ref{eq:model}, inference nodes by peak token demand $\div$ per-node batched throughput. A
+single node carries \emph{both} roles when it has RAM for tenants and VRAM (or unified memory)
+for weights --- exactly the box of \S\ref{sec:box}. The weight-sharing property is what makes
+inference cheap to co-locate: the model is a fixed cost amortized across the \emph{entire} tenant
+population, not a per-tenant tax. (Axis-A numbers are \meas{}; the Axis-B weight/throughput
+figures are \cited{} from the companion inference papers~\cite{xbench,edgepaper}.)
+
+\section{The unified-memory box as the atomic self-hostable unit}
+\label{sec:box}
+Put the two axes in one box with one physical memory pool and the architecture collapses to
+something new: a complete, self-hostable cloud in a single commodity unit.
+
+The enabling hardware is the \emph{unified-memory} box --- a Grace-Blackwell GB10-class system
+(e.g.\ NVIDIA DGX Spark, \cited{} 128\,GB unified LPDDR5X) or an AMD Ryzen AI Max+ 395 ``Strix
+Halo'' box (the class this paper's per-tenant constant was \emph{measured} on) at 128\,GB unified
+for $\approx$\$3{,}200. \emph{Unified} means CPU and GPU address the same physical DRAM: the
+per-tenant SQLite population (Axis A) and the model weights (Axis B) coexist in one 128\,GB space
+with \emph{no} CPU$\leftrightarrow$GPU copy --- the tenant data the app serves and the model the
+app calls live in the same address space. One box therefore runs the entire stack: the one
+binary with all 56 subsystems, per-tenant storage, replication, \emph{and} GPU inference.
+
+Table~\ref{tab:box} sizes it: reserve model weights $+$ engine $+$ OS, and the remainder $\div\,m$
+is the tenant capacity. With an 8B-Q8 model (8\,GiB) and $\approx$6\,GiB for engine/OS,
+$\approx$114\,GiB remains for tenant state $=$ a \meas{}-grounded 467{,}000 active tenants; at 1\%
+concurrency that is \textbf{$\approx$47 million registered users on one \$3{,}200 box}, at 0.1\%
+concurrency $\approx$467 million. Even at the conservative $m=1.0$\,MB it is $\approx$11.7 million
+registered at 1\%.
+
+\begin{table}[h]
+\centering
+\caption{``Cloud in a box'': tenant capacity of one 128\,GB unified-memory box after reserving
+model weights $+$ engine $+$ OS. Active-tenant counts use the \meas{} $m$; registered-user counts
+apply the stated concurrency; weight reservations are \cited{}/\modeled{}. Capex is the \$3{,}200
+box price $\div$ registered users at 1\% concurrency.}
+\label{tab:box}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l r r r r r}
+\toprule
+Resident model & Tenant RAM & Active ($m{=}0.25$) & Reg.\ @1\% & Reg.\ @0.1\% & Capex/user @1\% \\
+\midrule
+8B-Q8 ($\approx$8\,GiB)   & 114\,GiB & 467{,}000 & \textbf{46.7\,M} & 467\,M & \$0.000069 \\
+$\approx$20B-Q8 ($\approx$20\,GiB) & 102\,GiB & 418{,}000 & 41.8\,M & 418\,M & \$0.000077 \\
+70B-Q4 ($\approx$40\,GiB) & 82\,GiB  & 336{,}000 & 33.6\,M & 336\,M & \$0.000095 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+The economics follow directly. At \$3{,}200 per box and $\approx$47\,M registered users at 1\%
+concurrency, the one-time hardware capex is \textbf{$\approx$\$0.00007 per registered user}
+(\$68 per million). Scale is additive: each box is self-contained (shared-nothing tenants, its own
+model copy), so $N$ boxes are $N\times$ the capacity with no shared bottleneck. A sovereign,
+full-stack AI cloud --- app, storage, \emph{and} inference --- is a rack of commodity boxes, not a
+hyperscaler contract. (The tenant capacity is \meas{}-$m$-grounded; the weight reservation and
+inference throughput are \cited{}/\modeled{}; a real box's capacity depends on the p99 tenant size
+and the model chosen.)
 
 \section{Comparative analysis: shared Postgres + microservice mesh}
 \label{sec:compare}
@@ -379,8 +472,8 @@ Mesh, heavy (120\,MB svc + 70\,MB sidecar, 2 rep) & 190\,MB & 21.3\,GB & 37.3$\t
 
 Composed with the capacity model, the gap compounds: the mesh's 6--21\,GB fixed tax is paid on
 \emph{every node}, so at the 3-node HA floor --- where the unified platform serves up to
-$10^7$ tenants in $<$1\,GB of control-plane RAM (Table~\ref{tab:cap}) --- the mesh alternative
-already needs 19--64\,GB just to exist.
+$10^8$ registered tenants at 1\% concurrency in $<$1\,GB of control-plane RAM
+(Table~\ref{tab:cap}) --- the mesh alternative already needs 19--64\,GB just to exist.
 
 \section{Claims, grounded in the measurement}
 \label{sec:claims}
@@ -399,9 +492,9 @@ Table~\ref{tab:conc} is the empirical shape.
 Distinct tenants share no write path: each is a private single-writer SQLite file pinned to one
 pod (\S\ref{sec:arch}). There is no global lock, no distributed transaction, and no per-write
 consensus, so adding a node adds independent write and read capacity with no coordination
-overhead that grows with the fleet. Fleet size is therefore $\Theta(A)$ ---
-$103$ nodes at $10^7$ active, $\sim$1030 at $10^8$ --- with a constant factor set by the measured
-$m$. This is linear, not merely sublinear-with-a-bottleneck.
+overhead that grows with the fleet. Fleet size is therefore $\Theta(A)$ --- on 128\,GB nodes,
+20 at $10^7$ active, $\sim$196 at $10^8$ --- with a constant factor set by the measured $m$. This
+is linear, not merely sublinear-with-a-bottleneck.
 
 \paragraph{Proposition 3 (the one-binary memory advantage is multiplicative).}
 Composing $S$ subsystems into one runtime pays the fixed runtime + sidecar cost once rather than
@@ -409,6 +502,137 @@ $S$ times. Measured against a 56-subsystem mesh, the fixed-memory ratio is $11$-
 (Table~\ref{tab:mesh}), and it is paid per node, so it multiplies the per-node base $b$ in
 Eq.~\ref{eq:model}. Lowering $b$ is what keeps small deployments in the sub-gigabyte regime in
 Table~\ref{tab:cap}.
+
+\section{hanzo.network: the sovereign decentralized confidential compute fabric}
+\label{sec:fabric}
+\sloppy
+Everything above describes \emph{one} operator's fleet. The culminating step makes it a public,
+decentralized, confidential cloud: a fabric of independently-owned boxes coordinated leaderlessly
+by a BFT chain, where anyone can contribute compute and confidential workloads run on hardware the
+operator cannot inspect. The primitives below are real and cited to their source files; the
+assembly into a single fabric is stated honestly as roadmap where it is roadmap
+(\S\ref{sec:builtvroadmap}).
+
+\paragraph{The control plane is a consensus chain.} hanzo.network is a \texttt{luxfi/consensus}
+BFT chain~\cite{luxconsensus} --- the engine is real (\texttt{engine/bft}, \texttt{engine/chain},
+\texttt{engine/common}) with the Quasar protocol (\texttt{protocol/quasar})~\cite{quasar} --- whose
+VM \emph{state} \emph{is} the compute-fabric control plane: node membership and attestation, the
+tenant$\to$writer-node pinning map, replication assignments, and workload placement. The chain
+\emph{is} the scheduler --- leaderless BFT, no central coordinator, no single point of control or
+failure.
+
+\paragraph{The data plane is the per-tenant SQLite substrate --- unchanged.} Each node runs
+\texttt{hanzod} (the node daemon; \texttt{hanzo/node}) which spawns the full cloud binary: a
+consensus participant \emph{plus} the 56 app subsystems \emph{plus} GPU inference
+(\S\ref{sec:axes}). Tenant writes stay exactly as measured --- a private, writer-pinned SQLite
+file, WAL-replicated to consensus-agreed replicas. The chain coordinates \emph{placement}, not
+individual writes.
+
+\paragraph{Leaderless HA and durability --- the sweet spot.} The design sits deliberately between
+two failure modes. \emph{Global consensus per write} (every mutation is a BFT round) gives
+durability but does not scale --- the write path becomes one global bottleneck, the very thing
+\S\ref{sec:compare} faults Postgres for, made worse. \emph{Replication without consensus} scales
+writes but has no agreed failover --- a split brain can double-open a tenant or lose its tail.
+hanzo.network takes neither: per-tenant single-writer for the \emph{data} path (writes shard
+perfectly), and BFT consensus only for \emph{placement} --- who holds the writer pin, where the
+replicas live, and, on writer-node death, which replica is promoted. The writer pin
+(\texttt{cloud/writerpin}) already guarantees at-most-one writer; the writer/reader roles
+(\texttt{cloud/role}, \texttt{middleware\_reader.go}, fail-closed reads --- shipped in the
+reader-HA work) already give safe promotion. The chain makes that promotion decision
+\emph{deterministic and Byzantine-fault-tolerant across untrusted operators}. Writes never touch
+consensus; only the rare, slow-changing placement map does. That is why the fabric scales linearly
+\emph{and} survives node loss.
+
+\paragraph{Trust tiers make it trustless-public.} A public fabric of unknown operators cannot be
+trusted with plaintext tenant data unless the hardware enforces it, so hanzo.network schedules by
+\emph{trust tier}, recorded on-chain. \emph{Confidential tier}: nodes with a hardware TEE ---
+NVIDIA H100/H200 Confidential Computing, Intel TDX, or AMD SEV-SNP~\cite{tee} --- run tenant
+workloads inside an enclave the node \emph{operator} cannot read; the attestation is verified and
+recorded on-chain, and confidential workloads schedule \emph{only} onto attested nodes.
+\emph{Public tier}: any commodity box (a phone, a laptop, the \$3{,}200 unified box) takes
+public/research workloads where the operator is trusted enough for public data. Anyone can run
+\texttt{hanzod} and contribute, and the chain routes each workload to hardware whose trust tier
+matches its sensitivity --- the difference between a genuinely \emph{trustless} decentralized cloud
+and ``decentralized, but trust the operators.''
+
+\paragraph{Post-quantum from the identity layer up.} A sovereign cloud is a decades-long artifact,
+so its security horizon must not be capped by Shor's algorithm. hanzo.network is post-quantum
+\emph{end-to-end}, not classical-with-a-PQ-bolt-on: consensus runs a PQ security profile
+(\texttt{luxfi/consensus} \texttt{config/pq\_mode.go}, \texttt{security\_profile.go}) and PQ auth
+schemes (\texttt{protocol/auth}: ML-DSA-44/65 signatures, ML-KEM key exchange, legacy ECDSA
+\emph{forbidden} under strict PQ)~\cite{hip0005}; Quasar is a PQ BFT (BLS $+$ Ringtail threshold
+$+$ ML-DSA), and the primitives ship in \texttt{lux/crypto/\{mldsa,mlkem\}}. Node identity is an
+ML-DSA key; capability identity on the app side is PQ as well (\texttt{iam/capauth/\{keys,verify\}.go}).
+This is a durability argument as much as a security one: node identity, consensus, and key
+exchange all outlive the quantum transition.
+
+\paragraph{Frictionless, auto-provisioned wallet.} Every node and user has a PQ wallet, and if
+none is configured one is provisioned automatically as part of joining --- there is no ``install a
+browser extension, back up a seed phrase'' barrier. The wallet subsystem is real
+(\texttt{cloud/clients/wallets}: \texttt{wallets.go}, \texttt{custody.go}, \texttt{anchor.go},
+\texttt{store.go}, \texttt{safeclient.go}, over \texttt{clients/mpcseal}), MPC-custodied so there
+is no single seed to lose. The wallet is simultaneously the node's PQ \emph{identity} and its
+economic \emph{key}, so \texttt{hanzod up} yields identity, wallet, and fabric membership in one
+step --- essential to the viral model below.
+
+\paragraph{Economics: the AI-coin incentive.} The wallet stakes to join the fabric, earns for
+contributed compute --- priced by trust tier, so a TEE-confidential node earns more than a public
+one --- and pays for consumed workloads, all in the native AI coin (HIP-0001~\cite{hip0001}). This
+is the incentive that makes a viral node network \emph{self-sustaining}: contributing compute
+earns, so nodes join and stay. Against the \S\ref{sec:box} box economics --- a \$3{,}200 128\,GB
+box whose measured per-tenant capex is $\approx$\$0.00007/user --- a node's contributed compute
+earns against a trivial fixed cost, which is what closes the loop.
+
+\subsection{Viral deployment: \texttt{hanzod} is the unit, \texttt{cloud} is what it runs}
+\label{sec:viral}
+The reason this can actually spread is the deployment model. Every prior ``self-hostable cloud''
+gates on operator expertise --- stand up Kubernetes, then deploy --- which restricts the operator
+population to specialists. hanzo.network inverts it: you run \emph{one} daemon. \texttt{hanzod}
+(\texttt{hanzo/node}, a systemd-managed node service) is the viral unit; the cloud binary is the
+state machine it runs --- the relationship is \texttt{hanzod : cloud :: bitcoind : the ledger}. The
+daemon (i) \emph{joins hanzo.network} as a leaderless \texttt{luxfi/consensus} node; (ii)
+\emph{manages its own runtime adaptively} --- on a laptop or small box it spawns the cloud binary
+bare (no Kubernetes), and on a GPU/large node it bootstraps k3s \emph{internally} for workload
+isolation and GPU scheduling and runs cloud $+$ workloads inside it, so Kubernetes is an internal
+implementation detail of the node (the HIP-0117~\cite{hip0117} \texttt{cluster init} mechanic
+wrapped by the daemon), invisible to the operator; (iii) \emph{contributes compute by trust tier}
+(TEE$\to$confidential, bare$\to$public); and (iv) \emph{self-installs, self-updates, self-heals}.
+The whole onboarding is \texttt{download hanzod $\to$ hanzod up $\to$ you are an open-AI-cloud
+node}: one command, no Kubernetes expertise, PQ identity $+$ wallet $+$ membership included.
+
+The virality argument is then structural: \textbf{(a) no expertise barrier} --- one download and
+one command remove the k8s-operator gate that every prior decentralized-cloud project tripped on;
+\textbf{(b) monotone network effect} --- each joining node strictly increases fabric capacity,
+resilience, \emph{and} trust-tier coverage, so growth compounds; \textbf{(c) universal addressable
+population} --- trust-tiered participation makes the eligible node set \emph{everyone} (a phone
+serves public inference; a TEE box serves confidential tenants), not just datacenter operators;
+\textbf{(d) trivial per-node cost} --- a \$3{,}200 128\,GB unified box is a consumer purchase whose
+measured per-tenant economics make contributed compute effectively free at the margin, and the
+AI-coin incentive pays it back. Against hyperscaler centralization (one owner, metered rent,
+plaintext trust) and against prior decentralized-cloud efforts (still operator-expert, still
+trust-the-operator), the combination --- one-command node, leaderless BFT control, per-tenant
+shared-nothing data, hardware-enforced confidential tiers, PQ identity, an auto-wallet, and
+commodity unified-memory economics --- is what turns a measured efficiency result into a growth
+model.
+
+\paragraph{What is built vs.\ what is the assembly.}
+\label{sec:builtvroadmap}
+\textbf{Built (cited to source):} the BFT $+$ Quasar consensus engine (\texttt{luxfi/consensus},
+PQ mode $+$ ML-DSA/ML-KEM auth); the per-tenant writer pin (\texttt{cloud/writerpin}); the
+writer/reader HA roles (\texttt{cloud/role} $+$ \texttt{middleware\_reader.go}); the node daemon
+(\texttt{hanzod}); the unified cloud binary (HIP-0106) and in-process plugin/VM model (HIP-0116);
+the wallet/custody subsystem (\texttt{cloud/clients/wallets} $+$ \texttt{mpcseal}); PQ capability
+identity (\texttt{iam/capauth}); the PQ crypto primitives (\texttt{lux/crypto/\{mldsa,mlkem\}});
+the GPU/engine FFI (\texttt{hanzo\_engine\_ffi.h}) and \texttt{lux/node/vms}; and the specs
+HIP-0117 (BYO compute fleet), HIP-0005 (PQ security), HIP-0001 (AI coin).
+\textbf{Roadmap (the assembly):} the fabric-VM that makes consensus state the live scheduler; the
+on-chain tenant$\to$writer map with consensus-driven failover; on-chain TEE attestation and
+confidential trust-tier scheduling; the \texttt{hanzod} auto-join handshake, adaptive-k3s
+bootstrap, and self-heal orchestration; the auto-provision-on-join wallet flow; and the
+compute-earning settlement with cross-node trust-tier pricing. This paper's contribution is the
+\emph{measured foundation}; the fabric is the composition of shipped primitives, marked as design
+where it is design.
+\fussy
 
 \section{Limitations}
 \label{sec:limits}
@@ -445,6 +669,22 @@ schema, single-stream warm/cold workloads, with a bounded 2-connection pool. It 
 concurrent query load per tenant (which materializes more connections, each with its own page
 cache), nor multi-hour steady-state fragmentation. The 190\,MB base RSS is \cited{} from prior
 production sampling, not re-measured on this pass. These are the honest edges of the numbers.
+
+\item \textbf{The fabric is an assembly of shipped primitives, not a shipped fabric.} The
+per-tenant measurement, the unified binary, the writer pin, the writer/reader HA roles, the PQ
+consensus engine, the wallet subsystem, and the node daemon exist and are cited to source
+(\S\ref{sec:builtvroadmap}). The single decentralized confidential fabric of \S\ref{sec:fabric}
+--- the fabric-VM as live scheduler, on-chain tenant$\to$writer placement with consensus failover,
+on-chain TEE attestation and confidential scheduling, the \texttt{hanzod} auto-join/adaptive-k3s/
+self-heal orchestration, and the compute-earning settlement --- is design/roadmap. The efficiency
+and scaling results are measured; the fabric is the argued composition on top of them, and is
+labelled as such throughout.
+
+\item \textbf{Inference axis not measured on this pass.} Axis-B (GPU) figures --- model resident
+size, bandwidth, decode t/s --- are \cited{} from the companion inference papers, and the box
+capacity of Table~\ref{tab:box} treats the model reservation and throughput as \cited{}/\modeled{}.
+The tenant capacity (Axis A) is the measured part; the inference co-location is architecturally
+grounded (FFI, unified memory) but its throughput is not re-measured here.
 \end{itemize}
 
 \section{Conclusion}
@@ -457,12 +697,19 @@ live in one binary --- so the fixed platform cost is paid once, at $11$--$32\tim
 than the equivalent mesh. The measured per-active-tenant cost is $\approx$0.25\,MB, an idle
 tenant is free, and the \texttt{cache\_size} cap is a tunable ceiling rather than a footprint.
 The capacity model that follows from that one constant puts a billion registered tenants on
-$\sim$100 commodity nodes at 1\% concurrency, and on 11 at 0.1\% --- with no bottleneck tier and
-no rewrite between the small and the large regime. The design is not free of cost: writer
-failover, hot-tenant skew, and cross-tenant queries are genuine prices, stated in
-\S\ref{sec:limits}. But on the axis it is built for --- serving an enormous number of
-independent tenants cheaply and scaling their concurrency linearly --- the measurement supports
-the architecture.
+$\approx$20 standard 128\,GB nodes at 1\% concurrency, and on the 3-node HA floor at 0.1\% --- with
+no bottleneck tier and no rewrite between the small and the large regime. Two orthogonal axes
+compose in one process: per-tenant state (CPU/RAM, $O(\text{active})$) and shared-weight GPU
+inference (VRAM, $O(\text{models})$), which on a \$3{,}200 128\,GB \emph{unified}-memory box
+collapse into a complete cloud-in-a-box serving tens of millions of users. Extended over
+\texttt{luxfi/consensus}, a leaderless PQ BFT chain schedules placement (not writes) across
+independently-owned, trust-tiered nodes --- the shipped writer-pin, reader-HA, wallet, and PQ
+identity primitives composed into \texttt{hanzo.network}, a sovereign decentralized confidential
+cloud that grows one \texttt{hanzod up} at a time. The design is not free of cost: writer failover,
+hot-tenant skew, and cross-tenant queries are genuine prices, and the fabric layer is an argued
+assembly of measured primitives, all stated in \S\ref{sec:limits}. But on the axis it is built for
+--- serving an enormous number of independent tenants cheaply and scaling their concurrency
+linearly --- the measurement supports the architecture.
 
 \appendix
 \section{Reproducibility}
@@ -514,6 +761,24 @@ Dropbox-Class Filesystem over One Encrypted Block Substrate}. Hanzo Industries w
 (companion; \texttt{hanzo-pq-object-store}).
 \bibitem{edgepaper} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators} (companion
 white paper; source of the prior 154--225\,MB \texttt{cloud} working-set measurement).
+\bibitem{xbench} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: Measured AMD,
+NVIDIA, and Apple Performance} (companion; source of the cited 8.11\,GiB / 231\,GB/s / decode-t/s
+inference figures; \texttt{hanzo-cross-backend-inference}).
+\bibitem{luxconsensus} Lux Industries. \emph{HIP-0116: Plugin VM / In-Process Composition} and the
+\texttt{luxfi/consensus} BFT engine (\texttt{engine/bft}, \texttt{engine/chain},
+\texttt{engine/common}). \url{https://github.com/luxfi/consensus}.
+\bibitem{quasar} Lux Industries. \emph{Quasar: Post-Quantum BFT Consensus} (LP-020 / Lux Quasar
+consensus white paper; \texttt{luxfi/consensus/protocol/quasar}).
+\url{https://github.com/luxfi/consensus}.
+\bibitem{tee} Confidential computing hardware: NVIDIA H100/H200 Confidential Computing; Intel Trust
+Domain Extensions (TDX); AMD Secure Encrypted Virtualization --- Secure Nested Paging (SEV-SNP).
+Vendor documentation.
+\bibitem{hip0005} Hanzo AI. \emph{HIP-0005: Post-Quantum Security for AI Infrastructure}.
+\url{https://github.com/hanzoai/HIPs}.
+\bibitem{hip0001} Hanzo AI. \emph{HIP-0001: AI Token --- Hanzo's Native Currency}.
+\url{https://github.com/hanzoai/HIPs}.
+\bibitem{hip0117} Hanzo AI. \emph{HIP-0117: BYO Compute Fleet and Metered Billing}.
+\url{https://github.com/hanzoai/HIPs}.
 \bibitem{sqlite} SQLite. \emph{PRAGMA \texttt{cache\_size}} and \emph{Write-Ahead Logging}.
 \url{https://www.sqlite.org/pragma.html#pragma_cache_size}, \url{https://www.sqlite.org/wal.html}.
 \bibitem{istio} Istio. \emph{Sidecar resource footprint} (Envoy proxy memory, per-proxy).

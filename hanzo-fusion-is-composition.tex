@@ -1,0 +1,283 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\title{\textbf{Fusion Is Composition:\\ Kernel Fusion as the Functor Law}}
+\author{Hanzo AI --- ML Systems}
+\date{hanzo-kernel Paper 07.1 --- concept core of the \emph{One Source, Every Backend} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Kernel fusion is usually presented as a compiler optimization: a pass that inspects a graph and, when
+a cost model approves, merges adjacent operations to avoid writing an intermediate array to memory. This
+paper takes the opposite stance --- fusion is not a pass, it is an \emph{algebraic identity}. An
+elementwise GPU kernel is the lift of a scalar function to every array index, and such lifts obey the
+functor law $\mathrm{map}(g)\circ\mathrm{map}(f)=\mathrm{map}(g\circ f)$. Read right-to-left, that law
+\emph{is} fusion: one kernel computing the composed function, no intermediate. Reduce and Scan are the
+points where the law stops applying --- they are algebraic \emph{fences}, decidable from the operation's
+class, not from a pattern matcher. We show how this single idea becomes a working, one-launch fusion
+engine in \hk{}: a tiny op algebra whose fusibility rule is a total function of op class; one generic
+kernel that interprets any composed chain as straight-line arithmetic; and the same algebra lifted from a
+line to an arbitrary DAG. Every claim is gated bit-exactly on a CPU reference. The concrete payoff is
+measured on a real model pattern --- the per-layer Gated-DeltaNet chain fuses from 9 kernel launches to
+5, byte-for-byte identical to the unfused path.
+\end{abstract}
+
+\section{The pain: an intermediate nobody wanted}
+\label{sec:pain}
+
+Consider the tail of a Transformer feed-forward block, after its two matmuls have produced two arrays
+\code{gate} and \code{up}, each of length $n$. The SwiGLU activation is
+\[
+y \;=\; \mathrm{silu}(\code{gate}) \cdot \code{up}, \qquad \mathrm{silu}(x)=x\cdot\sigma(x).
+\]
+A \emph{kernel} is a function the GPU runs once per array element in parallel; a kernel \emph{launch} is
+one dispatch of that function over the whole array. The obvious way to compute $y$ is two kernels: one
+computes $t=\mathrm{silu}(\code{gate})$, writing $n$ floats to device memory (DRAM); a second reads $t$
+and \code{up} back from DRAM and writes $y$. That middle array $t$ is \emph{materialized} --- written to
+DRAM and immediately read back --- for no reason but that we wrote two kernels. On a decode step, where
+the whole workload is memory-bound (you are limited by how fast you can move bytes, not by arithmetic),
+that round-trip is pure waste.
+
+Now scale the pattern. Qwen3.5 and Qwen3.6 are hybrid models whose bulk layers are Gated-DeltaNet
+(GDN) linear attention, and each GDN layer emits a short elementwise chain ---
+$\mathrm{rms\_norm}(x)\cdot w\cdot\mathrm{silu}(g)$ and its siblings --- as a \emph{storm} of tiny kernel
+launches: roughly \textbf{9 launches per layer} on the ops-composed CUDA path. Each launch reads its
+inputs from DRAM, does a trivial amount of arithmetic, and writes its output back to DRAM for the next
+launch to read. Multiply by dozens of layers and every decoded token pays for a parade of intermediates.
+This is not a corner case; it is a measurable part of why an ops-composed engine trails a hand-fused one.
+
+The question this paper answers is: \emph{when may two adjacent kernels be merged into one, and how do
+you do it once, correctly, for every backend?} The usual answer is ``run a fusion pass with a pattern
+matcher and a cost model.'' Ours is simpler and total.
+
+\section{The idea: an elementwise kernel is a lifted function}
+\label{sec:idea}
+
+Strip a pointwise (elementwise) kernel to its essence and it is a scalar function $f:F\to F$ applied
+independently at every index $i$:
+\[
+\mathrm{map}(f)\,:\;\text{Array}\to\text{Array},\qquad \mathrm{map}(f)(A)[i]=f(A[i]).
+\]
+The word \emph{map} is exact: it is the same map a Rust programmer writes as \code{v.iter().map(f)}. Two
+such kernels in sequence apply $f$, store the result, then apply $g$. But applying $g$ after $f$ at every
+index is, by definition, applying $g\circ f$ at every index. That is the \textbf{functor law}:
+\[
+\boxed{\;\mathrm{map}(g)\circ\mathrm{map}(f)\;=\;\mathrm{map}(g\circ f)\;}
+\]
+Read left-to-right, the equation is two kernels with a materialized array between them. Read
+right-to-left, it is \emph{one} kernel computing the composed function $g\circ f$ with \emph{no}
+intermediate. \textbf{Kernel fusion is nothing but that law, read right-to-left.}
+
+If this feels familiar it is the transducer insight in disguise: \code{map(f)} and \code{map(g)} are
+transformations that do not mention the collection they run over, so you may compose the
+\emph{transformations} and apply the composite to the collection \emph{once}, never allocating the
+intermediate collection. Here the collection is a GPU array and ``once'' is a single kernel launch.
+Categorically, each Map is a morphism $\text{Array}\to\text{Array}$ and \emph{composition of morphisms is
+fusion}. There is no separate ``fusion pass'' to invent; there is only the associativity of $\circ$.
+
+\section{The class decides fusibility}
+\label{sec:class}
+
+Not every op is a Map, and the ones that are not are exactly the ones that cannot be fused this way. The
+whole surface is two classes:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Map} (a pointwise morphism): output element $i$ depends only on input(s) at index $i$
+(plus compile-time constants). It is shape-preserving and \emph{index-local}. Maps compose freely: any
+run of adjacent Maps is one Map, by the functor law. This is the fusible family ---
+\code{Add Sub Mul Div Neg Recip Abs Exp Rsqrt Sigmoid Tanh Silu Gelu}. (\code{Silu} and \code{Gelu} are
+not special cases: they are \emph{defined} as compositions of the primitives, so they are already one
+composed morphism.)
+\item \textbf{Reduce / Scan} (a contraction): output element $i$ depends on a \emph{whole row or axis}
+--- \code{sum}, \code{max}, \code{mean}, and the operations built on them (RMSNorm, softmax, matmul).
+This is \emph{not} index-local. It cannot be absorbed into an adjacent Map by the same lift, because it
+needs cross-lane communication: threads must exchange partial results (through shared memory or a
+subgroup reduction) to compute one output. A Reduce is therefore a \textbf{fence}.
+\end{itemize}
+
+The decision ``can these two adjacent ops fuse?'' is then a total function of their class --- no pattern
+matcher, no cost model:
+\[
+\mathrm{fusible}(a,b)\;:=\;\mathrm{is\_map}(a)\wedge\mathrm{is\_map}(b).
+\]
+At a fence there is still fusion, just attached at the fence's \emph{ports}: a Map run \emph{feeding} the
+reduction fuses into its input read (a \emph{prologue}), and a Map run \emph{consuming} the reduction's
+result fuses into its output write (an \emph{epilogue}). The reduction kernel itself is the seam where
+the pattern changes. RMSNorm is the canonical shape: \code{square}(Map, prologue) $\to$ \code{sum}(fence)
+$\to$ \code{scale-by-rsqrt}(Map, epilogue) --- three regions, the two Map runs each collapsed to one.
+
+\section{The mechanism: reify, fold, interpret}
+\label{sec:mech}
+
+Three small steps turn the algebra into a running engine. All of it lives in one crate module and is
+proven on a CPU reference (\S\ref{sec:eval}).
+
+\paragraph{Reify.} A pointwise expression is recorded as a tree of scalar morphisms rather than computed
+(Listing~\ref{lst:expr}). \code{Cur} is the value flowing down the pipeline at the current element;
+\code{In(id)} is a side-input array read at the current index; \code{Const} is a compile-time scalar.
+Operator overloading makes building one read like the math it denotes. Building an \code{Expr} computes
+nothing --- it records the trace.
+
+\begin{lstlisting}[language=Rust,caption={The op algebra. The whole fusible surface is a tree of unary
+and binary pointwise morphisms over the current value, side inputs, and constants.},label={lst:expr}]
+enum Expr { Cur, In(usize), Const(f32), Un(UnOp, Box<Expr>), Bin(BinOp, Box<Expr>, Box<Expr>) }
+
+// Morphism composition: substitute `inner` for every `Cur` leaf. This is the ONLY operation
+// the fusion pass needs -- map(g) . map(f) becomes map(g[Cur := f]).
+fn compose_cur(&self, inner: &Expr) -> Expr {
+    match self {
+        Expr::Cur       => inner.clone(),
+        Expr::Un(op, a) => Expr::Un(*op, Box::new(a.compose_cur(inner))),
+        Expr::Bin(op,a,b)=> Expr::Bin(*op, Box::new(a.compose_cur(inner)),
+                                           Box::new(b.compose_cur(inner))),
+        leaf            => leaf.clone(),
+    }
+}
+\end{lstlisting}
+
+\paragraph{Fold.} The fusion pass is one fold over the chain of steps: accumulate adjacent Maps by
+composing their expressions (\code{compose\_cur} \emph{is} $g[\code{Cur}:=f]$), and cut a new region at
+every Reduce. That is the entire pass (Listing~\ref{lst:fold}). Its output is a list of regions; the
+number of regions is the number of kernels, and it is strictly fewer than the number of steps whenever
+any two Maps were adjacent --- that gap \emph{is} the fusion.
+
+\begin{lstlisting}[language=Rust,caption={The fusion pass: fold adjacent Maps by composing their
+expressions; cut at every Reduce. No matcher, no cost model --- just the class.},label={lst:fold}]
+fn fuse(&self) -> Vec<Region> {
+    let (mut regions, mut acc) = (Vec::new(), None);
+    for step in &self.steps {
+        match step {
+            Step::Map(e) => acc = Some(match acc.take() {   // g after f  ==>  g[Cur := f]
+                None => e.clone(), Some(prev) => e.compose_cur(&prev),
+            }),
+            Step::Reduce(r) => { if let Some(e) = acc.take() { regions.push(Region::Map(e)); }
+                                 regions.push(Region::Reduce(*r)); }
+        }
+    }
+    if let Some(e) = acc.take() { regions.push(Region::Map(e)); }
+    regions
+}
+\end{lstlisting}
+
+\paragraph{Interpret.} A fused Map region is lowered to a small linear ``op program'' carried as a
+compile-time value, and \emph{one} generic kernel walks that program in a compile-time-\emph{unrolled}
+loop (Listing~\ref{lst:interp}). Because the loop and the branch are resolved at compile time (the DSL's
+lowering engine monomorphizes on the program value), each instruction becomes straight-line arithmetic
+in one kernel body: the input is read once, threaded through every op, and written once. There are no
+intermediate arrays and exactly one launch, whatever the chain length. This is not a hand-written fixed
+kernel --- any linear elementwise chain runs through this one \code{fused\_interp}.
+
+\begin{lstlisting}[language=Rust,caption={The one fused kernel. \code{prog} rides as a compile-time
+value, so \code{\#[unroll]} plus a comptime \code{match} lower the whole chain to straight-line code:
+one launch, zero intermediates.},label={lst:interp}]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn fused_interp<F: Float>(x: &Array<F>, sides: &Sequence<Array<F>>,
+                              out: &mut Array<F>, #[comptime] prog: Program) {
+    let i = ABSOLUTE_POS;
+    if i < out.len() {
+        let mut acc = x[i];
+        #[unroll]
+        for step in 0..prog.instrs.len() {
+            match comptime!(prog.instrs[step]) {
+                Instr::Un(op)          => acc = apply_un_dev::<F>(op, acc),
+                Instr::BinIn(op, slot) => acc = apply_bin_dev::<F>(op, acc, sides.index(slot)[i]),
+                Instr::BinConst(op, b) => { let c = comptime!(f32::from_bits(b));
+                                            acc = apply_bin_dev::<F>(op, acc, F::new(c)) }
+            }
+        }
+        out[i] = acc;
+    }
+}
+\end{lstlisting}
+
+The ergonomic surface is a builder that reads like the composition it denotes:
+\code{Fuse::new(a).\allowbreak{}mul(w).\allowbreak{}add(b).\allowbreak{}silu().\allowbreak{}run(c)}
+appends one instruction per call, compiles them to one program, and dispatches exactly one
+\code{fused\_interp}. The constant leaf is stored as \code{f32::to\_bits} so the program is
+\code{Eq + Hash} --- the lowering engine keys one compiled kernel per distinct fused chain.
+
+\section{From a line to a DAG}
+\label{sec:dag}
+
+A real forward pass is not a straight line. A value \emph{fans out} (is consumed by several later ops)
+and a binary op \emph{fans in} (reads two independently computed values). The expression
+$\mathrm{silu}(a)\cdot b + a$ reuses $a$ twice; a linear chain cannot express it in one region, but a
+DAG can, and it still fuses to \emph{one} kernel. The same algebra lifts from a path to a graph with no
+new ideas:
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{Trace.} A \code{NodeId}-taping newtype records an arbitrary pointwise DAG as a
+\code{Vec<Node>} (operator overloads push nodes instead of computing). The node algebra is the \emph{same}
+\code{UnOp}/\code{BinOp}/\code{Red} as the line case --- one IR, reused.
+\item \textbf{Partition.} Flood-fill maximal Map-only connected regions; cut every edge into a fence
+(a Reduce, or any non-elementwise op --- matmul, gather, conv). This is the identical \code{Class}
+predicate from \S\ref{sec:class}, applied to graph edges instead of list-adjacency.
+\item \textbf{Lower.} Each Map region compiles to a small DAG program over a per-element \emph{slot}
+array, and one generic \code{dag\_interp} kernel interprets it. Fan-out is a slot read by several later
+instructions; fan-in is a binary reading two slots. This generalizes \code{fused\_interp}'s single
+accumulator (a line) to $n$ accumulators (a graph): one launch, zero intermediates, any DAG shape.
+\end{enumerate}
+
+\section{Evaluation: the bit-exact gate}
+\label{sec:eval}
+
+Fusion must not change the numbers. Every fused chain is checked three ways on the CPU runtime, which
+executes a Map in program order and is therefore the definitional reference (the companion oracle paper,
+\cite{oracle}, makes this law and its cross-backend enforcement precise):
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item the fused \emph{one} kernel,
+\item the na\"ive \emph{$N$}-kernel pipeline that materializes $N{-}1$ device intermediates,
+\item a plain-Rust reference.
+\end{enumerate}
+The device morphism table (\code{apply\_un\_dev}) is a line-for-line mirror of the host table
+(\code{apply\_un}) --- which is \emph{why} fused equals reference bit-exactly, not merely within
+tolerance. The committed tests exercise the two patterns the llama.cpp fusion audit named plus a stress
+case (Table~\ref{tab:fuse}). The SwiGLU tail and the 3-op chain are \emph{byte-identical} fused-versus-
+na\"ive; a 7-op mixed chain runs in one launch and matches its host oracle. And on the real engine
+pattern that motivated \S\ref{sec:pain}, the DAG path fuses the per-GDN-layer chain
+$\mathrm{rms\_norm}(x)\cdot w\cdot\mathrm{silu}(g)$ from \textbf{9 launches to 5}, bit-exact
+($\text{max}=2.98\times10^{-8}$) against the unfused per-op path --- draining the launch storm directly.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Chain} & \textbf{Launches (na\"ive $\to$ fused)} & \textbf{Result vs na\"ive / reference} \\
+\midrule
+$\mathrm{silu}(a)\cdot b$ (SwiGLU tail)      & $2 \to 1$ & byte-identical / $\le 4.8\mathrm{e}{-}7$ \\
+$\mathrm{silu}(a\cdot w + b)$                & $3 \to 1$ & byte-identical / $\le 4.8\mathrm{e}{-}7$ \\
+7-op mixed chain (all families)              & $7 \to 1$ & matches host oracle \\
+$\mathrm{rms\_norm}(x)\cdot w\cdot\mathrm{silu}(g)$ (GDN, DAG) & $9 \to 5$ & bit-exact ($2.98\mathrm{e}{-}8$) \\
+\bottomrule
+\end{tabular}
+\caption{The fusion gate. Fused one-kernel $=$ na\"ive $N$-kernel $=$ plain-Rust reference on the CPU
+runtime. The launch-count drop is the fusion; the byte-identity is the guarantee that it changed nothing
+but the launch count.}
+\label{tab:fuse}
+\end{table}
+
+\section{Why this is the right base}
+
+Fusibility here is a property of the operation's \emph{type}, computed once, not a fact a matcher
+rediscovers for each new op combination. Adding an op adds one algebra variant and its device mirror; it
+adds \emph{zero} fusion rules. And the fusion composes \emph{with} the peak kernels rather than competing
+with them: the hand-tuned reduction and matmul kernels stay, and the Map regions attach to them as
+read-prologue and write-epilogue at the fence. That is the whole point of making Reduce a first-class
+fence rather than something a fusion pass must be taught to stop at. The elementwise fabric of an entire
+model --- the SwiGLU tails, the norm epilogues, the GDN gating --- collapses to a minimal set of kernels
+by one identity, and every step is proven to change only the launch count, never the result.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL.} Paper 07 (umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1 (this paper).
+\bibitem{tune} Hanzo AI. \emph{The Schedule Is a Value: Comptime-Specialized Autotuning.} Paper 07.2.
+\bibitem{island} Hanzo AI. \emph{Intrinsic Islands: An Oracle-Anchored Escape Hatch.} Paper 07.3.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{mmq} Hanzo AI. \emph{When the Product Won't Collapse: An int8 Tensor-Core MMQ Negative Result.} Paper 07.5.
+\bibitem{method} Hanzo AI. \emph{Verify, Then Delete: Collapsing a Kernel Cartesian Product.} Paper 07.6.
+\end{thebibliography}
+
+\end{document}

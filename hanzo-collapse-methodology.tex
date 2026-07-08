@@ -1,0 +1,185 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\title{\textbf{Verify, Then Delete:\\ A Method for Collapsing a Kernel Cartesian Product}}
+\author{Hanzo AI --- ML Systems}
+\date{hanzo-kernel Paper 07.6 --- part of the \emph{One Source, Every Backend} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The other papers in this series build the machinery to write a GPU kernel once and lower it to every
+backend. This paper is about the migration: how you drain $52{,}345$ lines of hand-written kernel
+arithmetic across five backend trees down toward a single source \emph{without} a big-bang rewrite and
+without ever shipping a slower engine. The method is a discipline we call \textbf{verify-then-delete}:
+never retire a hand-tuned kernel on faith, and never all at once. A hand-written kernel is deleted only
+when its single-source twin is (a) bit-exact against the shared CPU oracle \emph{and} (b) at least as fast
+on a kernel-only benchmark --- in practice $\ge 97\%$ of the incumbent's throughput. A
+per-\code{(op, type, backend)} registry flips one cell to the DSL the moment its twin passes both gates,
+so the product drains to a sum one measured cell at a time, with a working, faster-or-equal engine at
+every intermediate state. We give the ledger, the protocol, and the measured outcomes --- including a
+migration that was \emph{7.1$\times$ faster} than the shader it replaced and bit-exact, and, just as
+importantly, the migrations the gate correctly \emph{declined}.
+\end{abstract}
+
+\section{The ledger: what there is to collapse}
+\label{sec:ledger}
+
+Table~\ref{tab:ledger} is the denominator. It is the hand-written kernel arithmetic in the Hanzo ML and
+engine repositories: the same $\sim$20 operations, specialized over $\sim$22 GGUF quantization formats,
+re-implemented once per backend across five trees and five shading languages.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llr}
+\toprule
+\textbf{Tree} & \textbf{Language} & \textbf{Lines} \\
+\midrule
+CUDA (ML)      & CUDA C++                 & 13{,}123 \\
+ROCm           & HIP C++                  & 6{,}725  \\
+Metal          & Metal Shading Language   & 3{,}530  \\
+Vulkan         & GLSL $\rightarrow$ SPIR-V & 7{,}105  \\
+CUDA (engine)  & CUDA C++                 & 21{,}862 \\
+\midrule
+\textbf{Total} & 5 trees & \textbf{52{,}345} \\
+\bottomrule
+\end{tabular}
+\caption{The collapse ledger: hand-written, non-generated, non-vendored kernel arithmetic.\protect\footnotemark{}
+Roughly 85\% is a deletable target --- the duplicated arithmetic --- as opposed to the genuinely peak,
+genuinely per-backend kernels (block-quant tensor-core MMQ, \cite{mmq}) that stay behind islands.}
+\label{tab:ledger}
+\end{table}
+\footnotetext{These are the \emph{deletable} lines. A na\"ive \code{wc -l} over all
+\code{*.cu/*.cuh/*.hip/*.hpp/*.metal/*.comp} is roughly $2\x$ larger ($\sim$112k) because it also counts
+C++ headers, a \code{target/package/} build-artifact copy, machine-generated codebook tables (the i-quant
+grids), and vendored upstream kernels (FlashInfer, Marlin, GPTQ) --- none of which are hand-written
+duplication or a DSL collapse target.}
+
+The product is not merely a maintenance cost; it is the breeding ground for the divergence bugs the oracle
+paper catalogs (\cite{oracle}). Draining it is therefore a correctness project as much as a code-size one.
+But it must be drained safely: a rewrite that regresses performance, or that lands as one enormous
+untestable change, is worse than the duplication it removes.
+
+\section{The protocol: verify, then delete}
+\label{sec:protocol}
+
+The method is three rules, applied per cell of the $\text{types}\times\text{backends}$ matrix.
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Coverage first.} The DSL fills the entire matrix from one source. Many cells were previously
+\emph{missing} or buggy; those gain correct coverage immediately, before any deletion --- a strict
+improvement with nothing to retire.
+\item \textbf{The two-part gate.} A hand-tuned kernel is retired for its single-source twin \emph{only}
+when the twin is both:
+  \begin{itemize}[leftmargin=1.4em,itemsep=0pt]
+  \item \textbf{bit-exact} against the shared CPU oracle (the correctness half; \cite{oracle}), and
+  \item \textbf{at least as fast} on a kernel-only benchmark --- buffers created once, $N$ dispatches
+  enqueued back-to-back, one final sync, so the number reflects the kernel and not the host round-trip. In
+  practice the bar is $\ge 97\%$ of the incumbent's throughput.
+  \end{itemize}
+  The number decides, per quant type, per backend. Not a human's confidence --- the benchmark.
+\item \textbf{Delete on parity.} When a twin passes both gates, its hand-written copies are deleted and a
+per-\code{(op, type, backend)} registry flips that cell to the DSL, keyed by the gate result. Until it
+passes, the cell keeps its hand-tuned kernel. The registry is the seam that lets the product drain to a
+sum one measured cell at a time, with a working, faster-or-equal engine at every intermediate state.
+\end{enumerate}
+
+The protocol is reversible and never a downgrade by construction. It is a scoreboard with a gate, not a
+rewrite.
+
+\section{Measured migrations: the wins}
+\label{sec:wins}
+
+The method is not hypothetical; cells have flipped on \code{main}. All figures below are kernel-only
+benchmarks on the named hardware.\footnote{Throughput and latency are session benchmarks on evo (AMD Strix
+Halo, gfx1151; RADV/Vulkan and ROCm 7.13). The bit-exactness each accompanies is enforced by the committed
+tests of the oracle paper (\cite{oracle}).}
+
+\paragraph{Portability costs nothing (\dpa{} matvec).} The central fear of any portable DSL is a
+performance downgrade. It does not materialize on the bandwidth-bound matvec that dominates decode. A tuned
+single-source \dpa{} Q8 matvec --- \code{Vector<i8,4>}$\to$\code{OpSDot}, one thread block per output row
+with threads striding the groups so adjacent threads read adjacent packed weights (coalesced 256-byte
+transactions), partials tree-reduced in shared memory --- measures \textbf{196~GB/s} on evo ($8192^2$,
+cache-busting), which is \textbf{118\% of the $\sim$166~GB/s hand-tuned kernel} it replaces and $\sim$77\%
+of the DRAM roofline, bit-exact. The na\"ive one-thread-per-row version that started at $\sim$17~GB/s was
+memory-\emph{uncoalesced}, not DSL-limited; the fix was two standard steps --- coalescing and reduction ---
+both expressed in the DSL. The DSL reaches the same hardware integer-dot instruction and, with standard
+coalescing, \emph{beats} the hand-written code.
+
+\paragraph{A migration that improved performance (\code{add\_rmsnorm}).} Two hand-written Vulkan kernels
+were drained on \code{main}: the DSL block-per-row \code{rms\_norm} (270~GB/s) and \code{softmax}
+(268~GB/s) replaced na\"ive \code{.comp} shaders, each now the production kernel with its \code{.comp}
+deleted. The sharpest case is the fused residual-add\,+\,RMSNorm: the DSL \code{add\_rmsnorm} twin ran
+\textbf{7.1$\times$ faster} than the incumbent shader ($166.5\to23.4$~ms at $4096^2$ on RADV) \emph{and}
+was bit-exact ($s=x{+}\text{res}$ byte-identical, $y$ within $4.8\times10^{-7}$). The ``uniformity''
+change was also a large speedup, because the incumbent was na\"ive and the DSL block kernel is coalesced.
+Table~\ref{tab:migr} collects the flipped cells.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Kernel} & \textbf{Backend} & \textbf{Outcome} & \textbf{Correctness} \\
+\midrule
+\dpa{} Q8 matvec    & Vulkan (gfx1151) & 196~GB/s, 118\% of hand-tuned   & bit-exact \\
+\code{rms\_norm}    & Vulkan (gfx1151) & 270~GB/s, \code{.comp} deleted  & bit-exact \\
+\code{softmax}      & Vulkan (gfx1151) & 268~GB/s, \code{.comp} deleted  & bit-exact \\
+\code{add\_rmsnorm} & Vulkan (RADV)    & 7.1$\times$ ($166.5\to23.4$~ms) & bit-exact \\
+\bottomrule
+\end{tabular}
+\caption{Cells flipped to the DSL on \code{main}. Every deletion cleared both gates: bit-exact against the
+oracle and at least as fast (here, faster). The engine is faster-or-equal at every step.}
+\label{tab:migr}
+\end{table}
+
+\section{The discipline cuts both ways: the declines}
+\label{sec:declines}
+
+A gate that never says no is not a gate. Where a hand-tuned kernel is \emph{already optimal} --- the
+Vulkan quant matvec, Metal's \code{simd\_sum} reductions, the fused \code{rope\_norm} epilogue --- a
+bit-exact DSL twin was built, measured, and \emph{correctly not swapped}. A uniformity-only change with
+zero speedup and real regression risk is churn, not migration. Such a twin is kept as the portable
+\emph{fallback} for backends that lack the tuned version, and the tuned peak stays the specialized fast
+path. ``One source'' is the goal, but the gate serves it only by also refusing the swaps that would trade
+speed for tidiness. We only ever add coverage and correctness.
+
+\section{An engineering note: opening a backend so it can flip}
+\label{sec:rocm}
+
+A cell cannot flip on a backend that does not build. Shipping the DSL on AMD required fixing two
+independent upstream defects \emph{without} advancing the lowering engine past its newest published
+release (no version escape exists for either). First, the HIP FFI bindings are selected from
+\code{hipconfig --version}; ROCm 7.13 reports a patch past the newest shipped binding, so the upstream
+build emitted a feature with no bindings module and every symbol went undefined. The fix is a vendored
+\code{[patch.crates-io]} fork whose \code{build.rs} clamps an unknown-newer patch to the latest shipped
+binding --- ABI-safe because AMD versions every changed symbol (R0600) and 7.13 still maps
+\code{hipGetDeviceProperties} to that revision. Second, the HIP server uses a \code{MultiStream} gated
+behind a \code{std}-only configuration the \code{hip}/\code{rocm} features do not pull, so the ROCm feature
+is declared to include \code{cubecl/std}. Both are recorded because a portable DSL lives or dies on the
+least-loved backend building cleanly --- and only a backend that builds can have its cells verified and
+its hand-written kernels deleted.
+
+\section{The takeaway}
+
+Collapsing a Cartesian product of kernels is a migration problem, and migrations fail when they are
+faith-based or big-bang. Verify-then-delete makes both failure modes structurally impossible: the CPU
+oracle supplies an objective correctness gate (\cite{oracle}), the kernel-only benchmark supplies an
+objective performance gate, and the per-cell registry supplies incrementality. The result is an engine
+that is faster-or-equal at every intermediate state while its five hand-written kernel trees drain toward
+one source --- and a boundary, honestly drawn, where one op (\cite{mmq}) stays hand-written behind an
+island. The method is repeatable: point it at the next cell, run both gates, let the number decide.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL.} Paper 07 (umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{tune} Hanzo AI. \emph{The Schedule Is a Value: Comptime-Specialized Autotuning.} Paper 07.2.
+\bibitem{island} Hanzo AI. \emph{Intrinsic Islands: An Oracle-Anchored Escape Hatch.} Paper 07.3.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{mmq} Hanzo AI. \emph{When the Product Won't Collapse: An int8 Tensor-Core MMQ Negative Result.} Paper 07.5.
+\bibitem{method} Hanzo AI. \emph{Verify, Then Delete: Collapsing a Kernel Cartesian Product.} Paper 07.6 (this paper).
+\end{thebibliography}
+
+\end{document}

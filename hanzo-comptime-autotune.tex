@@ -1,0 +1,204 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\title{\textbf{The Schedule Is a Value:\\ Comptime-Specialized Autotuning Without Forks}}
+\author{Hanzo AI --- ML Systems}
+\date{hanzo-kernel Paper 07.2 --- part of the \emph{One Source, Every Backend} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A single-source kernel DSL promises to kill the ``one operation, $N$ backends, $N$ numeric behaviors''
+bug class by writing each op once. But there is a subtler place the same bug hides: the \emph{schedule}
+--- the tile size, vector width, unroll factor, and thread-block dimension a kernel is tuned with, which
+differs per device. The usual fix is to fork a hand-tuned kernel per device, and a fork is exactly what
+reintroduces the bug: two schedules, drifting independently, one of them one day reordering an
+accumulation and changing the numbers. This paper shows how to autotune without forking. The schedule is
+exposed as a set of compile-time (\code{\#[comptime]}) knobs on the \emph{one} source; each knob value is
+a distinct compiled kernel the lowering engine monomorphizes; a small set of these variants is timed once
+per \code{(device, op, shape)} and the winner cached to disk. Because the knobs never touch the
+arithmetic, \emph{every variant is byte-identical} --- the tuner buys speed and can never spend
+correctness. We give the three-value algebra (\code{Variant}, \code{Tuned}, \code{Tuner}), the
+per-device on-disk cache, the two shipped variant tables, and the offline tests that prove
+select/cache/reload works without a GPU.
+\end{abstract}
+
+\section{The pain: a fork that drifts}
+\label{sec:pain}
+
+Suppose you have written a matvec kernel once, in a portable DSL, and it lowers correctly to every
+backend. You are not done, because ``correct everywhere'' is not ``fast everywhere.'' The fastest
+schedule for an AMD iGPU is not the fastest for an NVIDIA datacenter part: they differ in warp/subgroup
+width, in how much shared memory pays off, in the ideal number of output elements a thread should carry
+(the unroll factor), in the block size that fills the machine. The reflex is to fork --- keep a
+\code{matvec\_amd} and a \code{matvec\_nvidia}, each hand-tuned.
+
+That reflex is the original sin the DSL exists to prevent, wearing a schedule's clothes. Two forks are
+two kernels, maintained by two hands, drifting apart. The day someone reorders a loop in one fork ``to
+help the unroll,'' its accumulation order changes, its rounding changes, and now the same operation
+produces different bits on two backends --- the precise failure a single-source DSL was supposed to make
+impossible (\cite{oracle}). Worse, the drift is invisible until a model degenerates on one device and not
+another.
+
+We want the performance a per-device schedule buys \emph{without} the second kernel that buys the bug.
+
+\section{The idea: a schedule is a compile-time value}
+\label{sec:idea}
+
+The DSL already gives one source lowered to every backend. The remaining fork --- the schedule --- can be
+folded into that one source if we treat the schedule not as \emph{code} but as a \emph{value}. In \hk{},
+a kernel parameter marked \code{\#[comptime]} is resolved at compile time, and the lowering engine
+\emph{monomorphizes} the kernel on it: each distinct comptime value produces a distinct compiled kernel,
+specialized as if you had hand-written it. So we lift the schedule knobs to \code{\#[comptime]}
+parameters of the one kernel (Listing~\ref{lst:tunedkernel}). A ``variant'' is then not a forked file but
+a \emph{choice of comptime tuple}. There is one source; only the chosen tuple differs per device.
+
+\begin{lstlisting}[language=Rust,caption={One autotuned source. The unroll factor \code{rpt}
+(rows-per-thread) is a comptime knob; the block size is the host's knob. Every \code{(rpt, block)} is a
+distinct compiled kernel yet bit-identical to the reference: the per-row fold is the same order, so only
+the thread$\to$row mapping and occupancy differ.},label={lst:tunedkernel}]
+#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
+pub fn rms_norm_tuned<F: Float>(x: &Array<F>, w: &Array<F>, out: &mut Array<F>,
+                                eps: &Array<F>, #[comptime] n: usize, #[comptime] rpt: usize) {
+    let nrows = out.len() / n;
+    let base = ABSOLUTE_POS * rpt;
+    #[unroll]
+    for r in 0..rpt {
+        let row = base + r;
+        if row < nrows {
+            let b = row * n;
+            let mut ss = F::new(0.0);
+            for i in 0..n { let v = x[b + i]; ss += v * v; }   // same fold, same order, every variant
+            let denom = (ss / F::cast_from(n as u32) + eps[0]).sqrt();
+            for i in 0..n { out[b + i] = x[b + i] / denom * w[i]; }
+        }
+    }
+}
+\end{lstlisting}
+
+The critical invariant is stated in the comment and enforced by test: the knobs change the
+thread-to-work mapping and the occupancy, \emph{not} the arithmetic. The per-row sum-of-squares is the
+same left fold in the same order for every \code{(rpt, block)}. Therefore all variants are
+\textbf{byte-identical} to each other and to the reference. The autotuner is choosing among numerically
+indistinguishable kernels; it cannot pick a ``faster but slightly wrong'' one, because there is no wrong
+one to pick.
+
+\section{The mechanism: three orthogonal values}
+\label{sec:mech}
+
+Autotuning decomposes into three plain values, each testable in isolation (Listing~\ref{lst:tune}).
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item A \textbf{\code{Variant}} is a named schedule: a closure \code{f(iters) -> (output, ms)} that
+launches the schedule \code{iters} times after a fixed warmup and returns its output and mean
+milliseconds per dispatch. The same closure both \emph{benchmarks} (many iters) and \emph{executes} (one
+iter) --- this is the crate's established \code{*\_bench} shape, so no separate ``run'' and ``time'' paths
+can disagree.
+\item A \textbf{\code{Tuned}} is the fluent builder: collect the variants for one
+\code{(op, shape-key)}, then \code{run}. It reads like the fusion builder --- fluent, no macro, no
+ceremony.
+\item A \textbf{\code{Tuner}} is the cache: an in-memory \code{(device, op, key) -> winner} map backed by
+a per-device on-disk file. It is a \emph{plain value} constructed over an explicit cache root, so it is
+fully unit-testable offline --- no GPU, no environment, no global state. The process-wide default roots
+at the XDG cache directory.
+\end{itemize}
+
+\begin{lstlisting}[language=Rust,caption={The production surface. One source per op, autotuned per device,
+no forks. On a cache hit only the winner launches (once, to produce its output); the losers are never
+run.},label={lst:tune}]
+let y = Tuned::new("rms_norm", format!("rows={rows},n={n}"))
+    .variant("b64_r1",  |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1,  64, it))
+    .variant("b128_r1", |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1, 128, it))
+    .variant("b256_r1", |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1, 256, it))
+    .variant("b64_r2",  |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 2,  64, it))
+    .run(&c);  // times each once per (device,op,shape), caches the winner, thereafter runs it
+\end{lstlisting}
+
+The selection logic is deliberately small. On a cache \emph{miss}, every variant is timed
+\code{TUNE\_ITERS} times (25), the fastest is kept, its winning name is recorded, and its
+already-computed output is returned --- no redundant re-run. On a cache \emph{hit}, only the winner is
+launched, once, to produce its output; the losers are never launched. If a cached winner name is no
+longer among the current variants (the set changed), that is treated as a miss and re-tuned rather than
+trusting a stale name.
+
+\paragraph{The cache is a value, not a database.} The on-disk format is one TSV file per device ---
+\code{\$XDG\_CACHE\_HOME/hanzo-kernel/autotune/<device>.tsv} --- each line \code{op\textbackslash tkey\textbackslash twinner}.
+No serde, no new dependency, no schema migration. Cross-process writes append and are idempotent (the
+loader keeps the last line for a key), which is exactly how an advisory autotune cache should behave: a
+hint that is safe to lose and safe to race on.
+
+\section{Evaluation: the variant tables and the offline proof}
+\label{sec:eval}
+
+Two ops ship autotuned (Table~\ref{tab:variants}). Both variant sets are proven on the CPU runtime, which
+needs no GPU to establish the two things under test: that the variants are numerically indistinguishable,
+and that the select/cache machinery works.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Op} & \textbf{Knobs} & \textbf{Variants (all byte-identical)} \\
+\midrule
+\code{rms\_norm}      & cube dim $\{64,128,256\}\times$ unroll $\{1,2\}$        & \code{b64\_r1 b128\_r1 b256\_r1 b64\_r2} \\
+\code{matvec\_q8\_dp4a} & cube dim $\{64,128,256\}\times$ vec.\ width $\{1,2,4,8\}$ & \code{b64\_v1 b64\_v4 b128\_v2 b256\_v8} \\
+\bottomrule
+\end{tabular}
+\caption{The autotune variant sets (\hk{} 0.2.17). A knob value is a distinct compiled kernel; the tuner
+caches the winner per \code{(device, op, shape)}. For \dpa{} matvec the vector-width knob is the ILP
+factor (groups per unrolled step); the per-group int8 dot is accumulated in the same order for every
+width, so all four are byte-identical.}
+\label{tab:variants}
+\end{table}
+
+The committed tests assert, for both ops:
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{Byte-identity.} Every schedule's output has identical bits to the reference (RMSNorm:
+exactly equal; \dpa{}: byte-identical across variants and within f32-reorder tolerance
+$2\times10^{-3}$ of the per-element oracle). The knobs do not touch the numerics.
+\item \textbf{Select and cache.} A first call is a miss that benchmarks all four variants
+(\code{benched == 4}) and records the winner. A second call is a hit that benchmarks \emph{zero}
+(\code{benched == 0}) and returns the winner's output. A fresh \code{Tuner} over the same directory
+reloads the winner \emph{from disk} and skips timing. A distinct shape-key is an independent decision. A
+shrunk variant set (winner absent) re-tunes rather than trusting a stale name.
+\end{enumerate}
+Timing on the CPU proves the select/cache mechanism; a GPU run additionally makes the \emph{winner}
+meaningful, since on the CPU the schedules are near-equivalent and the chosen winner is
+arbitrary-but-stable. The mechanism, not the specific winner, is what the offline tests pin down.
+
+\section{Why first-party, not the engine's autotuner}
+
+The lowering engine (CubeCL) ships an autotuner; it was studied and declined for three concrete reasons,
+not out of not-invented-here. First, it is re-exported only from \code{cubecl\_runtime}, so adopting it
+would force a \emph{second} engine crate into a facade architected so that only one line of one
+\code{Cargo.toml} names the engine at all --- a deliberate ``values, not places'' boundary the whole DSL
+is built to preserve. Second, its persistent cache lives under \code{target/} (via an MD5 checksum and
+serde), not the XDG path this layer is required to use. Third, its generic-associated-type input
+machinery is a large surface for what is, in the end, ``pick the fastest of $N$ named closures.'' The
+concepts above --- variant, tuned set, cache keyed by device and shape --- are \emph{deliberately} the
+same as the engine's; they are sized to this crate and pointed at XDG. A thin analog, not a new
+philosophy.
+
+\section{The takeaway}
+
+The schedule was the last place a backend forked a kernel, and the fork was the last hiding place for the
+divergence bug. Making the schedule a compile-time value folds that fork into the one source: the tuner
+enumerates numerically-identical variants, times them per device, and caches the winner, so the engine is
+autotuned and single-source at once. Speed is chosen; correctness is never spent. Combined with fusion as
+composition (\cite{fuse}) and the oracle law (\cite{oracle}), the schedule stops being a place where two
+implementations can disagree, because there is only ever one.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL.} Paper 07 (umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{tune} Hanzo AI. \emph{The Schedule Is a Value: Comptime-Specialized Autotuning.} Paper 07.2 (this paper).
+\bibitem{island} Hanzo AI. \emph{Intrinsic Islands: An Oracle-Anchored Escape Hatch.} Paper 07.3.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{mmq} Hanzo AI. \emph{When the Product Won't Collapse: An int8 Tensor-Core MMQ Negative Result.} Paper 07.5.
+\bibitem{method} Hanzo AI. \emph{Verify, Then Delete: Collapsing a Kernel Cartesian Product.} Paper 07.6.
+\end{thebibliography}
+
+\end{document}

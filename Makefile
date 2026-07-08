@@ -87,3 +87,7 @@ help:
 	@echo ""
 	@echo "Docker:"
 	@echo "  docker run --rm -v \"\$$PWD:/workdir\" -w /workdir texlive/texlive:latest make all"
+
+.PHONY: index
+index:
+	@scripts/gen-index.sh

@@ -68,7 +68,7 @@
   orders decisions, not bytes.} A small \emph{post-quantum},
   Byzantine-fault-tolerant replicated state machine (RSM)---the \textbf{Quasar}
   engine (\texttt{luxfi/consensus/protocol/quasar}), strict-PQ from day
-  one---over a fixed five-voter quorum orders only tiny
+  one---over a fixed seven-voter quorum orders only tiny
   metadata---membership, a
   placement map $(\textit{plugin},\textit{shard}) \!\to\! \{\textit{writer},
   \textit{followers}\}$, and writer leases carrying fencing epochs---while the
@@ -80,7 +80,7 @@
   steering a large weakly-coupled fleet---applied to a plugin runtime. We give
   the two-plane architecture, the single write-fence seam that couples them,
   a two-fence split-brain-safety argument (a linearizable lease grant
-  \emph{and} an object-store epoch compare-and-swap), the five-voter /
+  \emph{and} an object-store epoch compare-and-swap), the seven-voter /
   $N$-data-node topology, the plugin-authoring payoff, the
   Deployment$\rightarrow$StatefulSet cutover, and a nine-stage migration in
   which every stage is independently correct, canary-able, and reversible.
@@ -191,7 +191,7 @@ the left column and never touches the right.
  & \textbf{Control plane} & \textbf{Data plane} \\
 \midrule
 Orders & placement decisions & durable bytes \\
-Substrate & \textbf{Quasar} PQ-BFT RSM (\texttt{luxfi/consensus/protocol/quasar}), 5 voters & \texttt{hanzoai/replicate} over \texttt{vfs}, async log-ship \\
+Substrate & \textbf{Quasar} PQ-BFT RSM (\texttt{luxfi/consensus/protocol/quasar}), 7 voters (5-of-7 quorum) & \texttt{hanzoai/replicate} over \texttt{vfs}, async log-ship \\
 Size & kilobytes (fits in RAM everywhere) & terabytes (per-tenant streams) \\
 Consistency & linearizable & eventual to mirror; strong at the writer \\
 Request path? & \textbf{no} & \textbf{yes} \\
@@ -351,16 +351,17 @@ consequence precise in \S\ref{sec:failure}.
 \section{Topology}
 \label{sec:topology}
 
-The fleet is five voter nodes and $N$ non-voting data nodes. Five is the
-smallest quorum with Byzantine finality tolerating two simultaneous failures;
-the count is \emph{fixed} so agreement stays fast---consensus runs among five,
+The fleet is seven voter nodes and $N$ non-voting data nodes. With
+$N \ge 3f+1$, seven is the smallest voter set whose Byzantine quorum
+($2f+1 = 5$) tolerates two simultaneous faults ($f=2$);
+the count is \emph{fixed} so agreement stays fast---consensus runs among seven,
 not among the whole fleet. Each data node watches a read-only replica of the
 placement map (the RSM streams committed updates to it), hosts the shards the
 map assigns, runs the unchanged replication loop, and serves or proxies
 requests. Data nodes carry no consensus weight, so $N$ scales \emph{unbounded}
 without slowing agreement. In small deployments a node may be both voter and
 data node; at scale they separate so control-plane latency is independent of
-data-plane fan-out. The defaults are five voters and three data replicas---one
+data-plane fan-out. The defaults are seven voters and three data replicas---one
 writer plus two warm standbys, tolerating one node loss with a ready
 successor.
 
@@ -467,10 +468,10 @@ volume claims via volume-claim templates, and a rolling update with at most
 one pod unavailable in ordered-ready mode.
 
 The decisive property is that stable identifiers make a rolling image upgrade
-\emph{not} a membership change: the RSM sees the same five voters and the same
+\emph{not} a membership change: the RSM sees the same seven voters and the same
 data-node identities before and after, so no epoch reconfiguration and no
-placement churn occur on a deploy, and at-most-one-unavailable keeps the
-four-of-five voter quorum live throughout. The existing service aliases keep
+placement churn occur on a deploy, and at-most-one-unavailable keeps
+six-of-seven voters live---above the five-of-seven quorum---throughout. The existing service aliases keep
 resolving because the StatefulSet pods still carry the selector label the
 aliases match. The operator's service custom resource~\cite{hip0112} gains a
 StatefulSet-emitting mode---one boolean that switches the render path from a
@@ -571,9 +572,9 @@ a lease grant must be impossible to forge or equivocate, not merely unlikely.
 \emph{Strict post-quantum from day one} (the Pulsar RoundSigner under a strict
 \texttt{ChainSecurityProfile}), orthogonal to and simultaneous with the
 Byzantine guarantee, never classical-now / PQ-later, so the lease-granting
-quorum is quantum-secure on-doctrine from the start. Five
-voters plus $N$ data nodes, the smallest
-Byzantine quorum tolerating two failures, with unbounded data-node fan-out.
+quorum is quantum-secure on-doctrine from the start. Seven
+voters plus $N$ data nodes---the smallest voter set ($N \ge 3f+1$) whose
+Byzantine quorum ($2f+1 = 5$) tolerates two faults---with unbounded data-node fan-out.
 Coarse per-plugin sharding first, because one writer per plugin is
 \emph{zero} storage change; fine per-tenant sharding is a later opt-in. The
 writer serves reads and followers are HA standbys, the simplest correct
@@ -581,7 +582,7 @@ default, with follower-served stale reads available per connection for
 read-heavy plugins. Asynchronous log-ship as the default replication mode,
 reusing the existing pipeline unchanged, with synchronous zero-RPO
 replication a \emph{per-shard} opt-in rather than a fleet-wide tax. Defaults
-of five voters and three data replicas.
+of seven voters and three data replicas.
 
 \section{What We Do Not Claim}
 \label{sec:notclaim}
@@ -630,7 +631,7 @@ writers from racing, and let a new plugin inherit both. The naive answer puts
 every write through consensus and makes the coordinator a new single point of
 failure. The answer here is to notice that placement is a tiny,
 strongly-consistent decision on top of a large, already-solved,
-weakly-consistent byte stream, and to order only the decision. A five-voter
+weakly-consistent byte stream, and to order only the decision. A seven-voter
 BFT replicated state machine holds membership, a placement map, and
 epoch-fenced writer leases; the existing asynchronous log-ship carries the
 bytes unchanged; and a single write-fence seam, guarded by a linearizable

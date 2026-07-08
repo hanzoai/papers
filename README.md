@@ -11,7 +11,8 @@ building the **Zen** frontier model family alongside a vertically integrated,
 post-quantum AI and cryptography stack. The work spans frontier models, an agentic
 runtime, edge inference, and production post-quantum cryptography — engineered to run
 sovereign and disconnected in defense, regulated, and air-gapped environments rather
-than on centralized cloud.
+than on centralized cloud. The platform these papers document is generally
+available at [hanzo.ai](https://hanzo.ai).
 
 ## 2026 Highlights
 
@@ -40,6 +41,13 @@ Each claim below is developed in the catalogued papers ([INDEX.md](INDEX.md)):
   (`hanzo-continuous-learning-privacy`), serving economics (`hanzo-platform-infra-desktop`),
   and the unifying thesis (`hanzo-native-stack-thesis`). Unusually honest — they name their
   own stubs and reverted kernels and claim no win over NVIDIA.
+- **Unified sovereign-tenant cloud (measured).** The whole multi-tenant cloud as one Go
+  binary — 56 in-process subsystems over shared-nothing storage, each tenant its own
+  post-quantum-encrypted SQLite file. Measured on the production open path: ≈0.25 MB RAM
+  per actively-served tenant, near-zero idle — memory scales with concurrency, not
+  registrations, so one billion registered tenants at 1% peak concurrency fits ≈20
+  commodity 128 GB nodes (`hanzo-unified-tenant-cloud`; architecture companion
+  `cloud-unified-binary`).
 - **Production post-quantum cryptography.** All three NIST PQC standards — FIPS 203
   (ML-KEM), 204 (ML-DSA), 205 (SLH-DSA) — integrated into a live consensus system with
   hybrid classical/post-quantum security (`hanzo-full-spectrum-cyber`).

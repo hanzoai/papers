@@ -1,0 +1,79 @@
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  node distance=5mm,
+  voter/.style={draw=hzblue!70, fill=hzblue!12, rounded corners=2pt,
+                minimum width=13mm, minimum height=6mm, inner sep=1pt},
+  data/.style={draw=hzslate!60, fill=hzslate!10, rounded corners=2pt,
+               minimum width=15mm, minimum height=8mm, align=center, inner sep=1pt},
+  store/.style={draw=hzgreen!70, fill=hzgreen!12, rounded corners=2pt,
+                minimum width=52mm, minimum height=7mm, align=center},
+  rsm/.style={draw=hzblue!70, fill=hzblue!8, rounded corners=2pt,
+              minimum width=52mm, minimum height=7mm, align=center},
+  arr/.style={-{Latex[length=2mm]}, hzslate!80, line width=0.4pt},
+  watch/.style={-{Latex[length=2mm]}, hzblue!70, line width=0.5pt, dashed}
+]
+
+% --- control plane: five voters + RSM ---
+\node[voter] (v0) at (0.0,3.05) {voter-0};
+\node[voter] (v1) at (1.55,3.05) {voter-1};
+\node[voter] (v2) at (3.10,3.05) {voter-2};
+\node[voter] (v3) at (4.65,3.05) {voter-3};
+\node[voter] (v4) at (6.20,3.05) {voter-4};
+
+\node[rsm] (rsm) at (3.10,2.0)
+  {\textbf{Quasar} PQ-BFT RSM \;---\; orders \emph{decisions}\\[1pt]
+   \footnotesize placement map: $(\textit{plugin},\textit{shard})\!\to\!\{\textit{writer},\textit{followers}\}$, leases$+$epochs};
+
+\foreach \v in {v0,v1,v2,v3,v4} { \draw[arr] (\v.south) -- (rsm.north); }
+
+% --- data plane: N data nodes ---
+\node[data] (d0) at (0.0,0.55) {data-0\\\footnotesize writer};
+\node[data] (d1) at (1.75,0.55) {data-1\\\footnotesize follower};
+\node[data] (d2) at (3.50,0.55) {data-2\\\footnotesize follower};
+\node[hzslate!70] (ddots) at (5.05,0.55) {$\cdots$};
+\node[data] (dn) at (6.55,0.55) {data-$(N\!-\!1)$};
+
+% --- data plane byte sink ---
+\node[store] (mirror) at (3.10,-0.7)
+  {per-tenant ZapDB / SQLite \;$+$\; age-encrypted object-store mirror (HIP-0107)\\[1pt]
+   \footnotesize orders \emph{bytes} \;---\; async log-ship, reused unchanged};
+
+% watch edges (control -> data, read-only)
+\foreach \d in {d0,d1,d2,dn} { \draw[watch] (rsm.south) -- (\d.north); }
+% data -> sink
+\foreach \d in {d0,d1,d2,dn} { \draw[arr] (\d.south) -- (mirror.north); }
+
+% fence annotation on the writer's push
+\node[hzred!70, anchor=west, font=\fontsize{5.6}{6.6}\selectfont, align=left]
+  at (7.35,-0.7) {epoch-CAS\\fences a\\deposed\\writer};
+\draw[-{Latex[length=1.4mm]}, hzred!60] (7.3,-0.7) -- (mirror.east);
+
+\begin{scope}[on background layer]
+  \node[draw=hzblue!45, dashed, rounded corners=3pt, fit=(v0)(v4)(rsm),
+        inner sep=4pt, fill=hzblue!3] (cp) {};
+  \node[draw=hzslate!40, dashed, rounded corners=3pt, fit=(d0)(dn)(mirror),
+        inner sep=4pt, fill=hzslate!3] (dp) {};
+\end{scope}
+\node[hzblue!70, anchor=north west, font=\scriptsize\itshape]
+  at ([xshift=2pt,yshift=-1pt]cp.north west) {control plane (fixed, fast, off the request path)};
+\node[hzslate!70, anchor=south west, font=\scriptsize\itshape]
+  at ([xshift=2pt,yshift=1pt]dp.south west) {data plane (unbounded $N$, on the request path)};
+
+\node[hzblue!70, anchor=west, font=\fontsize{6}{7}\selectfont, align=left]
+  at (7.35,2.0) {\emph{watch}:\\read-only\\placement\\map};
+
+\end{tikzpicture}
+\caption{The two decomplected planes. A fixed five-voter Quasar post-quantum
+BFT replicated state machine orders only \emph{decisions}---membership, the
+placement map, and
+epoch-fenced writer leases (kilobytes). An unbounded set of data nodes
+\emph{watches} a read-only copy of that map and serves the actual
+\emph{bytes} through the unchanged asynchronous log-ship pipeline
+(HIP-0107). The dependence is one-directional: data nodes read the map but
+never block on the control plane to serve, so a control-plane quorum loss
+freezes placement while serving continues (\S\ref{sec:twoplanes},
+\S\ref{sec:failure}).}
+\label{fig:topology}
+\end{figure*}

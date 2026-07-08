@@ -307,6 +307,19 @@ export const siteConfig: SiteConfig = {
       tags: ['Engine', 'Economics', 'Platform', 'On-Device'],
     },
 
+    {
+      id: 'hanzo-unified-tenant-cloud',
+      title: 'The Unified Sovereign-Tenant Cloud',
+      subtitle: 'Linear Shared-Nothing Scaling via Per-Tenant SQLite and In-Process Composition',
+      abstract: 'The measured memory-and-scaling case for running an entire multi-tenant cloud as one Go binary — 56 in-process subsystems over shared-nothing storage, where every tenant is its own post-quantum-encrypted SQLite file and writes shard embarrassingly with no global lock. Measured through the production open path: an actively-served tenant costs ≈0.25 MB of RAM and an idle tenant essentially zero, so memory scales with concurrency, not registrations — one billion registered tenants at 1% peak concurrency fits ≈20 commodity 128 GB nodes. Measures the shared-Postgres microservice-mesh alternative at 11–32× the memory footprint, and is explicit about writer-pinning failover, hot-tenant skew, and cross-tenant query limits.',
+      pdfUrl: '/pdfs/hanzo-unified-tenant-cloud.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-unified-tenant-cloud.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-07-08',
+      authors: ['Zach Kelling'],
+      tags: ['Cloud', 'Multi-Tenancy', 'SQLite', 'Benchmarks'],
+    },
+
     // --- Hanzo Core Papers ---
     {
       id: 'aso',

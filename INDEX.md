@@ -42,14 +42,18 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-api-gateway` | ✓ | `hanzo-api-gateway/hanzo-api-gateway.tex` |
 | `hanzo-aso` | ✓ | `hanzo-aso/hanzo-aso.tex` |
 | `hanzo-base-runtime` | ✓ | `hanzo-base-runtime/hanzo-base-runtime.tex` |
+| `hanzo-bitexact-oracle` | ✓ | `hanzo-bitexact-oracle.tex` |
 | `hanzo-blockchain-platform` | ✓ | `hanzo-blockchain-platform/hanzo-blockchain-platform.tex` |
 | `hanzo-candle` | ✓ | `hanzo-candle/hanzo-candle.tex` |
 | `hanzo-chat` | ✓ | `hanzo-chat/hanzo-chat.tex` |
 | `hanzo-checkout` | ✓ | `hanzo-checkout/hanzo-checkout.tex` |
 | `hanzo-cloud-infrastructure` | ✓ | `hanzo-cloud-infrastructure/hanzo-cloud-infrastructure.tex` |
+| `hanzo-collapse-methodology` | ✓ | `hanzo-collapse-methodology.tex` |
 | `hanzo-commerce-payments` | ✓ | `hanzo-commerce-payments.tex` |
+| `hanzo-comptime-autotune` | ✓ | `hanzo-comptime-autotune.tex` |
 | `hanzo-consensus-ai` | ✓ | `hanzo-consensus-ai/hanzo-consensus-ai.tex` |
 | `hanzo-consensus-plugin-platform` | — | `hanzo-consensus-plugin-platform/main.tex` |
+| `hanzo-consensus-zap-compute` | ✓ | `hanzo-consensus-zap-compute.tex` |
 | `hanzo-console-dashboard` | ✓ | `hanzo-console-dashboard.tex` |
 | `hanzo-continuous-learning-privacy` | ✓ | `hanzo-continuous-learning-privacy.tex` |
 | `hanzo-cross-backend-inference` | ✓ | `hanzo-cross-backend-inference.tex` |
@@ -58,6 +62,8 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-datastore` | — | `hanzo-datastore/hanzo-datastore.tex` |
 | `hanzo-deepseek-v4-dspark` | — | `hanzo-deepseek-v4-dspark.tex` |
 | `hanzo-digital-securities-integration` | ✓ | `hanzo-digital-securities-integration/hanzo-digital-securities-integration.tex` |
+| `hanzo-distributed-decode-latency` | ✓ | `hanzo-distributed-decode-latency.tex` |
+| `hanzo-distributed-open-problems` | ✓ | `hanzo-distributed-open-problems.tex` |
 | `hanzo-dso` | ✓ | `hanzo-dso/hanzo-dso.tex` |
 | `hanzo-edge-inference` | ✓ | `hanzo-edge-inference.tex` |
 | `hanzo-encryption-security` | ✓ | `hanzo-encryption-security/hanzo-encryption-security.tex` |
@@ -67,9 +73,11 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-fhe-inference` | ✓ | `hanzo-fhe-inference/hanzo-fhe-inference.tex` |
 | `hanzo-flow` | ✓ | `hanzo-flow/hanzo-flow.tex` |
 | `hanzo-formal-verification` | ✓ | `hanzo-formal-verification/hanzo-formal-verification.tex` |
+| `hanzo-fusion-is-composition` | ✓ | `hanzo-fusion-is-composition.tex` |
 | `hanzo-gateway-krakend` | ✓ | `hanzo-gateway-krakend.tex` |
 | `hanzo-gpu-inference` | ✓ | `hanzo-gpu-inference/hanzo-gpu-inference.tex` |
 | `hanzo-harness-hacking` | ✓ | `hanzo-harness-hacking/hanzo-harness-hacking.tex` |
+| `hanzo-heterogeneous-distributed-inference` | ✓ | `hanzo-heterogeneous-distributed-inference.tex` |
 | `hanzo-hmm` | ✓ | `hanzo-hmm/hanzo-hmm.tex` |
 | `hanzo-iam-platform` | ✓ | `hanzo-iam-platform.tex` |
 | `hanzo-ico-infrastructure` | ✓ | `hanzo-ico-infrastructure/hanzo-ico-infrastructure.tex` |
@@ -77,6 +85,8 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-inference-stack` | ✓ | `hanzo-inference-stack.tex` |
 | `hanzo-ingress-proxy` | ✓ | `hanzo-ingress-proxy.tex` |
 | `hanzo-insights-analytics` | ✓ | `hanzo-insights-analytics.tex` |
+| `hanzo-int8-mmq-negative-result` | ✓ | `hanzo-int8-mmq-negative-result.tex` |
+| `hanzo-intrinsic-islands` | ✓ | `hanzo-intrinsic-islands.tex` |
 | `hanzo-jin-architecture` | ✓ | `hanzo-jin-architecture/hanzo-jin-architecture.tex` |
 | `hanzo-jin` | ✓ | `hanzo-jin/hanzo-jin.tex` |
 | `hanzo-kernel-dsl` | ✓ | `hanzo-kernel-dsl.tex` |
@@ -203,4 +213,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `ZEN_WHITEPAPER_2025` | ✓ | `zen/ZEN_WHITEPAPER_2025.tex` |
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
-**Total**: 198 papers, 192 with compiled PDFs
+**Total**: 208 papers, 202 with compiled PDFs

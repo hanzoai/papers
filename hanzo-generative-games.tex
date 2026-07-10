@@ -1,0 +1,637 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+% Local notation for the frame loop.
+\newcommand{\Tframe}{\ensuremath{T_{\mathrm{frame}}}}
+\newcommand{\Tstep}{\ensuremath{T_{\mathrm{step}}}}
+\newcommand{\Tenc}{\ensuremath{T_{\mathrm{enc}}}}
+\newcommand{\Tdec}{\ensuremath{T_{\mathrm{dec}}}}
+\newcommand{\Tring}{\ensuremath{T_{\mathrm{ring}}}}
+\newcommand{\fps}[1]{\mbox{#1\,fps}}
+
+\title{\textbf{The Frame Is the Token:\\ Generative Videogames on a Native Inference Stack}}
+\author{Hanzo AI --- ML Systems}
+\date{Games crossover in the native-inference series --- an inference-systems reading of the playable generative game}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A playable generative game is not a rendering problem wearing a neural coat; it is an
+\emph{inference-systems} artifact. Strip away the framing and what remains is an action-conditioned world
+model run in a \emph{fixed-shape frame loop} --- generate frame $t{+}1$ from a window of past frames and the
+player's action, exactly as an autoregressive decoder generates token $t{+}1$ from its context --- wrapped
+in a set of asset-generation pipelines (3D, music, voice, video, texture) and an authoring surface. Our
+thesis is that this structure is best served by a \emph{single native engine}, not a zoo of Python
+microservices: on the frame critical path, a $33$--$66$\,ms budget cannot absorb an HTTP hop, a second CUDA
+context, or a cold model load, and the three costs a service mesh imposes --- latency, resident memory, and
+operational surface --- are precisely the three a real-time neural game cannot pay. We develop the thesis in
+four measured moves. First, the \textbf{latency budget}: interactive play at \fps{15}--\fps{30} allots
+$33$--$66$\,ms per frame, and the frame pipeline splits cleanly into the same two regimes our inference work
+already characterizes --- the per-frame denoise loop over a compact latent is a fixed-shape,
+launch-overhead-bound computation, the CUDA-graph-favorable regime that won $\approx$1.47$\times$ on decode,
+while the VAE encode/decode at frame resolution is a compute-bound convolution wall (measured $96.4\%$ GPU
+utilization on dense prefill, NVIDIA GB10, where a graph recovers nothing) whose proven cure is a tiny
+distilled encoder, the same TAESD move that carried our native lip-sync dub to $11.6$\,fps combined
+(f16, GB10). \emph{Which regime a stage is in dictates which lever moves it} --- and that distinction is the
+section's intellectual content. Second, the \textbf{pipeline matrix}: modality by modality, honestly labelled
+measured-live (LLM game logic, TTS/voice, and a native localization dub measured at LSE-C $7.05$, speaker
+cosine $1.0$), in-port (3D/TRELLIS-class, video understanding), or planned (the world model itself; music;
+video generation). Third, the \textbf{distributed angle}: a world model too large for one consumer node
+splits pipeline-parallel across a heterogeneous home cluster over the series' canonical-\code{f32} ring
+(measured cross-vendor $50.4$\,tok/s decode, AMD gfx1151 $+$ NVIDIA GB10), the neural-game analog of a render
+farm --- with single-player as the latency-bound stream and spectate/multiplayer as batched rollouts in the
+throughput regime. Fourth, \textbf{authoring}: node-graph editing against a \emph{persistent} world-model
+session is prefix-cache reuse --- editing the game while it runs swaps the conditioning suffix against a
+cached world-state prefix. We close with game-specific \textbf{open problems} that we do not duplicate from
+the series' open-problems companion but cross-reference and extend --- centrally, that client-side prediction
+and speculative decoding are \emph{the same algorithm}: a cheap local draft rolled forward optimistically and
+reconciled against an authoritative target, with rollback on disagreement. Because the frame is the token,
+that isomorphism is exact, and the open question it raises --- the acceptance criterion for a \emph{perceptual}
+rather than a distributional match --- is, to our knowledge, new. Frame numbers for a world model on our stack
+are labelled projection; the primitives they rest on are labelled measured.
+\end{abstract}
+
+\section{Thesis: a playable generative game is an inference-systems artifact}
+\label{sec:thesis}
+
+The recent generation of neural game engines --- GameNGen simulating DOOM from a diffusion
+model~\cite{gamengen}, Oasis generating Minecraft frame-by-frame from keyboard input~\cite{oasis}, Microsoft's
+Muse/WHAM~\cite{wham} and MineWorld~\cite{mineworld}, Skywork's Matrix-Game~\cite{matrixgame}, and
+DIAMOND's diffusion world model~\cite{diamond} --- is usually read as a graphics result: the network has
+learned to \emph{render}. That reading buries the systems structure. Look at the loop these models actually
+run and it is an inference loop, not a render loop:
+\begin{equation}
+\text{frame}_{t+1} \;=\; f_\theta\!\left(\text{frame}_{t-w+1{:}t},\; \text{action}_t;\; \text{state}_t\right),
+\label{eq:loop}
+\end{equation}
+a function of a bounded window of past frames and the current action, advanced one step at a time, forever.
+This is \emph{autoregressive generation with a fixed context window}, and it is the same shape as language
+decode: \(\text{token}_{t+1}=g_\theta(\text{token}_{t-w+1{:}t})\). The frame is the token. The action is the
+extra conditioning. The window of past frames is the KV cache. Once this identification is made, the entire
+apparatus a native inference engine was built for --- fixed-shape kernel loops, CUDA-graph capture, KV-cache
+reuse, speculative decoding, pipeline parallelism, prefix caching --- transfers to the game loop not by
+analogy but by \emph{identity of the computation}. This paper is the systematic working-out of that transfer.
+
+\paragraph{The whole artifact, not just the world model.} A shippable game is more than
+Eq.~\eqref{eq:loop}. It needs 3D assets (meshes, materials), music and ambient audio, character voices,
+in-engine video, textures, an LLM driving NPC dialogue and game logic, and an authoring tool in which a
+designer builds and edits all of it. Every one of these is, today, a generative-model inference: TRELLIS-class
+image-to-3D~\cite{trellis}, ACE-Step-class music~\cite{acestep}, neural TTS and a lip-sync localization dub,
+Wan-class video~\cite{wan}, an image model for textures, and a language model for logic. The naive
+architecture stands each behind its own Python service. We argue that architecture is wrong for a game, and
+the argument is a systems argument with three axes.
+
+\paragraph{Latency.} The world-model loop has a hard real-time deadline (\S\ref{sec:latency}): at \fps{30},
+$33.3$\,ms per frame, end to end. A microservice boundary on that path --- serialize the latent, HTTP to the
+VAE service, deserialize, copy across a second process's CUDA context --- spends milliseconds the budget does
+not have, per frame, forever. The asset pipelines are not on the per-frame path, but they are on the
+\emph{authoring} path (\S\ref{sec:authoring}), where a designer's edit-to-preview loop wants to feel
+immediate. A single engine keeps the world-model session, the VAE, the samplers, and the asset models in one
+address space behind one CUDA context, so nothing on the frame critical path crosses a process boundary. The
+cross-process copy is not slow because the network is slow; it is slow because it exists at all, once per
+frame.
+
+\paragraph{Memory.} A per-modality service mesh loads redundant state. Each Python process carries its own
+framework runtime (a bare PyTorch process is gigabytes of RSS before a single weight loads), its own CUDA
+context, and its own copy of components that are in fact \emph{shared} --- the SD-family VAE that the world
+model, the 3D pipeline, the video pipeline, and the texture model all decode through is one autoencoder, not
+four. On a consumer accelerator --- a $24$\,GB discrete card or a $128$\,GB unified-memory APU, the exact
+targets our engine is built for~\cite{backend} --- loading it once versus four times is the difference between
+the game fitting and not. One engine deduplicates shared weights by construction.
+
+\paragraph{Operational surface.} $N$ services are $N$ deployment units, $N$ crash domains, $N$ version
+skews, $N$ ports to secure. A generative game cannot tolerate partial availability: if the VAE decoder is the
+service that OOM-restarted, there is no frame to show --- the game is down, not degraded. The engine's answer
+is the series' answer to every other deployment: one binary, built once from one source, lowering to CUDA,
+ROCm, Metal, Vulkan, and CPU behind a single loader~\cite{backend,umbrella}. The game inherits that operational
+surface --- one process, one artifact, one thing to watch --- rather than paying a mesh's.
+
+We are precise about what is and is not measured. The three-axis argument above is an \emph{architectural}
+claim; we have not run a head-to-head of a full game against a Python service mesh, and we do not report one.
+What we report measured are the \emph{primitives} the claim rests on --- the two graph regimes
+(\S\ref{sec:latency}), the dub pipeline (\S\ref{sec:matrix}), the cross-vendor ring
+(\S\ref{sec:distributed}) --- each on labelled hardware. Where we carry a primitive forward to a world model
+we have not yet run, we label it projection. The discipline of the series~\cite{het,openproblems} ---
+measured, designed, projected, never blurred --- is the discipline here.
+
+\section{The latency budget}
+\label{sec:latency}
+
+This is the core systems section, and its thesis is a partition: the frame pipeline is not one workload with
+one bottleneck but \emph{two workloads in two different performance regimes}, and the regimes are exactly the
+two the inference series already named --- the launch-overhead-bound decode regime, where CUDA-graph capture
+pays, and the compute-bound prefill regime, where it cannot. Getting a generative game to frame rate is the
+problem of putting each stage in the right regime and pulling the lever that regime responds to.
+
+\subsection{The arithmetic}
+\label{sec:budget}
+
+Interactive play needs \fps{15}--\fps{30} to feel like control rather than a slideshow, \fps{60} to feel
+native. The per-frame wall-clock budget is the reciprocal:
+\begin{equation}
+\Tframe \;=\; T_{\mathrm{ingest}} + \Tenc + K\cdot\Tstep + \Tdec \;\le\; \frac{1}{\text{fps}}
+\quad\Longrightarrow\quad
+\begin{cases}
+66.7\,\text{ms} & \text{at \fps{15}}\\
+33.3\,\text{ms} & \text{at \fps{30}}\\
+16.7\,\text{ms} & \text{at \fps{60}.}
+\end{cases}
+\label{eq:budget}
+\end{equation}
+The terms: $T_{\mathrm{ingest}}$ embeds the action (a keypress, a mouse delta, a controller state) into the
+conditioning --- negligible, a small matmul. $\Tenc$ encodes the previous frame to the latent the model works
+in, if the model is pixel-conditioned rather than latent-recurrent. $K\cdot\Tstep$ is the generative core: $K$
+denoise steps of a diffusion world model, or one autoregressive pass over the frame's tokens, at $\Tstep$
+each. $\Tdec$ decodes the produced latent back to pixels. The budget is brutal and it drives every design
+choice in the field: it is why GameNGen distills to $4$ sampling steps~\cite{gamengen}, why Oasis and
+MineWorld push few-step and diagonal decoding~\cite{oasis,mineworld}, and why real-time world models live or
+die on step-count. $K$ is the term you fight.
+
+\subsection{Two regimes, one pipeline}
+\label{sec:regimes}
+
+The intellectual content is not the arithmetic; it is recognizing that the two dominant terms sit in
+\emph{opposite} regimes, so they respond to opposite levers.
+
+\paragraph{The denoise loop $K\cdot\Tstep$ is decode: launch-overhead-bound, and graph-favorable.} A single
+denoise step over a compact latent (e.g.\ a $32{\times}32{\times}4$ or $16{\times}16$ token grid) is a long
+chain of \emph{small} kernels --- projections, attention over a short frame-token sequence, group-norms,
+elementwise activations --- each finishing in microseconds and gated by launch and scheduling overhead, not
+arithmetic. Crucially, \emph{the shape is fixed}: same resolution, same latent dimensions, same $K$, same
+kernel sequence, every frame. This is precisely the property that makes language \emph{decode} capturable ---
+one token, one static set of kernels --- and the series measured a $\approx$1.47$\times$ decode speedup from
+capturing that static submission into a CUDA graph and replaying it~\cite{backend,latency}. The frame loop is
+\emph{more} graph-favorable than decode, not less: it has no data-dependent control flow at all, whereas even
+decode must occasionally handle a variable-length context. The contrast that proves the point is the
+mixture-of-experts \emph{prefill} wall the series dissects~\cite{openproblems}: there, graph capture fails
+because MoE routing is data-dependent --- which experts fire changes per step, so the shape changes per step,
+and a static graph cache thrashes. A dense, fixed-topology world-model step has no such pathology. It is the
+clean case for capture, and the game loop lives in it by construction.
+
+\paragraph{The VAE encode/decode $\Tenc,\Tdec$ is prefill: compute-bound, and graph-immune.} The autoencoder
+runs at \emph{frame} resolution, not latent resolution: its convolutions are large GEMMs over a
+$256{\times}256$ or $512{\times}512$ image, and they saturate the device. This is the compute-bound regime the
+series characterizes on dense prefill, where the engine measured $\approx$96.4\% GPU utilization on an
+$8$B-parameter dense model (bf16, flash attention, NVIDIA GB10, node \emph{spark}), computed as the union of
+CUDA-kernel intervals over the wall span so it is not a stream-overlap artifact~\cite{openproblems}. When a
+stage is $96\%$ compute-bound there is at most $\approx$3.6\% of idle interstice for a graph to remove ---
+graph capture is the wrong lever because there is nothing for it to recover. We verified the general form of
+this directly in the series: capturing a whole dense prefill as one fixed-shape submission reproduces the
+eager logits bit-for-bit and moves throughput by less than run-to-run noise~\cite{openproblems}. The VAE wall
+is the same shape of problem.
+
+\paragraph{The measured cure for the VAE wall: a tiny distilled encoder.} Because the VAE is compute-bound,
+its lever is \emph{less computation}, not less overhead: a smaller autoencoder. We have measured exactly this
+lever on the adjacent workload. In the native lip-sync localization dub (\S\ref{sec:matrix}), profiling
+identified the VAE \emph{encoder}'s high-resolution convolution GEMMs as the realtime wall --- not batching,
+not GroupNorm, not host-device transfer, all measured and ruled out --- and the proven fix was a TAESD-style
+tiny distilled encoder mirroring the tiny decoder that Stable-Diffusion pipelines already
+ship~\cite{taesd,ldm}, which moved the combined pipeline to $11.6$\,fps (f16, node \emph{spark}/GB10). The same
+move applies to a pixel-conditioned world model: replace the full VAE on the frame path with a distilled
+encoder/decoder pair, trading a small, bounded reconstruction loss for the order-of-magnitude compute
+reduction the budget demands. A world model that keeps its state in latent space and only \emph{decodes} to
+pixels pays $\Tdec$ but not $\Tenc$, which is why latent-recurrent designs have a structural budget advantage
+and why the pixel-conditioned designs need the tiny encoder most.
+
+\paragraph{The partition is the design rule.} Table~\ref{tab:regimes} states the rule the section exists to
+establish. Do not reach for one lever and apply it everywhere; identify each stage's regime and pull that
+regime's lever. Capture the denoise loop into a graph; shrink the VAE with distillation and fuse its kernels.
+The two are composable --- graph the launch-bound half, compute-optimize the compute-bound half --- precisely
+\emph{because} they are in different regimes and do not contend for the same lever.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}p{3.5cm}p{2.4cm}p{2.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Frame-pipeline stage} & \textbf{Regime} & \textbf{Bottleneck} & \textbf{Correct lever} \\
+\midrule
+Action ingest & trivial & --- & (matmul; ignore) \\
+VAE encode $\Tenc$ & prefill-like & compute-bound & tiny distilled encoder (TAESD); kernel fusion \\
+Denoise loop $K{\cdot}\Tstep$ & decode-like & launch-overhead & CUDA-graph capture (fixed shape); step distillation to cut $K$ \\
+VAE decode $\Tdec$ & prefill-like & compute-bound & tiny distilled decoder; fusion \\
+\bottomrule
+\end{tabular}
+\caption{The frame pipeline is two regimes, not one. The denoise loop is fixed-shape and launch-overhead-bound
+--- the same regime where CUDA-graph capture won $\approx$1.47$\times$ on decode~\cite{backend} and where the
+data-dependent MoE-prefill wall does \emph{not} apply, because a dense world-model step has no data-dependent
+routing~\cite{openproblems}. The VAE runs at frame resolution and is compute-bound --- the regime where dense
+prefill measured $96.4\%$ utilization and a graph recovers nothing~\cite{openproblems}, cured instead by a
+smaller (distilled) autoencoder, the measured TAESD move from the native dub. Choosing the lever by regime is
+the whole discipline.}
+\label{tab:regimes}
+\end{table}
+
+\subsection{The frame-latent cache is the KV cache}
+\label{sec:kv}
+
+Eq.~\eqref{eq:loop} conditions frame $t{+}1$ on a window of the last $w$ frames. A correct implementation does
+not recompute the representation of those $w$ frames every step; it computes each frame's contribution once,
+caches it, and reuses it for every subsequent frame until it slides out of the window --- which is exactly the
+token KV cache, byte for byte the same mechanism. The consequences transfer wholesale. The
+\emph{context horizon} $w$ is the KV window: what the model can condition on, and therefore what it can keep
+consistent, is bounded by it, and everything past $w$ is forgotten (\S\ref{sec:open}, the persistence
+problem). \emph{Sliding-window eviction}, \emph{KV compression} (an FP8 frame-latent cache halves the resident
+state, with the cross-hop error-accumulation caveat the series raises for migration~\cite{openproblems}), and
+\emph{prefix reuse} (\S\ref{sec:authoring}) all apply to the frame cache with no reinterpretation. A native
+engine that already implements KV-cache management for tokens implements frame-latent caching for free; a
+per-service architecture, where each request is stateless, cannot --- it has nowhere to keep the cache between
+frames. This is the sharpest single instance of the thesis: the persistent, in-process session is not a
+convenience, it is the only place the frame cache can live.
+
+\section{The pipeline matrix}
+\label{sec:matrix}
+
+A game is a portfolio of generative modalities, and honesty about the portfolio is a systems virtue: the value
+of one engine is that a modality's status is a \emph{loader} question, not an \emph{architecture} question ---
+adding music is loading a music model, not standing up a service. Table~\ref{tab:matrix} states, per modality,
+what is measured-live on the native stack today, what is in-port, and what is planned, with no rounding up.
+
+\paragraph{Measured-live.} \emph{LLM game logic} is the engine's core competence: language decode at
+\code{llama.cpp} parity on every backend~\cite{backend}, driving NPC dialogue, quest state, and rule
+adjudication in-process. \emph{Voice} --- ASR for player speech and neural TTS for characters --- runs native.
+The strongest measured cell is the \emph{localization dub}: an ASR $\to$ translate $\to$ TTS $\to$ lip-sync
+pipeline that runs $100\%$ native (no Python on the inference path), measured at lip-sync confidence
+LSE-C $7.05$ --- beating the PyTorch reference implementation it was ported from --- with speaker-identity
+cosine $1.0$ and the $11.6$\,fps combined throughput (f16, node \emph{spark}/GB10) that the tiny-encoder work
+of \S\ref{sec:regimes} produced. A dub is a game-shaped workload in miniature: a diffusion UNet, a VAE on the
+critical path, an audio model, and a hard latency target, all native --- it is the existence proof for the
+frame pipeline's components.
+
+\paragraph{In-port.} \emph{3D assets} (TRELLIS-class structured-latent image-to-3D~\cite{trellis}) reuse the
+diffusion-UNet-plus-VAE machinery the dub already exercises natively; the port target is the structured-latent
+representation and its meshing, not new infrastructure. \emph{Image generation} for textures and 2D assets is
+live. \emph{Video understanding} for playtest analytics --- summarizing sessions, detecting stuck states,
+scoring difficulty from recorded play --- rests on the native vision path, which runs; the video-specific
+temporal head is a stub, so we mark the modality in-port rather than live.
+
+\paragraph{Planned.} The \emph{world model} itself --- the artifact of \S\ref{sec:latency} --- is not yet
+running on the stack; what exists are the primitives (fixed-shape graph loops, KV reuse, native VAE) it will
+compose. We say plainly: no world-model frame rate on our engine is measured, and \S\ref{sec:latency}'s
+budget for it is projection built on measured primitives. \emph{Music} (ACE-Step-class diffusion with a deep
+compression autoencoder~\cite{acestep}) and \emph{video generation} (Wan-class MoE video
+diffusion~\cite{wan}) are planned ports; the diffusion core is shared with modalities already native, which is
+the whole point of the portfolio-on-one-engine argument --- but shared machinery is not a running model, and we
+do not claim it as one.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{3.4cm}p{4.9cm}p{2.0cm}p{3.6cm}@{}}
+\toprule
+\textbf{Modality} & \textbf{Role in the game} & \textbf{Status} & \textbf{Native basis / port target} \\
+\midrule
+LLM game logic & NPC dialogue, quests, rule adjudication & measured-live & decode parity, every backend~\cite{backend} \\
+Voice (ASR $+$ TTS) & player speech in, character speech out & measured-live & native speech path \\
+Localization dub & lip-synced multilingual voice & measured-live & LSE-C $7.05$, cosine $1.0$, $11.6$\,fps (GB10) \\
+Image / texture gen & materials, 2D assets, textures & measured-live & native image diffusion \\
+3D assets & meshes, props, environments & in-port & TRELLIS-class latents~\cite{trellis} \\
+Video understanding & playtest analytics, QA & in-port & native vision; temporal head stub \\
+\textbf{World model} & \textbf{the playable frame loop} & \textbf{planned} & \textbf{graph loop $+$ KV $+$ tiny VAE (\S\ref{sec:latency})} \\
+Music / ambient & score, adaptive audio & planned & ACE-Step-class~\cite{acestep} \\
+Video generation & cutscenes, in-engine video & planned & Wan-class MoE~\cite{wan} \\
+\bottomrule
+\end{tabular}
+\caption{The modality portfolio on the native stack, labelled without rounding up. Measured-live cells carry
+first-party numbers on labelled hardware; in-port cells have native primitives running but the modality's
+specific head incomplete; planned cells share diffusion machinery with live modalities but are not yet running.
+The world model --- the central artifact --- is honestly planned: \S\ref{sec:latency} projects its budget from
+measured primitives, not from a measured world model.}
+\label{tab:matrix}
+\end{table}
+
+\section{The distributed angle: a render farm for neural game engines}
+\label{sec:distributed}
+
+The frontier world models are large --- Matrix-Game is a $17$B-parameter model~\cite{matrixgame} --- and the
+largest will not fit on one consumer node. The series already built the substrate for splitting a model across
+a heterogeneous fleet, and it transfers directly: a home cluster of mixed accelerators (an AMD APU, an NVIDIA
+dev kit, a Mac) is a game studio's render farm re-imagined for a neural engine, and the same
+\emph{canonical-\code{f32} ring} that carries cross-vendor LLM inference carries a cross-vendor world model.
+
+\paragraph{The measured substrate.} The series demonstrated one engine, built from one source for three
+vendors' kernels, sharding a model \emph{tensor-parallel} across an AMD/NVIDIA boundary over a commodity
+2.5\,GbE link and decoding coherently at $50.4$\,tok/s (TTFT $0.09$\,s, $213$\,tok/s prefill; AMD gfx1151
+node \emph{evo} $+$ NVIDIA GB10 node \emph{spark})~\cite{het}. The load-bearing fix was a canonical-\code{f32}
+wire: the two ranks legitimately run different $16$-bit compute dtypes (f16 on the ROCm rank, bf16 on the CUDA
+rank), and only a lossless \code{f32} payload on the wire lets them agree, reduced with a canonical tie-break
+so a rounding difference cannot fork the streams. The same work makes the case, on a measured $\approx$3.3$\times$
+synchronization tax, that \emph{pipeline parallelism} --- contiguous layer ranges, activations-only across each
+node boundary, one generation loop --- is the structurally right primitive for a heterogeneous
+cluster~\cite{het,latency}, and the pipeline-parallel keystone is measured on the same \emph{evo}$+$\emph{spark}
+pair at $145.8$\,tok/s decode on a $0.6$B model and $45.2$\,tok/s on a $30$B-A3B mixture-of-experts model.
+
+\paragraph{Why it fits the game.} These numbers are LLM decode, not world-model frames; carrying them to a
+world model is projection, and we label it so. But the \emph{structure} carries exactly, because the frame is
+the token. Pipeline parallelism ships an activation tensor across each seam, not a weight slice, so it is
+format-agnostic and sidesteps quant-aware sharding~\cite{openproblems}; a world model's frame latent is just
+such an activation. And the two play modes map onto the two regimes the series separates:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Single-player is the latency-bound stream.} One player, one autoregressive frame sequence, each
+frame on the critical path of the next --- this is the single-stream decode regime, governed by the
+geo-distributed latency floor $1/(C+\Tring)$ the series derives~\cite{latency}: minimize per-frame latency,
+keep the ring turn co-located, keep the frame cache node-local. A cross-continent ring floors a single stream
+at a few frames per second regardless of accelerator speed, which is the physics case for keeping a
+single-player world model regional, and the case for the speculative rollout of \S\ref{sec:open}.
+\item \textbf{Spectate and multiplayer are the throughput regime.} Many concurrent players, or many spectators
+watching one world, are many rollouts --- and a spectator, not in control, does not need low action-latency, so
+their rollouts can be \emph{batched} and run at higher per-frame latency for throughput. This is the
+micro-batched pipeline-parallel regime: fill the pipe, amortize the weight load across the batch, run the
+throughput dual of the layer-assignment optimization~\cite{openproblems}. The latency-bound single stream and
+the throughput-bound batch are the same two regimes, one primitive, that organize the whole series.
+\end{itemize}
+
+\section{Editing while it runs: authoring as prefix reuse}
+\label{sec:authoring}
+
+A generative game needs an authoring surface --- a node-graph editor (Hanzo Studio) in which a designer wires
+prompts, conditioning, LoRA adapters, reference assets, and rules, and drives the native endpoints behind each
+node. The systems content of authoring is the \emph{edit-while-running} loop, and it is another exact instance
+of an inference primitive: prefix caching.
+
+\paragraph{The edit loop is a prefix swap.} A persistent world-model session holds accumulated state --- the
+frame-latent KV cache of \S\ref{sec:kv}, the current world configuration --- as a \emph{prefix}. An edit
+(swap a LoRA, change a conditioning prompt, drop in a new asset, adjust a rule) changes the \emph{suffix} of
+the conditioning, not the accumulated world state. The naive implementation tears down the session and
+re-simulates from scratch on every edit; the correct one keeps the world-state prefix resident and recomputes
+only the changed conditioning --- exactly prefix caching in LLM serving, where the KV for a shared prompt
+prefix is retained across requests and only the divergent suffix is recomputed~\cite{latency}. Editing the game
+while it runs \emph{is} hot-swapping the conditioning suffix against a cached world-state prefix, and the
+designer sees the change take effect on the live world in the next frame rather than after a reload. This is
+only possible with a persistent in-process session: a stateless per-request service has no prefix to keep, so
+every edit is a cold start. The authoring loop is thus the second place (after the frame cache,
+\S\ref{sec:kv}) where the persistent native session is not an optimization but a precondition, and it connects
+authoring latency to the same session/prefix-reuse machinery the engine already runs for chat.
+
+\section{Open problems specific to generative games}
+\label{sec:open}
+
+The series' open-problems companion~\cite{openproblems} enumerates eight problems of \emph{heterogeneous
+distributed inference}; we do not restate them. The problems here are the ones the \emph{game} adds --- they
+sit on top of that agenda, cross-reference it where they touch, and are stated to make the open question
+precise rather than to claim a solution. The centerpiece, developed first and at length, is an isomorphism we
+believe is new and exactly true.
+
+\subsection{Action-latency compensation: speculative decoding \emph{is} client-side prediction}
+\label{sec:spec}
+
+\paragraph{The two mechanisms, and the claim.} \emph{Speculative decoding}~\cite{leviathan,chen} accelerates
+autoregressive generation: a cheap \emph{draft} model proposes $K$ tokens; the expensive \emph{target} model
+verifies all $K$ in one batched forward pass; the longest agreeing prefix is accepted and, on the first
+disagreement, the target's own distribution is sampled and the rest discarded --- yielding output distributed
+\emph{exactly} as the target would produce, at fewer target invocations, paying the target's latency once per
+accepted \emph{block} instead of once per token. \emph{Client-side prediction}~\cite{bernier}, the netcode
+technique every real-time multiplayer game ships, hides server round-trip latency: the client runs a cheap
+local simulation to predict the next frames and shows them immediately; when the authoritative server state
+arrives, agreement confirms the prediction and disagreement triggers a rollback-and-replay from the corrected
+state (the visible ``rubber-band''). Our claim is that these are not analogous --- they are the \emph{same
+algorithm}, optimistic execution of a cheap predictor reconciled against an authoritative source with rollback
+on disagreement, and that because the frame is the token (\S\ref{sec:thesis}) the identification is exact,
+term for term (Table~\ref{tab:iso}).
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{3.7cm}p{3.7cm}p{4.9cm}@{}}
+\toprule
+\textbf{Speculative decoding}~\cite{leviathan} & \textbf{Client-side prediction}~\cite{bernier} & \textbf{Speculative frame rollout (this paper)} \\
+\midrule
+draft model (cheap, local) & client predictor (cheap, local) & small local world model (cheap, on-device) \\
+target model (expensive, authoritative) & server (authoritative, remote) & large world model (authoritative, on the ring \S\ref{sec:distributed}) \\
+propose $K$ tokens & predict $K$ frames ahead & roll $K$ frames forward under player actions \\
+verify $K$ in one batched pass & server reconciliation & authoritative model verifies $K$ frames in one batched forward \\
+accept prefix / resample on reject & confirm / rollback $+$ replay & confirm frames / rubber-band correct \\
+acceptance rate $\alpha$ & prediction hit rate & frame-agreement rate \\
+distribution-exact & server-authoritative-exact & \emph{perceptually} acceptable (the open relaxation) \\
+\bottomrule
+\end{tabular}
+\caption{The isomorphism, term by term. Speculative decoding and client-side prediction are one algorithm ---
+optimistic execution of a cheap local draft against a slow authoritative target, reconciled with rollback ---
+and because the frame is the token the mapping is exact. The one row that is not a clean identity is the last,
+and it is exactly where the open problem lives (\S\ref{sec:spec}, ``what is open'').}
+\label{tab:iso}
+\end{table}
+
+\paragraph{Why the game instance is the interesting one.} In a distributed world model
+(\S\ref{sec:distributed}), the authoritative target may sit across a slow ring whose single-stream floor is a
+few frames per second~\cite{latency} --- unplayable. Speculative frame rollout is the cure the series already
+prescribes for tokens, read for frames: run a small, fast world model \emph{locally} (on the player's own
+device) to roll frames forward under the player's actions and display them at once, hiding the ring latency;
+the large authoritative model verifies the rolled-forward frames a block at a time; when they agree, the player
+saw the correct future with zero perceived latency, and when they disagree --- a genuine surprise the small
+model could not predict --- the world rubber-bands to the authoritative frame. This is speculative decoding's
+$r_{\mathrm{spec}}(\alpha,K)=\frac{1-\alpha^{K+1}}{1-\alpha}/(K c_d + C + \Tring)$ speedup~\cite{latency,leviathan},
+applied to frames, and it is why a distributed neural game can be playable at all across a slow link.
+
+\paragraph{What is open: the acceptance criterion for a perceptual match.} The isomorphism is exact except in
+the row that decides everything. Speculative decoding's accept test is a \emph{distributional} identity ---
+the drafted token is accepted with a probability that makes the output law identical to the target's, and a
+recomputed logit is comparable bit-for-bit only because the series' canonical-\code{f32} substrate makes it so
+(the determinism-boundary problem, \S1 of~\cite{openproblems}). A \emph{frame} is a point in a continuous
+latent space, and two world models will essentially never produce the bit-identical frame; requiring a
+bit-exact match would drive the acceptance rate to zero and destroy the method. The frame accept test must
+therefore be \emph{perceptual}: accept the drafted frame if it is perceptually close enough to the
+authoritative one that the correction would not be seen. This both \emph{loosens} the test --- a perceptual
+tolerance admits far more than a bit-exact one, so achievable $\alpha$ can be high --- and makes soundness
+\emph{ill-defined}: what metric ($\Delta$ in latent space, LPIPS, a learned perceptual head), at what
+threshold, bounds the \emph{perceptible} rubber-band without either rejecting acceptable frames (stutter) or
+accepting drift (the world silently diverging from authority)? This is the open problem, and it is distinct
+from the companion's determinism boundary: there, agreement must be \emph{bit-exact} for KV coherence; here,
+agreement must be \emph{perceptual} for playability, and the relaxation from one to the other is the whole
+research question. Formally: define the frame acceptance predicate $\mathcal{P}(\hat{x},x^\star)$ and bound,
+as a function of its threshold, both the expected accepted block length (hence the speedup) and the
+worst-case perceptible correction (hence the visual quality). Neither the token literature (which has no
+perceptual slack) nor the netcode literature (which reconciles \emph{known} authoritative state, not a
+generative model's sample) answers it.
+
+\subsection{Consistency and persistence beyond the context horizon}
+\label{sec:persist}
+
+The frame cache is the KV cache (\S\ref{sec:kv}), and its window $w$ is a hard horizon: a world model conditions
+only on the last $w$ frames, so a room you looked away from for longer than $w$ is, to the model, unvisited ---
+it will regenerate it inconsistently, the well-known failure of long-horizon world models. This is \emph{not}
+the companion's KV-compression-for-migration problem~\cite{openproblems}, which is about moving an existing
+cache across nodes without error accumulation; it is about representing world state that must persist
+\emph{beyond any KV window at all}. The open problem is an external, addressable \emph{world-state memory} that
+the frame loop reads from and writes to --- a persistent store of ``what is where'' (geometry, object state,
+what the player did) that re-conditions the model when a region re-enters the window, so consistency is bounded
+by the store's fidelity rather than by $w$. Its sub-questions: what is the right representation (an explicit 3D
+scene graph, a set of retrievable latents, a learned memory)? what is the read/write protocol on the frame
+critical path, and does it fit the budget of \S\ref{sec:budget}? and how does it compose with the speculative
+rollout of \S\ref{sec:spec}, whose local draft must consult the \emph{same} memory to predict a re-entered
+region correctly? This is the game's version of long-context, and the horizon it must beat is spatial and
+temporal, not just sequence length.
+
+\subsection{Determinism for shipped games}
+\label{sec:determinism}
+
+A shipped game must be reproducible: the same seed and the same inputs must yield the same asset and the same
+playthrough, across driver versions, across the vendor backends the engine targets, and across the years a
+game is supported --- both for the player's expectation that a world is stable and for QA to reproduce a bug.
+But GPU reductions are not associative across hardware, and the series' own work shows two ranks on two vendors
+diverge without a canonical-\code{f32} discipline~\cite{het,oracle}. The open problem is a determinism contract
+for a shipped generative game: which computations must be pinned to the canonical-\code{f32} bit-exact
+path~\cite{oracle} (asset generation at author time, where reproducibility is worth the speed) and which may
+run fast and non-deterministic (the real-time frame loop, where perceptual tolerance \S\ref{sec:spec} already
+admits variation)? This is the shipping dual of the companion's replicated-state determinism boundary: there,
+determinism is needed for two live ranks to \emph{agree}; here, for one machine to \emph{reproduce} another,
+possibly a driver generation later. The bit-exactness oracle~\cite{oracle} is the mechanism; the game-specific
+question is where to spend it, since pinning the whole frame loop to bit-exact would forfeit the graph and
+fusion wins of \S\ref{sec:latency}.
+
+\subsection{Provenance and license of generated assets}
+\label{sec:provenance}
+
+Every shipped asset in a generative game is a model output, which makes shipping one a provenance and licensing
+problem the series' correctness work does not touch. Each asset must carry \emph{which} model produced it,
+under \emph{which} weights and license, from \emph{which} prompt --- because the models in the portfolio
+(\S\ref{sec:matrix}) do not share license terms: TRELLIS, MineWorld, Matrix-Game, and Oasis are
+MIT~\cite{trellis,mineworld,matrixgame,oasis}, ACE-Step and Wan are Apache-2.0~\cite{acestep,wan}, but WHAM is
+released under a research-only Microsoft Research License~\cite{wham}, and a world model trained on a
+proprietary game's footage inherits that game's rights. A shipped title mixing assets from several is a
+derivative-works graph that must be tracked, not asserted. The open problem is a provenance-carrying asset
+pipeline: bind a signed manifest (C2PA-style~\cite{c2pa}, as our media work already does for dubbed audio) to
+every generated asset at generation time, propagate it through the authoring graph (\S\ref{sec:authoring}), and
+gate the ship on a license check --- so that ``can we ship this asset commercially'' is a query against
+recorded provenance, not a lawyer's reconstruction. This is an infrastructure problem the single-engine
+architecture is well-placed to solve, because provenance is captured at the one point every asset passes
+through.
+
+\subsection{Evaluation metrics for playability}
+\label{sec:eval}
+
+The field measures frame fidelity --- FID, PSNR, LPIPS --- but a game is not judged on how real a frame looks;
+it is judged on whether it is \emph{playable}. A world model can score well on per-frame image metrics and be
+unplayable: unresponsive to actions, temporally incoherent across the horizon (\S\ref{sec:persist}), or simply
+not fun. The open problem is a playability metric --- \emph{action-consistency} (does the world respond
+correctly and promptly to the control?), \emph{temporal coherence} (does state persist and evolve
+plausibly?), \emph{controllability} (can a policy achieve intended goals in the generated world?), and the
+harder qualitative axis. This matters for the systems work because it is the objective the levers of
+\S\ref{sec:latency} optimize \emph{against}: step-distillation to cut $K$, tiny encoders, and speculative
+rollout all trade fidelity for latency, and without a playability metric there is no principled way to set that
+trade --- how much frame quality may be spent to hit \fps{30} before the game stops being fun is unanswerable
+until playability is measurable. It is the open problem that the rest depend on to know when they are done.
+
+\section{Landscape: open world models}
+\label{sec:landscape}
+
+Table~\ref{tab:landscape} places the paper against the open world-model landscape, with every license verified
+from the project's Hugging Face model card or GitHub \code{LICENSE} rather than asserted from memory; where a
+project does not disclose a figure we mark it n/d rather than guess. The reference point is closed: GameNGen,
+the DOOM-simulating diffusion engine that opened the current wave~\cite{gamengen}, released neither weights nor
+code --- as does the broader closed frontier (the DeepMind Genie line of foundation world models) --- so it
+anchors the table as the thing the open models are measured against, not a thing one can build on. Among the
+open releases, the permissive-license cluster is real and usable: Oasis (MIT)~\cite{oasis}, MineWorld
+(MIT)~\cite{mineworld}, Matrix-Game (MIT)~\cite{matrixgame}, and DIAMOND (MIT)~\cite{diamond} ship weights and
+code under terms a commercial game can build on, while Microsoft's Muse/WHAM ships weights under a
+research-only license~\cite{wham} that a shipped product cannot --- the exact provenance distinction
+\S\ref{sec:provenance} argues must be tracked per asset. The systems reading of the table: these are all the
+same computation (Eq.~\eqref{eq:loop}), differing in scale, tokenizer, and sampler, and every one of them is a
+fixed-shape frame loop that the two-regime discipline of \S\ref{sec:latency} and the distributed substrate of
+\S\ref{sec:distributed} apply to unchanged. The engine does not care which of them it loads; that is the point.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{2.5cm}p{3.0cm}p{2.1cm}p{2.4cm}p{3.0cm}@{}}
+\toprule
+\textbf{Model} & \textbf{Origin} & \textbf{Params} & \textbf{License} & \textbf{Domain / notes} \\
+\midrule
+GameNGen & Google Research, DeepMind, Tel Aviv U. & SD-1.4 core (n/d) & closed (no release) & DOOM; $20$\,fps on TPU; \emph{reference point}~\cite{gamengen} \\
+Oasis (open-oasis) & Decart $+$ Etched & 500M (open ckpt) & MIT & Minecraft; diffusion-transformer, action-conditioned~\cite{oasis} \\
+Muse / WHAM & Microsoft Research & 200M, 1.6B & MS Research (non-commercial) & Bleeding Edge; AR token model~\cite{wham} \\
+Matrix-Game & Skywork AI & 17B (v1) & MIT & Minecraft/UE; keyboard$+$mouse diffusion I2W~\cite{matrixgame} \\
+MineWorld & Microsoft Research & 300M / 700M / 1.2B & MIT & Minecraft; visual-action AR transformer~\cite{mineworld} \\
+DIAMOND & Alonso et al.\ (NeurIPS'24) & RL-agent scale & MIT & Atari $+$ CS:GO; diffusion world model~\cite{diamond} \\
+\bottomrule
+\end{tabular}
+\caption{Open world models, licenses verified from each project's Hugging Face model card or GitHub
+\code{LICENSE} (not asserted from memory); undisclosed figures marked n/d. GameNGen is the closed reference the
+open field is measured against. The permissive (MIT/Apache) releases are buildable-on; Muse/WHAM's research-only
+license is not --- the provenance distinction \S\ref{sec:provenance} requires be tracked per shipped asset.
+Every row is the same fixed-shape frame loop (Eq.~\eqref{eq:loop}), which is why one engine serves all of them.}
+\label{tab:landscape}
+\end{table}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+A generative game reads as a graphics achievement and \emph{is} an inference-systems artifact: an
+action-conditioned world model run in a fixed-shape frame loop --- the frame is the token --- surrounded by a
+portfolio of generative-asset pipelines and an authoring surface, all of which are model inferences. Reading it
+that way is not a rhetorical move; it is what lets the machinery a native inference engine already has ---
+CUDA-graph capture, KV-cache reuse, pipeline parallelism over the canonical-\code{f32} ring, prefix caching,
+speculative decoding --- transfer to the game by identity of computation rather than by analogy. The systems
+content is the two-regime partition of the frame budget: the denoise loop is fixed-shape and
+launch-overhead-bound, so it is graph-favorable exactly as decode is, while the VAE is compute-bound at frame
+resolution, so it wants a smaller network exactly as the dense-prefill wall did --- and choosing the lever by
+regime is the discipline that gets a game to frame rate. The single-engine architecture is not an aesthetic
+preference; on the $33$--$66$\,ms frame path, a persistent in-process session is the only place the frame cache
+and the edit-loop prefix can live, and the memory and operational-surface costs of a service mesh are ones a
+real-time neural game cannot pay. We reported the primitives measured --- the graph regimes, the native dub, the
+cross-vendor ring --- and labelled the world model itself honestly as planned, its budget a projection over
+those primitives. And we set the game-specific open problems on top of, not duplicating, the series'
+agenda~\cite{openproblems}: centrally, that client-side prediction and speculative decoding are one algorithm,
+so a distributed neural game is playable across a slow ring by speculating frames locally and reconciling them
+against the authority --- with the acceptance criterion for a \emph{perceptual} rather than a distributional
+match the open question the isomorphism newly poses. When the frame is the token, a game is a decode loop with
+a controller on it, and the whole native stack is already built for decode.
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem{backend} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: Measured AMD, NVIDIA, and
+Apple Performance, and hanzo-engine at llama.cpp Decode Parity on Every Backend.} Paper 05 (measured).
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL --- Thesis and Guided
+Tour.} Paper 07 (umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{het} Hanzo AI --- ML Systems. \emph{One Cluster, Every Vendor: Cross-Vendor Tensor-Parallel LLM
+Inference over Commodity Ethernet.} Distributed-inference companion (measured).
+\bibitem{latency} Hanzo AI --- ML Systems. \emph{The Latency Physics of Geo-Distributed Autoregressive
+Decode.} Distributed-inference companion (analytical).
+\bibitem{openproblems} Hanzo AI --- ML Systems. \emph{Open Problems in Heterogeneous Distributed Inference.}
+Distributed-inference companion (research agenda).
+
+\bibitem{gamengen} D.\ Valevski, Y.\ Leviathan, M.\ Arar, S.\ Fruchter. \emph{Diffusion Models Are Real-Time
+Game Engines (GameNGen).} arXiv:2408.14837, 2024.
+\bibitem{oasis} Decart and Etched. \emph{Oasis: A Universe in a Transformer} (open-oasis; \code{Etched/oasis-500m},
+MIT). 2024.
+\bibitem{wham} A.\ Kanervisto et al. \emph{World and Human Action Models towards gameplay ideation (Muse/WHAM).}
+Nature 638, 2025. Weights: \code{microsoft/wham}, Microsoft Research License.
+\bibitem{matrixgame} Skywork AI. \emph{Matrix-Game: Interactive World Foundation Model.} arXiv:2506.18701, 2025.
+Weights \& code MIT (\code{SkyworkAI/Matrix-Game}).
+\bibitem{mineworld} J.\ Guo et al. \emph{MineWorld: a Real-Time and Open-Source Interactive World Model on
+Minecraft.} arXiv:2504.08388, 2025. MIT (\code{microsoft/mineworld}).
+\bibitem{diamond} E.\ Alonso, A.\ Jelley, V.\ Micheli, A.\ Kanervisto, A.\ Storkey, T.\ Pearce, F.\ Fleuret.
+\emph{Diffusion for World Modeling: Visual Details Matter in Atari (DIAMOND).} NeurIPS, 2024. MIT
+(\code{eloialonso/diamond}).
+
+\bibitem{trellis} J.\ Xiang et al. \emph{Structured 3D Latents for Scalable and Versatile 3D Generation
+(TRELLIS).} CVPR, 2025. MIT (\code{microsoft/TRELLIS}).
+\bibitem{acestep} ACE Studio and StepFun. \emph{ACE-Step: A Step Towards Music Generation Foundation Model.}
+2025. Apache-2.0 (\code{ACE-Step/ACE-Step-v1-3.5B}).
+\bibitem{wan} Wan Team, Alibaba Tongyi Lab. \emph{Wan: Open and Advanced Large-Scale Video Generative Models
+(Wan 2.2).} 2025. Apache-2.0.
+\bibitem{taesd} O.\ Sitton (madebyollin). \emph{TAESD: Tiny AutoEncoder for Stable Diffusion.} Open-source
+project, 2023.
+\bibitem{ldm} R.\ Rombach, A.\ Blattmann, D.\ Lorenz, P.\ Esser, B.\ Ommer. \emph{High-Resolution Image
+Synthesis with Latent Diffusion Models.} CVPR, 2022.
+
+\bibitem{leviathan} Y.\ Leviathan, M.\ Kalman, Y.\ Matias. \emph{Fast Inference from Transformers via
+Speculative Decoding.} ICML, 2023.
+\bibitem{chen} C.\ Chen, S.\ Borgeaud, G.\ Irving, J.-B.\ Lespiau, L.\ Sifre, J.\ Jumper. \emph{Accelerating
+Large Language Model Decoding with Speculative Sampling.} arXiv:2302.01318, 2023.
+\bibitem{bernier} Y.\ W.\ Bernier. \emph{Latency Compensating Methods in Client/Server In-game Protocol Design
+and Optimization.} Game Developers Conference (Valve Software), 2001.
+\bibitem{c2pa} Coalition for Content Provenance and Authenticity. \emph{C2PA Technical Specification.} Content
+provenance standard.
+
+\end{thebibliography}
+
+\end{document}

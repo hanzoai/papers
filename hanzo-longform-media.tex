@@ -1,0 +1,659 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+% Local notation for the film-assembly argument.
+\newcommand{\Nshots}{\ensuremath{N_{\mathrm{shots}}}}
+\newcommand{\Tshot}{\ensuremath{\bar{T}_{\mathrm{shot}}}}
+\newcommand{\Tfilm}{\ensuremath{T_{\mathrm{film}}}}
+\newcommand{\Tasm}{\ensuremath{T_{\mathrm{asm}}}}
+\newcommand{\asl}{\textsc{asl}}
+
+\title{\textbf{The Film Is Not a Context Window:\\ Feature-Length Generation as Hierarchical Assembly\\ on a Native Inference Stack}}
+\author{Hanzo AI --- ML Systems}
+\date{Long-form-media crossover in the native-inference series --- an inference-systems reading of feature-length generation}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A three-hour film is routinely mis-stated as a context-length problem --- as though generating it required a
+model that holds ten thousand seconds of pixels in one attention window. No model does, and our thesis is that
+none needs to. A feature is not a monolith; it is an \emph{assembly} of roughly two thousand shots of three to
+eight seconds each~\cite{cutting}, and coherence across it decomposes \emph{hierarchically}: the state that must
+persist across the whole runtime is small and structured --- a screenplay and a \emph{film bible} (who the
+characters are, what the world looks like, what the style is) of tens of thousands of tokens --- while the state
+that is expensive to compute (pixels, waveforms) never needs to persist beyond a single shot, because at every
+cut the image resets and only the semantics carry over. Long-form generation is therefore not a long-context
+problem but an \emph{orchestration-and-conditioning} problem layered over \emph{short-horizon} generators, and
+the long-horizon reasoning that keeps three hours coherent is done in the one place it is cheap: an LLM holding
+the whole screenplay in a single ordinary context. We develop this in four moves. First, the \textbf{coherence
+stack}: five layers --- story, entity, shot, global-style, and audio --- each with a persistent object, a
+conditioning mechanism, a coherence horizon, and a characteristic failure mode, formalized so that each
+failure has a named cure at its own layer. The load-bearing observation is that \emph{film grammar makes the
+cut a free reset}: the hard chunk-autoregressive drift problem that the recent forcing
+literature~\cite{diffusionforcing,selfforcing,causalforcing,oneforcing,tethercache,framepack} fights over
+minute-long clips is, in assembled film, bounded to the length of a single shot --- seconds, not hours --- and
+the games companion's persistence-beyond-the-horizon problem~\cite{games} is dissolved here rather than solved.
+Second, \textbf{error accumulation}: we separate intra-shot drift (real, bounded by shot length, measured by the
+cited video work) from cross-shot identity and style drift (the film-level risk), and propose --- marking each
+proposed unless measured --- cross-shot identity similarity and style-consistency metrics, anchored to the one
+identity axis the series has already measured, the localization dub's speaker-identity cosine $1.0$~\cite{games}.
+Third, the \textbf{systems} reading: a feature render is an \emph{embarrassingly parallel throughput job} ---
+$\sim$2000 independent shot-jobs over the series' measured heterogeneous ring~\cite{het} --- with the bible as a
+shared conditioning \emph{prefix} that prefix-caches across every shot, and each shot an \emph{idempotent},
+content-hashed unit that makes a three-hour render a resumable build DAG. We give a projection template for
+wall-clock on $1$ versus $M$ nodes and label the per-shot time a projection, because no feature-length render is
+measured on our stack. Fourth, \textbf{open problems} specific to film that neither companion owns: perceptual
+metrics for narrative coherence, the shot-length-versus-drift trade, motif persistence across musical cues,
+lip-sync integration for dialogue shots, and the rights and provenance of persistent generated identities. The
+substrate numbers we lean on are measured and cited to the hardware that produced them; every number about a
+feature-length artifact on our stack is labelled projection.
+\end{abstract}
+
+\section{Thesis: no model holds three hours, and none needs to}
+\label{sec:thesis}
+
+The reflexive framing of feature-length generation is a scaling framing: today's open video models generate
+clips of a few seconds~\cite{selfforcing,skyreels2}, a film is ten thousand seconds, so --- the framing goes ---
+the task is to grow the context, the memory, and the coherence horizon of a single generator by three or four
+orders of magnitude until it can hold an entire film at once. That framing is wrong, and its wrongness is the
+starting point of this paper. It mistakes the artifact for the computation. A film is not a single ten-thousand-
+second signal that a viewer experiences as one continuous shot; it is a \emph{cut} sequence of short shots, and
+the cutting is not incidental --- it is the medium's fundamental grammar.
+
+\paragraph{What a feature actually is, quantitatively.} Empirical cinemetrics settles the structure. Across
+seventy years of Hollywood film, the average shot length (\asl) fell from roughly twelve seconds in the 1930s to
+about four in recent decades, and the sequence of shot lengths has a nested waxing-and-waning structure at
+scales from seconds to tens of minutes~\cite{cutting}. Take a three-hour feature: $180$ minutes is $10{,}800$
+seconds, and at a contemporary \asl\ of five to six seconds that is on the order of $\Nshots\approx 2000$ shots;
+an action film at an \asl\ of two to three seconds has more. The unit of the medium is the \emph{shot}: three to
+eight seconds of continuous imagery, terminated by a cut. Nothing in a film is longer than a shot except by the
+viewer's assembly of shots into scenes and scenes into a story --- and that assembly is \emph{semantic}, carried
+by continuity of character, place, and narrative, not by continuity of pixels.
+
+\paragraph{The state that must persist is small and structured.} Ask what actually has to stay consistent across
+three hours. Not the pixels: shot $1873$ shares no pixel with shot $12$, and demanding it should would be a
+category error about how film works. What must stay consistent is a \emph{bounded, symbolic} object --- the
+protagonist's face and wardrobe, the look of a location, the visual style, the through-line of the plot, a
+character's voice. A working screenwriter encodes essentially all of it in a screenplay of roughly one page per
+minute of screen time: a three-hour film is a $\sim$180-page screenplay, on the order of $40{,}000$ tokens,
+plus a \emph{film bible} of character and location descriptions and reference images. That is the entire
+long-horizon state, and it is \emph{tiny}: $40{,}000$ tokens fits, with enormous margin, inside a single
+present-day LLM context of hundreds of thousands to millions of tokens. The long-horizon problem, stated
+correctly, is already solved --- not by a bigger video model, but by moving the long-horizon reasoning into the
+\emph{text} domain, where three hours of narrative is a short document.
+
+\paragraph{The thesis.} Long-form generative media is an \emph{orchestration and conditioning} problem over
+\emph{short-horizon} generators, not a long-context generation problem. A single LLM holds the whole film's
+structured plan in one context and is the long-horizon engine; a fleet of short-horizon generators (a few-second
+video model, a per-line speech model, a per-cue music model, an image model) renders the leaves; and coherence is
+manufactured \emph{hierarchically}, by conditioning every leaf on the small persistent state the plan defines and
+re-injecting it shot by shot. This inverts the scaling framing: the hard part is not holding three hours in a
+network, it is the \emph{decomposition} --- authoring the hierarchy, propagating identity and style down it, and
+\emph{assembling} the leaves back into a timeline --- and the decomposition is an inference-systems problem our
+native stack is well shaped to serve, because every leaf is a model inference and the orchestration is a
+throughput schedule over them.
+
+\paragraph{Relation to the companions, stated up front.} This paper sits deliberately between two others and
+duplicates neither. The games companion~\cite{games} owns the \emph{within-shot} computation: a shot is a short
+video clip, generated by exactly the fixed-shape frame loop --- ``the frame is the token'' --- whose latency
+budget, two-regime partition (launch-bound denoise loop versus compute-bound VAE), and cures that paper
+establishes; we take that analysis as given and never re-derive it, and we cross-reference it wherever a shot's
+internal cost is at issue. The distributed companions own the \emph{substrate}: the measured cross-vendor
+ring~\cite{het}, the latency physics of decode~\cite{latency}, and the eight open problems of heterogeneous
+distributed inference~\cite{openproblems}. What is \emph{new here} is the layer \emph{above} the shot and
+\emph{above} the ring: the hierarchical-assembly structure of a feature, its coherence stack, its error budget,
+and the throughput schedule that renders it. One sharp difference from the games companion orients everything
+below. There, the artifact is real-time and interactive, a single continuous frame loop under a $33$--$66$\,ms
+deadline, and \emph{persistence beyond the KV horizon is the central open problem} --- a room you looked away
+from must still be there when you look back. Here, the artifact is offline and \emph{pre-planned}: there is no
+per-frame deadline (a render is a batch job), the whole film exists as a plan before a single pixel is drawn,
+and the cut means we \emph{never} need continuity longer than one shot. The games companion's persistence
+problem is not solved in this paper; it is \emph{dissolved} by film grammar, and saying exactly how is the
+content of \S\ref{sec:stack}.
+
+\section{The coherence stack}
+\label{sec:stack}
+
+Coherence in a feature is not one property; it is five, at five scales, each maintained by a different mechanism
+and each failing in a different way. The engineering discipline of long-form generation is to name the layers,
+give each its own persistent object and conditioning mechanism, and fix each layer's failure at that layer rather
+than reaching for a single monolithic model to hold all five at once. Table~\ref{tab:stack} is the whole section
+in one view; the subsections develop each row. Throughout, the persistent objects are \emph{data} --- JSON plans,
+embeddings, reference images, LoRA adapters, voice ids --- not model weights, and every conditioning mechanism is
+an \emph{input} to a short-horizon generator, which is why the stack composes on inference infrastructure the
+series already has.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{@{}p{1.9cm}p{2.7cm}p{3.0cm}p{1.7cm}p{3.2cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Persistent object} & \textbf{Conditioning mechanism} & \textbf{Coherence horizon} & \textbf{Failure mode $\rightarrow$ cure} \\
+\midrule
+Story & screenplay / scene / shot tree ($\sim$40k tok) & LLM context (whole plan in one window) & whole film & plan drift $\rightarrow$ structured-output schema $+$ validation \\
+Entity & film bible: id embeddings, LoRA, voice ids & re-inject reference into every shot's conditioning & whole film & identity drift $\rightarrow$ embedding-anchored re-injection \\
+Shot & tail frames / KV of the current clip & chunk-autoregressive tail-frame conditioning & one shot (s) & intra-shot drift $\rightarrow$ short horizon; forcing/anti-drift \\
+Global style & style prompt fragment $+$ grade LUT & shared style token $+$ assembly-time color grade & whole film & style flicker $\rightarrow$ shared conditioning $+$ one grade pass \\
+Audio & voice ids, motifs, stems & per-line TTS, per-cue score, per-shot foley; mix & whole film & audio discontinuity $\rightarrow$ timeline assembly, not generation \\
+\bottomrule
+\end{tabular}
+\caption{The coherence stack. Each layer maintains one scale of consistency with its own persistent object
+(all \emph{data}, not weights) and its own conditioning mechanism, and fails in its own way with a cure local to
+the layer. The horizons are the key: only the \emph{shot} layer has a short (seconds) horizon, and it is the only
+layer where the hard chunk-autoregressive drift problem lives; every other layer's persistence is carried by a
+small structured object re-injected as conditioning, not by a long generative context. This is the whole
+argument of \S\ref{sec:thesis} made operational.}
+\label{tab:stack}
+\end{table}
+
+\subsection{Story layer: the LLM is the long-horizon engine}
+\label{sec:story}
+
+\paragraph{Object and mechanism.} The top of the stack is a \emph{hierarchical plan}: logline $\rightarrow$ acts
+$\rightarrow$ scenes $\rightarrow$ shots, authored by an LLM and materialized as a tree of structured records. A
+shot record names its location, the characters present, the camera and action, the dialogue lines, the intended
+duration, and references (by id) into the entity and style layers below. Because the whole plan is $\sim$40k
+tokens (\S\ref{sec:thesis}), a single LLM holds it in one context and authors it \emph{globally}: the model that
+writes shot $1873$ has shot $12$ in view, so setups pay off, arcs close, and the plot is consistent by
+construction --- the LLM \emph{is} the long-horizon engine, and its context window, not any video model's, is
+where three hours of narrative coherence actually lives. This is the technical core of the thesis: the coherence
+that the scaling framing wanted to buy with a giant video context is bought instead with an ordinary text
+context, because narrative is symbolic and compresses to tens of thousands of tokens.
+
+\paragraph{Failure mode: plan drift.} The characteristic failure is \emph{plan drift} --- an LLM emitting a plan
+that is locally plausible but globally inconsistent (a character who dies in scene 40 speaks in scene 47; a shot
+that references a location id never defined; a scene whose shot durations do not sum to its intended length).
+Free-form generation makes this failure invisible until render time.
+
+\paragraph{Cure: structured-output schemas and validation.} The cure is to make the plan a \emph{typed} object
+and check it before rendering. Each layer of the tree has a schema (a scene has a location-id that must resolve
+in the bible; a shot's character-ids must be a subset of its scene's; durations must sum; every referenced style
+and voice id must exist), and the LLM emits against the schema under constrained decoding, with a validation pass
+that rejects or repairs a plan that violates a cross-reference. This is the film analog of the series' broader
+discipline of validating at boundaries: the plan is the boundary between the long-horizon text engine and the
+short-horizon renderers, and a malformed plan is a bug caught cheaply in the text domain rather than expensively
+after two thousand shots have rendered. The plan is also what makes the render a \emph{DAG} (\S\ref{sec:systems}):
+a validated, content-addressable description of every leaf and its inputs.
+
+\subsection{Entity layer: the film bible is memory-as-retrieval}
+\label{sec:entity}
+
+\paragraph{Object and mechanism.} The entity layer is the \emph{film bible}: for each recurring character, a
+stable identity representation --- one or more reference images, an identity embedding, and, where fidelity
+demands it, a per-character low-rank adapter (LoRA)~\cite{lora,dreambooth} --- and a voice id; for each location,
+a reference and description; for props and creatures likewise. The mechanism is \emph{re-injection}: every shot
+that features a character conditions its generator on that character's identity representation, via image-prompt
+adaptation~\cite{ipadapter}, a loaded LoRA, or reference-image conditioning, so the character is rendered from
+the \emph{same} anchor in shot $12$ and shot $1873$. Identity is thus maintained not by the generator
+\emph{remembering} the character across two thousand shots --- it remembers nothing between independent shot-jobs
+--- but by the orchestrator \emph{retrieving} the identity from the bible and re-supplying it each time.
+
+\paragraph{This is the film analog of position-keyed world memory.} The games companion identifies, as an open
+problem for interactive world models, an external addressable \emph{world-state memory} that re-conditions the
+frame loop when a region re-enters view, so consistency is bounded by the store's fidelity rather than by the KV
+window~\cite{games}. The film bible is the same idea in a setting where it is not open but \emph{routine}: an
+external, addressable store of ``what everything is,'' read on every shot and written once at authoring time,
+whose retrieval key is the character/location id rather than a spatial position. The reason it is routine here
+and open there is exactly the pre-planning difference of \S\ref{sec:thesis}: an interactive world model does not
+know in advance which region will re-enter the window and must discover and store it online, whereas a film's plan
+names every entity in every shot \emph{before} rendering, so retrieval is a static lookup, not an online memory
+system. Memory-as-retrieval is the cure; the plan is what makes the retrieval trivial.
+
+\paragraph{Failure mode and cure.} The failure is \emph{identity drift}: the same character rendered subtly
+(or grossly) differently across shots --- face, age, wardrobe, or, for a voice, timbre. The cure is
+embedding-anchored re-injection with enough conditioning strength that the identity is pinned, and, where a bare
+reference embedding is too weak (fine facial identity, an unusual creature), a per-character LoRA that has
+memorized the identity into weights that are loaded for that character's shots. The measurement axis is
+cross-shot identity similarity (\S\ref{sec:error}); on the \emph{audio} side this axis is already measured for
+our stack, at speaker-identity cosine $1.0$ for the native localization dub~\cite{games}, which is the existence
+proof that re-injected identity conditioning can hold a character constant across independently generated
+segments. The visual analog is proposed, not yet measured.
+
+\subsection{Shot layer: where the only hard drift problem lives --- and how film grammar bounds it}
+\label{sec:shot}
+
+\paragraph{Object and mechanism.} A shot is a three-to-eight-second clip, generated by the frame-loop machinery
+the games companion analyzes~\cite{games}; within a shot, temporal continuity (a hand stays a hand, motion is
+smooth) is maintained by \emph{chunk-autoregressive} conditioning: the model generates a chunk of frames, then
+conditions the next chunk on the tail frames (and the KV) of the last, extending the clip while carrying visual
+state forward. This is the mechanism the recent literature has converged on for extending short generators ---
+diffusion forcing and its descendants condition each frame or chunk on previously generated
+context~\cite{diffusionforcing,selfforcing}, and the distillation and caching variants make it real-time and
+stable~\cite{causalforcing,oneforcing,tethercache}. The shot layer is the \emph{only} layer whose persistent
+object is a generative context (tail frames, KV) rather than a small symbolic anchor, and therefore the only
+layer where chunk-autoregressive drift --- the accumulation of error as each chunk conditions on the last --- is a
+first-order concern.
+
+\paragraph{The key observation: the cut is a free reset.} Here is where film grammar pays off as a systems
+property. The chunk-autoregressive literature fights drift over \emph{minute-scale} clips: TetherCache exists to
+stabilize ``long-form'' autoregressive video against ``accumulated distribution drift''~\cite{tethercache},
+FramePack packs frame context and prevents drift to reach ``thousands of frames''~\cite{framepack}, RAD adds a
+global memory to combat forgetting over long video~\cite{rad}, and WorldPlay engineers long-term geometric
+consistency for extended interactive sequences~\cite{worldplay}. All of that difficulty is the difficulty of
+holding one continuous shot coherent for a long time. \emph{In assembled film, we do not need a long continuous
+shot.} At every cut the image resets completely --- the next shot shares no pixel with the previous one, only
+semantics (the same character, now from a different angle; the same location, later) --- and the semantics are
+carried by the entity and style layers as re-injected conditioning, not by tail-frame continuity. So the
+chunk-autoregressive drift problem is bounded to the length of a single shot: seconds, not minutes, and certainly
+not hours. Feature-length coherence does \emph{not} require solving long-horizon video generation; it requires
+generating a three-to-eight-second clip well and cutting. The forcing literature we cite is exactly the right
+tool at exactly the right scale --- a shot --- and the assembly structure means we never pay for its hardest
+regime.
+
+\paragraph{Failure mode and cure.} The failure is intra-shot drift, and its cure is threefold and all at the
+shot layer: keep the horizon short (a shot is short by grammar, so the accumulation has little time to compound);
+use the anti-drift conditioning the cited work provides~\cite{tethercache,framepack} within the shot; and, when a
+shot must be long, prefer a cut --- the director's instrument is also the engineer's. This is the one place the
+games companion's within-shot analysis and this paper's cross-shot analysis meet: a shot's \emph{internal} budget
+and drift are the games companion's subject, and the \emph{number} of shots and their \emph{assembly} are this
+paper's.
+
+\subsection{Global-style layer: shared conditioning and a single grade}
+\label{sec:style}
+
+\paragraph{Object and mechanism.} A film has a look --- palette, contrast, grain, lens character, an overall
+visual grammar --- that must be constant across all two thousand shots even though they are rendered
+independently, possibly on different nodes at different times. The persistent object is a style specification: a
+style prompt fragment and, optionally, a style LoRA and a reference frame, plus a color-grade transform (a LUT).
+The mechanism is two-part: \emph{shared style conditioning} injected into every shot's generation so the shots
+are drawn in the same style to begin with, and an \emph{assembly-time grade} --- a single deterministic color
+transform applied to every rendered shot in the final timeline --- that removes residual shot-to-shot variation
+the way a colorist unifies footage from different cameras. Style is thus enforced twice: softly at generation and
+exactly at assembly.
+
+\paragraph{Failure mode and cure.} The failure is \emph{style flicker}: perceptible jumps in look across cuts,
+the tell of independently generated shots. The cure is that the grade is a \emph{pure function} applied
+uniformly, so it cannot itself introduce variation, and the shared conditioning narrows the gap the grade must
+close. Style consistency is the second proposed measurement axis of \S\ref{sec:error}. This layer is also the
+clearest small illustration of the paper's method: a whole-film property (constant look) maintained not by a
+model that holds the whole film, but by a small shared object (a style spec, a LUT) re-applied to every
+independently generated leaf.
+
+\subsection{Audio: long-form audio is assembly, not generation}
+\label{sec:audio}
+
+\paragraph{The audio stack mirrors the visual one, and is if anything cleaner.} A feature's soundtrack is three
+superimposed layers, each generated at its natural short unit and \emph{assembled} on a timeline, so that ``three
+hours of audio'' is, like three hours of video, never generated as one signal.
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Dialogue is per-line TTS.} Each spoken line is a short generation, conditioned on the speaking
+character's voice id from the bible (\S\ref{sec:entity}); speech is natively unbounded because a film has no
+single utterance longer than a sentence or two, and voice identity is held across the film by the same
+re-injection as visual identity --- the axis measured at cosine $1.0$~\cite{games}. Dialogue audio is a per-line
+job, placed at the line's timecode.
+\item \textbf{Score is per-cue, with shared motif conditioning.} A film score is not one long piece but a set of
+\emph{cues}, each a few tens of seconds under a scene, and this is how human composers work: a small set of
+\emph{motifs} (a character's theme, the main title) recur, re-orchestrated per cue. Generative music at cue
+scale~\cite{acestep} conditioned on a shared motif is the mechanism; per-scene cues placed on the timeline are
+the assembly. Motif \emph{persistence} across cues --- generating recognizably the same theme in different cues
+--- is genuinely open and we name it so (\S\ref{sec:open}).
+\item \textbf{Foley and ambience are per-shot.} Diegetic sound (footsteps, doors, room tone) is short and local
+to a shot or scene, generated or retrieved per shot and placed.
+\end{itemize}
+
+\paragraph{The mechanism is a mixdown, and the failure is a mix failure.} The three layers plus any effects are
+combined by \emph{timeline mixing} --- the deterministic sum of stems at their timecodes with levels and
+crossfades --- exactly as a dub is mixed. Long-form audio coherence is therefore an \emph{assembly} property, not
+a generation property: nothing generates three hours of audio; the orchestrator generates thousands of short
+audio units and mixes them at their times. The failure mode is discontinuity at a boundary (a hard cut in room
+tone, a level jump between cues), and the cure is the assembly craft that solves it in real post-production ---
+crossfades, consistent ambience beds, level automation --- applied deterministically at mix time, not a smarter
+generator. This is the audio statement of the whole paper: at every layer, ``long'' is achieved by assembling
+``short,'' and the intelligence is in the plan and the conditioning, not in a generator that holds the length.
+
+\section{Error accumulation: intra-shot drift versus cross-shot drift}
+\label{sec:error}
+
+The scaling framing's strongest instinct is that error \emph{accumulates}: chain enough conditioned generations
+and quality decays, identity wanders, style flickers. The instinct is correct about one kind of chaining and
+wrong about another, and separating the two is the error budget of long-form assembly.
+
+\paragraph{Intra-shot accumulation is real, and bounded by the shot.} Within a shot, chunk-autoregressive
+generation genuinely accumulates error: each chunk conditions on the last, so quantization, sampling, and
+modelling error compound frame over frame, which is precisely the drift the forcing and anti-drift literature
+measures and fights~\cite{selfforcing,tethercache,framepack,rad}. We do not re-measure it; we cite it, and we
+observe that assembly \emph{caps its horizon}. Drift that grows with clip length is fought, in continuous-video
+systems, by ever-cleverer memory and caching to push the tolerable length out to minutes; in assembled film it is
+capped at the shot length by grammar (\S\ref{sec:shot}), so the operating point sits in the easy regime of the
+same curves. The cross-shot boundary is not a site of accumulation at all: because the image resets at the cut,
+intra-shot error does \emph{not} propagate across it --- shot $k{+}1$ does not inherit shot $k$'s accumulated
+pixel error, only the bible's (constant) conditioning. The cut is an error \emph{firewall} as well as a free
+reset.
+
+\paragraph{Cross-shot accumulation is a different quantity: identity and style variance, not decay.} What
+\emph{can} drift across a film is not pixel quality but the \emph{identity} and \emph{style} anchors: a character
+rendered from the bible in two thousand independent shots may vary shot to shot, and while this is not the
+compounding decay of a chain (each shot is anchored to the \emph{same} bible reference, not to its predecessor,
+so there is no feedback), it is a \emph{variance} around the anchor that a viewer reads as inconsistency. The
+right model of cross-shot error is thus statistical dispersion around a fixed reference, not a random walk that
+wanders further with every step --- a crucial distinction, because dispersion is bounded by conditioning strength
+and does not grow with $\Nshots$, whereas a random walk would. Embedding-anchored re-injection (\S\ref{sec:entity})
+is what makes it dispersion rather than a walk: every shot pulls back to the same anchor.
+
+\paragraph{Proposed metrics (proposed, not measured).} To make the cross-shot budget measurable we propose two
+metrics, and mark both proposed because we have not run them on a feature-length render:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Cross-shot identity similarity.} For each recurring character $c$, embed the character's appearance
+in every shot $s$ that features it with a fixed identity encoder $\phi$ (a face-recognition embedding for
+humans), and report both the mean similarity to the bible reference,
+$\frac{1}{|S_c|}\sum_{s\in S_c}\cos\!\big(\phi(s),\phi(\text{ref}_c)\big)$, and the dispersion of
+$\{\phi(s)\}_{s\in S_c}$. High mean and low dispersion is a held identity; the audio instance of exactly this
+metric is measured at cosine $1.0$ for voice~\cite{games}, which both validates the metric's form and sets the
+target the visual axis aims at.
+\item \textbf{Style consistency.} Embed each rendered shot in a style space (a CLIP-image or dedicated style
+embedding) and report the across-shot variance, before and after the assembly grade (\S\ref{sec:style}); the
+grade should reduce it, and the residual is the style-flicker risk.
+\end{itemize}
+Both are \emph{cheap post-hoc measurements over the rendered shots}, not new training objectives, which fits the
+assembly architecture: the orchestrator already has every shot as a discrete artifact, so scoring the film's
+consistency is a pass over the shot set. Narrative coherence --- whether the assembled film makes \emph{sense},
+not merely whether its characters look constant --- is not captured by either metric and is the first open problem
+(\S\ref{sec:open}).
+
+\section{Systems: a feature render is an embarrassingly parallel throughput job}
+\label{sec:systems}
+
+The assembly thesis has a direct systems consequence: once the plan is authored, the shots are \emph{independent}.
+Shot $k$'s generation depends on the bible and the shot record, not on shot $k{-}1$'s pixels (that is the cut,
+\S\ref{sec:shot}), so the two thousand shot-jobs of a feature have \emph{no data dependence among them} and can
+be rendered in any order, on any number of nodes, concurrently. A feature render is therefore an
+\emph{embarrassingly parallel throughput job}, and it maps onto the series' measured heterogeneous substrate
+cleanly --- but by a different decomposition than the games companion's.
+
+\paragraph{Data-parallel over shots, not batched over viewers.} The games companion places interactive play in
+the throughput regime when there are many \emph{viewers} of one world, batching their rollouts~\cite{games}. A
+feature render is throughput-bound for a different reason: one artifact, many independent \emph{shots}. The
+natural parallelism is \emph{data-parallel over shots} --- each node pulls the next unrendered shot-job, renders
+it whole, writes the result, and pulls another --- a work-queue over a pool of heterogeneous nodes, each running
+the full short-horizon generator stack locally. Pipeline- and tensor-parallel splitting of a \emph{single} large
+generator across nodes (the mechanism the distributed companions analyze for a model too big for one
+node~\cite{het,latency}) is the \emph{inner} option, used only when one shot's model does not fit on one node;
+the \emph{outer}, dominant parallelism of a film render is shots across nodes, which needs no model splitting at
+all and so pays none of the sharding or ring-latency costs. The measured substrate we inherit is the
+cross-vendor fleet itself --- an AMD gfx1151 node and an NVIDIA GB10 node decoding coherently over commodity
+$2.5$\,GbE at $50.4$\,tok/s with a canonical-\code{f32} wire~\cite{het} --- and for a shot-parallel job the wire
+carries only job descriptions and finished shots, not per-token activations, so the ring's synchronization tax
+does not fall on the film's critical path.
+
+\paragraph{The bible is a shared prefix; the render is prefix-cache reuse at job scale.} Every shot conditions on
+the same bible fragments --- the style spec, and, for a given character, that character's identity conditioning ---
+so across the shot-set there is a large \emph{shared conditioning prefix} and a small per-shot \emph{suffix} (this
+shot's action, camera, dialogue). This is prefix caching~\cite{latency}, read at the scale of a render job rather
+than an interactive session: a node that has rendered one shot of a character holds that character's conditioning
+prefix warm and reuses it for the next shot of the same character, recomputing only the divergent suffix. The
+scheduling consequence is a locality objective --- routing a character's (or a location's, or a style's) shots
+preferentially to the node that already holds that prefix warm turns a cache into a placement heuristic --- and it
+is the batch-throughput dual of the games companion's interactive edit-loop prefix reuse~\cite{games}: same
+mechanism, different regime (a job over a fixed shot-set, not a live edit stream).
+
+\paragraph{Idempotent, content-hashed shots make the render a resumable build DAG.} Each shot is a
+\emph{pure function} of its inputs: (bible entities it references, shot record, model id, seed)
+$\mapsto$ shot content. Hash those inputs to a \emph{shot key}; the render is then a build system over
+$\Nshots$ targets. Three properties follow, and they are the reason the orchestration state is plain files, not a
+database. \emph{Resumability}: a render interrupted after $1200$ of $2000$ shots resumes by re-checking keys and
+skipping the $1200$ whose content already exists --- a three-hour render is not an all-or-nothing job. \emph{Incremental re-render}: an edit to the plan (rewrite one scene, recast one character) changes the keys of only
+the affected shots, so only those re-render, exactly as a build system rebuilds only what a source change
+invalidates --- the film analog of the games companion's incremental authoring. \emph{Determinism and provenance}:
+a shot is reproducible from its key (seed included), so the same key yields the same shot across nodes and across
+time, which both makes the render cacheable and gives every shot a recorded lineage (which model, which weights,
+which prompt) --- the provenance the open problem of \S\ref{sec:open} builds on. Idempotency is what upgrades
+``run two thousand jobs'' into ``evaluate a build DAG,'' with all the resumability and caching that implies.
+
+\paragraph{Projection: wall-clock on one versus $M$ nodes.} Because the shots are independent, the wall-clock
+model is elementary. Let $\Nshots$ be the shot count, $\Tshot$ the mean per-shot render time, and $\Tasm$ the
+assembly time (timeline mix and grade). On one node, serial:
+\begin{equation}
+\Tfilm^{(1)} \;=\; \Nshots\cdot\Tshot \;+\; \Tasm .
+\label{eq:serial}
+\end{equation}
+On $M$ homogeneous nodes rendering shots data-parallel from a shared queue:
+\begin{equation}
+\Tfilm^{(M)} \;\approx\; \Big\lceil \tfrac{\Nshots}{M} \Big\rceil\cdot\Tshot \;+\; \Tasm ,
+\qquad
+\text{speedup } S(M)=\frac{\Tfilm^{(1)}}{\Tfilm^{(M)}} \;\xrightarrow[\Tasm\ll \Nshots\Tshot]{}\; \min(M,\Nshots),
+\label{eq:parallel}
+\end{equation}
+i.e.\ \emph{near-linear} speedup up to $M=\Nshots$ nodes, capped only by the serial assembly tail $\Tasm$
+(Amdahl), which for a film is small: the mix and grade are a single pass over already-rendered material, cheap
+next to $\Nshots\cdot\Tshot$ of generation. On a \emph{heterogeneous} fleet, replace the even split by the
+work-queue's natural load-balancing --- fast nodes pull more shots --- so the makespan is
+$\approx \Nshots\Tshot / \sum_j \rho_j$ for node throughputs $\rho_j$ (in shots/s), the shot-parallel analog of
+the layer-assignment balance the distributed companion optimizes for a split model~\cite{openproblems}, but
+without the contiguity constraint because shots are interchangeable. \emph{We label $\Tshot$ a projection}: no
+feature-length render is measured on our stack, and the video generator itself is a port in progress (Wan-class
+MoE video~\cite{wan}) whose per-shot time is not yet a first-party number. What \emph{is} measured is every
+substrate the projection rests on --- the cross-vendor ring~\cite{het}, decode parity across
+backends~\cite{backend}, and the native dub's $11.6$\,fps combined throughput on a VAE-on-the-critical-path
+pipeline (f16, GB10)~\cite{games} that is a shot-shaped workload in miniature --- and the structure of
+Eqs.~\eqref{eq:serial}--\eqref{eq:parallel}, which holds for \emph{any} $\Tshot$ because the shots are
+independent. Plug in a measured $\Tshot$ when the video port lands and the wall-clock follows; the systems claim
+is the \emph{shape}, and the shape is not a projection.
+
+\paragraph{What the shape says.} Three consequences are worth stating plainly. A feature render is
+\emph{scalable} without algorithmic change: add nodes, render faster, linearly, until you run out of shots ---
+there is no coherence penalty for parallelism because coherence was already externalized into the bible and the
+plan. It is \emph{resumable and incremental} by construction (idempotent keys), so it behaves like a build, not a
+monolithic training run. And it is \emph{cheap on the wire}, because the shot is the unit of transport --- a
+finished MP4 of a few seconds --- not a stream of activations, so the throughput job is bandwidth-light exactly
+where the interactive companions are bandwidth-bound. The systems difficulty of long-form generation is not
+holding the length; it is scheduling the throughput and assembling the leaves, and both are ordinary
+distributed-systems work over the series' existing substrate.
+
+\section{Open problems specific to long-form media}
+\label{sec:open}
+
+These are the problems the \emph{film} adds, on top of --- not duplicating --- the games companion's game-specific
+problems~\cite{games} and the distributed companion's eight~\cite{openproblems}. Each is stated to make the open
+question precise, and cross-referenced where it touches a companion's territory.
+
+\paragraph{1. Perceptual metrics for narrative coherence.} The metrics of \S\ref{sec:error} score whether
+characters look constant and the style holds; they say nothing about whether the assembled film is
+\emph{coherent as a story} --- whether cause precedes effect, whether an establishing shot and its reverse agree
+on geography, whether the edit obeys continuity (eyelines, the $180$-degree rule, screen direction), whether the
+whole \emph{means} anything. This is the film analog of the games companion's playability metric~\cite{games} ---
+in both, per-frame fidelity is measurable and the property that actually matters is not --- but it is distinct: a
+game's open axis is \emph{interactive} (does the world respond to control?), a film's is \emph{narrative and
+editorial} (does the cut sequence read?). The open problem is a computable proxy for narrative and continuity
+coherence over an assembled shot sequence --- plausibly a vision-language model scoring continuity across shot
+boundaries, or a learned editor's-eye metric --- and, as with playability, it is the objective the rest optimize
+against: the shot-length and drift trades below cannot be set without it.
+
+\paragraph{2. The optimal shot-length--versus--drift trade.} Shot length is a free variable with two-sided cost.
+Longer shots mean fewer cuts (a specific directorial feel) and fewer independent jobs, but push each shot deeper
+into the chunk-autoregressive drift regime (\S\ref{sec:shot}), costing intra-shot quality; shorter shots reset
+drift more often and parallelize better, but a film cut every two seconds is a specific, often wrong, aesthetic,
+and more shots mean more cross-shot identity/style variance surface (\S\ref{sec:error}). There is an optimization
+here --- choose each shot's length to trade intra-shot drift against cross-shot variance and cut rate under a
+narrative-coherence constraint (problem 1) --- and it couples to the systems layer, since shot length sets both
+$\Nshots$ and $\Tshot$ in Eq.~\eqref{eq:parallel}. It is genuinely open because its objective (problem 1) is
+open and its drift term is model-specific (it depends on how fast a given generator drifts, a measured quantity
+per model~\cite{tethercache,framepack}).
+
+\paragraph{3. Motif persistence across musical cues.} The score layer (\S\ref{sec:audio}) needs a character's
+theme to recur \emph{recognizably} across cues that are generated independently and orchestrated differently ---
+the musical instance of cross-segment identity (\S\ref{sec:entity}), but harder, because musical identity is a
+motif (a melodic/harmonic gesture) that must survive re-instrumentation, tempo change, and mood, not a fixed
+embedding to be re-injected verbatim. The open problem is a motif-conditioning mechanism for generative
+music~\cite{acestep} that preserves thematic identity under transformation, and a metric for whether two cues
+``contain the same theme'' --- neither of which the per-cue assembly of \S\ref{sec:audio} supplies on its own.
+It is the audio dual of narrative coherence: assembly places the cues, but whether they cohere \emph{musically}
+across a film is unquantified.
+
+\paragraph{4. Lip-sync integration for dialogue shots.} A dialogue shot must satisfy \emph{two} generators at
+once: the video layer renders the speaking character (from the bible, \S\ref{sec:entity}) and the audio layer
+renders the line (per-line TTS, \S\ref{sec:audio}), and the character's mouth must match the audio. The series
+has the measured piece --- the native localization dub achieves lip-sync confidence LSE-C $7.05$ with speaker
+cosine $1.0$~\cite{games} --- but that pipeline dubs \emph{existing} footage; the open problem is integrating
+lip-sync into \emph{generated} dialogue shots, where video and audio are \emph{both} being synthesized and must
+be made consistent. Two architectures are open and untested at film scale: generate the audio first and condition
+the video generator on it (audio-driven talking-head generation as the shot renderer), or generate the video and
+apply the measured dub as a post-pass per shot. Which composes better with the bible conditioning and the
+throughput schedule (\S\ref{sec:systems}), and at what added $\Tshot$, is unmeasured; the LSE-C $7.05$ result is
+the anchor it would build on, not the answer.
+
+\paragraph{5. Rights and provenance of persistent generated identities.} A film bible \emph{is} a persistent
+synthetic identity --- a face, a voice, a name, reused across a feature and, plausibly, across sequels and a
+franchise. That raises questions the games companion's per-asset provenance~\cite{games} frames but does not
+answer for a \emph{persistent, reused} identity: if a character's face is derived from a training distribution or
+a reference actor, what are the rights in the resulting persistent identity; who owns a generated voice reused
+across films; how is consent for a likeness recorded and enforced across a bible's lifetime; and how does a viewer
+or a rights-holder \emph{verify} which model and which references produced a given character. The mechanism the
+systems layer already provides is the hook: idempotent shot keys (\S\ref{sec:systems}) record, per shot, exactly
+which bible entities, weights, and prompts produced it, so a signed provenance manifest (C2PA-style~\cite{c2pa})
+can bind to the \emph{identity} and travel with it across the franchise. The open problem is the rights and
+consent \emph{model} over persistent generated identities, and the enforcement of it through the provenance the
+render already captures --- a governance question the architecture is well placed to serve but does not settle.
+
+\section{Landscape: closed feature systems and the open long-video frontier}
+\label{sec:landscape}
+
+Table~\ref{tab:landscape} places the paper against the landscape, with every license and claim verified from the
+source rather than asserted, and undisclosed figures marked n/d. The frame to read it in is this paper's thesis:
+the frontier is racing to \emph{lengthen the generator}, and this paper argues the length should instead be
+achieved by \emph{assembly}, so the table's axis of interest is not who generates the longest clip but which
+systems externalize coherence into structure versus internalize it into a bigger model.
+
+\paragraph{The closed reference points.} Meta's Movie Gen is the most complete published feature-oriented system
+--- a cast of media foundation models up to $30$B parameters generating $1080$p video with synchronized
+audio~\cite{moviegen} --- and it is closed: no weights, no code, a reference point the open field is measured
+against rather than built on, exactly as GameNGen anchors the games companion's landscape~\cite{games}. The
+general-purpose closed video generators --- Google's Veo line and OpenAI's Sora~\cite{sora} --- likewise ship as
+products, not artifacts, and neither is a feature-\emph{assembly} system: they generate high-quality short clips,
+and the orchestration of clips into a film is left to the user. The closed frontier's bet is the scaling bet:
+larger models, longer clips.
+
+\paragraph{The open long-video frontier is a forcing-and-anti-drift literature.} The open releases we build on are
+precisely the short-horizon generators and the techniques that extend them, and their center of gravity is the
+chunk-autoregressive drift problem (\S\ref{sec:shot}). Diffusion Forcing established per-token/per-chunk
+conditioning for sequence generation~\cite{diffusionforcing}; Self Forcing closed the train--test gap for
+autoregressive video diffusion~\cite{selfforcing}; Causal Forcing and One-Forcing drove it toward real-time and
+one-step generation~\cite{causalforcing,oneforcing}; TetherCache, FramePack, and RAD attack the accumulated drift
+that limits how long a single continuous clip can hold~\cite{tethercache,framepack,rad}; and WorldPlay pushes
+long-term geometric consistency for interactive sequences~\cite{worldplay}. SkyReels-V2 is the release that most
+directly targets \emph{film}, an ``infinite-length film generative model'' built on a diffusion-forcing framework
+and released under CC-BY-4.0~\cite{skyreels2}, and it is the sharpest illustration of the two philosophies: it
+pursues length \emph{inside} the generator (a longer continuous synthesis), where this paper pursues length
+\emph{outside} it (assembly of short shots), and the two are complementary --- a better short-shot generator makes
+every leaf of our assembly better. The systems reading of the table is the paper's thesis restated: all these
+generators are the games companion's fixed-shape frame loop at clip scale~\cite{games}, our stack loads whichever
+of them is best per shot, and the feature-length coherence they individually struggle to reach is supplied
+\emph{around} them by the coherence stack of \S\ref{sec:stack}.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{@{}p{2.9cm}p{2.5cm}p{1.9cm}p{2.0cm}p{3.4cm}@{}}
+\toprule
+\textbf{System} & \textbf{Origin} & \textbf{Scale} & \textbf{License} & \textbf{Length approach / notes} \\
+\midrule
+Movie Gen & Meta & 30B & closed (no release) & feature-oriented, synced audio; \emph{reference point}~\cite{moviegen} \\
+Veo / Sora & Google DeepMind / OpenAI & n/d & closed (product) & short-clip generators; assembly left to user~\cite{sora} \\
+SkyReels-V2 & SkyReels team & n/d & CC-BY-4.0 & ``infinite-length film'' via diffusion forcing (length \emph{inside})~\cite{skyreels2} \\
+Self / Causal / One-Forcing & academic~\cite{selfforcing,causalforcing,oneforcing} & clip-scale & open & AR video, train--test gap, real-time, one-step \\
+TetherCache / FramePack / RAD & academic~\cite{tethercache,framepack,rad} & clip-scale & open & anti-drift for long continuous clips \\
+WorldPlay & academic~\cite{worldplay} & clip-scale & open (n/d) & long-term geometric consistency, interactive \\
+\textbf{This paper} & \textbf{Hanzo AI} & \textbf{orchestration} & \textbf{---} & \textbf{length \emph{outside} the generator: hierarchical assembly (\S\ref{sec:stack})} \\
+\bottomrule
+\end{tabular}
+\caption{The long-form landscape, licenses and claims verified from each source (arXiv abstract, model card, or
+product page); undisclosed figures marked n/d. The closed frontier (Movie Gen, Veo, Sora) and the open forcing/
+anti-drift literature both pursue length \emph{inside} the generator; this paper pursues length \emph{outside}
+it, by assembly, and consumes any of these as its per-shot leaf. The two philosophies are complementary: a
+better short-shot generator improves every leaf of the assembly.}
+\label{tab:landscape}
+\end{table}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Feature-length generation is read as a scaling problem --- grow the generator until it holds three hours --- and
+it is instead an \emph{assembly} problem. A film is $\sim$2000 shots of a few seconds~\cite{cutting}, coherence
+across it decomposes into five layers each maintained by a small structured object and a conditioning mechanism
+(\S\ref{sec:stack}), and the long-horizon state that must persist is not a context window of pixels but a
+$\sim$40k-token screenplay and a film bible that fit, trivially, in one LLM context --- so the long-horizon engine
+is a language model, and the video, speech, and music models are short-horizon leaves. The observation that makes
+it work is that film grammar makes the cut a \emph{free reset}: the chunk-autoregressive drift the open literature
+fights over minute-long clips is bounded, in assembled film, to a single shot, so the games companion's
+persistence-beyond-the-horizon problem is dissolved rather than solved, and error accumulation splits into a real
+but shot-bounded intra-shot drift and a cross-shot \emph{dispersion} around fixed anchors that does not grow with
+length. The systems consequence is that a feature render is embarrassingly parallel --- independent shot-jobs over
+the measured heterogeneous ring~\cite{het}, with the bible as a shared prefix that prefix-caches across the job
+and idempotent content-hashed shots that make the render a resumable build DAG --- with near-linear speedup in
+nodes and a wall-clock that follows Eq.~\eqref{eq:parallel} for any per-shot time. We labelled that per-shot time,
+and every feature-length number, a projection, because no three-hour render is measured on our stack; we leaned
+only on measured substrate --- the ring, decode parity, the native dub's cosine $1.0$ and LSE-C $7.05$ --- and
+cited it to its hardware. And we set the film-specific open problems on top of the companions' agendas rather than
+duplicating them: perceptual narrative-coherence metrics, the shot-length/drift trade, musical-motif persistence,
+lip-sync for generated dialogue, and the rights and provenance of persistent synthetic identities. The through-
+line is one sentence: long-form media is not generated long, it is \emph{assembled} long, and the intelligence
+lives in the plan, the bible, and the schedule --- not in a model that holds three hours it never needs to hold.
+
+\begin{thebibliography}{99}
+\small
+
+% --- Series companions ---
+\bibitem{games} Hanzo AI --- ML Systems. \emph{The Frame Is the Token: Generative Videogames on a Native
+Inference Stack.} Games crossover in the native-inference series.
+\bibitem{het} Hanzo AI --- ML Systems. \emph{One Cluster, Every Vendor: Cross-Vendor Tensor-Parallel LLM
+Inference over Commodity Ethernet.} Distributed-inference companion (measured).
+\bibitem{latency} Hanzo AI --- ML Systems. \emph{The Latency Physics of Geo-Distributed Autoregressive Decode.}
+Distributed-inference companion (analytical).
+\bibitem{openproblems} Hanzo AI --- ML Systems. \emph{Open Problems in Heterogeneous Distributed Inference.}
+Distributed-inference companion (research agenda).
+\bibitem{backend} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: hanzo-engine at llama.cpp
+Decode Parity on Every Backend.} Paper 05 (measured).
+
+% --- Chunk-autoregressive video: forcing and anti-drift ---
+\bibitem{diffusionforcing} B.\ Chen, D.\ Mart\'i Monso, Y.\ Du, M.\ Simchowitz, R.\ Tedrake, V.\ Sitzmann.
+\emph{Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion.} arXiv:2407.01392.
+\bibitem{selfforcing} X.\ Huang, Z.\ Li, G.\ He, M.\ Zhou, E.\ Shechtman. \emph{Self Forcing: Bridging the
+Train-Test Gap in Autoregressive Video Diffusion.} arXiv:2506.08009.
+\bibitem{causalforcing} H.\ Zhu, M.\ Zhao, G.\ He, H.\ Su, C.\ Li, J.\ Zhu. \emph{Causal Forcing: Autoregressive
+Diffusion Distillation Done Right for High-Quality Real-Time Interactive Video Generation.} arXiv:2602.02214.
+\bibitem{oneforcing} J.\ Feng, J.\ Cui, Y.\ Ban, C.-J.\ Hsieh. \emph{One-Forcing: Towards Stable One-Step
+Autoregressive Video Generation.} arXiv:2605.23458.
+\bibitem{tethercache} Y.\ Meng, X.\ Luo, L.\ Li, W.\ Jiang, C.\ Gao, X.\ Chen, Y.\ Li, X.-P.\ Zhang.
+\emph{TetherCache: Stabilizing Autoregressive Long-Form Video Generation with Gated Recall and Trusted
+Alignment.} arXiv:2606.13035.
+\bibitem{framepack} L.\ Zhang, S.\ Cai, M.\ Li, G.\ Wetzstein, M.\ Agrawala. \emph{Frame Context Packing and
+Drift Prevention in Next-Frame-Prediction Video Diffusion Models (FramePack).} arXiv:2504.12626.
+\bibitem{rad} T.\ Chen, Z.\ Ding, A.\ Li, C.\ Zhang, Z.\ Xiao, Y.\ Wang, C.\ Jin. \emph{Recurrent Autoregressive
+Diffusion: Global Memory Meets Local Attention.} arXiv:2511.12940.
+\bibitem{worldplay} W.\ Sun, H.\ Zhang, H.\ Wang, J.\ Wu, Z.\ Wang, Z.\ Wang, Y.\ Wang, J.\ Zhang, T.\ Wang,
+C.\ Guo. \emph{WorldPlay: Towards Long-Term Geometric Consistency for Real-Time Interactive World Modeling.}
+arXiv:2512.14614.
+
+% --- Feature-scale and open long-video systems ---
+\bibitem{moviegen} A.\ Polyak, A.\ Zohar, A.\ Brown, et al.\ (Meta). \emph{Movie Gen: A Cast of Media Foundation
+Models.} arXiv:2410.13720.
+\bibitem{skyreels2} G.\ Chen, D.\ Lin, J.\ Yang, et al. \emph{SkyReels-V2: Infinite-length Film Generative
+Model.} arXiv:2504.13074. CC-BY-4.0.
+\bibitem{sora} OpenAI. \emph{Video Generation Models as World Simulators (Sora).} Technical report, 2024.
+(Closed; product.)
+\bibitem{wan} Wan Team, Alibaba Tongyi Lab. \emph{Wan: Open and Advanced Large-Scale Video Generative Models
+(Wan 2.2).} Apache-2.0.
+
+% --- Identity conditioning ---
+\bibitem{lora} E.\ J.\ Hu, Y.\ Shen, P.\ Wallis, Z.\ Allen-Zhu, Y.\ Li, S.\ Wang, L.\ Wang, W.\ Chen.
+\emph{LoRA: Low-Rank Adaptation of Large Language Models.} arXiv:2106.09685.
+\bibitem{dreambooth} N.\ Ruiz, Y.\ Li, V.\ Jampani, Y.\ Pritch, M.\ Rubinstein, K.\ Aberman. \emph{DreamBooth:
+Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation.} CVPR, 2023.
+\bibitem{ipadapter} H.\ Ye, J.\ Zhang, S.\ Liu, X.\ Han, W.\ Yang. \emph{IP-Adapter: Text Compatible Image
+Prompt Adapter for Text-to-Image Diffusion Models.} arXiv:2308.06721.
+
+% --- Music ---
+\bibitem{acestep} ACE Studio and StepFun. \emph{ACE-Step: A Step Towards Music Generation Foundation Model.}
+Apache-2.0.
+
+% --- Film statistics and provenance ---
+\bibitem{cutting} J.\ E.\ Cutting, J.\ E.\ DeLong, C.\ E.\ Nothelfer. \emph{Attention and the Evolution of
+Hollywood Film.} Psychological Science 21(3):440--447, 2010.
+\bibitem{c2pa} Coalition for Content Provenance and Authenticity. \emph{C2PA Technical Specification.} Content
+provenance standard.
+
+\end{thebibliography}
+
+\end{document}

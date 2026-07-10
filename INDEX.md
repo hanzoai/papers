@@ -95,6 +95,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-kms-secrets` | ✓ | `hanzo-kms-secrets.tex` |
 | `hanzo-ledger-finance` | ✓ | `hanzo-ledger-finance.tex` |
 | `hanzo-llm-gateway` | ✓ | `hanzo-llm-gateway/hanzo-llm-gateway.tex` |
+| `hanzo-longform-media` | ✓ | `hanzo-longform-media.tex` |
 | `hanzo-mcp-server` | ✓ | `hanzo-mcp-server/hanzo-mcp-server.tex` |
 | `hanzo-ml-framework` | ✓ | `hanzo-ml-framework/hanzo-ml-framework.tex` |
 | `hanzo-native-stack-thesis` | ✓ | `hanzo-native-stack-thesis.tex` |
@@ -214,4 +215,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `ZEN_WHITEPAPER_2025` | ✓ | `zen/ZEN_WHITEPAPER_2025.tex` |
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
-**Total**: 209 papers, 203 with compiled PDFs
+**Total**: 210 papers, 204 with compiled PDFs

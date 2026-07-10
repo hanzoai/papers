@@ -75,6 +75,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-formal-verification` | ✓ | `hanzo-formal-verification/hanzo-formal-verification.tex` |
 | `hanzo-fusion-is-composition` | ✓ | `hanzo-fusion-is-composition.tex` |
 | `hanzo-gateway-krakend` | ✓ | `hanzo-gateway-krakend.tex` |
+| `hanzo-generative-games` | ✓ | `hanzo-generative-games.tex` |
 | `hanzo-gpu-inference` | ✓ | `hanzo-gpu-inference/hanzo-gpu-inference.tex` |
 | `hanzo-harness-hacking` | ✓ | `hanzo-harness-hacking/hanzo-harness-hacking.tex` |
 | `hanzo-heterogeneous-distributed-inference` | ✓ | `hanzo-heterogeneous-distributed-inference.tex` |
@@ -213,4 +214,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `ZEN_WHITEPAPER_2025` | ✓ | `zen/ZEN_WHITEPAPER_2025.tex` |
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
-**Total**: 208 papers, 202 with compiled PDFs
+**Total**: 209 papers, 203 with compiled PDFs

@@ -1,0 +1,468 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\title{\textbf{One Cluster, Every Vendor:\\ Cross-Vendor Tensor-Parallel LLM Inference over Commodity Ethernet}}
+\author{Hanzo AI --- ML Systems}
+\date{Distributed companion to the \emph{One Source, Every Backend} series --- extends Paper 05 across the wire}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Real accelerator fleets are vendor-mixed: an AMD APU, an NVIDIA dev kit, and a Mac sit on the same
+desk, and no collective-communication library spans them --- NCCL is NVIDIA-only, RCCL is AMD-only, and
+neither will open a channel to the other. This paper reports a working result, with its limits stated
+plainly. One inference engine (\code{hanzo-engine}, Rust, one codebase, per-backend kernels) runs
+on three vendor-diverse accelerators --- AMD ROCm gfx1151 (a ``Strix Halo'' APU, node \emph{evo}), NVIDIA
+CUDA sm\_121 (a GB10 Blackwell, node \emph{spark}), and Apple Metal M4 Max (node \emph{dbc}). We make its
+Megatron-style tensor-parallel (TP) collectives \emph{vendor-agnostic} by host-staging every exchange
+--- \code{device}$\to$\code{CPU}$\to$\code{TCP}$\to$\code{CPU}$\to$\code{device} --- so any device that
+can copy to host storage can join the ring, which is exactly what NCCL/RCCL cannot do across a vendor
+boundary. On a two-node ring (\emph{evo} ROCm $+$ \emph{spark} CUDA) over a 2.5GbE direct link, the
+sharded engine \textbf{builds, connects, shards a \code{world\_size}$=$2 tensor-parallel model, and
+generates fully coherent multi-token output --- chain-of-thought and a correct answer --- across the
+AMD/NVIDIA boundary at 50.4~tok/s decode} (TTFT 0.09s, 213~tok/s prefill). To our knowledge this is the
+first reported cross-vendor (AMD$+$NVIDIA) tensor-parallel LLM inference over commodity ethernet in a
+single engine.
+
+We are equally explicit about the engineering, because the honest failures are the paper's most useful
+content. The socket-ring path had only ever been \emph{compiled}, never \emph{run} (only the NCCL path
+was exercised), and bringing it up cross-vendor surfaced four heterogeneity bugs --- a \code{len}$^2$
+byte-count overflow, a missing ROCm host-staging arm that meant the ring never even compiled for AMD, a
+10s handshake timeout that raced heterogeneous startup, and --- the subtle one that blocked coherent
+decode --- a \emph{heterogeneous-dtype-on-the-wire} hazard, where the ROCm rank auto-selects \code{f16}
+and the CUDA rank auto-selects \code{bf16} and each reinterpreted its neighbour's 16-bit words as the
+wrong floating-point layout, corrupting the reduction from the first layer. The cure is a canonical
+\code{f32} ring wire (a lossless superset of both) plus a \code{world\_size}$-$1 accumulating all-reduce
+correct for any \code{N}$\geq$2 and the removal of a spurious power-of-two world-size restriction; all
+four fixes are merged on \code{main}, and a same-vendor control (both ranks \code{f16}) matches the
+cross-vendor run token-for-token, isolating the wire dtype as the sole cross-vendor variable. The
+measured cost of the primitive is itself a result: 50.4~tok/s is $\approx$3.3$\times$ slower than the same
+model single-node (168~tok/s), and the gap is \emph{all} synchronization --- an all-reduce every layer,
+over the wire. That measured tax is the empirical case for \textbf{pipeline parallelism} --- contiguous
+layer ranges, activations-only on the wire (\code{O(nodes)} hops, not \code{O(layers)} all-reduces),
+format-agnostic, one generation loop driving stateless workers --- as the structurally better primitive
+for heterogeneous clusters: the numeric fixes made TP \emph{correct}, not well-matched. Three residuals
+stay honestly open, and we develop them, with five further problems, as a research agenda in the
+companion~\cite{openproblems}: the two ranks still sample independently from their own-dtype logits (a
+near-tie argmax can diverge and desync the KV caches), the CUDA rank must run graphless to stay lockstep
+with the graphless ROCm rank, and TP is still coupled to the dequantized (safetensors) weight path.
+\end{abstract}
+
+\section{The problem: fleets are vendor-mixed, and the collective libraries are not}
+\label{sec:problem}
+
+The single-node premise of this series is that the interesting inference target is a commodity box a
+customer already owns~\cite{backend}. The multi-node reality is that they own \emph{several}, and not
+from one vendor. A team that bought an AMD ``Strix Halo'' mini-PC last quarter, a Grace-Blackwell dev kit
+this quarter, and codes on a MacBook has three capable accelerators totalling well over a hundred
+gigabytes of unified memory --- enough to hold a model no single one of them can --- sitting idle on a
+LAN. The obstacle is not the models and not the math. It is that \emph{the collective-communication
+layer is single-vendor by construction}.
+
+Tensor parallelism~\cite{megatron} shards each weight matrix across ranks and, twice per transformer
+block (after attention, after the MLP), performs an \code{all\_reduce} to sum the partial results back
+into a full activation. That \code{all\_reduce} is the whole game, and in practice it is delegated to a
+vendor library: \textbf{NCCL}~\cite{nccl} on NVIDIA, \textbf{RCCL}~\cite{rccl} on AMD. Both are excellent
+and both are closed at the vendor boundary: NCCL speaks to NVIDIA GPUs over NVLink/PCIe/GPUDirect and
+has no concept of an AMD peer; RCCL is the symmetric mirror. There is no NCCL$\leftrightarrow$RCCL
+channel, no cross-vendor GPUDirect, and no shared handle either side will accept. So the textbook path to
+running one model across \emph{evo} and \emph{spark} together does not merely underperform --- it does
+not exist.
+
+The engine already dodges the \emph{first} half of this problem. \code{hanzo-engine} is one Rust codebase
+that lowers to CUDA, ROCm, Metal, Vulkan, and CPU behind a single model loader, reaching \code{llama.cpp}
+decode parity on all three vendors from that one build~\cite{backend}; the kernel layer that makes ``one
+source, every backend'' hold is the subject of the companion DSL papers~\cite{umbrella,fuse,oracle}. What
+was missing is the \emph{second} half: a way for those per-vendor engines to talk to \emph{each other}
+inside one cluster. This paper builds that channel, runs it across a vendor boundary for the first time,
+and reports --- without varnish --- exactly how far it gets and what it cost to get there.
+
+\section{The design: a host-staged socket ring makes the collective vendor-agnostic}
+\label{sec:design}
+
+The engine carries a unified \code{Comm} abstraction with three backends behind one enum: \code{Nccl}
+(the fast same-vendor NVIDIA path), \code{Ring} (a socket-based collective), and \code{Dummy}
+(\code{world\_size}$=$1). The idea that makes cross-vendor work possible is in the \code{Ring} backend,
+and it is deliberately humble: \textbf{stage every tensor through host memory and move the bytes over
+TCP.}
+
+Concretely, a ring \code{sum\_all\_reduce} does not touch a vendor collective at all. It pulls the
+tensor's storage to the CPU, converts it to a canonical \code{f32} payload, exchanges the bytes with its
+ring neighbours over ordinary TCP sockets, sums in \code{f32}, and copies the reduced result back to the
+device in its native dtype (Listing~\ref{lst:stage}). The single load-bearing property is that the
+exchange happens in \code{CpuStorage}, which \emph{every} backend can produce --- CUDA, Metal, and ROCm
+each implement \code{to\_cpu\_storage()}. The device that produced the tensor is irrelevant by the time
+the bytes reach the socket. \emph{Why} the wire dtype is a canonical \code{f32} rather than the raw
+device bytes --- the difference between coherent and garbage output across vendors --- is the subject of
+\S\ref{sec:rootcause}; here it is simply the shipped design.
+
+\begin{lstlisting}[language=Rust,caption={The vendor-agnostic collective, condensed from the shipping
+code. The reduce goes device$\to$host$\to$canonical \code{f32}$\to$TCP$\to$\code{f32} sum$\to$device; the
+\code{match} over \code{Storage} is the only place the backend is named, and every arm lands in the same
+\code{CpuStorage}. The \code{cpu\_to\_f32} stage is what makes an \code{f16} rank and a \code{bf16} rank
+agree (\S\ref{sec:rootcause}). NCCL, by contrast, would keep the whole exchange on-device and refuse a
+foreign-vendor peer.},label={lst:stage}]
+fn sum_all_reduce(&self, xs: &Tensor) -> Result<Tensor> {
+    let storage = xs.storage_and_layout().0;
+    let host = match &*storage {              // device -> host (any backend)
+        Storage::Cpu(s)   => s.clone(),
+        Storage::Cuda(s)  => s.to_cpu_storage()?,
+        Storage::Metal(s) => s.to_cpu_storage()?,
+        #[cfg(feature = "rocm")]
+        Storage::Rocm(s)  => s.to_cpu_storage()?, // was missing: ring never built for AMD (Bug 2)
+    };
+    let wire = cpu_to_f32(&host)?;            // CANONICAL wire dtype: f16|bf16|f32 -> f32
+    let sum  = self.ring_exchange(&wire, xs.dims())?; // world_size-1 accumulating steps, sum in f32
+    Tensor::from_slice(&sum, xs.dims(), xs.device())? // host -> device
+        .to_dtype(xs.dtype())                 // back to this rank's native compute dtype
+}
+\end{lstlisting}
+
+This is not free. NCCL keeps the reduction on-device and rides NVLink; the host-staged ring pays two
+extra device$\leftrightarrow$host copies per collective, a widening cast to \code{f32}, and then rides a
+2.5GbE link whose measured goodput is $\approx$280~MB/s (\S\ref{sec:repro}). That is the correct trade for
+the problem: we spend bandwidth to buy \emph{vendor-agnosticism}, because the alternative on a mixed fleet
+is not a faster collective, it is \emph{no} collective. The ring is selected purely by configuration ---
+\code{use\_ring()} is true when the \code{ring} feature is built and a \code{RING\_CONFIG} path is present
+in the environment (\S\ref{sec:repro}) --- so the same engine binary is a single-node server, an NCCL
+rank, or a socket-ring rank depending only on how it is launched.
+
+\section{Compiles $\ne$ runs: an unexercised path was broken three ways}
+\label{sec:compiles}
+
+Here is the lesson that generalizes past this codebase. \emph{The ring path had been written, had type-
+checked, had shipped in every build for months --- and had never once been run.} All multi-GPU testing
+had gone through NCCL (the same-vendor path), so the socket ring was dead code that happened to compile.
+The first time it was asked to carry a real tensor across a real vendor boundary, it failed three
+separate ways, each a different species of the gap between ``the compiler accepted it'' and ``it does the
+thing.'' All three are fixed on \code{main} (commit \code{63cc4c7ac}); the fourth, subtler failure ---
+visible only once the generated tokens came out wrong --- is \S\ref{sec:rootcause}.
+
+\paragraph{Bug 1 --- a \code{len}$^2$ byte count (a logic error the types could not catch).}
+The wire code computed its transfer size as
+\begin{center}
+\code{let nbytes = x.len() * std::mem::size\_of\_val(x);}
+\end{center}
+This looks reasonable and is badly wrong. For a slice \code{x:\ \&[T]}, \code{size\_of\_val(x)} is
+\emph{already} the size of the whole referent --- \code{x.len()}\,$\times$\,\code{size\_of::<T>()} --- so
+multiplying by \code{x.len()} again yields \code{len}$^2$\,$\times$\,\code{elem\_size}, overshooting the
+true byte count by a factor of \code{len}. The subsequent \code{from\_raw\_parts(ptr, nbytes)} then
+fabricates a byte slice spanning far past the end of the allocation, and \code{write\_all} walks off the
+buffer and hits \code{EFAULT}. It is invisible for a one-element tensor (\code{len}$^2 =$ \code{len}) and
+fatal for every real activation. The fix is one token --- delete the \code{x.len()\ *} --- but the point
+is that the type system was content the entire time: both operands are \code{usize}, the product is a
+\code{usize}, and the meaning is nonsense. Only \emph{running} it with \code{len}$>$1 reveals it.
+
+\paragraph{Bug 2 --- the ring never compiled for AMD (a hole hidden by a feature flag).}
+The device$\to$host \code{match} in Listing~\ref{lst:stage} had arms for \code{Cpu}, \code{Cuda}, and
+\code{Metal} but \emph{not} \code{Rocm}. Because \code{Storage::Rocm} only exists when the \code{rocm}
+feature is enabled, and no one had ever built \code{ring} $+$ \code{rocm} together, the non-exhaustive
+\code{match} was never forced into existence. The moment you try to build the one configuration a
+heterogeneous ROCm$+$CUDA cluster needs, it fails to compile. The fix adds the two
+\code{\#[cfg(feature = "rocm")]} arms (one in \code{sum\_all\_reduce}, one in \code{all\_gather}) that
+stage a ROCm tensor to host exactly like the others. This is the subtler lesson: a feature-gated code
+path is not merely untested, it may be \emph{unbuilt}, and a green CI that never enables that flag
+combination proves nothing about it.
+
+\paragraph{Bug 3 --- a handshake that assumed both nodes were the same speed.}
+The ring's neighbour-connect loop gave up after 10 seconds. On a homogeneous cluster every rank boots in
+lockstep and 10s is generous. On a \emph{heterogeneous} cluster the nodes do not load at the same rate ---
+a Blackwell dev kit and an APU parse weights, warm kernels, and reach the barrier at visibly different
+times --- so the faster node would time out waiting for the slower one and abort the whole ring. Raising
+the timeout to 120s (and matching the panic message) lets asynchronous, uneven startup settle. The
+assumption ``all ranks are interchangeable, so they arrive together'' is exactly the kind of invariant
+that is silently true on one vendor and silently false across three.
+
+None of these three is deep. That is the message. A distributed path can be well-typed, code-reviewed,
+and shipped, and still be dead on arrival in three independent ways, because ``it compiles'' certifies
+none of the things that actually matter at run time --- the arithmetic of a byte count, the existence of a
+match arm under a flag nobody set, or a timing assumption baked into a constant. And a fourth bug, subtler
+than all three and invisible until the generated tokens themselves came out wrong, waited past these; it
+is the root cause of cross-vendor incoherence, and its fix is what turns prefill into coherent decode
+(\S\ref{sec:rootcause}).
+
+\section{Result: coherent decode across the AMD/NVIDIA boundary}
+\label{sec:result}
+
+With the four heterogeneity bugs fixed --- three mechanical (\S\ref{sec:compiles}), one numeric
+(\S\ref{sec:rootcause}) --- the cross-vendor ring generates coherent output. On a two-node ring ---
+\emph{evo} (AMD ROCm gfx1151) as rank~0, \emph{spark} (NVIDIA CUDA sm\_121) as rank~1 --- connected by a
+2.5GbE direct cable, the sharded engine:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item \textbf{builds} with \code{ring} $+$ \code{rocm} on the AMD node and \code{ring} $+$ \code{cuda} on
+the NVIDIA node (Bug~2 was the blocker);
+\item \textbf{connects} the ring --- each rank binds its listen port, dials its right neighbour, and
+accepts its left, the handshake surviving the uneven boot (Bug~3);
+\item \textbf{shards} a Qwen3-0.6B at \code{world\_size}$=$2, each node holding half of every parallelized
+weight matrix via the \code{ColumnParallelLayer}/\code{RowParallelLayer} split; and
+\item \textbf{decodes coherently} --- running the host-staged \code{f32} \code{all\_reduce} across the
+vendor boundary at every layer --- emitting a chain-of-thought and a correct final answer in lockstep, at
+\textbf{50.4~tok/s decode} (TTFT 0.09s, 213~tok/s prefill).
+\end{enumerate}
+
+The two ranks run \emph{different} 16-bit compute dtypes --- \emph{evo} in \code{f16}, \emph{spark} in
+\code{bf16} (\S\ref{sec:rootcause}) --- and still agree, because the reduction crosses the wire in
+canonical \code{f32}. To our knowledge this is the first reported cross-vendor (AMD$+$NVIDIA)
+tensor-parallel LLM inference over commodity ethernet in a single engine: two different-vendor
+accelerators jointly executing one tensor-parallel forward \emph{and} autoregressive decode, over a
+commodity cable, with no shared-vendor collective (NCCL/RCCL) between them --- the \code{all\_reduce} that
+both libraries refuse across the boundary runs to completion on plain TCP.
+
+\paragraph{Controls isolate the wire, not the model.} A \emph{same}-vendor control --- both ranks forced
+to \code{f16}, so the raw-bytes shortcut and the canonical-\code{f32} wire coincide --- produces the same
+tokens as the cross-vendor run, which pins the dtype wire (\S\ref{sec:rootcause}), not the ring
+mechanism, as the only thing heterogeneity changed. A \emph{single}-node control --- the same Qwen3-0.6B
+on \emph{spark} alone --- generates the same answer at 168~tok/s decode and 464~tok/s prefill. So the
+cross-vendor 50.4~tok/s is $\approx$3.3$\times$ slower than single-node decode, and the entire gap is
+synchronization: a host-staged \code{all\_reduce} every layer, over the wire, is the only added work. The
+model is coherent and the kernels are at parity; what the ring costs is the wire.
+
+\section{Root cause and fix: the heterogeneous-dtype-on-the-wire hazard}
+\label{sec:rootcause}
+
+The fourth bug was invisible until the tokens themselves came out wrong, and it is the one worth dwelling
+on, because it is the trap waiting in every host-staged cross-vendor collective. We state the cause, the
+fix, and the residuals the fix leaves.
+
+\subsection{The cause: two ranks legitimately pick different 16-bit formats}
+\label{sec:dtype}
+
+The engine picks its compute dtype \emph{per node} from the \emph{local} device. The selector
+(\code{determine\_auto\_dtype\_all}) returns \code{f16} when it sees a ROCm gfx1151 device --- RDNA3.5 has
+fast \code{f16} matrix cores (WMMA) but no fast \code{bf16} matmul --- and \code{bf16} for the CUDA
+Blackwell path. So on a mixed ring the two ranks legitimately and independently choose \emph{different}
+16-bit formats: \emph{evo} runs the model in \code{f16}, \emph{spark} in \code{bf16}. The original
+host-staged ring shipped \emph{raw device-dtype bytes} and the receiver reinterpreted them as \emph{its
+own} local dtype. Since \code{f16} and \code{bf16} share a 16-bit container but split it differently ---
+5-bit exponent / 10-bit mantissa versus 8-bit exponent / 7-bit mantissa --- every value crossing the
+boundary was silently re-read with the wrong exponent/mantissa layout. The bit pattern was intact; its
+\emph{interpretation} was wrong, which is worse, because nothing errored: the \code{all\_reduce} summed
+correctly-typed nonsense into correctly-typed nonsense, corrupting activations from the first layer.
+Notably, a \emph{same}-vendor ring never exposed this --- both ranks pick the same dtype and the raw-bytes
+shortcut accidentally works --- which is precisely why the hazard survived months of same-vendor NCCL and
+ring testing until the first cross-vendor run, and why the same-vendor control (\S\ref{sec:result}) is the
+clean isolator.
+
+\subsection{The fix: a canonical \code{f32} wire and an \code{N}-node accumulating reduce}
+\label{sec:fix}
+
+The remedy is structural, not a patch: the wire needs a \emph{canonical} dtype both ranks agree on
+independent of their local compute dtype. \code{f32} is the natural choice --- a lossless superset of both
+\code{f16} and \code{bf16}, and higher-precision accumulation for the reduction besides. The shipped
+reduce (Listing~\ref{lst:stage}) stages each device tensor to host, converts to \code{f32}
+(\code{cpu\_to\_f32}), exchanges and sums in \code{f32}, and converts the result back to the receiver's
+native device dtype. The 16-bit formats now meet only \emph{inside} each node; the wire is always
+\code{f32}, so both ranks reduce the same values bit-for-bit regardless of vendor, and the reduction is
+carried out in the CPU-\code{f32} path with a canonical tie-break so a ROCm box and a CUDA box do not
+diverge on rounding order.
+
+The same pass closed a latent correctness bound. The original \code{sum\_all\_reduce} performed a
+\emph{single} write-right / read-left exchange and summed the neighbour's shard --- a complete all-reduce
+for two ranks, but for \code{N}$>$2 rank $i$ only ever incorporates rank $i{-}1$, so ranks $i{-}2,
+i{-}3,\dots$ never reach it. The fix replaces the single exchange with the textbook \code{world\_size}$-$1
+accumulating ring (each rank forwards and sums its running shard for \code{N}$-$1 steps), correct for any
+\code{N}$\geq$2, and removes a spurious power-of-two world-size restriction inherited from the NCCL path
+(\code{is\_power\_of\_two}) that had made four the smallest cluster past two nodes the ring would even
+admit. The all-reduce is now algorithmically correct for any \code{N}$\geq$2; the \emph{measured}
+cross-vendor demonstration in this paper is the two-node \emph{evo}$+$\emph{spark} ring, and multi-node
+(\code{N}$>$2, e.g.\ adding \emph{dbc}/Metal) cross-vendor runs are the natural next validation, not a
+claimed measurement here.
+
+\subsection{Residuals: three problems the fix leaves open}
+\label{sec:residual}
+
+Coherent cross-vendor decode holds, but three residuals bound the result. We state each crisply and
+develop all three, alongside five further problems, as a research agenda in the companion~\cite{openproblems}.
+
+\paragraph{Sampling divergence (a determinism boundary).} The \emph{reduced activations} now agree
+bit-for-bit, but each rank still computes its final logits on its own device in its own 16-bit dtype and
+samples \emph{locally}. In the demonstrated runs the argmax stays in lockstep; a near-argmax-tie could in
+principle resolve differently under \code{f16} versus \code{bf16} rounding and desync the per-rank KV
+caches. The robust cure --- the head rank samples and broadcasts the token id, so every rank advances on
+the same token --- removes the divergence by construction; it is a determinism-boundary problem in
+replicated-state distributed inference, not a numeric one.
+
+\paragraph{Graphless lockstep (an execution-symmetry assumption).} The two ranks run \emph{two}
+generation loops kept in phase by the per-token \code{all\_reduce} barrier. To stay in phase the CUDA rank
+must run \emph{graphless}, matching the graphless ROCm rank and forgoing the $\approx$1.5$\times$ decode
+speedup CUDA-graph capture would give~\cite{backend}. Decode is coherent this way, but per-token
+cross-node lockstep between nodes that legitimately want different execution strategies is fragile --- an
+argument for pipeline parallelism (\S\ref{sec:pipeline}), where each node's execution is a purely local
+choice, rather than a bug to patch.
+
+\paragraph{Format coupling (a sharding limitation).} The TP collectives are wired through the
+non-quantized (safetensors) model path --- \code{ColumnParallelLayer} and \code{RowParallelLayer} live in
+the normal model definitions --- and \emph{not} through the GGUF quantized path. So even with the
+numerics correct, TP cannot yet shard the very block-quantized formats that make edge inference fit in
+commodity memory. Quant-aware sharding (splitting on superblock boundaries without a dequant--requant
+loss) is an open problem~\cite{openproblems}; pipeline parallelism sidesteps it (\S\ref{sec:pipeline})
+because activations, not weights, cross the seam.
+
+\section{The case for pipeline parallelism}
+\label{sec:pipeline}
+
+The dtype hazard and the \code{N}-node reduce are fixed, so the tensor-parallel ring on \code{main} is now
+\emph{correct}. But correct is not the same as well-matched, and the residuals of \S\ref{sec:residual}
+together with the measured synchronization tax point the same way. Tensor parallelism was built for a
+homogeneous, tightly-coupled, high-bandwidth, single-vendor machine, and every place it strains on our
+cluster is a place it assumes that machine: a per-layer all-reduce assumes cheap bandwidth
+(\S\ref{sec:design}) --- the measured $\approx$3.3$\times$ decode tax is exactly this bill; per-token
+lockstep assumes symmetric execution (\S\ref{sec:residual}); the parallel layers assume dequantized
+weights (\S\ref{sec:residual}). Fixing the numerics made the primitive correct; it did not make it the
+right primitive for a heterogeneous fleet.
+
+\textbf{Pipeline parallelism} inverts the mismatch. Partition the model into contiguous \emph{layer
+ranges}, one range per node; a token's hidden state flows through node~0's layers, crosses the wire once
+to node~1, flows through its layers, and so on. The consequences line up against the strains almost
+one-to-one:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Activations-only on the wire.} What crosses a node boundary is a single hidden-state tensor,
+once per boundary, forward --- not an \code{all\_reduce} of every layer's output twice per block. On a
+$\approx$280~MB/s link that is the difference between a per-token tax of \code{O(1)} small transfers and
+\code{O(layers)} full-width collectives; it is the same $\approx$3.3$\times$ tax converted from
+per-layer to per-node.
+\item \textbf{One canonical cast, not a per-op reinterpretation.} The activation is a single tensor at
+each boundary, so agreeing on one wire dtype (\S\ref{sec:dtype}) is one cast at one seam per node, not a
+property every collective must carry. The heterogeneous-dtype hazard shrinks from pervasive to pointwise.
+\item \textbf{Format-agnostic.} Activations are just floats; the boundary does not know or care whether the
+node that produced them ran a safetensors or a GGUF model, on which vendor, with which kernel. Pipeline
+parallelism sidesteps the format coupling of \S\ref{sec:residual} for free, so a mixed cluster can run
+quantized shards.
+\item \textbf{One generation loop, stateless workers.} The head node runs the single sampling/generation
+loop; the others are stateless layer-executors that receive an activation, run their layers (holding only
+their own KV cache), and forward. There is no second generation loop to keep in phase and no cross-node
+per-token lockstep, so the CUDA-graph asymmetry (\S\ref{sec:residual}) becomes a purely \emph{local}
+choice --- each node may capture graphs for its own layers or not, and nobody desynchronizes --- and the
+sampling divergence collapses to the head's single sampler.
+\end{itemize}
+
+Pipeline parallelism is not a free lunch --- for a single decode stream it adds pipeline-bubble latency
+proportional to the number of stages, and throughput needs micro-batching to fill the
+pipe~\cite{gpipe}. Its wide-area latency budget --- one network hop per stage on the critical path of
+every token --- is the subject of the companion latency analysis~\cite{latency}, which shows the budget
+is spendable precisely because pipelining overlaps transport under compute and speculative decoding
+amortizes the round-trip. But its \emph{coupling} to the cluster is minimal and its assumptions are the
+ones a heterogeneous fleet can actually honour. The right primitive for one-model-across-many-vendors is
+the one that puts the least on the wire and demands the least agreement between ranks, and on both axes
+that is pipeline, not tensor, parallelism. The cross-vendor decode result (\S\ref{sec:result}) proves the
+\emph{channel} works across the boundary; the argument here is about which \emph{traffic pattern} to run
+over it, and it is under construction in the same codebase.
+
+\section{Reproducibility}
+\label{sec:repro}
+
+\paragraph{Hardware and link.} \emph{evo}: AMD Ryzen AI Max+ 395 ``Strix Halo,'' Radeon 8060S iGPU
+(gfx1151, RDNA3.5), ROCm. \emph{spark}: NVIDIA GB10 Grace-Blackwell (sm\_121), CUDA. \emph{dbc}: Apple
+M4 Max, Metal. \emph{evo}$\leftrightarrow$\emph{spark} is a direct 2.5GbE cable (static
+\code{192.168.77.0/24}), whose measured sustained-TCP goodput is $\approx$280~MB/s ($\approx$2.24~Gbit/s);
+its wide-area latency budget is analysed in the companion~\cite{latency}. The three-node substrate is a
+wired ethernet mesh with \emph{spark} kernel-IP-forwarding the closing \emph{evo}$\leftrightarrow$\emph{dbc}
+edge, so no switch or router is required.
+
+\paragraph{Build.} Each node builds the \emph{same} engine source with its own backend feature plus
+\code{ring}: \code{--features "cuda ring"} on \emph{spark}, \code{--features "rocm ring"} on \emph{evo}.
+The three mechanical fixes are at commit \code{63cc4c7ac}; the canonical-\code{f32} wire and the
+\code{world\_size}$-$1 reduce are on \code{main} (\code{hanzo-quant/src/distributed/},
+\code{hanzo-engine/src/ops.rs}).
+
+\paragraph{Ring configuration.} The ring backend is activated by pointing \code{RING\_CONFIG} at a JSON
+file per node; rank $r$ binds \code{port} and dials its right neighbour at
+\code{right\_ip:right\_port}. A two-node \emph{evo}(rank~0)$+$\emph{spark}(rank~1) ring:
+
+\begin{lstlisting}[language=Rust,caption={\code{RING\_CONFIG} for a 2-node cross-vendor ring. Rank~0
+(evo) listens on 9000 and dials spark; rank~1 (spark) listens on 9001 and dials back to evo, closing the
+ring.},label={lst:ring}]
+// evo  (rank 0, 192.168.77.1):  RING_CONFIG=/etc/hanzo/ring0.json
+{ "master_ip": null,           "master_port": 9002,
+  "port": 9000, "right_ip": "192.168.77.2", "right_port": 9001,
+  "rank": 0, "world_size": 2 }
+
+// spark (rank 1, 192.168.77.2):  RING_CONFIG=/etc/hanzo/ring1.json
+{ "master_ip": "192.168.77.1", "master_port": 9002,
+  "port": 9001, "right_ip": "192.168.77.1", "right_port": 9000,
+  "rank": 1, "world_size": 2 }
+\end{lstlisting}
+
+\noindent A \code{hanzo cluster init} / \code{hanzo cluster join <token>} pair wraps this JSON in a
+scan-to-join token (base58 of the topology plus a terminal QR code) so the operator never hand-writes the
+ports; the token bakes in the peer list and each worker self-assigns its rank. Both ranks launch the
+ordinary \code{hanzo serve} with \code{RING\_CONFIG} set and the same model.
+
+\paragraph{What is measured vs.\ open.} Measured on the real 2.5GbE link: cross-vendor build, connect,
+\code{world\_size}$=$2 shard, and coherent multi-token \emph{decode} across the AMD/NVIDIA boundary
+(50.4~tok/s decode, TTFT 0.09s, 213~tok/s prefill on Qwen3-0.6B); the same-vendor \code{f16}$+$\code{f16}
+control matching token-for-token; and the single-node \emph{spark} control (168~tok/s decode, 464~tok/s
+prefill). Open (\S\ref{sec:residual}, \cite{openproblems}): head-broadcast sampling to close the
+determinism boundary, \code{N}$>$2 cross-vendor runs, GGUF-path TP, and the migration to pipeline
+parallelism. No projected or synthetic number appears in this paper.
+
+\section{Related work and contribution}
+\label{sec:related}
+
+Tensor parallelism is Megatron-LM~\cite{megatron}; pipeline parallelism is GPipe and its
+successors~\cite{gpipe}; the on-device collectives are NCCL~\cite{nccl} and RCCL~\cite{rccl}, each
+single-vendor by design. Distributed inference over commodity/heterogeneous networks has been explored
+most prominently by Petals~\cite{petals}, which runs pipeline-parallel shards across volunteer nodes over
+the public internet --- close in spirit to \S\ref{sec:pipeline}, and evidence that the activations-only
+pattern is the one that survives a slow, loose network. What we add is narrow and, to our knowledge, not
+previously shown: a \emph{single} inference engine, one source lowered to three vendors' kernels, running
+a \emph{tensor-parallel} forward \emph{and coherent decode} across an \emph{AMD$+$NVIDIA} boundary on
+\emph{commodity ethernet} with \emph{no} shared-vendor collective --- and an unusually explicit account of
+the failure modes that a host-staged cross-vendor collective exposes (the \code{len}$^2$ overflow, the
+unbuilt ROCm arm, the startup-race timeout, and the heterogeneous-dtype wire). The design contribution is
+the observation, made concrete by those failures, that heterogeneity is a stress test for homogeneity
+assumptions, and that pipeline parallelism minimizes exactly the assumptions that break. This paper is the
+distributed extension of the ``one source, every backend'' thesis~\cite{backend,umbrella}: having made one
+engine run on every backend, we make those backends run in one cluster. Two companions extend the arc: the
+latency-physics analysis~\cite{latency} carries the wide-area budget for \S\ref{sec:pipeline}, and the
+three-plane compute-fabric blueprint~\cite{consensus} turns the trusted-LAN ring into a permissionless,
+consensus-managed, PQ-authenticated network. The open questions this result raises are collected as a
+research agenda in the open-problems companion~\cite{openproblems}.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+No collective library crosses a vendor boundary, so a mixed AMD/NVIDIA/Apple fleet cannot run one model
+together through the standard path. Host-staging the collective through CPU memory and TCP makes the
+channel vendor-agnostic, and on that channel one engine --- built from a single source for three vendors'
+kernels --- shards a model \code{world\_size}$=$2 across an AMD/NVIDIA boundary over a 2.5GbE cable and
+\emph{decodes coherently} at 50.4~tok/s, which we believe is a first. The road to that result ran through
+three bugs in a path that compiled for months but had never run --- a reminder that ``it builds''
+certifies almost nothing about a distributed system --- and one deeper hazard, a heterogeneous-dtype wire
+that a same-vendor cluster can never expose, cured by a canonical \code{f32} payload and an accumulating
+\code{world\_size}$-$1 all-reduce correct for any \code{N}$\geq$2. The measured $\approx$3.3$\times$
+synchronization tax, and the residuals that remain --- local sampling that can diverge at a near-tie,
+graphless lockstep between two generation loops, and TP's coupling to the dequantized weight path --- all
+point one way: toward pipeline parallelism, whose activations-only, one-generation-loop, format-agnostic
+shape asks of a heterogeneous cluster only what such a cluster can actually give. The channel is open
+across the boundary and coherent over it; the companions drive the right traffic~\cite{latency}, harden
+it into a network~\cite{consensus}, and enumerate what is left to solve~\cite{openproblems}.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{backend} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: Measured AMD, NVIDIA,
+and Apple Performance, and hanzo-engine at llama.cpp Decode Parity on Every Backend.} Paper 05.
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL --- Thesis and Guided
+Tour.} Paper 07 (umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{latency} Hanzo AI --- ML Systems. \emph{The Latency Physics of Geo-Distributed Autoregressive
+Decode.} Distributed-inference companion (analytical).
+\bibitem{consensus} Hanzo AI --- ML Systems. \emph{The Three-Plane Compute Fabric: Consensus-Managed,
+ZAP-Transported Decentralized AI Inference.} Distributed-inference companion (architecture).
+\bibitem{openproblems} Hanzo AI --- ML Systems. \emph{Open Problems in Heterogeneous Distributed
+Inference.} Distributed-inference companion (research agenda).
+\bibitem{megatron} M.\ Shoeybi, M.\ Patwary, R.\ Puri, P.\ LeGresley, J.\ Casper, B.\ Catanzaro.
+\emph{Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.} arXiv:1909.08053, 2019.
+\bibitem{gpipe} Y.\ Huang et al. \emph{GPipe: Efficient Training of Giant Neural Networks using Pipeline
+Parallelism.} NeurIPS, 2019.
+\bibitem{petals} A.\ Borzunov et al. \emph{Petals: Collaborative Inference and Fine-tuning of Large
+Models.} arXiv:2209.01188, 2022.
+\bibitem{nccl} NVIDIA. \emph{NCCL: NVIDIA Collective Communications Library.}
+\bibitem{rccl} AMD. \emph{RCCL: ROCm Communication Collectives Library.}
+\end{thebibliography}
+
+\end{document}

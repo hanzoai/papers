@@ -1,0 +1,714 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+\usepackage{amsthm}
+
+\newtheorem{proposition}{Proposition}
+
+% Honesty labels: distinguish what is built from what is designed.
+\newcommand{\built}{\textcolor{str}{\small\textbf{[built]}}}
+\newcommand{\partialb}{\textcolor{kw}{\small\textbf{[partial]}}}
+\newcommand{\design}{\textcolor{cmt}{\small\textbf{[design]}}}
+
+\title{\textbf{The Three-Plane Compute Fabric:\\
+Consensus-Managed, ZAP-Transported\\ Decentralized AI Inference}}
+\author{Hanzo AI --- ML Systems}
+\date{Architecture Blueprint --- \emph{One Source, Every Backend} series, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A heterogeneous GPU fleet already runs a single model across ROCm, CUDA, and Metal
+today: the Hanzo engine's socket-ring shards a model tensor- and pipeline-parallel across
+mismatched accelerators over a canonical \code{f32} wire, and a \code{hanzo cluster}
+command onboards a worker by scanning a QR token. But that ring is configured by a static
+JSON file handed out of band, and its bytes cross the wire as \emph{plaintext TCP} between
+nodes that never authenticate each other. It is a LAN appliance, not a network. This paper
+is the blueprint for the missing two-thirds: turning that ring into a permissionless,
+byzantine-fault-tolerant AI inference \emph{network} that any developer --- or any
+public-cloud GPU miner --- can join and be paid for useful work. The thesis is one of
+\emph{decomplection}: a serving cluster has three concerns that monolithic stacks braid
+together and we hold apart as three orthogonal, independently-complete planes. The
+\textbf{control plane} is a Lux \emph{Quasar} consensus chain: membership, permissionless
+miner admission, layer placement, and config distribution become BFT-agreed state, with the
+Photon committee-selection primitive (Fisher--Yates over a luminance-weighted population)
+reused to sample GPU nodes and luminance re-bound from consensus-vote success to
+\emph{validated inference contribution}. The \textbf{transport} is \emph{ZAP}, the Lux
+zero-copy wire, whose post-quantum handshake (\code{WrapPQ} over an authenticated
+\code{Session} exposing a verified 32-byte \code{PeerID}) carries \emph{both} consensus
+control messages \emph{and} tensor activations over one PQ-authenticated channel --- retiring
+the plaintext ring sockets and converting the QR join token from a bearer secret into a
+handshake credential. The \textbf{data plane} is the existing inference ring, unchanged in
+kind: it receives its topology from consensus instead of a JSON file and moves its tensors
+over ZAP instead of raw TCP. We are scrupulous about the built/designed line. Built and
+cited to source: the cross-vendor ring, the \code{hanzo cluster} scan-to-join CLI, the ZAP
+Go wire with its PQ handshake, the Quasar engine with Photon/Wave/Focus and BLS$+$Pulsar$+$ML-DSA
+threshold signing, and the ZAP measurements ($17\times$ serialization and $345\times$ parse
+versus JSON-RPC, $\sim$$4.5\times$ versus gRPC with zero marshal/unmarshal). Designed, and
+labelled as such: consensus-driven membership, the ZAP-swapped ring transport, miner
+admission, and result verification by threshold-signing over inference outputs. No benchmark
+here is invented; every measured number is attributed to the code that produced it. The
+contribution is the architecture and its honest status, offered as a blueprint the wider
+AI-infrastructure community can build on.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The dominant shape of a model-serving stack is a monolith: one operator, one datacenter, one
+process tree that owns scheduling, transport, and tensor math all at once. vLLM, TGI, and
+Triton each fuse ``who is in the cluster,'' ``how bytes move between ranks,'' and ``what the
+GPUs compute'' into a single trusted binary on a private network. That fusion is fine when the
+operator owns every GPU. It fails the moment the fleet is \emph{heterogeneous} (a ROCm mini-PC,
+a rented CUDA instance, an Apple laptop), \emph{permissionless} (a stranger's GPU wants to
+contribute and be paid), or \emph{untrusted} (the node holding your activations is not yours).
+None of those three failures is a math problem; each is a \emph{concerns} problem. The cluster
+braids together things that want to be separate.
+
+This paper takes the opposite stance, the one our engineering culture states as a law: one and
+only one way to do everything, composable and orthogonal. A decentralized inference cluster has
+exactly three concerns, and we give each its own plane:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Control} --- who is in the cluster, who may join, which node holds which layers,
+and what the run configuration is. This is agreement among mutually distrusting parties: a
+\emph{consensus} problem.
+\item \textbf{Transport} --- how a byte gets from one node to another, and how each end knows
+who the other is. This is an \emph{authenticated wire} problem.
+\item \textbf{Data} --- the actual tensor exchange: activations forward, gradients or
+all-reduce sideways. This is a \emph{numerics and topology} problem.
+\end{itemize}
+The claim is that these three are genuinely orthogonal, that Hanzo and Lux already ship a
+best-in-class primitive for each, and that composing them --- rather than reinventing a
+monolith --- yields something no monolith can be: a GPU network anyone can join. The control
+primitive is Lux \emph{Quasar} consensus~\cite{quasar,luxconsensus}; the transport is
+\emph{ZAP}~\cite{zap,lp201}; the data plane is the Hanzo cross-backend inference
+engine~\cite{infstack}.
+
+\paragraph{The honesty frame.} This is an architecture paper, and its credibility rests on not
+blurring what runs today with what is designed. We adopt three labels, used inline throughout
+and collected in the status table of \S\ref{sec:status}: \built{} for code on \code{main},
+cited to its file; \partialb{} for a primitive that is compiled and exercised but not yet wired
+end-to-end; and \design{} for a proposed composition. The measured numbers we quote (ring
+parity across vendors, ZAP throughput and latency, Photon and luminance costs) are all \built{},
+each attributed to the benchmark that produced it. The network-level assembly --- consensus as
+the live scheduler, the ring running over ZAP, miner admission and payment --- is \design{},
+and never dressed as more.
+
+\paragraph{Contribution.} We (i) inventory the built substrate with source citations
+(\S\ref{sec:today}); (ii) state the three-plane architecture and prove its concerns are
+separable (\S\ref{sec:planes}); (iii) give the threat model and a result-integrity scheme for
+byzantine miners (\S\ref{sec:threat}); (iv) bind the economic layer to the existing luminance
+primitive (\S\ref{sec:econ}); (v) lay out a staged migration from the static-config LAN cluster
+to a public network (\S\ref{sec:migration}); and (vi) publish an honest built-versus-designed
+status table (\S\ref{sec:status}) and the limitations (\S\ref{sec:limits}).
+
+\section{The substrate that exists today}
+\label{sec:today}
+
+Before proposing a network we account for what is already on \code{main}. Every claim in this
+section is \built{} and cites the file that implements it. The point of the inventory is that
+the three planes are not vaporware waiting to be written: each has a mature primitive, and the
+work is composition, not invention.
+
+\subsection{Data plane: the heterogeneous inference ring}
+\label{sec:ring}
+
+The Hanzo engine already runs one model split across several GPUs of \emph{different vendors}.
+Its \code{distributed} module (\code{hanzo-engine/src/distributed.rs},
+\code{hanzo-quant/src/distributed/}) provides two backends behind one \code{Comm} abstraction:
+NCCL for homogeneous NVIDIA, and a portable \emph{ring} backend for everything else. The ring
+does tensor-parallel and pipeline-parallel sharding by exchanging activations with its
+right-hand neighbor, rank $r$ dialing rank $(r{+}1) \bmod N$ in an all-reduce cycle
+(\code{hanzo-quant/src/distributed/socket.rs}). Cross-vendor generation works because the ring
+wire is a \emph{canonical} \code{f32} format and reductions take a backend-independent
+CPU-\code{f32} path with a canonical tie-break (\code{hanzo-engine/src/ops.rs}), so a ROCm box
+and a CUDA box agree bit-for-bit on the reduced tensor rather than each rank reinterpreting the
+other's raw 16-bit words in the wrong \code{f16}-versus-\code{bf16} layout. The topology is a static struct read from a JSON file
+named by the \code{RING\_CONFIG} environment variable (Listing~\ref{lst:ringcfg}): master
+address, per-rank ports, this rank's index, and the world size. The cross-backend engine
+underneath --- five backends, the full GGUF quant zoo, decode parity with \code{llama.cpp} --- is
+the subject of the companion stack paper~\cite{infstack}; here it is simply the data plane.
+
+\begin{lstlisting}[caption={The data-plane topology today: a static \code{RING\_CONFIG} JSON.
+Every node needs the full member list up front; nothing authenticates a peer.},label={lst:ringcfg}]
+{ "master_ip": "10.0.0.1", "master_port": 8000,
+  "port": 8001, "right_ip": "10.0.0.2", "right_port": 8001,
+  "rank": 0, "world_size": 4 }
+\end{lstlisting}
+
+Two properties of this substrate matter for everything below. First, it is \emph{correct across
+vendors} --- the hard part, cross-backend numeric agreement, is solved. Second, it is
+\emph{unauthenticated plaintext}: the ring exchanges raw bytes over \code{std::net::TcpStream}
+with \code{write\_all}/\code{read\_exact} and ships its control messages as \code{serde\_json}
+over the same socket. It is safe only on a trusted private mesh. That is the gap the transport
+plane closes.
+
+\subsection{The onboarding UX: \code{hanzo cluster} scan-to-join}
+\label{sec:clustercli}
+
+Handing every node a JSON file out of band does not scale past a lab. The \code{hanzo cluster}
+subcommand (\code{hanzo-cli/src/cluster.rs}) already replaces it with a scan-to-join flow.
+\code{hanzo cluster init} on the head (rank 0) enumerates the ring, prints a \emph{join token}
+and its QR code, and launches; \code{hanzo cluster join} on a worker decodes the token and
+launches as a ring daemon. The token is a \code{bs58}-encoded JSON \code{JoinToken}
+(Listing~\ref{lst:token}) --- a nonce, the head address, the world size, the ordered ring
+addresses, and the model --- compact enough to fit in one QR or one paste. This is the correct
+\emph{shape} of onboarding: a worker needs one string to join. But observe what the token is
+today: a \emph{bearer credential in cleartext}. Anyone who photographs the QR can join the ring,
+and the ring cannot tell an invited worker from an intruder, because the token carries topology,
+not identity. Holding that observation is the whole of \S\ref{sec:threat}.
+
+\begin{lstlisting}[language=Rust,caption={The join token (\code{hanzo-cli/src/cluster.rs}):
+\code{bs58(JSON)} so it fits one QR. It is topology, not identity --- a bearer secret today.},label={lst:token}]
+struct JoinToken {
+    nonce: u64,           // ring id, printed {:016x}
+    master: String,       // rank-0 (head) reachable IP
+    world_size: usize,
+    addrs: Option<Vec<String>>, // full ordered ring [rank0..rankN-1]
+    model: String,
+}
+\end{lstlisting}
+
+\subsection{Transport: ZAP, the zero-copy post-quantum wire}
+\label{sec:zap}
+
+ZAP (Zero-copy Application Protocol, \code{github.com/luxfi/zap}) is the Lux universal
+wire~\cite{zap,lp201}. Its serialization is zero-copy: a message is read directly out of the
+network buffer with no parse and no allocation (measured \built{} parse $2.9$~ns/op at zero
+allocations; build $44$~ns/op). Against the protocols an AI stack would otherwise reach for,
+the wire eliminates the marshal/unmarshal step entirely: $17\times$ faster serialization and
+$345\times$ faster parse than JSON-RPC (the MCP transport), $\sim$$157\times$ faster than
+protobuf on deserialization ($21$~ns versus $3231$~ns, zero allocations), and $\sim$$4.5\times$
+faster than gRPC with the whole codec layer deleted rather than optimized~\cite{zap,lp201,luxconsensus}.
+End-to-end it sustains $114$K transactions/s on a single connection and $376$K across $20$
+parallel connections~\cite{luxconsensus}.
+
+For a public network the decisive feature is not speed but \emph{authenticated identity}. ZAP's
+PQ layer (\code{conn\_pq.go}) wraps an established connection \emph{after} a post-quantum
+handshake: \code{handshake.Initiator.Run(tcp)} produces a \code{Session}, and \code{WrapPQ(tcp,
+sess)} returns an ordinary \code{net.Conn} that AEAD-frames every write, zeroes its keys on
+close, and --- critically --- exposes \code{PeerID() [32]byte}, ``the verified peer identity for
+callers that need to route on it (e.g.\ validator-set membership checks).'' That one method is
+the hinge of the entire security argument (\S\ref{sec:threat}): the transport already hands the
+control plane a cryptographically verified identity for the node on the other end.
+
+Inside the Hanzo engine, ZAP is a first-class module (\code{hanzo-engine/src/zap/}). Its
+message and adapter surface is compiled and exercised in-process --- \code{ZapInferenceServer}
+translates ZAP \code{ChatRequest}s into the engine's real \code{Request} channel and streams
+\code{ChatChunk}s back, satisfying the same \code{ZapInference} trait a networked client would
+(\code{server.rs}, \code{client.rs}). We mark this \partialb{}, honestly: the out-of-process
+\code{zap://} transport is a documented stub that carries no \code{capnp} build dependency yet
+(``flipping on the wire is mechanical,'' \code{transport.rs}), and a few methods
+(\code{tokenize}, \code{detokenize}, \code{re\_isq}) return ``not yet wired.'' The wire exists
+in Go and is production-deployed across Lux consensus, MPC, and DEX systems; the engine-side
+Rust surface is built but not yet turned on over a socket.
+
+\subsection{Control: the Quasar consensus engine}
+\label{sec:quasar}
+
+Lux \emph{Quasar} (\code{github.com/luxfi/consensus}) is a DAG-native, post-quantum BFT
+consensus engine~\cite{quasar,luxconsensus}. It is built from small, orthogonal sub-protocols,
+four of which this paper reuses directly:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Photon} (\code{protocol/photon}) selects a $K$-of-$N$ committee each round by
+Fisher--Yates shuffle over the node population, drawing with a rejection-sampled uniform integer
+(\code{emitter.go}) to remove the modulo bias that a grinding adversary could exploit on
+committee sampling. The population is weighted by \emph{luminance}.
+\item \textbf{Luminance} (\code{photon/luminance.go}) is a per-node reputation in ``lux'' units:
+each node starts at $100$, a successful vote multiplies its brightness by $1.1$ (capped at
+$1000$), a failure by $0.9$ (floored at $10$), and \code{Brightness} normalizes to a selection
+weight in $[0.1, 10]$. It is a cheap, bounded, exponential reputation --- a brightness update
+costs $72$~ns \built{}.
+\item \textbf{Wave} (\code{protocol/wave}) runs per-round threshold voting with Fast
+Probabilistic Consensus; a vote round costs $3.38$~\textmu s and a $K$-of-$N$ Photon selection
+$3.03$~\textmu s \built{}.
+\item \textbf{Quasar} (\code{protocol/quasar}) seals decisions with threshold signatures across
+three independent cryptographic paths --- BLS12-381 (48-byte aggregate), Pulsar Ring-LWE
+threshold, and ML-DSA-65 (FIPS 204, rolled to a 192-byte Groth16 proof) --- each independently
+toggleable, all three in parallel under \code{TripleSignRound1}. A QuasarCert verifies in
+$\sim$$2$--$5$~ms on CPU, GPU-batchable $10$--$100\times$~\cite{luxconsensus}.
+\end{itemize}
+Quasar's own inter-node transport is already ZAP, not gRPC or libp2p (\code{consensus/LLM.md}).
+Control and transport are, in the Lux stack, \emph{already} composed; what is missing is binding
+that composition to the \emph{GPU} population instead of the validator population.
+
+\section{The three-plane architecture}
+\label{sec:planes}
+
+The blueprint is a single sentence: \emph{run the inference ring's topology as Quasar consensus
+state, and move every byte --- control and tensor alike --- over ZAP.} Figure~\ref{fig:planes}
+is the whole system. What follows gives each plane its interface and states, as a proposition,
+why the three do not leak into each other.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{tabular}{@{}l@{}}
+\toprule
+\textbf{Control plane} --- Quasar consensus (BFT, post-quantum) \hfill \design{} \\
+\quad Photon committee over GPU nodes $\cdot$ luminance = useful-work weight \\
+\quad membership $\cdot$ miner admission $\cdot$ layer placement $\cdot$ config $\cdot$ result attest \\
+\midrule
+\textbf{Transport plane} --- ZAP PQ wire \hfill \built{}\,/\,\partialb{} \\
+\quad \code{WrapPQ} session $\cdot$ verified \code{PeerID} $\cdot$ AEAD frames \\
+\quad one channel for BOTH control messages AND tensor activations \\
+\midrule
+\textbf{Data plane} --- Hanzo inference ring \hfill \built{} \\
+\quad tensor/pipeline parallel $\cdot$ canonical \code{f32} all-reduce $\cdot$ 5 backends \\
+\quad topology handed down by control; bytes carried by transport \\
+\bottomrule
+\end{tabular}
+\caption{Three orthogonal planes. Each is independently complete and separately citable to
+code; the network is their composition, not a new monolith. Labels mark built versus designed
+per \S\ref{sec:status}.}
+\label{fig:planes}
+\end{figure}
+
+\subsection{Control plane: consensus as the scheduler}
+\label{sec:control}
+
+The control plane replaces the static \code{RING\_CONFIG} JSON (Listing~\ref{lst:ringcfg}) and
+the out-of-band QR token with \emph{agreed state on a Quasar chain}. The chain's VM state
+\emph{is} the cluster's control surface \design{}:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Membership} --- the set of GPU nodes, each identified by its ZAP \code{PeerID}
+(an ML-DSA public key), with advertised capability (backend, VRAM, resident models, measured
+decode/prefill throughput). Joining and leaving are transactions, so the member list is
+BFT-agreed rather than hand-distributed.
+\item \textbf{Miner admission} --- a permissionless join. A public-cloud GPU submits a join
+transaction carrying its \code{PeerID} and a stake bond; admission is a consensus decision, not
+an operator's SSH session. This is the step that turns ``my four boxes'' into ``anyone's GPU''
+(\S\ref{sec:econ}).
+\item \textbf{Placement / routing} --- which node holds which contiguous layer range of which
+model. Pipeline-parallel assignment (node $A$ holds layers $0$--$7$, $B$ holds $8$--$15$) and
+the ring order become an on-chain placement map. A request is routed by reading that map, not by
+trusting a JSON file.
+\item \textbf{Config distribution} --- model id, quantization, sampling defaults, ring
+\code{world\_size}: the fields of \code{JoinToken} and \code{RingConfig} become chain state, so
+every node reads an identical, agreed configuration.
+\end{itemize}
+
+The mechanism is not new code so much as a \emph{re-population} of Photon. Photon selects a
+committee by weighted Fisher--Yates over a node set; point it at the \emph{GPU} population and it
+selects a committee of GPU nodes --- to ratify a placement, to admit a miner, or to verify a
+result (\S\ref{sec:threat}). Luminance, today a function of consensus-vote success, is re-bound
+to \emph{validated inference contribution}: a node whose outputs pass verification brightens and
+is preferentially selected and rewarded; a node that stalls or returns wrong tensors dims and is
+sampled out. The primitive is unchanged --- an exponential, bounded, cheap reputation --- only
+the event that drives \code{Illuminate(id, success)} moves from ``voted with the quorum'' to
+``did correct inference work.'' Crucially, \emph{writes to consensus are rare and
+slow-changing}: placement and membership shift on the order of nodes joining and models loading,
+not on the order of tokens generated. The hot path --- a forward pass through the ring --- never
+touches consensus.
+
+\subsection{Transport plane: one PQ wire for control and tensors}
+\label{sec:transport}
+
+Every inter-node byte moves over ZAP. This is deliberately \emph{one} wire for two kinds of
+traffic that a monolith would split across two stacks:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Control messages} --- consensus votes, placement updates, admission requests ---
+which Quasar already speaks over ZAP.
+\item \textbf{Tensor data} --- the activation exchange and all-reduce that the ring performs
+every micro-step --- which today crosses raw TCP and, under this design, crosses the same
+authenticated \code{WrapPQ} \code{net.Conn} instead.
+\end{itemize}
+Unifying them on one wire is the payoff of decomplection: the ring does not need to know it is on
+a network of strangers, only that it holds a \code{net.Conn}; the transport does not need to know
+whether the bytes are a vote or an activation. ZAP's zero-copy framing is what makes carrying
+tensors over an authenticated session affordable --- there is no marshal/unmarshal tax on the
+activation exchange, only an AEAD seal over a buffer the ring already owns (the $64$~KiB
+\code{MaxPQRecord} chunking of \code{conn\_pq.go} maps naturally onto activation-sized writes).
+The identity that the handshake establishes, \code{PeerID}, is the same value the control plane
+keys membership on: the node you complete a ZAP handshake with \emph{is} the node consensus
+admitted, by construction, with no separate PKI to reconcile.
+
+\subsection{Data plane: unchanged in kind}
+\label{sec:data}
+
+The data plane is the least-changed and that is the point. The ring's numerics --- canonical
+\code{f32} reduction, tensor/pipeline sharding, the five-backend kernels --- are correct today
+(\S\ref{sec:ring}) and stay exactly as they are. Two wires change underneath them: the topology
+arrives from the control plane's placement map rather than \code{RingConfig::load()}, and the
+\code{TcpStream} is a ZAP \code{net.Conn} rather than a bare socket. The ring code that computes
+does not move. This is composition over rewrite: we are not building a decentralized inference
+engine, we are giving the inference engine we have a control plane and an authenticated
+transport.
+
+\subsection{Why three planes, stated precisely}
+\label{sec:whythree}
+
+\begin{proposition}[Orthogonality of the three planes]
+\label{prop:ortho}
+The control, transport, and data planes can each be replaced or scaled independently without
+modifying the other two, because they share only two narrow, typed interfaces: the control plane
+emits a \emph{placement map} keyed by \code{PeerID}, and the transport plane emits an
+authenticated \code{net.Conn} whose \code{PeerID} matches. The data plane consumes both and
+exposes neither consensus nor cryptography; the transport consumes an identity and exposes a
+byte stream, knowing nothing of tensors; the control consumes admission and contribution events
+and exposes agreed state, knowing nothing of wire framing.
+\end{proposition}
+
+\begin{proof}[Argument]
+By interface inspection. The data plane's dependencies are exactly (i) a topology --- rank,
+world size, neighbor address, layer range --- and (ii) a \code{net.Conn} per neighbor. Neither
+names a consensus type or a cipher. Swap Quasar for any state machine that produces the same
+placement map and the ring is unaffected; swap ZAP for any authenticated \code{net.Conn} with a
+stable peer identity and the ring is unaffected; swap the ring's kernels (add a backend, change
+the quant) and neither consensus nor transport observes it. The only cross-plane invariant is
+that the \code{PeerID} the transport authenticates equals the \code{PeerID} the control plane
+admitted --- a single equality, checked once at connection setup, which is precisely what
+\code{WrapPQ}'s \code{PeerID()} was built to support (``validator-set membership checks,''
+\code{conn\_pq.go}). Three concerns, two interfaces, one shared value. \qed
+\end{proof}
+
+The contrast with a monolithic serving stack is now sharp. In vLLM or Triton, ``who is in the
+cluster'' is a launch-time flag baked into the process, ``how bytes move'' is a hardcoded NCCL
+or gRPC channel with no peer authentication, and ``what computes'' is the same binary --- the
+three concerns are one artifact, so you cannot add a permissionless member, cannot authenticate
+a stranger's GPU, and cannot verify a result without forking the whole thing. Our planes are
+three artifacts with two seams. That is the difference between a cluster and a network.
+
+\section{Threat model and result integrity}
+\label{sec:threat}
+
+A permissionless network inherits adversaries a private cluster never has. We state the model,
+the gaps in today's substrate, and the design that closes them.
+
+\paragraph{Assets and adversaries.} The assets are: the integrity of an inference result (the
+tokens a user is billed for must be the model's real output), the confidentiality and
+authenticity of activations in flight, the correctness of the placement map, and the fairness of
+reward. The adversaries are: a network attacker on the path between nodes (public-cloud tenants
+share fabric); an \emph{intruder} who obtained a join token; and a \emph{byzantine miner} who
+joined honestly but returns wrong, fabricated, or lazily-cached tensors to earn reward without
+doing the work.
+
+\paragraph{Gap 1: the wire is plaintext (\built{} problem).} Today the ring is raw TCP
+(\S\ref{sec:ring}). A path attacker can read activations, inject a forged tensor into the
+all-reduce, or man-in-the-middle a neighbor. \textbf{Closure \design{}:} the ZAP PQ handshake.
+After \code{WrapPQ}, every frame is AEAD-sealed and every peer is a verified ML-DSA identity;
+injection and eavesdropping both fail against a post-quantum authenticated channel. The tensor
+plane inherits the same wire security consensus already relies on.
+
+\paragraph{Gap 2: the join token is a bearer secret (\built{} problem).} The QR token
+(Listing~\ref{lst:token}) is cleartext topology; whoever holds it joins (\S\ref{sec:clustercli}).
+\textbf{Closure \design{}:} make the token a \emph{handshake credential}, not the thing that
+grants access. Under the design the token carries the ring's \code{PeerID} set (or a commitment
+to it); a worker presenting the token must then \emph{complete a ZAP PQ handshake} proving
+possession of an admitted ML-DSA key. A photographed QR no longer joins anyone --- it only names
+who is allowed to, and access is gated on the handshake the intruder cannot forge. The token
+degrades from a secret to a public address book, which is the correct security posture: identity
+is the credential, topology is not.
+
+\paragraph{Gap 3: a miner may lie about its work (the hard one).} Authentication proves
+\emph{who} sent a tensor, not that the tensor is \emph{correct}. A byzantine miner holding layers
+$8$--$15$ can return plausible-looking garbage and collect reward. This is the genuinely new
+problem, and consensus is the tool. We propose three composable mechanisms, in increasing cost,
+scheduled by the control plane \design{}:
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+\item \textbf{Threshold attestation of outputs.} A completed inference (or a placement-epoch's
+batch of them) is sealed with a QuasarCert: a Photon committee of GPU nodes threshold-signs the
+$(\text{request}, \text{output})$ pair with BLS$+$Pulsar$+$ML-DSA (\S\ref{sec:quasar}). A billed
+result carries a certificate that a supermajority attested to it, giving the user cryptographic
+non-repudiation and making a single lying miner insufficient to certify a bad output.
+\item \textbf{Redundant re-execution / spot checks.} The scheduler occasionally assigns the same
+layer range to two independent miners and compares --- cheap because the ring wire is already
+\emph{canonical} \code{f32} (\S\ref{sec:ring}), so two honest miners on different vendors produce
+\emph{bit-identical} tensors and any disagreement is a proof of fault, not a rounding artifact.
+The canonical-\code{f32} property, built for cross-vendor correctness, doubles as the substrate
+for verifiable redundancy. A miner caught disagreeing with the honest majority is dimmed by
+luminance and slashed.
+\item \textbf{Reputation as the economic backstop.} Luminance (\S\ref{sec:quasar}) makes
+correct work compound and incorrect work decay: a node that fails verification multiplies its
+brightness by $0.9$ and is sampled into fewer committees and paid for less work, converging its
+influence and income toward zero. Reputation is the slow, cheap layer under the fast, expensive
+cryptographic ones.
+\end{enumerate}
+Byzantine fault tolerance is a property the control plane already has (Quasar tolerates $<1/3$
+adversarial stake); the contribution here is \emph{extending it from block finality to inference
+finality} by threshold-signing over outputs and exploiting canonical \code{f32} for cheap
+re-execution. We are explicit that this is \design{}: the threshold-signing primitive is built,
+its application to inference outputs is proposed.
+
+\paragraph{Non-goal: confidentiality from the operator.} This design authenticates and verifies;
+it does not, by itself, hide activations from the miner that computes them. Workloads needing
+that require a hardware TEE tier (H100/H200 confidential computing, TDX, SEV-SNP), an orthogonal
+extension developed in the tenant-cloud companion~\cite{tenantcloud} and out of scope here.
+
+\section{The economic layer: luminance as useful-work weighting}
+\label{sec:econ}
+
+A permissionless network needs an incentive, and the incentive must be \emph{useful-work},
+because paying for wasted computation (proof-of-work hashing) is exactly what an inference
+network should not do. The luminance primitive is already a useful-work meter in miniature: it
+rewards nodes for correct participation and decays nodes for failure. The economic design
+\design{} binds three quantities to it:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Admission by stake.} A miner joins by bonding stake in a transaction
+(\S\ref{sec:control}). Stake is the sybil cost --- spinning up a thousand fake GPUs is a
+thousand bonds --- and the slashing target when verification (\S\ref{sec:threat}) catches a
+fault.
+\item \textbf{Reward by validated contribution.} Payment for an inference accrues to the miners
+whose outputs were attested, weighted by luminance and by measured work (tokens $\times$ model
+size $\times$ layer share). Because luminance rises with correct work and falls with incorrect
+work, expected income tracks \emph{honest throughput}, and a lazy or lying miner earns less than
+its electricity costs.
+\item \textbf{Routing by brightness.} The Photon committee that ratifies placement and verifies
+results draws with luminance weight, so brighter (more reliably correct) nodes are preferentially
+given work --- reputation and revenue reinforce, which is what makes ``contribute a GPU, get
+paid'' a stable equilibrium rather than a race to the bottom.
+\end{itemize}
+The mechanism reuses one existing primitive (luminance) for reputation, one existing primitive
+(stake-weighted BFT) for sybil-resistance and slashing, and one existing primitive (Photon) for
+work routing. The realized system is ``any dev, any miner, contributes a GPU and is paid for
+inference work,'' with the payment denominated in the network's native token and the fairness
+enforced by the same consensus that finalizes the placement map. This is the point of contact
+with the sovereign-cloud economics of the tenant-cloud companion~\cite{tenantcloud}, which
+develops the wallet, staking, and settlement primitives this layer would sit on.
+
+\section{Migration path: from LAN appliance to public network}
+\label{sec:migration}
+
+The design is only credible if there is a continuous path from what runs today to the network,
+with no flag day. There is, in four stages, each shippable and independently valuable.
+
+\paragraph{Stage 0 (today, \built{}).} Static \code{RING\_CONFIG} JSON, QR join token, raw-TCP
+ring, canonical \code{f32} across vendors. Works on a trusted LAN; this is the baseline.
+
+\paragraph{Stage 1 --- authenticate the wire (\design{}, smallest step).} Replace the ring's
+\code{TcpStream} with a ZAP \code{WrapPQ} \code{net.Conn} and make the join token gate on a PQ
+handshake (\S\ref{sec:threat}, Gaps 1--2). No consensus yet: the topology is still the static
+map, but the wire is now authenticated and encrypted and the token is a credential. This alone
+converts the appliance into something safe to run across untrusted networks, and it exercises the
+engine's ZAP module end-to-end --- turning the \partialb{} \code{zap://} transport on
+(\S\ref{sec:zap}) is precisely this step.
+
+\paragraph{Stage 2 --- consensus owns the map (\design{}).} Stand up a Quasar chain whose state
+is the membership and placement map. Nodes read topology from the chain instead of
+\code{RingConfig::load()}; \code{hanzo cluster join} becomes an admission transaction rather than
+a local launch. Placement is still operator-proposed and consensus-ratified (permissioned
+membership, BFT config). The ring code is untouched; only the source of its topology moves from
+file to chain.
+
+\paragraph{Stage 3 --- permissionless miners and paid work (\design{}).} Open admission to
+staked strangers, bind luminance to validated inference contribution, and turn on result
+attestation and spot-check re-execution (\S\ref{sec:threat}--\S\ref{sec:econ}). This is the full
+network: anyone bonds, joins, is placed by consensus, serves layers over authenticated ZAP, is
+verified by a Photon committee, and is paid by luminance-weighted contribution.
+
+The staging matters because each stage stands alone. Stage 1 is worth shipping even if Stages
+2--3 never do (it fixes a real security gap). Stage 2 is worth shipping for a single operator's
+multi-datacenter fleet (BFT config, no static files) without any economics. Only Stage 3 needs
+the token and slashing machinery. There is no rewrite between stages --- the same ring, the same
+ZAP, more of the control plane each time.
+
+\section{Connection to the latency-physics companion}
+\label{sec:latency}
+
+A pipeline-parallel ring over a wide-area network has a latency budget a single box does not: each
+pipeline stage adds a network hop to the critical path of every token. The companion
+latency-physics analysis~\cite{latency} argues that this budget is spendable precisely because
+two techniques compose over ZAP. First, \textbf{pipeline parallelism hides transport latency
+under compute}: with enough micro-batches in flight, a stage's forward pass overlaps the next
+stage's activation transfer, so the ring's throughput approaches the slowest stage's compute rate
+rather than the sum of hop latencies --- and ZAP's zero-copy framing minimizes the per-hop
+transport term to an AEAD seal, not a marshal. Second, \textbf{speculative decoding amortizes the
+round-trip}: a draft model proposes several tokens that the ring verifies in one pipelined pass,
+so the wide-area round-trip is paid once per \emph{accepted block} of tokens instead of once per
+token. The engine already factors speculative decoding behind one \code{SpeculativeProposer}
+trait~\cite{infstack}; over a consensus-managed ZAP ring, the draft can even run on a nearby,
+brighter node while the target pipeline spans the fleet. The three-plane fabric is what makes
+these composable: the data plane does the pipelining and speculation, the transport plane makes
+each hop cheap and authenticated, and the control plane places draft and target where the latency
+budget is best --- decomplected, so each optimization lives in exactly one plane. We cite the
+companion for the quantitative budget; here it is enough that the architecture does not fight the
+physics.
+
+\section{Status: built, partial, and designed}
+\label{sec:status}
+
+Table~\ref{tab:status} is the honest ledger. It is the table to read first: it says exactly which
+sentences of this paper are code on \code{main} and which are blueprint. The pattern is
+deliberate --- every \emph{primitive} is built and cited; every \emph{composition} into the
+network is designed. That is what makes this a buildable blueprint rather than a wish.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{4.9cm}p{1.5cm}p{1.5cm}p{5.0cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Plane} & \textbf{Status} & \textbf{Evidence / source} \\
+\midrule
+Cross-vendor inference ring (TP/PP, canonical \code{f32}) & Data & \built{} &
+\code{distributed.rs}, \code{distributed/socket.rs}, \code{ops.rs}~\cite{infstack} \\
+NCCL $+$ portable ring backends & Data & \built{} & \code{hanzo-quant/src/distributed/} \\
+\code{hanzo cluster} scan-to-join (bs58/QR token) & Data & \built{} &
+\code{hanzo-cli/src/cluster.rs} \\
+Five-backend engine, decode parity, quant zoo & Data & \built{} &
+companion stack paper~\cite{infstack} \\
+ZAP Go wire (zero-copy, $17\times$/$345\times$ vs JSON-RPC) & Transport & \built{} &
+\code{luxfi/zap}~\cite{zap,lp201} \\
+ZAP PQ handshake, \code{WrapPQ}, verified \code{PeerID} & Transport & \built{} &
+\code{conn\_pq.go} \\
+ZAP engine module (in-process adapter surface) & Transport & \partialb{} &
+\code{engine/src/zap/*.rs} (server/client) \\
+\quad out-of-process \code{zap://} (capnp wire) & Transport & \partialb{} &
+\code{engine/src/zap/transport.rs} (stub) \\
+Quasar BFT engine; Photon, Wave, Focus & Control & \built{} &
+\code{luxfi/consensus}~\cite{quasar,luxconsensus} \\
+Luminance reputation (100 base, $\times1.1$/$\times0.9$) & Control & \built{} &
+\code{photon/luminance.go} \\
+BLS$+$Pulsar$+$ML-DSA threshold signing (QuasarCert) & Control & \built{} &
+\code{protocol/quasar}~\cite{luxconsensus} \\
+\midrule
+Ring transport over ZAP (retire raw TCP) & Transport & \design{} & \S\ref{sec:transport}, Stage 1 \\
+Join token as PQ handshake credential & Transport & \design{} & \S\ref{sec:threat}, Gap 2 \\
+Consensus-owned membership \& placement map & Control & \design{} & \S\ref{sec:control}, Stage 2 \\
+Permissionless miner admission (stake bond) & Control & \design{} & \S\ref{sec:econ}, Stage 3 \\
+Luminance $\gets$ validated inference contribution & Control & \design{} & \S\ref{sec:control} \\
+Result verification (threshold attest $+$ spot check) & Control & \design{} & \S\ref{sec:threat}, Gap 3 \\
+Luminance-weighted reward / routing & Control & \design{} & \S\ref{sec:econ} \\
+\bottomrule
+\end{tabular}
+\caption{Built-versus-designed ledger. Every primitive (upper block) is code on \code{main},
+cited to its file with its measured cost where relevant; every network composition (lower block)
+is design, cited to the section that specifies it and the migration stage that ships it.}
+\label{tab:status}
+\end{table}
+
+\paragraph{Reproducing the built numbers.} The ZAP figures ($2.9$~ns parse, $17\times$/$345\times$
+versus JSON-RPC, $114$K/$376$K TPS) reproduce with \code{go test -bench=. -benchmem} in
+\code{luxfi/zap} and \code{luxfi/consensus/bench/}; the Photon/Wave/luminance costs ($3.03$~\textmu s,
+$3.38$~\textmu s, $72$~ns) reproduce with \code{GOWORK=off go test -bench=. ./bench/} in
+\code{luxfi/consensus}, measured on Apple M1 Max. The cross-vendor ring runs with a
+\code{RING\_CONFIG} JSON per rank and \code{hanzo cluster init}/\code{join}; the cross-backend
+engine numbers are reproduced by the protocol in the companion stack paper~\cite{infstack}. None
+of these numbers is produced by this paper; each is attributed to its source so the blueprint's
+foundation is auditable.
+
+\section{Limitations}
+\label{sec:limits}
+
+The rigor is the persuasion, so the costs are as plain as the benefits.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{The network is a composition, not a shipped network.} The primitives are built and
+cited; the assembly of \S\ref{sec:planes}--\S\ref{sec:econ} is \design{}. Nothing here should be
+read as ``Hanzo runs a permissionless GPU network today.'' It runs a cross-vendor ring on a
+trusted mesh (Stage 0) and ships every primitive the network needs.
+
+\item \textbf{The ZAP engine wire is not yet turned on.} The Rust ZAP module is \partialb{}: its
+in-process surface is exercised, but the \code{zap://} out-of-process transport is a documented
+stub and a few methods return ``not yet wired'' (\S\ref{sec:zap}). Stage 1 depends on completing
+it. The Go ZAP wire it mirrors is production-deployed, so the risk is integration, not invention.
+
+\item \textbf{Wide-area tensor transport is unproven at scale.} The ring was built for a LAN.
+Pipeline parallelism over a wide-area network is argued to be latency-tolerant
+(\S\ref{sec:latency}) but not measured here; the companion latency paper carries that budget, and
+a real deployment must validate it. Bandwidth, not just latency, may bound activation exchange
+for large hidden dimensions.
+
+\item \textbf{Result verification adds cost.} Threshold attestation and redundant re-execution
+(\S\ref{sec:threat}) are not free: a QuasarCert verifies in $2$--$5$~ms and spot-check redundancy
+duplicates work on sampled requests. The scheme is designed to make the \emph{expected} overhead
+small (attest per epoch, spot-check a fraction) but it is a real tax the monolithic single-trust
+model does not pay --- the price of permissionlessness.
+
+\item \textbf{Confidentiality from the operator is out of scope.} This design authenticates and
+verifies; it does not hide activations from the computing miner without a TEE tier
+(\S\ref{sec:threat}). Sensitive workloads need that orthogonal extension.
+
+\item \textbf{Luminance re-binding is a policy change with game-theoretic edges.} Moving the
+\code{Illuminate} trigger from vote-success to inference-contribution is a one-line mechanism
+change but a large incentive-design question: collusion among a committee, grinding on the
+verification lottery, and reward-share disputes across a pipeline are real and not solved by the
+primitive alone. We name them; we do not claim to have priced them.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The heterogeneous GPU ring already solves the hard, unglamorous problem --- one model computing
+correctly across ROCm, CUDA, and Metal, bit-for-bit, over a canonical wire. What it lacks to
+become a network is not more numerics but two planes it does not have: a control plane to decide
+membership and placement among parties who do not trust each other, and a transport plane to
+authenticate the strangers it talks to. Both already exist as best-in-class Lux primitives ---
+Quasar consensus and the ZAP post-quantum wire --- and the entire contribution of this paper is
+to hold the three concerns apart and compose them: consensus schedules, ZAP carries, the ring
+computes. That decomplection is what a monolith cannot do and what makes ``any developer, any
+miner, contributes a GPU and is paid for inference work'' a buildable system rather than a slogan.
+We have drawn the line between built and designed down the middle of every claim: the ring, the
+scan-to-join CLI, the ZAP wire with its verified \code{PeerID}, the Quasar engine with luminance
+and threshold signing are code on \code{main}, cited and measured; the network that composes them
+--- consensus-owned membership, the ZAP-transported ring, permissionless admission, and result
+verification by threshold-signing over outputs --- is design, staged for a migration with no flag
+day. The primitives are done. The composition is the blueprint. We publish it so the rest of the
+AI-infrastructure community can build on the same three planes.
+
+\begin{thebibliography}{20}
+\small
+
+\bibitem{infstack}
+Hanzo AI --- ML Systems. \emph{Hanzo ML and Hanzo Engine: A Unified Multi-Backend, Multi-Modal
+Inference Stack}. Hanzo AI white paper, 2026 (companion; the data-plane engine, cross-vendor ring,
+and five-backend decode parity).
+
+\bibitem{tenantcloud}
+Hanzo AI Research. \emph{The Unified Sovereign-Tenant Cloud: Linear Shared-Nothing Scaling via
+Per-Tenant SQLite and In-Process Composition}. Hanzo Industries white paper, 2026 (companion; the
+\code{hanzo.network} fabric, wallet/staking, TEE trust tiers, and PQ identity primitives).
+
+\bibitem{latency}
+Hanzo AI --- ML Systems. \emph{The Latency Physics of Decentralized Decode: Pipeline Parallelism
+and Speculative Decoding over ZAP}. Hanzo AI white paper, 2026 (companion; the wide-area latency
+budget referenced in \S\ref{sec:latency}).
+
+\bibitem{quasar}
+Lux Industries. \emph{Quasar: Post-Quantum DAG-Native BFT Consensus} (LP-020 / LP-105). Lux
+Network, 2026. \url{https://github.com/luxfi/consensus}.
+
+\bibitem{luxconsensus}
+Lux Industries. \emph{luxfi/consensus}: the Quasar engine --- \code{protocol/photon} (Fisher--Yates
+committee selection, luminance), \code{protocol/wave} (FPC threshold voting), \code{protocol/focus},
+\code{protocol/quasar} (BLS $+$ Pulsar $+$ ML-DSA threshold signing). Source and benchmarks
+(\code{bench/}, \code{README.md}, \code{LLM.md}). \url{https://github.com/luxfi/consensus}.
+
+\bibitem{zap}
+Lux Industries. \emph{ZAP: Zero-copy Application Protocol} --- the universal wire.
+\code{github.com/luxfi/zap} (\code{zap.go}, \code{conn\_pq.go} PQ handshake / \code{WrapPQ} /
+\code{PeerID}, \code{README.md} benchmarks).
+
+\bibitem{lp201}
+Lux Industries. \emph{LP-201: ZAP as the Universal Wire} and \emph{LP-200: The ZAP Stack}. Lux
+Proposals, 2026. \url{https://github.com/luxfi/lps} (the $17\times$/$345\times$ vs JSON-RPC and
+$\sim$$4.5\times$ vs gRPC measurements).
+
+\bibitem{mldsa}
+National Institute of Standards and Technology. \emph{FIPS 204: Module-Lattice-Based Digital
+Signature Standard (ML-DSA)}. NIST, 2024.
+
+\bibitem{mlkem}
+National Institute of Standards and Technology. \emph{FIPS 203: Module-Lattice-Based
+Key-Encapsulation Mechanism Standard (ML-KEM)}. NIST, 2024.
+
+\bibitem{bls}
+D. Boneh, B. Lynn, and H. Shacham. Short Signatures from the Weil Pairing. \emph{Journal of
+Cryptology}, 17(4):297--319, 2004.
+
+\bibitem{petals}
+A. Borzunov et al. \emph{Petals: Collaborative Inference and Fine-tuning of Large Models}. ACL
+System Demonstrations, 2023 (decentralized inference over volunteer GPUs; no BFT control plane or
+PQ-authenticated transport).
+
+\bibitem{kwon2023}
+W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention.
+\emph{SOSP}, 2023 (the monolithic single-operator serving baseline).
+
+\bibitem{pinkas}
+B. Pinkas and M. Reiter, and the committee-grinding threat that motivates rejection-sampled
+uniform selection in \code{photon/emitter.go}. (Bias-free sortition under a grinding adversary.)
+
+\end{thebibliography}
+
+\end{document}

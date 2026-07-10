@@ -1,0 +1,414 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\newcommand{\Tring}{\ensuremath{T_{\mathrm{ring}}}}
+
+\title{\textbf{Open Problems in Heterogeneous\\ Distributed Inference}}
+\author{Hanzo AI --- ML Systems}
+\date{Research-agenda companion to the distributed-inference series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Three companion papers report a working heterogeneous distributed-inference stack. One engine shards a
+model tensor-parallel across an AMD/NVIDIA boundary over commodity ethernet and decodes
+coherently~\cite{het}; an analytical model derives the latency physics of geo-distributed autoregressive
+decode and the speculative-decoding cure~\cite{latency}; and a three-plane blueprint turns the
+trusted-LAN ring into a permissionless, consensus-managed, post-quantum-authenticated
+network~\cite{consensus}. Building them surfaced eight problems a homogeneous, single-trust,
+datacenter-local stack never has to confront, because each is an assumption that only \emph{heterogeneity},
+\emph{wide-area distribution}, or \emph{permissionlessness} puts under load. This paper states the eight
+precisely --- with the formal object where one exists --- and ties each to the companion that owns the
+relevant result, so the boundary between what is measured, what is designed, and what is open stays sharp.
+The eight are: (1) sampling-determinism boundaries in replicated-state inference; (2) quant-aware
+tensor-parallel sharding on block-quantized weights; (3) pipeline parallelism as the format-agnostic
+primitive and its layer-assignment ILP; (4) speculative decoding as a latency amortizer, made adaptive
+under round-trip time and acceptance drift; (5) the prefill launch-overhead wall, attacked by fixed-shape
+graph capture versus compiler-level fusion; (6) KV-cache wire compression for prefill migration and its
+cross-hop error accumulation; (7) the geo-distributed decode latency floor and the placement/replication
+optimization that follows from it; and (8) cheap verifiable inference for a permissionless compute
+network. None is a tuning parameter; each is a research question, and several compose --- the layer
+schedule of (3) and the geo-placement of (7) are one joint optimization, and the determinism boundary of
+(1) and the cheap verification of (8) share the canonical-\code{f32} substrate. We publish the agenda so
+the problems can be attacked on the same terms.
+\end{abstract}
+
+\section{Introduction: where the assumptions break}
+\label{sec:intro}
+
+A model-serving stack built for one datacenter, one vendor, and one operator gets to assume a great deal:
+every rank runs the same silicon and the same numeric format, the network between ranks is a nanosecond-
+scale NVLink fabric, and every node is trusted to compute what it claims. The distributed-inference series
+removes those assumptions one at a time --- the fleet becomes vendor-mixed~\cite{het}, the links become
+intercontinental~\cite{latency}, and the nodes become strangers who must be paid and
+verified~\cite{consensus} --- and each removal exposes a problem the assumption had been hiding.
+
+This paper is the ledger of what those removals expose. It is deliberately \emph{not} a results paper: it
+states problems, not solutions, and its contribution is precision --- each problem is pinned to the
+companion that owns the surrounding result, given its formal shape where it has one, and separated from
+the parts already solved so that no claim is duplicated across the series. We adopt the series' discipline
+of labelling measured, designed, and open, and here everything is open by construction; the job is to say
+\emph{exactly} what is open and why the environment forces it.
+
+The eight problems fall into four families. \textbf{Correctness under replication} (\S\ref{sec:determinism}):
+when several ranks must agree on a sampled token, where must their arithmetic be bit-identical?
+\textbf{The right primitive and its schedule} (\S\ref{sec:quantshard}--\S\ref{sec:pp}): tensor parallelism
+is correct but coupled to dequantized weights and to a per-layer collective; pipeline parallelism is
+format-agnostic but demands a hard scheduling decision. \textbf{Paying the wire} (\S\ref{sec:spec}--\S\ref{sec:geofloor}):
+the latency of a wide-area hop is on the critical path of every token, and the levers are speculation,
+compression, and placement. \textbf{Trust without an operator} (\S\ref{sec:verify}): a permissionless node
+can lie about its work, and full re-execution is too expensive to be the answer. We take them in that
+order.
+
+\section{Problem 1: determinism boundaries in replicated-state inference}
+\label{sec:determinism}
+
+\paragraph{Statement.} In any inference topology where more than one rank holds replicated state that must
+stay coherent --- most sharply, the tensor-parallel ring of~\cite{het}, where each rank keeps its own KV
+cache and advances it token by token --- every rank must sample the \emph{same} next token, or the caches
+diverge and the streams silently fork. The cross-vendor ring makes the \emph{reduced activations} agree
+bit-for-bit by exchanging them in a canonical \code{f32} wire and reducing with a canonical
+tie-break~\cite{het}. But the final logits are computed \emph{after} the last reduction, locally, in each
+rank's own 16-bit compute dtype (\code{f16} on the ROCm rank, \code{bf16} on the CUDA rank). Sampling is
+therefore \emph{outside} the agreement the wire guarantees: at a near-argmax tie, \code{f16} and
+\code{bf16} rounding can select different tokens, and the ranks desync.
+
+\paragraph{The formal object.} Call the \emph{agreement set} $\mathcal{A}$ the minimal set of tensors that
+must be bit-identical across replicas for state to stay coherent. The canonical-\code{f32} reduce places
+the post-attention and post-MLP activations in $\mathcal{A}$. Coherent decode additionally requires the
+\emph{sampled token id} $\in\mathcal{A}$; the open question is the cheapest way to put it there. Two
+mechanisms bound the design space:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Broadcast the decision.} One head rank samples and broadcasts the token id; the others do not
+sample at all. Cost: one small ($\le 8$-byte) broadcast per token on the critical path. Correct by
+construction for \emph{any} sampler (greedy, temperature, top-$p$, min-$p$), because there is exactly one
+draw.
+\item \textbf{Canonicalize the computation.} Every rank computes logits in canonical \code{f32} with a
+deterministic tie-break and a shared RNG stream, so all ranks sample identically without communicating.
+Cost: an \code{f32} logit head on every rank and a synchronized RNG; fragile the moment any op on the path
+is not bit-reproducible across vendors.
+\end{itemize}
+The trade is broadcast latency versus redundant canonical compute, and it interacts with the sampler:
+stochastic sampling needs a \emph{shared seed and a shared draw}, which effectively forces the broadcast
+mechanism, so the ``canonicalize'' route is really only clean for greedy decode.
+
+\paragraph{What is open.} A general theory of determinism boundaries for replicated-state inference: which
+ops must be canonical, the cost of canonicalization versus decision-broadcast as a function of vocabulary
+size and ring width, and the extension to speculative decoding (\S\ref{sec:spec}), where the boundary must
+hold not for one token but for a verified block of $K$. This is the correctness dual of the verification
+problem of \S\ref{sec:verify}: the same canonical-\code{f32} property that makes two honest ranks agree is
+what lets a third party \emph{check} that they did.
+
+\section{Problem 2: quant-aware tensor-parallel sharding}
+\label{sec:quantshard}
+
+\paragraph{Statement.} Tensor parallelism shards each weight matrix along rows (column-parallel) or columns
+(row-parallel), giving each rank a contiguous slice of the matrix~\cite{megatron}. The block-quantized
+formats that make edge inference fit in commodity memory --- GGUF $k$-quants and their kin --- store
+weights in \emph{superblocks}: a run of (typically) 256 weights sharing a block scale, with sub-block
+scales and a packed low-bit mantissa. A naive row/column shard cuts \emph{through} a superblock, so a
+rank's slice no longer contains the shared scale its weights are quantized against. The only way to shard
+such a layout with an arbitrary cut is to dequantize the whole matrix, slice, and requantize per shard ---
+which reintroduces the dequant--requant loss the format exists to avoid, and defeats the memory saving by
+materializing the dense matrix. This is why the shipping TP path in~\cite{het} is wired only through the
+dequantized (safetensors) model definitions and cannot shard a GGUF model at all.
+
+\paragraph{What is open.} \emph{Quant-aware sharding}: a split that respects superblock boundaries. If the
+shard count divides the matrix dimension into superblock-aligned pieces (or the matrix is padded to make
+it so), each rank receives whole superblocks with their scales intact and no dequantization is needed. The
+open questions are the constraints and their cost: which (hidden size, head count, shard count, block size)
+combinations admit an aligned split; how much padding waste an arbitrary combination incurs; whether a
+format with per-shard scale replication can be sharded losslessly at any cut; and whether the analysis
+differs for row- versus column-parallel layers, which cut different axes of the superblock grid. The prize
+is TP over quantized weights --- but note that pipeline parallelism (\S\ref{sec:pp}) sidesteps the entire
+problem, because it ships \emph{activations}, not weight slices, across the seam and each node loads its
+layer range in whatever quantization it likes. Problem~2 is worth solving only where TP is worth keeping:
+inside a node or an NVLink domain, for a matrix too wide to hold on one accelerator.
+
+\section{Problem 3: pipeline parallelism as the universal primitive, and its layer-assignment ILP}
+\label{sec:pp}
+
+\paragraph{The engineering result (in progress).} The heterogeneous-cluster analysis of~\cite{het} argues,
+and the latency analysis of~\cite{latency} proves under a wide-area cost model, that \emph{pipeline
+parallelism} (PP) is the right primitive for a heterogeneous fleet: it is format-agnostic (\S\ref{sec:quantshard}),
+carries only an activation tensor across each node boundary rather than an all-reduce per layer, imposes no
+head-count-divides-node-count constraint, and reduces the sampling determinism boundary
+(\S\ref{sec:determinism}) to a single head sampler. Implementing PP as the default multi-node primitive in
+the same engine is an engineering task under way in the codebase; it is not the open problem. The open
+problem is what PP forces you to decide that TP does not.
+
+\paragraph{The open problem: optimal layer-range assignment.} PP must cut the $L$-layer model into $N$
+contiguous ranges and assign each to a node, under nodes that differ in \emph{compute}, \emph{memory}, and
+\emph{link bandwidth} simultaneously. Let node $j$ have compute throughput $\rho_j$ (layers/s-equivalent)
+and memory capacity $M_j$; let layer $l$ have compute weight $w_l$ and resident footprint $m_l$ (weights
+plus its KV cache). A pipeline is a permutation $\pi$ of nodes onto stages and a contiguous partition
+$0=c_0<c_1<\dots<c_N=L$ assigning layers $[c_{j-1},c_j)$ to stage $j$. Steady-state pipelined throughput is
+set by the slowest stage, so the assignment problem is
+\begin{equation}
+\min_{\pi,\;c}\;\max_{1\le j\le N}\;
+\max\!\left(\underbrace{\frac{1}{\rho_{\pi(j)}}\sum_{l=c_{j-1}}^{c_j-1} w_l}_{\text{stage compute}},\;
+\underbrace{\frac{B_{\mathrm{hop}}}{b_{\pi(j),\pi(j+1)}}}_{\text{activation transmit}}\right)
+\quad\text{s.t.}\quad
+\sum_{l=c_{j-1}}^{c_j-1} m_l \le M_{\pi(j)}\ \ \forall j,
+\label{eq:ilp}
+\end{equation}
+where $B_{\mathrm{hop}}$ is the per-hop activation size and $b_{\cdot,\cdot}$ the link bandwidth between
+consecutive stages. For a \emph{fixed} node ordering $\pi$ the inner problem --- partition a weighted
+sequence into $N$ contiguous parts minimizing the bottleneck part under per-part capacity --- is solvable
+exactly by dynamic programming or parametric search. The difficulty is the \emph{joint} choice of ordering
+$\pi$ (which node is adjacent to which, hence which link carries each hop) together with the partition and,
+in the geo setting (\S\ref{sec:geofloor}), the placement of nodes in space: that couples an assignment, a
+sequencing, and a facility-location decision, and is NP-hard in general.
+
+\paragraph{What is open.} A practical solver: good heuristics with a bounded approximation ratio for
+Eq.~\eqref{eq:ilp}; online \emph{re-balancing} as nodes join, leave, or thermally throttle (the membership
+of a permissionless network~\cite{consensus} is not static); and the memory-vs-compute tension when the
+throughput-optimal cut violates a small node's capacity. The single-stream \emph{latency} objective ---
+$\sum_j$ stage compute $+\,\Tring$ rather than the bottleneck --- is the variant~\cite{latency} analyses;
+Eq.~\eqref{eq:ilp} is its throughput dual, and a real scheduler must weigh the two. Prior PP scheduling
+work assumes homogeneous stages~\cite{gpipe} or homogeneous datacenter nodes~\cite{pipedream}; the open
+case is genuinely heterogeneous $\rho_j$, $M_j$, and $b_{jk}$ at once.
+
+\section{Problem 4: speculative decoding as a geo-distributed latency amortizer, made adaptive}
+\label{sec:spec}
+
+\paragraph{What the companion owns.} The latency paper~\cite{latency} derives the speculative-decoding
+cure in full: a local draft proposes $K$ tokens, the distributed target verifies all $K$ in one pipeline
+pass, and at acceptance rate $\alpha$ the effective rate is
+$r_{\mathrm{spec}}(\alpha,K)=\frac{1-\alpha^{K+1}}{1-\alpha}\big/(Kc_d+C+\Tring)$, which recovers
+interactive speeds on an intercontinental ring by paying the round-trip once per accepted \emph{block}
+rather than once per token. That derivation, its optimal $K^\star$ for fixed $\alpha$, and the numbers are
+the companion's result and are not restated here.
+
+\paragraph{What is open.} The companion treats $\alpha$ as a fixed parameter and $K$ as a tuned constant.
+In deployment neither holds. The acceptance rate $\alpha$ \emph{drifts} within a single generation --- it
+is high on boilerplate and low at genuine decision points, and it depends on prompt, temperature, and how
+far the draft and target have diverged in context --- so the throughput-optimal $K$ is a moving target,
+not a launch-time flag. The open problem is an \emph{online} controller that adapts $K$ to the measured
+acceptance and the measured ring latency $\Tring$: estimate $\alpha$ from a trailing window of
+accept/reject outcomes, react to $\Tring$ jitter and packet loss that the constant-$\ell$ model omits, and
+set $K$ to the running optimum with a stability guarantee (a controller that chases a noisy $\alpha$ can
+oscillate). Two couplings make it harder and are themselves open: the determinism boundary of
+\S\ref{sec:determinism} must hold across the \emph{whole verified block}, not one token, so a replicated
+target must agree on the accept/reject cut; and the draft can itself be placed on a nearby, more reliable
+node~\cite{consensus}, making draft placement part of the scheduling problem of \S\ref{sec:pp}. The
+genuinely empirical unknown --- measured $\alpha$ for real draft/target pairs on real prompt distributions,
+which the companion explicitly does not claim --- gates any adaptive scheme.
+
+\section{Problem 5: the prefill launch-overhead wall}
+\label{sec:prefill}
+
+\paragraph{Statement.} On identical mathematics, hanzo-engine prefill reaches a lower GPU utilization than
+\code{llama.cpp} not because any kernel is slow but because there are too many kernels. Profiled on an
+NVIDIA GB10 (node \emph{spark}) running a 35B-class mixture-of-experts prefill, the engine sustains
+$\approx$79.3\% GPU utilization across $\approx$33{,}000 kernel launches per step, against
+\code{llama.cpp}'s $\approx$97.3\% across $\approx$3{,}000 --- an order of magnitude more launches for the
+same work. Per-kernel \emph{busy} time is already at parity; the gap is entirely the idle interstice
+between launches, i.e.\ launch and scheduling overhead, not arithmetic. Decode does not have this problem,
+because the decode path is captured into a CUDA graph that replays the whole token as one submission; the
+prefill path is not, because mixture-of-experts routing is \emph{data-dependent} --- which experts fire
+depends on the tokens --- so the shape of the work changes per step and a naive static graph capture does
+not apply.
+
+\paragraph{Two attacks, and they compose.} There are two structurally different ways to collapse the launch
+count, and they are not exclusive:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Fixed-shape chunked graph capture.} Quantize the data-dependent dimension: route to a fixed
+capacity per expert (pad or drop to a chunk size), so the per-step work has a bounded set of shapes, and
+capture a CUDA graph per shape. This keeps the many small kernels but pays their launch cost \emph{once}
+at capture and replays them as one submission, exactly as decode already does. It is a runtime technique
+and inherits the graph machinery the engine has.
+\item \textbf{Compiler-level DAG fusion.} Reduce the \emph{number} of kernels rather than the cost of
+launching them: fuse elementwise and reduction chains into fewer, fatter kernels at compile time, so there
+is less to launch in the first place. This is the subject of the kernel-fusion companion~\cite{fuse},
+where fusion is shown to be composition; extending it from local elementwise chains to the full prefill DAG
+(across the MoE gate, the expert GEMMs, and the combine) is the open compiler problem.
+\end{itemize}
+Graph capture attacks the \emph{launch cost}; fusion attacks the \emph{launch count}; applied together they
+multiply. The decisive reason to invest in fusion as well as capture is portability: graph capture is a
+CUDA (and partial ROCm) facility, but fusion is a property of the kernel \emph{source} and therefore
+transfers to every backend the engine targets --- Metal, Vulkan, and ROCm, where graph support is weaker or
+absent~\cite{backend}. The open problem is the fusion \emph{partitioner}: given the prefill DAG, choose the
+kernel boundaries that minimize launches subject to register and shared-memory limits, and do it once,
+portably, from the one source.
+
+\section{Problem 6: KV-cache wire compression for prefill migration}
+\label{sec:kvcompress}
+
+\paragraph{Statement.} In steady-state pipeline decode the KV cache never crosses the wire --- each node
+keeps the keys and values for its own layers~\cite{latency}. The exception is \emph{migration}: moving a
+prefilled context between nodes, as in disaggregated prefill/decode, session hand-off, or re-placement when
+the schedule of \S\ref{sec:pp} changes. Then the KV cache --- the large, context-growing state --- must be
+shipped, and its size, not the activation's, sets the transfer cost. The engine already has an FP8 KV
+representation, so the obvious move is to ship KV in FP8 and halve the bytes.
+
+\paragraph{What is open.} Error accumulation across hops. A single FP8 round-trip of the KV cache is a
+tolerable, well-studied quantization. The open question is what happens when compression is applied
+\emph{repeatedly} --- a context migrated across several nodes over its lifetime, or a design that keeps KV
+in FP8 resident and re-quantizes on each write --- so that quantization error compounds hop over hop and
+layer over layer. Formally: bound the accumulated error of $H$ successive FP8 (de)compressions of a KV
+cache as a function of $H$, context length, and layer depth, and identify the schemes that arrest it ---
+error feedback (carry the residual forward), selective precision (keep the attention-sink and recent tokens
+in higher precision), or a migration protocol that recompresses from a retained high-precision anchor
+rather than from the last lossy copy. This is the compression dual of the determinism boundary
+(\S\ref{sec:determinism}): the all-reduce must be canonical \code{f32} because it is summed every layer,
+but the KV cache may tolerate FP8 precisely because it is \emph{read}, not reduced --- and the open problem
+is exactly how much, and for how many hops.
+
+\section{Problem 7: the geo-distributed decode latency floor and the placement it dictates}
+\label{sec:geofloor}
+
+\paragraph{What the companion owns.} The latency paper~\cite{latency} establishes the floor: single-stream
+autoregressive decode must traverse every pipeline stage per token, so its rate is $1/(C+\Tring)$ where
+$\Tring$ is the one-way loop latency, and because $\Tring$ is bounded below by the speed of light in fiber
+($\approx$4.9\,$\mu$s/km), an intercontinental ring floors decode at a few tok/s \emph{regardless of
+accelerator speed}. The companion also states the levers as placement laws --- regional-first placement,
+speculate across every slow boundary, co-locate the ring turn, keep KV node-local --- and proves pipeline
+parallelism dominates tensor parallelism over any slow link by $\sim\!4L/N$. The floor, the laws, and the
+$4L/N$ result are the companion's and are not restated.
+
+\paragraph{What is open.} The companion's laws are heuristics, stated and argued but not optimized or
+measured end-to-end. Two things remain. First, \emph{empirical validation}: the companion is explicit that
+it reports no wall-clock from a running geo deployment; a real multi-continent ring, with real jitter and
+loss, must confirm the $1/(C+\Tring)$ floor and the speculative recovery. Second, and deeper, the
+\emph{placement and replication optimization} the floor implies. If one ring cannot serve a global user
+base at interactive latency, the answer is \emph{regional replicas} --- multiple rings, each latency-local
+to a set of users, with requests routed to the nearest --- and choosing how many rings, in which regions,
+holding which shards, to minimize the population's tail latency under a memory and cost budget is a
+facility-location problem entangled with the layer-assignment ILP of \S\ref{sec:pp}: where a node sits in
+space changes both which users it is near and which link it contributes to its ring. Formalizing that
+joint placement--partition problem, and the routing that assigns each request to a ring, is open, and it is
+the geo-scale version of Problem~3.
+
+\section{Problem 8: cheap verifiable inference for a permissionless compute network}
+\label{sec:verify}
+
+\paragraph{What the companion owns.} The three-plane blueprint~\cite{consensus} builds the transport and
+control layers of a permissionless inference network: a post-quantum-authenticated ZAP wire that proves
+\emph{who} sent a tensor, a Quasar consensus control plane that admits staked miners and agrees the
+placement map, and a Photon committee that can threshold-sign an $(\text{request},\text{output})$ pair.
+For result integrity it proposes three composable mechanisms --- threshold attestation of outputs,
+redundant re-execution with the canonical-\code{f32} property as a bit-exact cross-vendor oracle, and
+luminance reputation as the economic backstop --- and labels them, honestly, as design. Authentication and
+committee formation are solved there and not reopened here.
+
+\paragraph{What is open: verification that is cheaper than the work.} Authentication proves who sent a
+tensor, not that the tensor is \emph{correct}, and the blueprint's strongest integrity mechanism ---
+redundant re-execution --- costs a full second computation on every checked request. That is fine as a
+sampled spot check but cannot be the common path: a network whose verification costs as much as its
+inference has no margin to pay honest miners. The open problem is \emph{sub-linear} verification of correct
+inference. Candidate directions, each unproven for transformer decode:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Sampling-based logit audits.} A verifier recomputes a \emph{random subset} of the claimed
+logits (a few positions, a few layers) and checks them against the miner's committed output, catching a
+cheating miner with high probability at a fraction of the compute. The open question is the soundness
+--- how large a subset defeats an adversary who corrupts only the tokens a user cares about --- and how it
+composes with the canonical-\code{f32} determinism (\S\ref{sec:determinism}) that makes a recomputed logit
+comparable bit-for-bit in the first place.
+\item \textbf{Redundant-execution economics.} Treat verification as a game: honest computation must be the
+profit-maximizing strategy under a spot-check probability $p$, a stake bond, and a slashing penalty. The
+open problem is to price $p$, the bond, and the reward so that the \emph{expected} cost of cheating exceeds
+its gain for a rational miner, while keeping the honest miner's expected verification tax small --- and to
+do so against collusion among a committee and grinding on the verification lottery, threats the blueprint
+names but does not price.
+\end{itemize}
+The unifying observation is that the canonical-\code{f32} wire built for cross-vendor \emph{correctness}
+(\S\ref{sec:determinism}, \cite{het}) is the same substrate that makes inference \emph{checkable}: two
+honest nodes agree bit-for-bit, so any disagreement is a proof of fault rather than a rounding artifact.
+Turning that from a full-re-execution check into a sampled, economically-sound one is the last open
+problem, and the one that decides whether a permissionless inference network can exist at all.
+
+\section{Synthesis}
+\label{sec:synthesis}
+
+The eight problems are not independent, and Table~\ref{tab:map} states their dependencies as plainly as
+their statements. Three throughlines run across them.
+
+\emph{Canonical \code{f32} is load-bearing twice.} The same property that makes an \code{f16} rank and a
+\code{bf16} rank agree on a reduced activation (\S\ref{sec:determinism}) is what lets a third party check a
+miner's work without a rounding dispute (\S\ref{sec:verify}). Correctness under replication and verifiable
+correctness are the same substrate seen from two sides.
+
+\emph{Scheduling is one problem at two scales.} The layer-assignment ILP of \S\ref{sec:pp} and the
+regional-replica placement of \S\ref{sec:geofloor} are the LAN and geo faces of a single
+partition-and-place optimization; solving one in isolation leaves the other's coupling on the table, and a
+real deployment sets both at once, with speculative-draft placement (\S\ref{sec:spec}) folded in.
+
+\emph{Pipeline parallelism dissolves more than it creates.} It sidesteps quant-aware sharding
+(\S\ref{sec:quantshard}), collapses the determinism boundary to one sampler (\S\ref{sec:determinism}), and
+makes the graph-capture asymmetry a local choice (\S\ref{sec:prefill}) --- but it buys those with the
+scheduling problem of \S\ref{sec:pp} and the migration cost of \S\ref{sec:kvcompress}. The net is
+favourable, which is why the series argues for it; the residue is real, which is why it is here.
+
+Finally, the register. Some of these are engineering with a known shape --- adaptive $K$ (\S\ref{sec:spec}),
+fixed-shape graph capture (\S\ref{sec:prefill}), FP8 migration (\S\ref{sec:kvcompress}) --- and will yield
+to careful implementation and measurement. Others are genuinely research --- the determinism-boundary
+theory (\S\ref{sec:determinism}), the heterogeneous scheduling ILP (\S\ref{sec:pp}), sub-linear
+verification (\S\ref{sec:verify}) --- and may not have clean answers. We have tried to say which is which,
+because the most useful thing an open-problems paper can do is not overclaim the difficulty of the easy
+ones or underclaim the depth of the hard ones.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}p{0.4cm}p{4.5cm}p{2.2cm}p{5.1cm}@{}}
+\toprule
+\# & \textbf{Problem} & \textbf{Exposed by} & \textbf{What is open (owning companion)} \\
+\midrule
+1 & Sampling-determinism boundary & heterogeneity & minimal agreement set; broadcast vs.\ canonicalize cost~\cite{het} \\
+2 & Quant-aware TP sharding & heterogeneity & superblock-aligned splits without dequant--requant~\cite{het} \\
+3 & PP layer-assignment ILP & heterogeneity & Eq.~\eqref{eq:ilp}: heuristics, online rebalance~\cite{het,latency} \\
+4 & Adaptive speculation & wide area & online $K$ under drifting $\alpha$, jittering $\Tring$~\cite{latency} \\
+5 & Prefill launch-overhead wall & (single-node) & fusion partitioner; portable, composes with capture~\cite{fuse,backend} \\
+6 & KV wire compression & wide area & cross-hop FP8 error accumulation bound~\cite{latency} \\
+7 & Geo decode latency floor & wide area & empirical floor; regional-replica placement~\cite{latency} \\
+8 & Cheap verifiable inference & permissionless & sub-linear logit audits; slashing economics~\cite{consensus} \\
+\bottomrule
+\end{tabular}
+\caption{The eight open problems, the environment property that exposes each, and the open kernel with the
+companion that owns the surrounding result. Problems 3 and 7 are one optimization at two scales; problems 1
+and 8 share the canonical-\code{f32} substrate. Problem 5 is exposed already single-node but is sharpest
+when prefill is distributed.}
+\label{tab:map}
+\end{table}
+
+\section*{Acknowledgement of scope}
+\addcontentsline{toc}{section}{Acknowledgement of scope}
+This paper contributes problem statements, not solutions, and every result it leans on belongs to a cited
+companion: the cross-vendor decode measurement and its residuals~\cite{het}, the latency floor and the
+speculative cure~\cite{latency}, and the three-plane network with its verification design~\cite{consensus}.
+Where a formal object appears --- the agreement set (\S\ref{sec:determinism}), the assignment ILP
+Eq.~\eqref{eq:ilp}, the error-accumulation bound (\S\ref{sec:kvcompress}) --- it is stated to make the open
+question precise, not claimed as solved. The measured numbers quoted (the launch-overhead profile of
+\S\ref{sec:prefill}) are attributed to the hardware that produced them (NVIDIA GB10) and to the companion
+that carries the surrounding stack~\cite{backend}.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{het} Hanzo AI --- ML Systems. \emph{One Cluster, Every Vendor: Cross-Vendor Tensor-Parallel LLM
+Inference over Commodity Ethernet.} Distributed-inference companion (measured).
+\bibitem{latency} Hanzo AI --- ML Systems. \emph{The Latency Physics of Geo-Distributed Autoregressive
+Decode.} Distributed-inference companion (analytical).
+\bibitem{consensus} Hanzo AI --- ML Systems. \emph{The Three-Plane Compute Fabric: Consensus-Managed,
+ZAP-Transported Decentralized AI Inference.} Distributed-inference companion (architecture).
+\bibitem{backend} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: hanzo-engine at
+llama.cpp Decode Parity on Every Backend.} Paper 05 (measured).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{megatron} M.\ Shoeybi, M.\ Patwary, R.\ Puri, P.\ LeGresley, J.\ Casper, B.\ Catanzaro.
+\emph{Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.}
+arXiv:1909.08053, 2019.
+\bibitem{gpipe} Y.\ Huang et al. \emph{GPipe: Efficient Training of Giant Neural Networks using Pipeline
+Parallelism.} NeurIPS, 2019.
+\bibitem{pipedream} D.\ Narayanan, A.\ Harlap, A.\ Phanishayee, et al. \emph{PipeDream: Generalized
+Pipeline Parallelism for DNN Training.} SOSP, 2019.
+\bibitem{petals} A.\ Borzunov et al. \emph{Petals: Collaborative Inference and Fine-tuning of Large
+Models.} arXiv:2209.01188, 2022.
+\bibitem{leviathan} Y.\ Leviathan, M.\ Kalman, Y.\ Matias. \emph{Fast Inference from Transformers via
+Speculative Decoding.} ICML, 2023.
+\bibitem{chen} C.\ Chen, S.\ Borgeaud, G.\ Irving, J.-B.\ Lespiau, L.\ Sifre, J.\ Jumper. \emph{Accelerating
+Large Language Model Decoding with Speculative Sampling.} arXiv:2302.01318, 2023.
+\end{thebibliography}
+
+\end{document}

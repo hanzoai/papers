@@ -41,9 +41,11 @@ identity axis the series has already measured, the localization dub's speaker-id
 Third, the \textbf{systems} reading: a feature render is an \emph{embarrassingly parallel throughput job} ---
 $\sim$2000 independent shot-jobs over the series' measured heterogeneous ring~\cite{het} --- with the bible as a
 shared conditioning \emph{prefix} that prefix-caches across every shot, and each shot an \emph{idempotent},
-content-hashed unit that makes a three-hour render a resumable build DAG. We give a projection template for
-wall-clock on $1$ versus $M$ nodes and label the per-shot time a projection, because no feature-length render is
-measured on our stack. Fourth, \textbf{open problems} specific to film that neither companion owns: perceptual
+content-hashed unit that makes a three-hour render a resumable build DAG. The \emph{assembly} half of this is
+now measured end to end in the native orchestrator --- a full three-hour placeholder cut assembles in under
+$30$\,s on one box ($\approx\!9$\,s across three nodes; per-shot $\approx\!0.21$--$0.26$\,s), and re-rendering
+recomputes \emph{zero} shots --- while the \emph{generative} per-shot time stays labelled a projection until the
+Wan-class video port lands, at which point the same wall-clock template resolves. Fourth, \textbf{open problems} specific to film that neither companion owns: perceptual
 metrics for narrative coherence, the shot-length-versus-drift trade, motif persistence across musical cues,
 lip-sync integration for dialogue shots, and the rights and provenance of persistent generated identities. The
 substrate numbers we lean on are measured and cited to the hardware that produced them; every number about a
@@ -348,7 +350,10 @@ grade should reduce it, and the residual is the style-flicker risk.
 \end{itemize}
 Both are \emph{cheap post-hoc measurements over the rendered shots}, not new training objectives, which fits the
 assembly architecture: the orchestrator already has every shot as a discrete artifact, so scoring the film's
-consistency is a pass over the shot set. Narrative coherence --- whether the assembled film makes \emph{sense},
+consistency is a pass over the shot set. A first, \emph{structural} version of this scoring --- a shot-to-shot
+luma-cosine proxy --- is shipped and measured in the orchestrator~\cite{film}; the embedding-based variants (the
+identity encoder $\phi$ above, a CLIP-image style embedding) are wired but await a served vision-embedding model,
+so those remain proposed. Narrative coherence --- whether the assembled film makes \emph{sense},
 not merely whether its characters look constant --- is not captured by either metric and is the first open problem
 (\S\ref{sec:open}).
 
@@ -399,7 +404,9 @@ invalidates --- the film analog of the games companion's incremental authoring. 
 a shot is reproducible from its key (seed included), so the same key yields the same shot across nodes and across
 time, which both makes the render cacheable and gives every shot a recorded lineage (which model, which weights,
 which prompt) --- the provenance the open problem of \S\ref{sec:open} builds on. Idempotency is what upgrades
-``run two thousand jobs'' into ``evaluate a build DAG,'' with all the resumability and caching that implies.
+``run two thousand jobs'' into ``evaluate a build DAG,'' with all the resumability and caching that implies. The
+orchestrator confirms this on real hardware: re-running an already-rendered film recomputes \emph{zero} shots,
+every content key resolving to an existing artifact~\cite{film}.
 
 \paragraph{Projection: wall-clock on one versus $M$ nodes.} Because the shots are independent, the wall-clock
 model is elementary. Let $\Nshots$ be the shot count, $\Tshot$ the mean per-shot render time, and $\Tasm$ the
@@ -421,15 +428,26 @@ next to $\Nshots\cdot\Tshot$ of generation. On a \emph{heterogeneous} fleet, rep
 work-queue's natural load-balancing --- fast nodes pull more shots --- so the makespan is
 $\approx \Nshots\Tshot / \sum_j \rho_j$ for node throughputs $\rho_j$ (in shots/s), the shot-parallel analog of
 the layer-assignment balance the distributed companion optimizes for a split model~\cite{openproblems}, but
-without the contiguity constraint because shots are interchangeable. \emph{We label $\Tshot$ a projection}: no
-feature-length render is measured on our stack, and the video generator itself is a port in progress (Wan-class
-MoE video~\cite{wan}) whose per-shot time is not yet a first-party number. What \emph{is} measured is every
-substrate the projection rests on --- the cross-vendor ring~\cite{het}, decode parity across
-backends~\cite{backend}, and the native dub's $11.6$\,fps combined throughput on a VAE-on-the-critical-path
-pipeline (f16, GB10)~\cite{games} that is a shot-shaped workload in miniature --- and the structure of
-Eqs.~\eqref{eq:serial}--\eqref{eq:parallel}, which holds for \emph{any} $\Tshot$ because the shots are
-independent. Plug in a measured $\Tshot$ when the video port lands and the wall-clock follows; the systems claim
-is the \emph{shape}, and the shape is not a projection.
+without the contiguity constraint because shots are interchangeable. \emph{The assembly half is now measured end to end; only the generative $\Tshot$ is a projection.} The native
+film orchestrator (\code{hanzo-film}, merged into the engine~\cite{film}) runs the full plan-to-timeline
+pipeline, and on a $20$-lane CPU box (node \emph{evo}) with \emph{placeholder} image-sequence shots standing in
+for the video generator, a shot assembles in $\approx\!0.206$--$0.256$\,s end to end --- keyframe $9$\,ms,
+Ken-Burns motion $123$\,ms, tail-frame handoff $21$\,ms, mix $15$\,ms, mux $63$\,ms --- so a full three-hour
+placeholder cut ($\Nshots\!\approx\!2000$) assembles in under $30$\,s on one box and $\approx\!9$\,s across three
+nodes, and an end-to-end mini-film (two scenes, six shots, two recurring characters) renders to a $16.02$\,s
+H.264$+$AAC file (measured by \code{ffprobe})~\cite{film}. These numbers validate the \emph{assembly} half of
+Eqs.~\eqref{eq:serial}--\eqref{eq:parallel} on real hardware: the orchestration, prefix reuse, mix, and mux are
+measured, the near-linear speedup from one box to three appears as predicted, and the serial assembly tail
+$\Tasm$ is confirmed small (seconds against a generation cost measured in hours). What remains a
+\emph{projection} is the generative $\Tshot$: the video generator is a Wan-class MoE port in progress~\cite{wan},
+and at an estimated $90$--$120$\,s per clip a three-hour film projects to $\approx\!54$--$72$\,h serial on one
+GPU versus $\approx\!18$--$24$\,h across the measured three-node ring~\cite{het} --- linear in nodes per
+Eq.~\eqref{eq:parallel}, and labelled projection until the port lands a first-party per-clip number. The other
+substrates the estimate rests on are measured: the cross-vendor ring~\cite{het}, decode parity across
+backends~\cite{backend}, and the native dub's $11.6$\,fps on a VAE-on-the-critical-path pipeline (f16,
+GB10)~\cite{games} that is a shot-shaped workload in miniature. The systems claim is the \emph{shape} of
+Eqs.~\eqref{eq:serial}--\eqref{eq:parallel}; the assembly shape is now measured, and the generative term is the
+only projection left in it.
 
 \paragraph{What the shape says.} Three consequences are worth stating plainly. A feature render is
 \emph{scalable} without algorithmic change: add nodes, render faster, linearly, until you run out of shots ---
@@ -605,6 +623,8 @@ Distributed-inference companion (analytical).
 Distributed-inference companion (research agenda).
 \bibitem{backend} Hanzo AI. \emph{Edge LLM Inference Across Commodity Accelerators: hanzo-engine at llama.cpp
 Decode Parity on Every Backend.} Paper 05 (measured).
+\bibitem{film} Hanzo AI --- ML Systems. \emph{hanzo-film: A Native Plan-to-Timeline Orchestrator for
+Feature-Length Assembly.} Engine component (measured; merged at \code{cdca071b4}).
 
 % --- Chunk-autoregressive video: forcing and anti-drift ---
 \bibitem{diffusionforcing} B.\ Chen, D.\ Mart\'i Monso, Y.\ Du, M.\ Simchowitz, R.\ Tedrake, V.\ Sitzmann.

@@ -1,0 +1,92 @@
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  node distance=6mm,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=8mm,
+              inner xsep=4pt, inner ysep=3pt},
+  stage/.style={box, fill=hzslate!8, draw=hzslate!60},
+  feat/.style={box, fill=hzblue!10, draw=hzblue!70},
+  pol/.style={box, fill=hzred!8, draw=hzred!55},
+  sel/.style={box, fill=hzgreen!14, draw=hzgreen!70},
+  arm/.style={box, fill=hzslate!12, draw=hzslate!55, minimum width=17mm},
+  armhot/.style={box, fill=hzgreen!16, draw=hzgreen!75, minimum width=17mm},
+  arr/.style={-{Latex[length=2mm]}, hzslate!80, line width=0.4pt},
+  arrhot/.style={-{Latex[length=2mm]}, hzgreen!75, line width=0.5pt}
+]
+
+% ---- Panel (a): enso single-arm routing ----
+\node[feat] (req) {request\\\textit{(prompt, ctx len,}\\\textit{media, SLO)}};
+\node[feat, right=of req] (x) {\textbf{featurize}\\$x=\phi(\text{req})$\\\scriptsize task\,$\parallel$\,hash\,$\parallel$\,len};
+\node[pol, right=of x] (pol) {\textbf{policy}\\$u(x,p)=x^{\!\top}\!W p$\\\scriptsize per-arm utility};
+\node[sel, right=8mm of pol] (sel) {\textbf{SLO selector}\\$\arg\max_{p:\,\mathrm{feasible}}$\\$u-\lambda c-\mu\ell$};
+
+% arm pool
+\node[arm, right=9mm of sel, yshift=13.5mm] (a1) {Opus 4.8};
+\node[armhot, below=2.2mm of a1] (a2) {GPT-5.5};
+\node[arm, below=2.2mm of a2] (a3) {Gemini 3.1 Pro};
+\node[arm, below=2.2mm of a3] (a4) {DeepSeek-V4 / Zen\\\scriptsize 1M ctx ladder};
+\node[draw=hzslate!40, dashed, rounded corners=2pt, fit=(a1)(a4),
+      inner sep=3pt, label={[hzslate!70,font=\tiny]above:frontier arm pool}] (pool) {};
+
+\draw[arr] (req) -- (x);
+\draw[arr] (x) -- (pol);
+\draw[arr] (pol) -- (sel);
+\draw[arr] (sel.east) -- (pool.west);
+\draw[arrhot] (sel.east) to[out=0,in=180] (a2.west);
+\node[hzgreen!70, font=\tiny, right=1mm of a2] {selected};
+
+% guard + learning loop
+\node[box, fill=hzslate!6, draw=hzslate!45, below=7mm of x, xshift=6mm]
+  (guard) {\textbf{guard} (two-tier safety) \;$\parallel$\; \textbf{observe}$(u,x,p,r)\to$ LinUCB $\theta_u$};
+\draw[arr, dashed, hzred!65] (a2.south) |- (guard.east);
+\draw[arr, dashed, hzred!65] (guard.west) -| (pol.south)
+  node[pos=0.25, below, hzred!65, font=\tiny] {reward feedback};
+
+\node[hzslate!70, font=\small\bfseries, above=1mm of req.north west, anchor=south west]
+  {(a)\; \texttt{enso} --- learned single-arm routing};
+
+% ---- Panel (b): enso-ultra fan-out + synthesis ----
+\begin{scope}[yshift=-46mm]
+\node[feat] (breq) {request};
+\node[feat, right=of breq] (bx) {\textbf{featurize}\\$x=\phi(\text{req})$};
+\node[pol, right=of bx] (bpol) {\textbf{policy}\\top-$N$ by $u(x,p)$};
+
+\node[armhot, right=10mm of bpol, yshift=8mm] (b1) {Opus 4.8};
+\node[armhot, below=2.2mm of b1] (b2) {GPT-5.5};
+\node[armhot, below=2.2mm of b2] (b3) {Gemini 3.1 Pro};
+\node[draw=hzgreen!45, dashed, rounded corners=2pt, fit=(b1)(b3),
+      inner sep=3pt, label={[hzgreen!70,font=\tiny]above:parallel fan-out ($N$ arms)}] (bpool) {};
+
+\node[sel, right=10mm of b2, minimum width=20mm] (synth)
+  {\textbf{synthesizer}\\\scriptsize rank $\parallel$ fuse\\\scriptsize (training-free)};
+\node[feat, right=of synth] (ans) {answer\\\scriptsize + provenance};
+
+\draw[arr] (breq) -- (bx);
+\draw[arr] (bx) -- (bpol);
+\draw[arrhot] (bpol.east) to[out=0,in=180] (b1.west);
+\draw[arrhot] (bpol.east) to[out=0,in=180] (b2.west);
+\draw[arrhot] (bpol.east) to[out=0,in=180] (b3.west);
+\draw[arrhot] (b1.east) to[out=0,in=180] (synth.west);
+\draw[arrhot] (b2.east) to[out=0,in=180] (synth.west);
+\draw[arrhot] (b3.east) to[out=0,in=180] (synth.west);
+\draw[arr] (synth) -- (ans);
+
+\node[hzslate!70, font=\small\bfseries, above=1.5mm of breq.north west, anchor=south west]
+  {(b)\; \texttt{enso-ultra}: top-$N$ fan-out $+$ synthesis};
+\end{scope}
+
+\end{tikzpicture}
+\caption{Enso serving architecture. \textbf{(a)}~\texttt{enso} turns a request
+into a feature vector $x$, scores every arm profile $p$ by the learned bilinear
+utility $x^{\top}Wp$, and returns the SLO-feasible $\arg\max$ of
+$u-\lambda c-\mu\ell$: exactly one frontier arm is selected per request. A
+two-tier safety guard gates the request, and each served outcome feeds an
+\texttt{observe}$(u,x,p,r)$ update that adapts the per-user weights $\theta_u$
+online (LinUCB). The routing policy and the closed learning loop are the ones
+specified in the Hanzo Router paper~\cite{hanzorouterpaper}. \textbf{(b)}~\texttt{enso-ultra}
+reuses the same learned policy to select the top-$N$ arms, dispatches them in
+parallel, and fuses their candidate answers with a training-free synthesizer.
+Orchestration is training-free; all learning lives at the routing layer.}
+\label{fig:arch}
+\end{figure*}

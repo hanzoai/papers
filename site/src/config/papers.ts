@@ -320,6 +320,19 @@ export const siteConfig: SiteConfig = {
       tags: ['Cloud', 'Multi-Tenancy', 'SQLite', 'Benchmarks'],
     },
 
+    {
+      id: 'hanzo-router',
+      title: 'Hanzo Router',
+      subtitle: 'Memory-Aware, Local-First LLM Routing with a Learned SLO-Constrained Policy',
+      abstract: 'A production request stream is dominated by its easiest queries — short chats, classification, formatting, boilerplate — yet frontier pricing charges the hardest-query rate on every token. Describes the router hanzo-node uses to place each request across a swappable pool of local and cloud models, decomplecting mechanism from brain: the mechanism is pure logic over value inputs (a model registry, a memory snapshot, the set of already-loaded models, a per-request SLO) that prefers reusing a resident model at zero marginal cost, then loading a local model that fits available memory, then the cheapest usable cloud model; the brain is a swappable policy behind a one-method seam — a rule-based cold-start policy, a learned bilinear utility with per-user online LinUCB adaptation, or a small trainable routing encoder. Gives the SLO-constrained objective the learned policy optimizes (quality − λ·cost − μ·latency under hard feasibility ceilings), the memory-aware fit check that makes local-first placement deterministic and unit-testable, and a usage-plane signal that biases routing away from providers near their rate limits. Claims no measured benchmark saving: instead an itemized cost model that goes beyond API token prices — serving simple traffic locally for the price of electricity rather than a rented GPU — whose arithmetic yields roughly a 90% reduction in total AI spend for a mixed workload.',
+      pdfUrl: '/pdfs/hanzo-router.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-router/main.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-07-07',
+      authors: ['Zach Kelling'],
+      tags: ['Router', 'Routing', 'Economics', 'On-Device', 'SLO'],
+    },
+
     // --- Hanzo Core Papers ---
     {
       id: 'aso',

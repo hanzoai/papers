@@ -1,0 +1,424 @@
+\documentclass[11pt]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage[hidelinks]{hyperref}
+
+\emergencystretch=2em % avoid overfull lines from long \texttt{} terms in narrow columns
+
+\definecolor{hzblue}{rgb}{0.12,0.30,0.55}
+\definecolor{hzslate}{rgb}{0.22,0.25,0.30}
+\definecolor{hzgreen}{rgb}{0.10,0.45,0.25}
+\definecolor{hzred}{rgb}{0.60,0.16,0.16}
+
+% =====================================================================
+% Results injection contract (numbers-as-data; the paper is a pure
+% function of the measured data).
+%
+% Every measured Enso / Enso-Ultra cell defaults to \runpending. When
+% the enso-bench harness has produced results, it writes a plain-LaTeX
+% file `results-data.tex' into this directory that \renewcommand's the
+% \rEns... / \rUlt... macros below with the measured values. Until that
+% file exists we typeset "run pending" and never a fabricated number.
+% Arm-baseline cells are provider-reported constants (see \S5) and are
+% typeset directly, not through this seam.
+%
+% results-data.tex must define, per benchmark key K in
+%   {SWEBP, TBENCH, LCB, LCBP, HLE, CHARXIV, GPQA}:
+%     \renewcommand{\rEns<K>}{..}   Enso accuracy
+%     \renewcommand{\rEnsC<K>}{..}  Enso cost/1k tasks ($)
+%     \renewcommand{\rUlt<K>}{..}   Enso-Ultra accuracy
+%     \renewcommand{\rUltC<K>}{..}  Enso-Ultra cost/1k tasks ($)
+% =====================================================================
+\newcommand{\runpending}{\textit{\small run pending}}
+\makeatletter
+\@for\ensokey:={SWEBP,TBENCH,LCB,LCBP,HLE,CHARXIV,GPQA}\do{%
+  \expandafter\newcommand\csname rEns\ensokey\endcsname{\runpending}%
+  \expandafter\newcommand\csname rEnsC\ensokey\endcsname{\runpending}%
+  \expandafter\newcommand\csname rUlt\ensokey\endcsname{\runpending}%
+  \expandafter\newcommand\csname rUltC\ensokey\endcsname{\runpending}%
+}
+\makeatother
+\IfFileExists{results-data.tex}{\input{results-data.tex}}{}
+
+\title{Enso: Learned Per-Request Routing to Frontier Intelligence, and Enso Ultra's Training-Free Fan-Out Synthesis}
+\author{Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    Los Angeles, California \\
+    \texttt{https://hanzo.ai}}
+\date{Hanzo Research}
+
+\begin{document}
+
+\hanzocoverpage
+
+\twocolumn[
+  \begin{@twocolumnfalse}
+  \maketitle
+  \begin{abstract}
+  \noindent
+  The strongest answer to a given request rarely comes from the same model twice.
+  On hard software engineering a frontier reasoning model wins; on long-context
+  synthesis a million-token model wins; on cheap high-volume traffic the marginal
+  gain of the most expensive model is zero. A single monolithic model is therefore
+  a bet that one weight set dominates every request in the stream, which the
+  published per-benchmark spread between frontier models refutes. We describe
+  \textbf{Enso}, Hanzo's proprietary closed model family that turns this spread
+  into a product. \texttt{enso} is a learned router: it featurizes each request,
+  scores every arm in a pool of frontier models by a bilinear utility
+  $x^{\top}Wp$, and returns the single SLO-feasible arm that maximizes
+  $\mathrm{quality}-\lambda\,\mathrm{cost}-\mu\,\mathrm{latency}$, adapting to each
+  user online. \texttt{enso-ultra} reuses the same policy to select the top-$N$
+  arms, dispatches them in parallel, and fuses their answers with a training-free
+  synthesizer. The routing policy is the one specified in the Hanzo Router
+  paper~\cite{hanzorouterpaper}; this paper is about the family it powers, the
+  serving substrate that presents it as one \texttt{/v1} API, and how it compares
+  to a learned orchestrator from the recent literature (Sakana AI's
+  Fugu~\cite{fugu}). Our design choice is deliberate and stated plainly: unlike
+  Fugu-Ultra, whose orchestrator is trained with reinforcement learning, Enso is
+  \emph{training-free at the orchestration layer and learned only at the routing
+  layer}, so a new frontier arm is onboarded by adding a row, not by retraining a
+  policy over the pool. We report our measured evaluation from the \texttt{enso-bench}
+  harness, mirroring Fugu's Table~1 methodology and adding a cost-per-benchmark
+  column it lacks; where a measurement is not yet in hand we typeset it as
+  \emph{run pending} rather than invent a number.
+  \end{abstract}
+  \vspace{1.5em}
+  \end{@twocolumnfalse}
+]
+
+\section{Introduction}
+\label{sec:intro}
+
+A frontier language model is a fixed bet. Its weights encode one balance of code,
+reasoning, math, chart understanding, long-context recall, and instruction
+following, and that balance is frozen at training time. But the request stream a
+production assistant sees is not fixed: one request is a graduate-level physics
+question, the next is a repository-scale refactor, the next is a chart to read,
+the next is a one-line reformat. The public per-benchmark tables make the
+consequence concrete. On the same seven benchmarks, the frontier models trade the
+lead back and forth---one leads on SWE-Bench Pro, another on LiveCodeBench Pro,
+another on Humanity's Last Exam---and no single model holds every column. A
+monolithic deployment picks one of these models and eats its losses on every
+column it does not lead. That is the structural inefficiency Enso removes.
+
+The move is to stop shipping a model and start shipping a \emph{policy over
+models}. Enso is a closed family with two SKUs behind one API. \texttt{enso}
+routes each request to the single frontier arm most likely to serve it best under
+a per-request service-level objective; the pool today spans a frontier reasoning
+arm (Claude Opus 4.8), a strong generalist (GPT-5.5), a multimodal arm (Gemini
+3.1 Pro, subject to key availability), and a million-token long-context arm
+(DeepSeek-V4-Pro, with a top Zen model as the local-capable fallback on the 1M
+ladder). \texttt{enso-ultra} spends more to buy the ceiling: it fans the request
+out to the top-$N$ arms in parallel and synthesizes one answer from their
+candidates. Both SKUs are a single \texttt{/v1} endpoint; the caller sends
+messages and gets an answer, and never has to know---or maintain keys for---the
+providers underneath.
+
+This framing has two consequences we make central. First, \textbf{routing beats
+monoliths whenever the pool's per-request argmax beats any fixed member}, and the
+published spread shows that condition holds. A learned router that identifies the
+right arm per request inherits the pool's upper envelope, not any single model's
+average. Second, \textbf{a router makes cost a first-class, transparent axis}. A
+monolith charges its one price on every token regardless of whether the request
+needed it; a router that optimizes $\mathrm{quality}-\lambda\,\mathrm{cost}-\mu\,\mathrm{latency}$
+sends cheap requests to cheap arms and prices each answer at the arm that actually
+served it. We therefore report a cost-per-benchmark column alongside accuracy---the
+number a buyer of intelligence actually pays---which comparison tables in this
+line of work typically omit.
+
+We are explicit about lineage. The routing mechanism, the SLO objective, the
+bilinear utility, and the online per-user adaptation are specified and analyzed in
+the Hanzo Router paper~\cite{hanzorouterpaper}; we cite that work for the policy
+internals rather than restating them, and focus here on (i)~the Enso \emph{family}
+and the serving substrate that presents it as one product (\S\ref{sec:arch}),
+(ii)~the Enso Ultra fan-out/synthesis SKU and why its orchestration is deliberately
+training-free (\S\ref{sec:ultra}), and (iii)~a measured evaluation against the same
+benchmarks a learned-orchestrator baseline reports (\S\ref{sec:eval}).
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Learned orchestration: Fugu, Trinity, Conductor.} The closest system to
+Enso is Sakana AI's \textbf{Fugu}~\cite{fugu}, a learned orchestrator over a pool
+of frontier models---Gemini 3.1 Pro, Claude Opus 4.8, and GPT-5.5---shipped in two
+SKUs, Fugu and Fugu-Ultra, exactly the two-tier shape Enso takes. Fugu is trained
+with supervised fine-tuning plus separable CMA-ES~\cite{sepcmaes}, and Fugu-Ultra
+adds GRPO reinforcement learning~\cite{grpo} at the orchestration layer; both build
+on the ICLR~2026 foundations Trinity~\cite{trinity} (evolutionary composition of
+experts) and Conductor~\cite{conductor} (RL-orchestrated ensembles). Enso shares
+Fugu's thesis---that the per-request argmax over a frontier pool beats any fixed
+member---and its two-SKU packaging, and we treat Fugu's published results as the
+reference point our evaluation mirrors (\S\ref{sec:eval}). Enso differs in where
+the learning sits: Fugu-Ultra learns an orchestrator with RL over the pool,
+whereas Enso learns only the routing policy and keeps orchestration training-free
+(\S\ref{sec:ultra}), so onboarding a new arm is a data change, not a retrain.
+
+\paragraph{Routing and cascading.} Enso's single-arm SKU is a router in the line of
+RouteLLM~\cite{routellm}, which learns a strong/weak binary router from preference
+data; FrugalGPT~\cite{frugalgpt}, which cascades cheap-to-expensive with a learned
+stopping scorer; Hybrid LLM~\cite{hybridllm}, which routes on a quality-aware
+threshold; AutoMix~\cite{automix}, which escalates via self-verification; and
+Tabi~\cite{tabi}, a multi-level inference system. Enso generalizes their binary or
+cascade decision to a constrained continuous objective,
+$\mathrm{quality}-\lambda\,\mathrm{cost}-\mu\,\mathrm{latency}$, over a pool of many
+frontier arms, and adds per-user online adaptation~\cite{linucb} that cascade work
+generally omits. The full treatment is in the router paper~\cite{hanzorouterpaper}.
+
+\paragraph{Ensemble synthesis.} Enso Ultra's fan-out/synthesis is grounded in
+multi-agent and ensembling work: Mixture-of-Agents~\cite{moa} layers proposer and
+aggregator models; LLM-Blender~\cite{llmblender} ranks and generatively fuses
+candidates from a model bank; and self-consistency~\cite{selfconsistency} shows
+that aggregating multiple independent samples improves reasoning. Ultra applies
+these fusion ideas across \emph{heterogeneous frontier arms} rather than samples
+from one model, and keeps the fuser training-free.
+
+\section{Enso Architecture}
+\label{sec:arch}
+
+Enso is two layers with one seam between them: a \emph{routing layer} that decides
+which arm(s) serve a request, and a \emph{serving layer} that presents the family
+as one metered product. Figure~\ref{fig:arch} shows both SKUs.
+
+\input{figures/architecture}
+
+\subsection{The routing layer: policy as data}
+\label{sec:routing}
+
+The router is the mechanism and policy specified in the Hanzo Router
+paper~\cite{hanzorouterpaper}; we summarize only what the family needs and cite
+that work for the rest. Each arm is one row in a cross-modal registry---a
+\texttt{(model, level, modality)} profile carrying an eval-measured quality vector
+over tasks plus normalized latency, cost, VRAM, and context reach. A request is
+turned into a feature vector $x$ by a hashing-trick featurizer (task one-hot,
+hashed n-grams, log-length, media flag, bias) in sub-microsecond time, and every
+arm profile $p$ is scored by the learnable bilinear utility
+\begin{equation}
+u(x,p) = x^{\top} W p, \qquad W\in\mathbb{R}^{D\times K}.
+\end{equation}
+The selector returns the SLO-feasible $\arg\max$ of the constrained objective
+\begin{equation}
+\arg\max_{p\,:\,\mathrm{feasible}(p)}\; u(x,p) - \lambda\,\widehat{c}(p) - \mu\,\widehat{\ell}(p),
+\end{equation}
+where the hard ceilings ($\texttt{max\_latency\_ms}$, $\texttt{max\_cost}$,
+$\texttt{min\_quality}$) gate the candidate set and the soft weights
+$\lambda,\mu$ trade cost and latency against quality. Offline, $W$ is a closed-form
+ridge fit~\cite{ridge}; online, each user carries a LinUCB bandit~\cite{linucb}
+whose parameter $\theta_u$ starts at $W$ and drifts toward that user's taste as
+outcomes arrive through a single \texttt{observe}$(u,x,p,r)$ call. The essential
+property for the family is that \emph{the policy is a function of data}: adding a
+frontier arm is adding a profile row, and its ranking then falls out of the same
+$W$ without a code change. A two-tier safety guard gates every request before the
+selector runs, cheaply on the hot path and escalating only ambiguous prompts.
+
+\subsection{The serving layer: family-as-data}
+\label{sec:serving}
+
+The serving substrate (the \texttt{zen-svc} engine behind the Hanzo AI
+gateway~\cite{hanzogateway}) turns the routing decision into one product. Three
+properties matter.
+
+\paragraph{One identity.} Whichever arm serves a request, the response is presented
+as Enso. The serving layer performs identity injection and upstream-hiding: the
+caller sees a single model family and its provenance, not the underlying provider,
+and never manages third-party keys. This is what lets the pool change---an arm
+added, retired, or swapped for a better version---without any client change.
+
+\paragraph{One meter.} Every routed request is metered on one plane, so cost is
+attributed per request to the arm that actually served it. This is the substrate
+that makes the cost-per-benchmark column of \S\ref{sec:eval} a real, per-request
+number rather than a blended list price, and it is what lets a deployment set
+$\lambda$ to move spend without touching application code.
+
+\paragraph{The 1M context ladder.} Long-context requests are a distinct pool. When
+a request's context exceeds the reach of the default arms, the router climbs a
+million-token ladder---a frontier long-context arm (DeepSeek-V4-Pro) with a top Zen
+model as the local-capable rung---selected by the same feasibility gate
+($\texttt{max\_context}\ge k$) as any other constraint. Long context is thus not a
+special mode but another column in the same registry, chosen by the same policy.
+
+\section{Enso Ultra: Training-Free Fan-Out Synthesis}
+\label{sec:ultra}
+
+\texttt{enso-ultra} is the ceiling SKU. Where \texttt{enso} spends the policy's
+confidence to pick one arm, Ultra spends compute to reduce the risk that the single
+argmax was wrong on a hard request: it selects the top-$N$ arms by the same utility
+$u(x,p)$, dispatches them in parallel, and fuses their candidate answers into one.
+The fan-out reuses the routing layer unchanged---the top-$N$ are simply the first
+$N$ of the same ranked, SLO-feasible candidate list---so Ultra inherits the pool,
+the guard, and the online adaptation for free.
+
+\paragraph{The synthesizer is training-free.} This is the deliberate contrast with
+Fugu-Ultra. Fugu-Ultra learns its orchestrator with GRPO~\cite{grpo}: the policy
+that decides how to combine models is itself an RL-trained artifact over the pool.
+Enso Ultra's synthesizer is training-free---it ranks and fuses the $N$ candidate
+answers with a fixed procedure grounded in the ensembling literature
+(Mixture-of-Agents-style aggregation~\cite{moa}, pairwise ranking and generative
+fusion as in LLM-Blender~\cite{llmblender}, and the aggregation-improves-reasoning
+result of self-consistency~\cite{selfconsistency}), with no weights of its own that
+depend on the current pool. The engineering consequence is the point:
+\emph{all learning in Enso lives at the routing layer, none at the orchestration
+layer}. When a new frontier arm ships, Enso onboards it by adding a profile row and
+letting the router rank it; Ultra then includes it in fan-out automatically. A
+system that learned its orchestrator over the pool---as Fugu-Ultra does---would in
+principle need to revisit that trained policy when the pool changes. We view
+training-free orchestration as the more maintainable choice for a family whose pool
+is expected to churn as frontier models are released, and we make no claim that it
+dominates a trained orchestrator on quality; \S\ref{sec:eval} reports the measured
+comparison and \S\ref{sec:limits} states the caveats.
+
+\paragraph{Provenance.} Because the serving layer meters every arm, an Ultra answer
+carries which arms contributed and at what cost, so the fan-out's price is
+transparent per request---the same metering that prices the single-arm SKU prices
+the ensemble.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\paragraph{Methodology.} We mirror the methodology of Fugu's Table~1~\cite{fugu}:
+the same seven public benchmarks---SWE-Bench Pro~\cite{swebench}, Terminal-Bench
+2.1~\cite{terminalbench}, LiveCodeBench~\cite{livecodebench}, LiveCodeBench Pro,
+Humanity's Last Exam (HLE)~\cite{hle}, CharXiv Reasoning~\cite{charxiv}, and GPQA
+Diamond~\cite{gpqa}---and the same arm pool. Enso and Enso-Ultra numbers are
+\emph{our own measurements} from the \texttt{enso-bench} harness. Per the
+honest-reporting discipline of \S\ref{sec:limits}, arm-baseline figures are
+provider-reported (identical to those Fugu tabulates), and every not-yet-measured
+Enso cell is typeset \emph{run pending} rather than filled with a guess. Beyond
+accuracy we report \textbf{cost per 1{,}000 tasks}, the per-request-metered spend
+(\S\ref{sec:serving}) that a comparison of routers must include and that Fugu's
+table omits.
+
+\paragraph{Reference point.} For context, Table~\ref{tab:fugu} reproduces Fugu's
+published results verbatim as reported by Sakana AI~\cite{fugu}; these are their
+system's numbers, not ours, and are included only to anchor the benchmark scale and
+the shape of the two-SKU comparison.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{Reference: Fugu's published results, \emph{as reported by Sakana
+AI}~\cite{fugu} (their system, not measured by us). Baselines are provider-reported.
+Reproduced to anchor scale; our measured results are in Table~\ref{tab:enso}.}
+\label{tab:fugu}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Benchmark & Opus 4.8 & Gemini 3.1 Pro & GPT-5.5 & Fugu & Fugu-Ultra \\
+\midrule
+SWE-Bench Pro        & 69.2 & 54.2 & 58.6 & 59.0 & 73.7 \\
+Terminal-Bench 2.1   & 74.6 & 70.3 & 78.2 & 80.2 & 82.1 \\
+LiveCodeBench        & 87.8 & 88.5 & 85.3 & 92.9 & 93.2 \\
+LiveCodeBench Pro    & 84.8 & 82.9 & 88.4 & 87.8 & 90.8 \\
+HLE                  & 49.8 & 44.4 & 41.4 & 47.2 & 50.0 \\
+CharXiv Reasoning    & 84.2 & 83.3 & 84.1 & 85.1 & 86.6 \\
+GPQA Diamond         & 92.0 & 94.3 & 93.6 & 95.5 & 95.5 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Enso results.} Table~\ref{tab:enso} is our result table: the same
+benchmarks and provider-reported arm baselines, with Enso and Enso-Ultra measured
+by \texttt{enso-bench}, plus the cost column. At the time of writing the harness
+reports GPQA Diamond (full), an HLE-500 subset, and a LiveCodeBench slice first,
+with the agentic benchmarks (SWE-Bench Pro, Terminal-Bench) pending; cells not yet
+measured read \emph{run pending}.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{Enso measured evaluation (\texttt{enso-bench}). Arm columns are
+provider-reported baselines (as in Table~\ref{tab:fugu}); the \textbf{Enso} and
+\textbf{Enso-Ultra} accuracy columns are our measurements, and \$/1k is the
+per-request-metered cost per 1{,}000 tasks (\S\ref{sec:serving}). \emph{Run
+pending} marks a measurement not yet in hand---never a fabricated number. Values
+are injected from \texttt{enso-bench} results at build time; see the results-data
+contract in \texttt{main.tex}.}
+\label{tab:enso}
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{Provider-reported arms} & \multicolumn{2}{c}{\textbf{Enso}} & \multicolumn{2}{c}{\textbf{Enso-Ultra}} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+Benchmark & Opus 4.8 & Gem 3.1 & GPT-5.5 & acc. & \$/1k & acc. & \$/1k \\
+\midrule
+SWE-Bench Pro      & 69.2 & 54.2 & 58.6 & \rEnsSWEBP   & \rEnsCSWEBP   & \rUltSWEBP   & \rUltCSWEBP   \\
+Terminal-Bench 2.1 & 74.6 & 70.3 & 78.2 & \rEnsTBENCH  & \rEnsCTBENCH  & \rUltTBENCH  & \rUltCTBENCH  \\
+LiveCodeBench      & 87.8 & 88.5 & 85.3 & \rEnsLCB     & \rEnsCLCB     & \rUltLCB     & \rUltCLCB     \\
+LiveCodeBench Pro  & 84.8 & 82.9 & 88.4 & \rEnsLCBP    & \rEnsCLCBP    & \rUltLCBP    & \rUltCLCBP    \\
+HLE                & 49.8 & 44.4 & 41.4 & \rEnsHLE     & \rEnsCHLE     & \rUltHLE     & \rUltCHLE     \\
+CharXiv Reasoning  & 84.2 & 83.3 & 84.1 & \rEnsCHARXIV & \rEnsCCHARXIV & \rUltCHARXIV & \rUltCCHARXIV \\
+GPQA Diamond       & 92.0 & 94.3 & 93.6 & \rEnsGPQA    & \rEnsCGPQA    & \rUltGPQA    & \rUltCGPQA    \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{What we expect to see, and how we will read it.} The hypothesis Enso is
+built on is that the router's per-request argmax tracks the pool's upper envelope:
+on each row, \texttt{enso} should approach or exceed the best single arm at a cost
+below the most expensive arm, and \texttt{enso-ultra} should lift the ceiling
+further at a higher, metered cost. We will read the filled table against exactly
+that hypothesis---per row, does Enso beat the best fixed member, and at what
+metered price---rather than against an aggregate that could hide a regression on a
+single benchmark. Until each cell is measured it stays \emph{run pending}, and the
+released \texttt{enso-bench} data is the source of every number that replaces a
+placeholder.
+
+\section{Limitations and Honest-Reporting Notes}
+\label{sec:limits}
+
+\paragraph{Provider-reported baselines.} The arm-baseline figures in
+Tables~\ref{tab:fugu} and~\ref{tab:enso} are provider-reported, not re-measured by
+us under a shared harness. Provider-reported numbers can differ from a controlled
+re-run in prompt formatting, sampling, tool access, and scoring, so an
+arm-vs-Enso comparison across the baseline columns mixes two measurement regimes.
+We keep the baselines because they are the numbers the field cites and because they
+match Fugu's table, but a like-for-like study would re-measure every arm inside
+\texttt{enso-bench}; that is future work.
+
+\paragraph{Agentic benchmarks pending.} The agentic rows (SWE-Bench Pro,
+Terminal-Bench 2.1) are the most expensive to run and the last to land; at the time
+of writing they are \emph{run pending}. Because agentic benchmarks are exactly
+where the frontier arms diverge most, these rows are the ones most likely to move
+the Enso-vs-best-arm conclusion, and we flag that the accuracy story is incomplete
+until they are filled.
+
+\paragraph{Training-free is a choice, not a claim of dominance.} We argue Enso's
+training-free orchestration is more maintainable under pool churn
+(\S\ref{sec:ultra}); we do \emph{not} claim it beats a trained orchestrator such as
+Fugu-Ultra on accuracy. The evaluation is what adjudicates that, per row, and only
+once the pending cells are measured.
+
+\paragraph{Numbers are data.} No number in this paper is invented. Arm baselines are
+provider-reported constants; every Enso and Enso-Ultra cell is either a measurement
+injected from the \texttt{enso-bench} results at build time or the literal string
+\emph{run pending}. The cost column is a per-request-metered figure from the serving
+plane (\S\ref{sec:serving}), not a blended list price.
+
+\section{Conclusion}
+
+No single frontier model leads every benchmark, so a monolith is a standing bet
+against its own losing columns. Enso replaces that bet with a learned policy over a
+pool of frontier arms: \texttt{enso} routes each request to the single arm most
+likely to serve it best under a per-request cost/latency/quality objective, and
+\texttt{enso-ultra} fans the hardest requests out to the top-$N$ arms and
+synthesizes one answer. Both are one \texttt{/v1} product---one identity, one meter,
+one 1M-context ladder---so the pool can change underneath without a client change.
+Against the recent learned-orchestrator baseline, Fugu, Enso shares the thesis and
+the two-SKU shape but places all learning at the routing layer and keeps
+orchestration training-free, so onboarding a new arm is a data change rather than a
+retrain. We report the comparison the way a buyer of intelligence reads it---accuracy
+and metered cost, per benchmark---and we report it honestly: measured where we have
+measured, \emph{run pending} where we have not.
+
+{\small
+\bibliographystyle{plain}
+\bibliography{references}
+}
+
+\end{document}

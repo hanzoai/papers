@@ -13,304 +13,240 @@
 \definecolor{zenblue}{RGB}{41,121,255}
 \hypersetup{colorlinks=true,linkcolor=zenblue,urlcolor=zenblue,citecolor=zenblue}
 
-\title{\textbf{Zen MoDE: Mixture of Distilled Experts Architecture}\\
-\large Technical Report v2025.06}
-\author{Antje Worring, Zach Kelling, Zen LM Research Team\\
-\texttt{research@zenlm.org}}
-\date{June 2025}
+\title{\textbf{Zen MoDE: Mixture of Diverse Experts}\\
+\large Complexity-Aware Routing over Frozen Experts Harvested from Open Models}
+\author{Zen LM Research, Hanzo AI\\
+\texttt{research@hanzo.ai}}
+\date{2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-We present Zen MoDE (Mixture of Distilled Experts), the core architectural innovation underlying the Zen model family. Zen MoDE addresses two fundamental challenges in large language model scaling: computational efficiency via sparse expert routing, and knowledge transfer via distilled expert initialization. We introduce semantic routing, where experts specialize by input domain and linguistic style rather than by position-hashing or random assignment. Combined with distilled expert initialization from smaller dense teacher models, Zen MoDE achieves performance matching a 400B-parameter dense model using only 47B active parameters (480B total). We present the router architecture, expert specialization analysis, load balancing algorithm, and performance benchmarks comparing Zen MoDE against dense equivalents.
+We present Zen MoDE (Mixture of Diverse Experts), the architecture underlying zen5.
+MoDE inverts the usual economics of frontier training: rather than train experts, it
+\emph{harvests} them. Expert modules are extracted from the largest open-weight models
+available---spanning six architecturally distinct families---and served frozen. The only
+trained parameters are a complexity estimator, a cross-architecture alignment layer, and
+a per-tier router: roughly 394M parameters, or 0.013\% of the assembled pool. A
+complexity-aware hierarchical router estimates task difficulty from a prompt's first
+tokens and activates only the tier that task warrants, so a greeting costs 0.8B active
+parameters and a proof costs 100B+. Because the experts are frozen and already trained,
+the method reaches frontier scale for the cost of training a small router. This paper
+describes the expert pool, the alignment and routing design, and the training procedure.
+Evaluation is in progress and reported separately; we publish no benchmark numbers here
+that we have not measured.
 \end{abstract}
 
 \section{Introduction}
 
-Scaling language models requires navigating a fundamental tension: more parameters improve capability, but increase inference cost proportionally. Mixture-of-Experts (MoE) architectures offer an elegant resolution: maintain a large parameter count while activating only a sparse subset per forward pass.
+Scaling a frontier model conventionally means training one: a single architecture, one
+pretraining run, and a compute bill that grows with parameter count. Mixture-of-Experts
+reduces the \emph{inference} cost of that model by activating a subset of its
+parameters, but the experts are still trained together, from scratch, within one family.
 
-Conventional MoE implementations route tokens to experts via a learned linear router, trained to maximize routing utility. In practice, this leads to load imbalance (popular experts become overloaded while others are underutilized) and poor expert specialization (experts do not develop interpretable specializations).
+The open-weight ecosystem now offers a different opportunity. Several organizations have
+each spent enormous compute training large models with genuinely different inductive
+biases---Gated DeltaNet, Lightning Attention, GLM MoE, DeepseekV3-style MoE, FP8 MoE.
+Those weights are published. The expensive artifact---a trained expert---already exists;
+what is missing is a way to use experts from different families together.
 
-Zen MoDE introduces three innovations that address these limitations:
+Zen MoDE is that mechanism. It treats published models as an \textbf{expert pool} to be
+harvested rather than a baseline to be beaten, and trains only the machinery needed to
+route across them:
 
 \begin{enumerate}
-  \item \textbf{Semantic routing}: Expert selection guided by semantic content embeddings, enabling interpretable domain and style specialization.
-  \item \textbf{Distilled expert initialization}: Each expert is initialized from a smaller dense teacher model specialized on a semantic domain, providing warm-start knowledge.
-  \item \textbf{Adaptive capacity factors}: Dynamic capacity allocation based on real-time expert load, preventing token dropping under skewed distributions.
+  \item \textbf{Diverse, not distilled.} Experts are taken \emph{as-is} from six model
+        families and never fine-tuned. Their diversity is the point: models trained by
+        different groups, on different data, with different attention mechanisms learn
+        different representations, and a router can exploit that.
+  \item \textbf{Complexity-aware routing.} A lightweight estimator predicts task
+        difficulty from the first 64 tokens and selects a tier. Standard MoE routes
+        every token through the same-size network; MoDE varies the network.
+  \item \textbf{Frozen experts, tiny trainable surface.} $\sim$394M trained parameters
+        against a $\sim$3.1T pool---two to three orders of magnitude less training
+        compute than pretraining a model of comparable capability.
 \end{enumerate}
 
-\section{Architecture}
+\section{Expert Pool}
 
-\subsection{Overall Structure}
+Experts are harvested from open-weight models spanning six text families and four
+additional modalities. Each source contributes its FFN/MoE blocks; weights are frozen at
+extraction and never updated.
 
-Zen MoDE follows the standard Transformer architecture with MoE layers replacing every-other dense feed-forward network (FFN) layer:
+\begin{table}[H]
+\centering
+\caption{Text expert sources. Tier is the complexity band the source serves.}
+\begin{tabular}{llrrl}
+\toprule
+\textbf{Source} & \textbf{Architecture} & \textbf{Total} & \textbf{Active} & \textbf{Tier} \\
+\midrule
+Qwen3.5-0.8B & Gated DeltaNet (dense)       & 0.8B  & 0.8B & T0 --- trivial \\
+Qwen3.5-9B   & Gated DeltaNet (dense)       & 9B    & 9B   & T1 --- standard \\
+MiniMax-M2.5 & Lightning Attention MoE      & 230B  & 10B  & T2 --- complex \\
+GLM-5        & GLM MoE                      & 744B  & 40B  & T3 --- advanced \\
+Kimi K2.5    & DeepseekV3 MoE (384 experts) & 1.04T & 32B  & T4 --- frontier \\
+Ling-1T      & FP8 MoE                      & 1T    & 50B  & T4 --- frontier \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Multimodal expert sources.}
+\begin{tabular}{lllr}
+\toprule
+\textbf{Modality} & \textbf{Source} & \textbf{Architecture} & \textbf{Total} \\
+\midrule
+Vision & Qwen3-VL-30B          & Vision-language transformer   & 30B \\
+Video  & Wan2.2                & MoE diffusion (3D causal VAE) & $\sim$14B \\
+Video  & CogVideoX-5B          & Expert transformer + 3D-RoPE  & 5B \\
+3D     & TRELLIS.2 (Microsoft) & Rectified flow DiT + SC-VAE   & 4B \\
+Audio  & Qwen3-Omni            & Thinker--Talker omni MoE      & 30B \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The assembled pool is $\sim$3.1T total parameters across 1000+ experts, of which at most
+$\sim$189B are active on any request. Every source is used under its own license and is
+credited, with that license, in the repository's NOTICE.
+
+\section{Complexity-Aware Hierarchical Routing}
+
+\subsection{The estimator}
+
+Standard MoE applies the same computation to every token: a linear router selects
+top-$K$ experts from one pool, and depth is fixed whether the prompt is a greeting or a
+research question. MoDE first asks how hard the task is.
+
+A 207M-parameter estimator reads the first 64 tokens and predicts a complexity tier
+$t \in \{T0,\dots,T4\}$. Only that tier's experts are activated.
+
+\begin{table}[H]
+\centering
+\caption{Complexity tiers and their activation budget.}
+\begin{tabular}{llll}
+\toprule
+\textbf{Tier} & \textbf{Active} & \textbf{Latency target} & \textbf{Example} \\
+\midrule
+T0 & 0.8B      & $<$50ms  & ``Hello, how are you?'' \\
+T1 & 9B        & $<$200ms & ``Summarize this article'' \\
+T2 & 10--40B   & $<$2s    & ``Compare Keynesian vs.\ monetarist economics'' \\
+T3 & 40--80B   & $<$5s    & ``Derive Black--Scholes from first principles'' \\
+T4 & 80--100B+ & $<$10s   & ``Design a novel consensus algorithm'' \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The estimator is deliberately small: it must be cheap enough that running it on every
+request is free relative to the compute it saves. Misprediction is recoverable---see
+adaptive escalation.
+
+\subsection{Cross-architecture alignment}
+
+Experts from different families do not share a representation space. A 134M-parameter
+alignment layer projects each source's hidden states into a shared space, which is what
+permits a Gated DeltaNet expert and a DeepseekV3 MoE expert to serve the same request.
+This layer, the estimator, and the router are the only trained components.
+
+\subsection{Router}
+
+The 52M-parameter MoDERouter performs per-tier expert selection. It adopts two published
+results rather than reinventing them:
 
 \begin{itemize}
-  \item \textbf{Layer structure}: Alternating dense attention + {dense FFN, MoE FFN} pattern.
-  \item \textbf{Expert count}: 128 experts per MoE layer.
-  \item \textbf{Active experts}: Top-$K=8$ experts per token ($K=2$ for the 14B model).
-  \item \textbf{Expert FFN size}: $4d_{\text{model}}$ hidden dimension (same as dense FFN equivalent).
-  \item \textbf{Shared experts}: 4 experts always activated (``shared'' experts, active for every token).
+  \item \textbf{ReMoE ReLU routing} (ICLR 2025)---ReLU gating gives an adaptive expert
+        count per token instead of a fixed top-$K$, so token difficulty varies the
+        expert budget \emph{within} a tier as the estimator varies it \emph{across}
+        tiers.
+  \item \textbf{MoE++ zero-computation experts} (ICLR 2025, oral)---zero, copy, and
+        constant experts let trivial tokens bypass FFN compute entirely, reported
+        upstream at 1.1--2.1$\times$ throughput.
 \end{itemize}
 
-The total parameter count $P_{\text{total}}$ and active parameters $P_{\text{active}}$ for an $L$-layer model with $N_E$ experts:
+\subsection{Adaptive escalation}
 
-\begin{align}
-P_{\text{total}} &= P_{\text{attn}} + P_{\text{shared}} + N_E \cdot P_{\text{expert}} \\
-P_{\text{active}} &= P_{\text{attn}} + P_{\text{shared}} + K \cdot P_{\text{expert}}
-\end{align}
+A tier chosen from 64 tokens can be wrong: a prompt may look simple and turn out to
+require reasoning. When generation confidence drops below threshold, MoDE promotes the
+request mid-generation to a higher tier. The estimator therefore need not be right, only
+cheap and approximately right; escalation makes its error recoverable rather than fatal.
 
-For the 480B Zen MoDE: $P_{\text{total}} = 480B$, $P_{\text{active}} = 47B$ (9.8\% activation ratio).
-
-\subsection{Model Scale Configurations}
+\section{Trainable Surface}
 
 \begin{table}[H]
 \centering
-\caption{Zen MoDE model configurations}
-\label{tab:configs}
-\begin{tabular}{lcccccc}
+\caption{Trained parameters. Everything else is frozen.}
+\begin{tabular}{lrl}
 \toprule
-Model & Total Params & Active Params & Experts & $K$ & Layers & $d_{\text{model}}$ \\
+\textbf{Component} & \textbf{Parameters} & \textbf{Role} \\
 \midrule
-Zen MoDE 14B & 14B & 2.4B & 64 & 2 & 28 & 2048 \\
-Zen MoDE 72B & 72B & 8.1B & 128 & 4 & 64 & 4096 \\
-Zen MoDE 236B & 236B & 22B & 128 & 8 & 80 & 7168 \\
-Zen MoDE 480B & 480B & 47B & 128 & 8 & 94 & 7680 \\
+ComplexityEstimator & 207M & Predicts the task's tier \\
+AlignmentLayer      & 134M & Projects diverse architectures to a shared space \\
+MoDERouter          & 52M  & Per-tier expert routing (ReLU gating) \\
+\midrule
+\textbf{Total} & \textbf{$\sim$394M} & \textbf{0.013\% of the $\sim$3.1T pool} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\section{Semantic Routing}
+This is the central economic claim, and it follows from the design rather than from a
+measurement: if the experts are frozen and already trained, the training cost of the
+assembled model is the training cost of the router.
 
-\subsection{Router Architecture}
+\section{Training}
 
-Conventional MoE routers apply a linear projection to the token representation and take the top-$K$ softmax scores:
+Training proceeds in five phases:
 
-\begin{equation}
-\text{router}_{\text{standard}}(x) = \text{TopK}(\text{softmax}(\mathbf{W}_r x), K)
-\end{equation}
-
-The Zen MoDE semantic router adds a two-stage process:
-
-\paragraph{Stage 1: Semantic Embedding.} A lightweight embedding model $f_s$ maps the input sequence prefix to a 256-dimensional semantic vector:
-\begin{equation}
-\mathbf{s} = f_s(\text{prefix}) \in \mathbb{R}^{256}
-\end{equation}
-
-This semantic vector captures topic domain, linguistic register, and task type at the sequence level.
-
-\paragraph{Stage 2: Expert Scoring.} Token-level routing is biased toward experts whose learned prototype $\mathbf{p}_e$ is nearest to the semantic vector:
-
-\begin{equation}
-\text{score}(x, e) = \underbrace{\mathbf{w}_e^\top x}_{\text{token routing}} + \underbrace{\beta \cdot \text{sim}(\mathbf{s}, \mathbf{p}_e)}_{\text{semantic bias}}
-\end{equation}
-
-where $\beta = 0.3$ balances local (token) and global (semantic) routing signals.
-
-\subsection{Expert Specialization}
-
-\begin{table}[H]
-\centering
-\caption{Expert specialization analysis: top domains per expert cluster (128 experts, 16 clusters)}
-\label{tab:specialization}
-\begin{tabular}{lll}
-\toprule
-Cluster & Primary Domain & Secondary Domains \\
-\midrule
-1--8 & Code (Python, JS, Rust) & Algorithms, data structures \\
-9--16 & Mathematics (formal) & Proofs, theorems \\
-17--24 & Scientific writing & Academic, citations \\
-25--32 & Medical/clinical & Pharmacology, anatomy \\
-33--40 & Legal text & Contracts, statutes \\
-41--48 & Financial text & Earnings, risk, regulation \\
-49--56 & Creative writing & Fiction, poetry \\
-57--64 & Conversational & Dialogue, casual register \\
-65--72 & News and journalism & Current events, AP style \\
-73--80 & Technical documentation & Manuals, API docs \\
-81--88 & Multilingual (CJK) & Japanese, Chinese, Korean \\
-89--96 & Multilingual (Arabic) & Arabic, Farsi, Hebrew \\
-97--104 & Multilingual (Slavic) & Russian, Polish, Czech \\
-105--112 & Low-resource languages & African, SE Asian \\
-113--120 & Instruction following & Commands, structured output \\
-121--128 & Reasoning (chain-of-thought) & Logic, planning \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Expert specialization is measured by the Jensen-Shannon divergence between the token distribution of expert $e$'s input and the corpus-wide distribution. Higher divergence indicates stronger specialization. Zen MoDE experts achieve average JS-divergence of 0.42 versus 0.18 for standard top-K routing (2.3$\times$ improvement).
-
-\section{Distilled Expert Initialization}
-
-\subsection{Teacher Model Preparation}
-
-For each semantic domain cluster $c$, we prepare a specialist dense teacher model:
 \begin{enumerate}
-  \item Start from a 7B dense model pre-trained on the full corpus.
-  \item Fine-tune on domain-specific data (e.g., code corpus for code experts, PubMed for medical experts).
-  \item Extract the FFN weight matrices $\{W_1^c, W_2^c\}$ for each layer as expert initialization.
+  \item \textbf{Expert extraction}---harvest FFN/MoE blocks from each source model.
+  \item \textbf{Alignment pre-training}---learn the cross-architecture projections.
+  \item \textbf{Router training}---train the complexity estimator and per-tier routers.
+  \item \textbf{Integration}---joint fine-tuning of the trainable surface, experts frozen.
+  \item \textbf{Omnimodal fusion}---add the vision, video, 3D, and audio experts.
 \end{enumerate}
 
-\subsection{Expert Initialization Protocol}
+Hanzo's contribution on top of the harvested experts is confined to identity training,
+agentic-data fine-tuning, and abliteration. The experts' capabilities are the source
+models' own, and we claim none of them.
 
-Expert $e$ in cluster $c$ is initialized by projecting the teacher FFN weights to expert dimensions:
-
-\begin{equation}
-W_{e,\text{init}} = \mathbf{P}_e \cdot W^c_{\text{teacher}} \cdot \mathbf{Q}_e
-\end{equation}
-
-where $\mathbf{P}_e, \mathbf{Q}_e$ are random orthogonal projections that map from teacher dimensions to expert dimensions. This preserves the spectral properties of the teacher weights in a lower-dimensional subspace.
+\section{Lineup}
 
 \begin{table}[H]
 \centering
-\caption{Distilled initialization vs. random initialization (perplexity on held-out eval, lower is better)}
-\label{tab:distillation}
-\begin{tabular}{lccc}
+\caption{zen5 configurations. Active parameters are a range because the tier is chosen per request.}
+\begin{tabular}{lrll}
 \toprule
-Initialization & Step 1K & Step 10K & Step 100K \\
+\textbf{Model} & \textbf{Total} & \textbf{Active} & \textbf{Target} \\
 \midrule
-Random & 48.2 & 18.4 & 8.4 \\
-Copy from dense base & 22.4 & 12.8 & 7.8 \\
-Distilled (ours) & \textbf{16.4} & \textbf{10.2} & \textbf{7.2} \\
+zen5       & 750B & 0.8--50B   & General \\
+zen5-coder & 1.8T & 0.8--80B   & Code \\
+zen5-omni  & 2.5T & 0.8--100B  & Omnimodal \\
+zen5-max   & 3.1T & 0.8--100B+ & Frontier \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Distilled initialization provides significant early-training advantage, converging to final loss in 31\% fewer training steps.
+\section{Evaluation}
 
-\section{Load Balancing}
+Evaluation is in progress. Routing accuracy, per-tier latency, and end-task quality are
+measured by \texttt{scripts/benchmark.py} in the zen5 repository and will be reported
+when the numbers are real. We publish none here. The architecture's claim---frontier
+capability at router-training cost---is worth testing honestly, and a fabricated table
+would only obscure whether it holds.
 
-\subsection{Expert Load Imbalance Problem}
+\section{Related Work}
 
-Without load balancing, popular experts become overloaded while others are underutilized. Overloaded experts either drop tokens (capacity-limited) or become bottlenecks (unlimited capacity). Both outcomes degrade performance.
+MoDE builds directly on published results: ReMoE (ICLR 2025) for ReLU-gated adaptive
+expert counts, MoE++ (ICLR 2025, oral) for zero-computation experts, and Transfusion for
+unified autoregressive and diffusion modeling in a single architecture. Its novelty is
+not any single mechanism but the composition: cross-architecture experts harvested from
+independently trained open models, made interoperable by a learned alignment, and
+selected by a complexity estimator that varies compute with task difficulty. We are not
+aware of an existing model that combines these.
 
-\subsection{Auxiliary Load Balancing Loss}
+\section*{Availability}
 
-Zen MoDE minimizes an auxiliary load balancing loss alongside the main language modeling objective:
-
-\begin{equation}
-\mathcal{L}_{\text{balance}} = \alpha \cdot N \sum_{e=1}^{N_E} f_e \cdot P_e
-\end{equation}
-
-where $f_e = \frac{1}{T} \sum_t \mathbf{1}[e \in \text{TopK}(t)]$ is the fraction of tokens routed to expert $e$, $P_e = \frac{1}{T} \sum_t p_t^e$ is the average routing probability for expert $e$, and $\alpha = 0.01$ is the load balancing coefficient.
-
-\subsection{Adaptive Capacity Factors}
-
-The capacity factor $C$ limits the maximum tokens an expert can process per batch:
-\begin{equation}
-\text{capacity}_e = C \cdot \frac{\text{batch size} \cdot \text{seq len}}{N_E}
-\end{equation}
-
-Zen MoDE uses adaptive capacity factors that adjust per-expert based on rolling load statistics:
-\begin{equation}
-C_e(t) = C_{\text{base}} + \gamma \cdot \left(\bar{f}_e - \frac{1}{N_E}\right)
-\end{equation}
-
-Under-utilized experts ($\bar{f}_e < 1/N_E$) get reduced capacity, over-utilized experts get increased capacity, preventing token dropping under natural load distribution skew.
-
-\section{Benchmark Results}
-
-\subsection{Performance vs. Dense Equivalent}
-
-\begin{table}[H]
-\centering
-\caption{Zen MoDE vs. dense equivalent: MMLU 5-shot (\%)}
-\label{tab:perf_dense}
-\begin{tabular}{lccc}
-\toprule
-Model & Params & Active & MMLU \\
-\midrule
-Dense 7B & 7B & 7B & 63.4 \\
-Zen MoDE 14B & 14B & 2.4B & 72.8 \\
-Dense 13B & 13B & 13B & 67.2 \\
-Dense 70B & 70B & 70B & 80.2 \\
-Zen MoDE 72B & 72B & 8.1B & 84.8 \\
-Dense 400B (estimated) & 400B & 400B & 90.4 \\
-Zen MoDE 480B & 480B & 47B & 91.2 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Zen MoDE 480B matches estimated dense-400B performance with only 47B active parameters—an 8.5$\times$ reduction in inference FLOPs.
-
-\subsection{Expert Utilization}
-
-\begin{table}[H]
-\centering
-\caption{Expert utilization metrics (Zen MoDE 72B)}
-\label{tab:utilization}
-\begin{tabular}{lcc}
-\toprule
-Metric & Standard Top-K & Zen MoDE \\
-\midrule
-Utilization entropy & 5.42 bits & 6.81 bits (max 7 bits) \\
-CV (coefficient of variation) & 0.84 & 0.31 \\
-Token drop rate & 3.2\% & 0.8\% \\
-Expert utilization below 50\% & 24 experts & 8 experts \\
-Expert utilization above 200\% & 18 experts & 3 experts \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Routing Quality}
-
-\begin{table}[H]
-\centering
-\caption{Routing quality metrics}
-\label{tab:routing}
-\begin{tabular}{lcc}
-\toprule
-Metric & Standard Top-K & Semantic Routing \\
-\midrule
-Domain consistency (same-domain token routing) & 61.4\% & 84.2\% \\
-Expert JS-divergence & 0.18 & 0.42 \\
-Router confidence (avg top score) & 0.48 & 0.62 \\
-Cross-domain routing (noise) & 38.6\% & 15.8\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\section{Training Efficiency}
-
-\subsection{Compute Budget}
-
-The MoDE architecture provides significant training compute savings over dense models at equivalent capacity:
-
-\begin{equation}
-\frac{\text{FLOPs}_{\text{MoDE}}}{\text{FLOPs}_{\text{dense-equivalent}}} = \frac{K + N_{\text{shared}}}{N_E} \approx \frac{12}{128} \approx 9.4\%
-\end{equation}
-
-In practice, attention layers (non-sparse) and overhead reduce the realized savings to approximately 8$\times$ reduction in training FLOPs for the same total parameters.
-
-\subsection{Communication Overhead (Distributed Training)}
-
-Expert parallelism requires all-to-all communication to route tokens to the correct expert device. Communication overhead as a fraction of total training time:
-
-\begin{table}[H]
-\centering
-\caption{Expert parallelism communication overhead}
-\label{tab:comm}
-\begin{tabular}{lccc}
-\toprule
-Model & Expert Parallelism & Comm / Total & Effective Throughput \\
-\midrule
-72B & 8 nodes & 8.4\% & 91.6\% of compute \\
-236B & 16 nodes & 11.2\% & 88.8\% of compute \\
-480B & 32 nodes & 14.8\% & 85.2\% of compute \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\section{Conclusion}
-
-Zen MoDE demonstrates that principled mixture-of-experts design—semantic routing, distilled expert initialization, and adaptive load balancing—substantially improves over naive sparse routing approaches. The 480B Zen MoDE model matches estimated dense-400B performance at 8.5$\times$ lower inference FLOPs, and semantic routing increases expert specialization by 2.3$\times$ as measured by domain-routing consistency. Distilled expert initialization accelerates convergence by 31\%, enabling efficient training of very large expert counts.
-
-\begin{thebibliography}{99}
-\bibitem{moe_original} Shazeer, N. et al. Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer. \textit{ICLR}, 2017.
-\bibitem{switch} Fedus, W. et al. Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity. \textit{JMLR}, 2022.
-\bibitem{gshard} Lepikhin, D. et al. GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding. \textit{ICLR}, 2021.
-\bibitem{mixtral} Jiang, A. et al. Mixtral of Experts. \textit{arXiv:2401.04088}, 2024.
-\bibitem{expert_specialization} Zuo, S. et al. Taming Sparsely Activated Transformer with Stochastic Experts. \textit{ICLR}, 2022.
-\end{thebibliography}
+Architecture, extraction, and router-training code: \url{https://github.com/zenlm/zen5}.
+Each harvested source is credited, with its license, in that repository's NOTICE.
 
 \end{document}

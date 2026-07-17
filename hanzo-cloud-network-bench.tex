@@ -200,9 +200,12 @@ The fix (\texttt{zap-proto/http}, branch \texttt{perf/zero-alloc-codec}) is
 mechanical, not architectural: pool the \texttt{RequestCtx} once per connection,
 hand-roll a frame encoder that appends into a pooled buffer, and drain the
 4-byte length prefix through \texttt{bufio.Peek}/\texttt{Discard} so no header
-array escapes to the heap. The marshalers drop to \textbf{zero} allocations
-(\texttt{MarshalResponse} $19\to0$ allocs, $1215\to61$\,ns); a full request/
-response round trip allocates nothing. Golden tests confirm the wire is
+array escapes to the heap. The serve path serializes with
+\texttt{AppendResponse} into that reused buffer --- \textbf{zero} allocations,
+versus 19 for the old fresh-slice \texttt{MarshalResponse} --- and
+\texttt{UnmarshalRequest} decodes headers in place, also zero-alloc; over a warm
+connection the serve loop allocates nothing per request. Golden tests confirm the
+wire is
 \emph{byte-identical} before and after --- this is a pure codec rewrite, no
 protocol change. The measured effect (Table~\ref{tab:zap}): ZAP rises
 $91\text{k}\to570\text{k}$ req/s, a \textbf{6.3$\times$} lift that

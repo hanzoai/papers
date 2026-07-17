@@ -475,6 +475,32 @@ Composed with the capacity model, the gap compounds: the mesh's 6--21\,GB fixed 
 $10^8$ registered tenants at 1\% concurrency in $<$1\,GB of control-plane RAM
 (Table~\ref{tab:cap}) --- the mesh alternative already needs 19--64\,GB just to exist.
 
+\paragraph{(4) The call path itself: an in-process function call, measured.}
+Axes (1)--(3) count what the mesh \emph{spends}; this one measures what the unified design
+\emph{saves} on the call. Every inter-subsystem read the mesh routes over the network, the
+unified binary makes as a direct Go call into the co-resident subsystem's own store --- no
+socket, no TLS handshake, no (de)serialization. We measure the customer billing surface's usage
+read, which resolves the caller's spend \emph{directly} from the co-resident per-tenant finance
+ledger (\texttt{finance.ListUsage} --- one SQLite scan of the org's own file):
+\textbf{1.25\,ms for a 100-row read, 10.5\,ms at 1000 rows} (\meas{}; GB10 node, cgo/SQLite,
+warm), with \emph{zero} network round trips. The mesh alternative pays a billing$\to$ledger hop
+plus (re)serialization on every such read, on top of the fixed-memory tax of
+Table~\ref{tab:mesh}.
+
+The discipline this exacts --- stated plainly because we paid for it in an outage --- is that an
+in-process call must be a direct function \emph{reference}, never in-process HTTP that re-routes
+by request path. When the same billing read was instead expressed as an in-process HTTP request
+to \texttt{/v1/billing/usage} against the shared app, and the ledger subsystem's own route for
+that path was not compiled into this binary, the request matched the only registration of that
+path --- the \emph{caller}'s own handler --- and re-entered it, answering itself.
+Composition-by-path is a footgun; composition-by-reference (\texttt{finance.Current().ListUsage})
+is the invariant. Symmetrically, the balance gate that fronts these reads must gate \emph{writes
+and metered compute}, never plain reads, or a zero-balance tenant cannot even view its own state.
+To keep both invariants honest, a per-subsystem functional smoke (\texttt{cmd/smoke},
+\S\ref{sec:repro}) issues 30 side-effect-free reads across the binary's mounted subsystems and
+asserts a working code on each --- never a 5xx, never a read wrongly gated 402 ---
+failing the release before such a regression ships.
+
 \section{Claims, grounded in the measurement}
 \label{sec:claims}
 We state the design's guarantees as propositions, each tied to a measured or structural fact
@@ -735,7 +761,17 @@ $100\rightarrow1000$ incremental slope. Idle test: close all handles, re-measure
 close all, open 1000 fresh, re-measure. Large-tenant knob: inflate the seed to 25\,MB
 (60{,}000 padded rows) and repeat the \texttt{cache\_size} sweep under a full-scan warm workload.\\
 \textbf{Capacity model.} Eq.~\ref{eq:model} with $U=24$\,GB, $b=0.19$\,GB, $m\in\{0.25,1.0\}$\,MB,
-32\,GB nodes, HA floor 3; disk $R\times0.38$\,MB object-tiered.
+32\,GB nodes, HA floor 3; disk $R\times0.38$\,MB object-tiered.\\
+\textbf{In-process call path (\S\ref{sec:compare}, axis 4).} Host \texttt{spark}: NVIDIA GB10
+(Grace--Blackwell, aarch64), production driver cgo/\texttt{mattn}. Usage-read latency: seed
+$N\in\{100,1000,5000\}$ debits into one org's finance ledger via \texttt{finance.RecordUsage},
+then benchmark \texttt{finance.ListUsage} over that org's file ---
+\texttt{CLOUD\_KMS\_MASTER\_KEY\_REF=<32B> go test -bench=ListUsage -benchmem
+./clients/finance/} in \texttt{github.com/hanzoai/cloud} (1.25/10.5/61\,ms at 100/1000/5000
+rows). Functional composition: \texttt{go build ./cmd/smoke \&\& SMOKE\_BASE\_URL=<url>
+[SMOKE\_TOKEN=<bearer>] ./smoke} probes one read per mounted subsystem and exits non-zero on any
+402-on-read or 5xx; it is wired as the release gate in
+\texttt{.github/workflows/release.yml}.
 
 \begin{thebibliography}{9}
 \bibitem{hip0106} Hanzo AI. \emph{HIP-0106: Cloud --- Unified Hanzo Binary}.

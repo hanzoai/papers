@@ -1,0 +1,343 @@
+\documentclass[11pt,twocolumn]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{shared/lstlang}
+
+\title{The Hanzo Cloud Data Plane: Benchmarking \texttt{zip}, ZAP, and the
+Road to a Million Requests per Second}
+
+\author{
+    Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    Los Angeles, California \\
+    \texttt{https://hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+We present a reproducible benchmark of the Hanzo cloud data plane --- the
+\texttt{zip} web framework and its native ZAP binary transport --- and a
+systems-tuning study on a two-node 2.5\,GbE testbed (an NVIDIA GB10 ``spark''
+server, 20 cores, aarch64; a 32-core x86\_64 ``evo'' load generator). We
+establish that \texttt{zip} carries a negligible tax over the \texttt{fasthttp}
+engine it wraps ($\approx$24\,ns and one 48-byte allocation per request;
+$0.95\times$ raw throughput on a no-op handler). We then show that the naive
+distributed result --- 194{,}000 req/s over the wire --- is not a CPU or
+bandwidth limit but a \emph{single hardware RX-queue} on the 2.5\,GbE NIC, whose
+driver refuses hardware multi-queue. Enabling Receive Packet Steering (RPS) plus
+a deeper backlog and larger socket buffers lifts the same link to
+\textbf{518{,}000 req/s (a $2.67\times$ gain)}, at which point the tuned network
+result exceeds loopback because the server's cores no longer contend with the
+load generator. Finally we characterize the ZAP transport. It initially ran
+\emph{slower} than HTTP (91k vs.\ 481k req/s loopback), which we localize by
+construction to a non-zero-allocation codec --- three allocation sites, the
+largest an un-pooled request context, driving 2203 garbage collections in six
+seconds (relaxing \texttt{GOGC} $100\to800$ alone more than doubles throughput).
+Pooling the context and making the marshalers zero-allocation --- a pure codec
+rewrite with a byte-identical wire --- lifts ZAP $6.3\times$ to \textbf{570k
+req/s, overtaking HTTP by $1.18\times$}, with GC falling $2203\to62$. We show
+this is a CPU/allocation win, not a wire win on trivial payloads (the ZAP frame
+is \emph{larger} there: 124 vs.\ 75 bytes), and that over the saturated 2.5\,GbE
+link both transports tie at $\approx$530k. Separately, on the serialization axis
+--- native typed RPC vs.\ HTTP+JSON on a shared record --- ZAP \emph{decodes}
+$35$--$174\times$ faster at zero allocations (13\,ns vs.\ 473--2334\,ns), a wash
+on encode, netting $1.1$--$1.3\times$ end-to-end once the socket dominates. We
+release the framework as \texttt{hanzoai/benchmarks} and the tuning as a single
+idempotent script.
+\end{abstract}
+
+\section{Introduction}
+The Hanzo control plane ships as a single Go binary that mounts every subsystem
+(AI gateway, commerce, IAM, KMS) and serves \texttt{api.hanzo.ai}~\cite{hip0106}.
+Its HTTP surface is \texttt{zip}~\cite{zip}, a framework built on a fork of
+\texttt{fiber}~/ \texttt{fasthttp}, and its inter-subsystem calls travel over
+\emph{ZAP}, a typed binary transport that reuses \texttt{fasthttp} request and
+response objects over a length-framed wire~\cite{zaphttp}. Two questions follow
+naturally: \emph{(i)} how much does the framework cost over the bare engine, and
+\emph{(ii)} where is the real ceiling of the data plane on modern hardware ---
+is it the framework, the CPU, the network stack, or the link?
+
+Benchmarking answers only when it is fair. We hold the handler, the payload, the
+concurrency, and the tuning identical across every measurement; we report
+allocations, not just throughput; and we separate the \emph{load generator's}
+limits from the \emph{server's}. All artifacts, scripts, and raw numbers are
+public in \texttt{hanzoai/benchmarks}.
+
+\section{Methodology}
+\paragraph{Testbed.} \emph{spark} is an NVIDIA GB10 (Grace--Blackwell) developer
+system: 20 aarch64 cores, running the server. \emph{evo} is a 32-core x86\_64
+box, running the load generator. They are joined by a direct 2.5\,GbE wired link
+(\texttt{enP7s7}$\leftrightarrow$\texttt{eno1}, both \texttt{Speed: 2500Mb/s},
+subnet 192.168.77.0/24) --- confirmed with \texttt{ethtool}, distinct from the
+WiFi path used for control SSH. A second host, \emph{dbc}, is wired on a 1\,GbE
+USB-ethernet port for future dual-loader aggregation.
+
+\paragraph{Framework.} \texttt{hanzoai/benchmarks} is two-tier. The
+\emph{property/micro} tier (\texttt{cloud/shard}, \texttt{framework/zip}) is pure
+Go, deterministic, and cluster-free, so it runs in CI and isolates a primitive
+(routing ns/op) or proves an invariant. The \emph{integration} tier
+(\texttt{k3s/}, \texttt{distributed.sh}) stands the real binary up and drives it
+over the network. Load is generated with \texttt{bombardier} (a
+\texttt{fasthttp}-based client that actually saturates the server; \texttt{hey},
+a \texttt{net/http} client, caps near 100k and is unsuitable) and, for ZAP, with
+a purpose-built client (\S\ref{sec:zap}) since no HTTP tool speaks the protocol.
+
+\paragraph{Fairness.} Every server exposes the identical handler --- \texttt{GET
+/health} returning the two-byte body \texttt{"ok"}. Connections are warm
+(keep-alive) so we measure steady-state, not handshakes. We report the median of
+sustained throughput and the p50/p99 latency; where garbage collection is
+implicated we report allocations per operation from \texttt{-benchmem}.
+
+\section{The Framework Tax: \texttt{zip} vs.\ \texttt{fasthttp}}
+The in-process cost of \texttt{zip} over raw \texttt{fiber} is a constant
+$\approx$24\,ns and exactly one 48-byte allocation (the \texttt{*zip.Ctx}),
+independent of route shape~\cite{zipbench}; on a handler doing $\sim$3500\,ns of
+real work it is under 1\%. End to end, driven by \texttt{bombardier} on loopback
+(Table~\ref{tab:framework}), \texttt{zip} sustains $0.95\times$ of raw
+\texttt{fasthttp} --- the wrapper is noise.
+
+\begin{table}[t]
+\centering
+\caption{End-to-end HTTP, loopback, spark, \texttt{-c 125}. Same handler.}
+\label{tab:framework}
+\begin{tabular}{lrr}
+\toprule
+framework & req/s & vs.\ fasthttp \\
+\midrule
+raw \texttt{fasthttp} & 365--400k & $1.00\times$ \\
+\texttt{zip} (HTTP)   & 338--348k & $0.95\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{The Network Ceiling Is Not the Box}
+\label{sec:ceiling}
+Moving the load off-box \emph{lowered} throughput --- and adding connections made
+it worse (Table~\ref{tab:ceiling}). Throughput fell from 194k at \texttt{-c 1000}
+to 154k at \texttt{-c 8000} while p99 latency rose $5\to52$\,ms: classic
+congestion collapse. Yet the link ran at $\sim$70\,MB/s, only 22\% of the
+2.5\,GbE bandwidth, and spark's cores sat mostly idle. By Little's law the
+194k/5.1\,ms operating point is latency-bound, not bandwidth-bound.
+
+The root cause is structural: \texttt{ethtool -l} reports the NIC configured with
+a \emph{single hardware RX queue}, and the driver rejects reconfiguration
+(\texttt{ethtool -L}: ``Operation not supported''). All inbound packets are
+therefore serviced by one core's softirq, and that single core is the ceiling.
+
+\begin{table}[t]
+\centering
+\caption{Untuned evo$\to$spark over 2.5\,GbE. Congestion collapse.}
+\label{tab:ceiling}
+\begin{tabular}{lrr}
+\toprule
+loader $\to$ target & req/s & p99 latency \\
+\midrule
+loopback (\texttt{-c 500})   & 365k & --- \\
+evo$\to$spark \texttt{-c 1000} & 194k & 5.1\,ms \\
+evo$\to$spark \texttt{-c 4000} & 167k & 24\,ms \\
+evo$\to$spark \texttt{-c 8000} & 154k & 52\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{System Tuning: $2.67\times$ on the Same Wire}
+The software remedy for a single-queue NIC is Receive Packet Steering, which
+hashes flows across cores in the kernel. We apply RPS (and RFS/XPS) across all 20
+cores, raise \texttt{net.core.netdev\_max\_backlog} from 1000 to 300000, set
+256\,MiB socket buffers, widen the ephemeral port range, and pin the performance
+governor --- all in one idempotent \texttt{tune.sh}, run on server and loader
+alike. The result (Table~\ref{tab:tuned}) is $2.67\times$: the same 2.5\,GbE link
+now sustains \textbf{518k req/s}, peaking at 696k.
+
+\begin{table}[t]
+\centering
+\caption{evo$\to$spark, both ends tuned. Same link, same handler.}
+\label{tab:tuned}
+\begin{tabular}{lrrr}
+\toprule
+concurrency & untuned & tuned & gain \\
+\midrule
+\texttt{-c 1000} & 194k & 518k & $2.67\times$ \\
+\texttt{-c 2000} & collapsed & 518k & --- \\
+\texttt{-c 4000} & 154k & 474k (peak 696k) & $3.1\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations. First, the tuned \emph{network} figure (518k) now exceeds the
+loopback figure (365--400k): over the wire spark's 20 cores serve full-time,
+whereas on loopback they are shared with the load generator. At 518k spark idles
+only $\sim$12\%, so this is close to the true single-loader serving ceiling; the
+remaining headroom is the province of a second, parallel NIC path.
+
+\section{The ZAP Transport: A Zero-Alloc Codec Overtakes HTTP}
+\label{sec:zap}
+\texttt{zip} is ZAP-native --- a bare listen address binds the binary transport;
+\texttt{http://} binds \texttt{fasthttp}. Because HTTP tools cannot speak ZAP we
+built \texttt{zapbench}, a concurrent client over \texttt{zaphttp.Transport}. The
+first result inverted the expectation: ZAP delivered only 91k req/s on loopback
+against HTTP's 481k --- ZAP \emph{lost} by $5\times$.
+
+The cause was not the wire but the codec. The tail (p50 303\,\textmu s but p99
+13\,ms) is a garbage-collection signature, and relaxing \texttt{GOGC} $100\to800$
+more than doubled ZAP to 203k --- proof the path was allocation-bound. Three
+allocation sites carried it. \texttt{MarshalRequest}/\texttt{MarshalResponse}
+minted a fresh frame slice per call; header decode performed \texttt{string()}
+copies into a \texttt{map[string][]string}; and structurally, \texttt{zaphttp}'s
+server allocated a fresh \texttt{fasthttp.RequestCtx} \emph{per request}
+(\texttt{server.go}), where \texttt{fasthttp}'s own server pools it per
+connection. Over a six-second run the ZAP server triggered \textbf{2203}
+garbage collections; the HTTP server, 57.
+
+The fix (\texttt{zap-proto/http}, branch \texttt{perf/zero-alloc-codec}) is
+mechanical, not architectural: pool the \texttt{RequestCtx} once per connection,
+hand-roll a frame encoder that appends into a pooled buffer, and drain the
+4-byte length prefix through \texttt{bufio.Peek}/\texttt{Discard} so no header
+array escapes to the heap. The serve path serializes with
+\texttt{AppendResponse} into that reused buffer --- \textbf{zero} allocations,
+versus 19 for the old fresh-slice \texttt{MarshalResponse} --- and
+\texttt{UnmarshalRequest} decodes headers in place, also zero-alloc; over a warm
+connection the serve loop allocates nothing per request. Golden tests confirm the
+wire is
+\emph{byte-identical} before and after --- this is a pure codec rewrite, no
+protocol change. The measured effect (Table~\ref{tab:zap}): ZAP rises
+$91\text{k}\to570\text{k}$ req/s, a \textbf{6.3$\times$} lift that
+\textbf{overtakes HTTP at 481k --- ZAP wins $1.18\times$} on loopback, with p99
+collapsing $13\,\text{ms}\to1.19\,\text{ms}$ and GC falling $2203\to62$.
+
+Two corrections to intuition survive the fix, and both matter for where ZAP is
+actually worth deploying. \emph{First, the win is CPU, not the wire.} Measured by
+\texttt{TestWireBytes}, the ZAP frame is \emph{larger} than HTTP (124 vs.\ 75
+bytes for a \texttt{/health} request); ZAP overtakes HTTP by spending fewer
+cycles per byte, not fewer bytes. \emph{Second, \texttt{zaphttp} does not skip
+JSON.} It carries the HTTP body as opaque bytes on both transports, so a handler
+pays the same (de)serialization cost either way; on a chat-shaped JSON payload
+ZAP is in fact $0.95\times$ HTTP, a slight loss from copying the body into the
+frame tail. JSON-elision is a property of \emph{native} ZAP typed RPC --- a
+separate axis \texttt{zaphttp} does not exercise. The loopback win is therefore
+real and purely a CPU/allocation win; over the 2.5\,GbE link both transports tie
+at $\approx$530k, saturating the wire (\S\ref{sec:ceiling}) where the codec is no
+longer the bottleneck.
+
+\begin{table}[t]
+\centering
+\caption{ZAP vs.\ HTTP, loopback, \texttt{-c 125}, same handler. The zero-alloc
+codec flips ZAP from a $5\times$ loss to a $1.18\times$ win.}
+\label{tab:zap}
+\begin{tabular}{lrl}
+\toprule
+transport & req/s & note \\
+\midrule
+\texttt{zip} HTTP (fasthttp)          & 481k & zero-alloc; 57 GC \\
+\texttt{zip} ZAP (\texttt{GOGC=100})  & 91k  & alloc-bound; 2203 GC \\
+\texttt{zip} ZAP (\texttt{GOGC=800})  & 203k & $2.2\times$; confirms cause \\
+\textbf{\texttt{zip} ZAP zero-alloc}  & \textbf{570k} & \textbf{0 allocs/req; 62 GC; $1.18\times$ HTTP} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Skipping JSON: Typed RPC vs.\ HTTP+JSON}
+\label{sec:json}
+Section~\ref{sec:zap} isolates \emph{framing} CPU: \texttt{zaphttp} carries the
+HTTP body opaque, so both transports pay the same JSON cost and ZAP's win is the
+zero-alloc frame codec alone. That leaves ZAP's larger structural claim untested
+--- that a \emph{native} typed binary message is read field-by-field off the wire
+with no parse step, where JSON must scan text and reflect. We test it directly:
+one shared record (an \texttt{eth\_getBalance}-shaped call, four fields each way)
+round-tripped by \texttt{encoding/json} (stdlib), by \texttt{goccy/go-json} and
+\texttt{sonic} (the fastest third-party JSON), and by \texttt{zap-proto/go}'s
+typed builder/reader. Same fields in, same compute, same fields out; a
+round-trip-equivalence test enforces byte-exact re-encoding and that every field
+is consumed on both sides, so neither codec skips work the other does.
+
+The decode path is the headline (Table~\ref{tab:serde}). Reading the four-field
+request costs \textbf{13\,ns and zero allocations} in ZAP --- a zero-copy read at
+a fixed offset --- against 473\,ns/4\,allocs for the fastest JSON
+(\texttt{goccy}) and 2334\,ns/13\,allocs for stdlib: a \textbf{35$\times$ to
+174$\times$} gap, and the difference between allocating nothing and allocating
+per field. This is the ``skip JSON'' advantage made concrete --- there is no
+parse, only a pointer and an offset.
+
+Two honest counterweights. \emph{Encode is a wash}, not a win: ZAP serializes in
+629\,ns with \emph{more} allocations than JSON (12 vs.\ 4), because the published
+\texttt{v1.3.0} builder defers variable-length tails through a copy and escapes
+its object builder to the heap --- the pooled fixed-width API that removes this is
+not in the released tag, so we report the tag-reproducible number. Netted out, the
+server handler (decode\,+\,compute\,+\,encode) still favors ZAP at 274\,ns vs.\
+\texttt{goccy}'s 431\,ns, because the decode margin dominates the encode wash.
+\emph{And end-to-end the margin compresses}: over the loopback \texttt{/rpc}
+endpoint ZAP serves 535k req/s against \texttt{sonic}'s 483k ($1.11\times$),
+\texttt{goccy}'s 452k ($1.18\times$), and stdlib's 407k ($1.31\times$) --- real,
+but far below the 174$\times$ microbenchmark gap, because at half a million
+requests per second the socket and scheduler dominate and serialization is a
+shrinking slice of per-request cost. Finally, on a structured record ZAP's wire is
+also \emph{smaller} (162 vs.\ 233 bytes total): JSON's hex-string addresses and
+decimal integers are verbose. This refines \S\ref{sec:zap} --- ZAP's frame is
+larger only on trivial (\texttt{/health}-sized) payloads, and smaller once the
+record carries real typed fields.
+
+\begin{table}[t]
+\centering
+\caption{Serialization only, one shared 4-field record, GB10, median of 3,
+default \texttt{GOGC}. Decode is where typed-binary skips JSON entirely; the
+round-trip is fastest on ZAP though it allocates more than \texttt{goccy}.}
+\label{tab:serde}
+\begin{tabular}{lrrr}
+\toprule
+codec & decode (ns) & round-trip (ns) & round-trip allocs \\
+\midrule
+JSON stdlib          & 2334          & 3063         & 17 \\
+JSON \texttt{sonic}  & 845           & 1460         & 14 \\
+JSON \texttt{goccy}  & 473           & 904          & \textbf{8} \\
+\textbf{ZAP typed}   & \textbf{13.4} & \textbf{630} & 12 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Aside: Horizontal-Scale Routing}
+The same data plane shards per-tenant SQLite state across pods by
+highest-random-weight (rendezvous) election over a static membership set. A
+million synthetic tenants distribute across pods with 0.05\% standard deviation
+at $N{=}3$ (no hot shard), every tenant resolves to exactly one deterministic
+owner (the no-two-writers invariant, verified over $10^5$ tenants $\times$ 6
+re-elections), a $4\to5$ scale-up remaps only 20.1\% of tenants (the rendezvous
+ideal), and the routing itself costs $\approx$545\,ns per request. Horizontal
+writer scale is thus gated on I/O, not routing.
+
+\section{Conclusions and Future Work}
+The Hanzo data plane is not framework-bound (\texttt{zip} $\approx$
+\texttt{fasthttp}), and on a single 2.5\,GbE link it serves 518k req/s once the
+kernel's receive path is tuned --- a $2.67\times$ gain from software steering
+alone, with the box only $\sim$12\% idle. The ZAP codec is now
+zero-allocation and overtakes HTTP by $1.18\times$ on loopback (\S\ref{sec:zap}),
+and its native typed RPC decodes structured records $35$--$174\times$ faster than
+JSON at zero allocations (\S\ref{sec:json}) --- a decode advantage that today is
+masked end-to-end by socket overhead and a not-yet-zero-alloc encode path, and
+that a pooled fixed-width builder would surface. The remaining levers to seven
+figures are orthogonal and physical: a \emph{dual-loader} across the two physical
+NICs (parallel RX paths), faster interconnect (10\,GbE/RDMA), and a
+\texttt{writev} split so ZAP's frame tail avoids one body copy on large payloads.
+We also intend to benchmark the
+post-quantum transports natively available in Go 1.26
+(\texttt{X25519MLKEM768}): PQ-TLS 1.3, ZAP-over-PQ-TLS, and PQ-QUIC, separating
+handshake cost (ML-KEM) from steady-state AEAD throughput.
+
+\begin{thebibliography}{9}
+\bibitem{hip0106} Hanzo Industries. \textit{HIP-0106: The Unified Cloud Binary}. 2026.
+\bibitem{zip} \texttt{zap-proto/zip} --- the ZAP-native web framework. \url{https://github.com/zap-proto/zip}.
+\bibitem{zaphttp} \texttt{zap-proto/http} --- ZAP-HTTP binary transport. \url{https://github.com/zap-proto/http}.
+\bibitem{zipbench} \texttt{zap-proto/zip} \texttt{BENCHMARKS.md} --- framework wrapper tax.
+\end{thebibliography}
+
+\end{document}

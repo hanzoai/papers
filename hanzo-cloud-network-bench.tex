@@ -43,8 +43,11 @@ load generator. Finally we characterize the ZAP transport: contrary to
 expectation it is currently \emph{slower} than HTTP (91k vs.\ 338k req/s
 loopback), and we show by construction that this is a garbage-collection
 artifact of a non-zero-allocation codec (relaxing \texttt{GOGC} $100\to800$
-more than doubles it to 203k), not a property of the wire, which is strictly
-tighter than HTTP text. We release the framework as \texttt{hanzoai/benchmarks}
+more than doubles it to 203k). The specific defect is an un-pooled request
+context in the ZAP server, not a wire property; and the ZAP wire is in fact
+measurably \emph{larger} than HTTP, not smaller --- its advantage is skipping
+JSON (de)serialization on typed payloads, which a trivial handler cannot show.
+We release the framework as \texttt{hanzoai/benchmarks}
 and the tuning as a single idempotent script.
 \end{abstract}
 
@@ -187,11 +190,18 @@ more than doubled ZAP to 203k with p99 falling to 4.6\,ms
 allocations live in the reference codec: \texttt{MarshalRequest} mints a fresh
 frame slice per call, and header decode performs \texttt{string()} copies into a
 \texttt{map[string][]string}, whereas \texttt{fasthttp}'s HTTP path is
-zero-allocation. The ZAP wire is strictly tighter than HTTP text (fewer bytes,
-no header re-parsing), so a zero-allocation codec --- pooled frame buffers,
-direct header bytes --- is expected to match or beat HTTP, and to widen its lead
-on a saturated link where bytes-per-request dominate. That optimization is the
-subject of ongoing work in \texttt{zap-proto/http} and \texttt{zap-proto/bench}.
+zero-allocation. The single largest culprit is structural: \texttt{zaphttp}'s
+server allocates a fresh \texttt{fasthttp.RequestCtx} per request
+(\texttt{server.go}), where \texttt{fasthttp}'s own server pools it via
+\texttt{sync.Pool}. Two corrections to intuition follow from
+\texttt{zap-proto/bench}: the ZAP wire is \emph{larger} than HTTP (452 vs.\ 243
+bytes for a small request, far worse for large bodies), and raw throughput is
+comparable rather than a blowout. ZAP's real advantage is orthogonal to the wire
+--- typed binary messages that skip JSON (de)serialization --- which a two-byte
+handler cannot exercise. The fair comparison, now in progress in
+\texttt{zap-proto/http} and \texttt{zap-proto/bench}, pools the request context
+and drives a typed JSON-shaped payload, where ZAP avoids the marshal cost HTTP
+pays.
 
 \begin{table}[t]
 \centering

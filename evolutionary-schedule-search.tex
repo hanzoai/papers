@@ -1,0 +1,578 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\title{\textbf{Evolutionary Schedule Search in a One-Source Kernel DSL,\\
+and the Continual-Improvement Loop It Anchors}}
+\author{Hanzo AI Research}
+\date{hanzo-kernel Paper 09 --- part of the \emph{One Source, Every Backend} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A one-source kernel DSL exposes each operation's schedule --- tile dimensions, buffering depth, vector
+width, padding stride, per-shape selection --- as compile-time knobs, so every knob assignment is a distinct
+monomorphized kernel and the space of assignments is a discrete search problem. We already own the base
+algebra for it: a per-\code{(device,\,op,\,shape)} winner cache (\code{tune.rs}) that times a small variant
+set once and reuses the winner. This paper does three things. (1)~It reports the campaign's manual search as
+the only empirical sample --- roughly 15 hand-evaluated configurations --- and extracts the constants a
+search must respect: a static-rejection filter that is \emph{free} (register spill, LDS over the occupancy
+budget), a per-op fitness signal at $\pm0.4\%$ and a full-bench signal at $\pm0.8\%$, strongly
+\emph{non-additive} lever interaction (BK=64 lost alone; single-buffering won; the cross-product was never
+explored), and hard \emph{device non-transfer} (the reference's best-occupancy $64{\times}64$ tile is the
+\emph{worst} time on gfx1151). (2)~It specifies a multi-fidelity evolutionary schedule search over that
+space --- static rejection before any GPU time, bit-exactness as viability not penalty, sustained-only
+fitness through the honest instrument, refutation-log negative priors seeding the population, and an island
+model across a heterogeneous fleet --- with an eval-budget analysis showing $\sim$300 configurations/night
+against $\sim$15 by hand. (3)~It embeds the search in a continual-improvement loop: campaign transcripts
+distil into decision-point evaluations (the shipped 22-case \code{roofline} bench is the pilot) and
+process-supervision data; a \emph{calibrated judge flock}, weighted by measured ground truth rather than
+preference, selects training signal under a Goodhart tripwire; and the whole agent fleet coordinates through
+a shared field rather than pairwise, which we frame as the small-$N$ precursor of a mean-field game. The
+search is not yet run: its arithmetic is derived from measured constants, and the manual search is the only
+empirical evidence. We mark that boundary throughout.
+\end{abstract}
+
+\section{The schedule is a value, and the space is searchable}
+\label{sec:intro}
+
+In a multi-backend engine the recurring correctness hazard is ``the same operation, a different hand-tuned
+kernel per device, therefore a different numeric behavior.'' The DSL removes it by writing each operation
+once and lowering that one source to every backend. Autotuning closes the remaining loop: the \emph{schedule}
+(tile size, vector width, unroll factor, buffering, cube dimension) becomes a set of \code{\#[comptime]}
+knobs on that single source. Because the compiler monomorphizes on comptime state, each knob assignment is a
+distinct compiled kernel with identical semantics --- so exploring schedules is a search over compiled
+variants of one bit-exact source, never a fork.
+
+The campaign of the companion study~\cite{refutation} produced the evidence that this search is worth
+automating: the winning schedules were \emph{not} the ones intuition or the reference implementation
+predicted, they interacted non-additively, and they did not transfer across devices. Those three facts
+(\S\ref{sec:handsearch}) are precisely the conditions under which a cached, per-device, measured search
+beats hand-tuning. We first ground the machinery in what already exists (\S\ref{sec:tuners}), then specify
+the search (\S\ref{sec:algorithm}), then embed it in a learning loop (\S\S\ref{sec:loop}--\ref{sec:meanfield}).
+
+\section{Grounding: the existing schedule algebra}
+\label{sec:tuners}
+
+The base layer is three orthogonal values in \code{hanzo-kernel/src/tune.rs}, deliberately kept as pure
+data so the mechanism is testable without a GPU.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+\item \textbf{\code{Variant}} --- a named schedule: a closure \code{f(iters) -> (output, ms)}. The same
+closure benchmarks (many iters) and executes (one iter), so a variant is both a candidate and a runnable
+kernel.
+\item \textbf{\code{Tuned}} --- a fluent builder collecting the variants for one \code{(op, shape-key)}.
+\item \textbf{\code{Tuner}} --- the cache: an in-memory \code{(device, op, key) $\to$ winner} map backed by
+one TSV file per device under the XDG cache dir. A cache \emph{miss} times every variant \code{TUNE\_ITERS=25}
+times and persists the fastest; a \emph{hit} launches only the winner once. It is a plain value over an
+explicit root, so the select/cache/reload logic is unit-tested with pure closures --- no GPU, no globals.
+\end{itemize}
+
+The result of a run is a \code{Pick\{output, winner, from\_cache, benched, timings\}}; \code{benched} is $N$
+on a miss and $0$ on a hit, making ``the second call skips timing'' an observable. A first-party design was
+chosen over \code{cubecl\_runtime::tune} for three concrete reasons, not for their own sake: its tuner is
+re-exported only from \code{cubecl\_runtime} (adopting it would force a second engine crate into a facade
+architected so only \code{Cargo.toml} names the engine); its persistent cache lives under \code{target/} via
+an MD5 checksum and \code{serde}, not the required XDG path; and its \code{TuneInputs::At} GAT plus
+\code{KeyGenerator}/\code{InputGenerator} traits are far more surface than ``pick the fastest of $N$ named
+closures'' needs.
+
+This layer already proves the loop on the CPU runtime: two ops (\code{rms\_norm}, \code{matvec\_q8\_dp4a})
+each expose one comptime-knobbed source with a 4-variant set; the tests show every variant bit-exact against
+the CPU oracle, a winner selected and cached in memory and on disk, and a fresh \code{Tuner} reloading the
+winner from disk. What is \emph{missing} is the search itself: the variant set is hand-written and tiny, the
+objective is a single timing with no multi-fidelity gating, and there is no population, no cross-device
+migration, and no negative prior. This paper specifies those.
+
+\section{The only empirical sample: the manual search}
+\label{sec:handsearch}
+
+The campaign hand-evaluated on the order of 15 schedule configurations for the two dominant prefill GEMMs on
+gfx1151. That sample --- small, but real and hardware-verified --- fixes the constants any automated search
+must obey.
+
+\subsection{The fidelity ladder and its costs}
+\label{sec:fidelity}
+
+Evaluation is not one operation but a ladder of increasing cost and decreasing throughput (Table~\ref{tab:fidelity}).
+The load-bearing fact is that the first rung is \emph{free}: a compile plus a read of shader statistics
+(registers, LDS bytes, scratch) rejects a large fraction of candidates --- anything that spills scratch
+($>0$) or exceeds the LDS occupancy budget --- before a single GPU dispatch. The campaign repeatedly killed
+configurations at this rung: a 32\,KB accumulator spill (occupancy capped at 2), a 40\,KB double-buffered
+K-tile (occupancy capped at 6 where registers alone allowed $\sim$9), an f16-accumulator variant whose VGPRs
+went \emph{up} $168\to180$. None of these needed a timed run to be disqualified.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.225\textwidth}>{\raggedright\arraybackslash}p{0.265\textwidth}ll@{}}
+\toprule
+\textbf{Fidelity} & \textbf{Signal} & \textbf{Cost / config} & \textbf{Noise} \\
+\midrule
+static (compile + shaderstats) & scratch, LDS, VGPR, occupancy & seconds, no GPU & exact (deterministic) \\
+bit-exact oracle              & \code{scale\_rel} vs CPU reference & seconds        & exact (a gate, not a score) \\
+sustained per-op (in-engine)  & GPU $\mu$s at the live shape       & seconds        & $\pm0.4\%$ \\
+full bench (in-engine)        & pp512 / tg128 vs \code{llama}      & minutes        & $\pm0.8\%$ \\
+\bottomrule
+\end{tabular}
+\caption{The evaluation fidelity ladder. Static rejection and the bit-exact gate are effectively free
+relative to timed runs; the two timed rungs carry the $\pm0.4\%$ / $\pm0.8\%$ noise floors measured after the
+harness fix of~\cite{refutation}. Per-config compile time (a single-shader \code{glslc}/\code{spirv-opt} is
+seconds; a cubecl re-monomorphization plus engine relink is longer) is treated as an order-of-magnitude
+modeling constant, not a logged datapoint (\S\ref{sec:limits}).}
+\label{tab:fidelity}
+\end{table}
+
+\subsection{Non-additivity and device non-transfer}
+\label{sec:nonadditive}
+
+Two properties of the sample make greedy, one-lever-at-a-time tuning provably incomplete.
+
+\textbf{Non-additivity.} The schedule knobs contend for shared occupancy resources (LDS bytes and VGPRs),
+so their effects are not separable. \code{BK}=64 \emph{lost} when changed alone (it doubled LDS and left
+occupancy at 6); single-buffering \emph{won} (occupancy $6\to8$, GEMM $232\to181\,\mu$s); the recorded losers
+also include \code{sb64} (single-buffer $\times$ BK=64) and \code{sb\_bm64} (single-buffer $\times$ BM=64).
+The eventual shipping schedule was \emph{single-buffer $\wedge$ BK=32 $\wedge$ BM=64 $\wedge$ packed-f16vec2
+LDS} --- reached by a chain of single-lever A/Bs, with the full cross-product never explored. A greedy walk
+that had accepted BK=64's solo loss as final would have masked a lever that only pays in combination; a
+search must be able to evaluate joint assignments.
+
+\textbf{Device non-transfer.} The reference implementation selects a tuned tile \emph{family}
+(\{64{\texttt{x}}64, 128{\texttt{x}}128, 128{\texttt{x}}256\}) per GEMM shape for its target GPUs. On gfx1151
+the smallest of these, the $64{\times}64$ RN4 tile, achieved the \emph{best} occupancy of any variant (10
+subgroups/SIMD) and the \emph{worst} sustained time ($1915\,\mu$s vs the $128{\times}128$ RN8 tile's
+$1634\,\mu$s): the larger tile's activation-reuse amortization beats occupancy on this silicon. Independently,
+the optimal thread count for the block-reduce MoE matvec \emph{differs by kernel} on the same device (Q4\_K at
+\code{nt}=64, Q6\_K at \code{nt}=32). A schedule optimal on one device or one op is not merely suboptimal
+elsewhere --- it can be the worst choice. This is the empirical justification for a winner cache keyed on
+\code{(device, op, shape)} rather than a global constant, and for running the search on the deployment
+hardware.
+
+\section{Multi-fidelity evolutionary schedule search}
+\label{sec:algorithm}
+
+The search treats a schedule as a genome and the fidelity ladder as a cost-ordered filter, so that GPU time
+is spent almost entirely on candidates that have already survived free static analysis and the correctness
+gate.
+
+\paragraph{Genome.} A schedule is the tuple
+\[
+g \;=\; \bigl(\underbrace{\mathrm{BM},\mathrm{BN},\mathrm{BK}}_{\text{tile}},\;
+\underbrace{\beta}_{\text{buffering}\in\{1,2\}},\;
+\underbrace{v}_{\text{vec width}\in\{\mathrm{u16},\mathrm{f16{\times}2},\mathrm{uvec4}\}},\;
+\underbrace{\sigma}_{\text{pad stride}},\;
+\underbrace{\pi}_{\text{per-shape selector}}\bigr),
+\]
+each coordinate a comptime knob, so $g$ names one monomorphized, bit-exact kernel. Selection is elitist with
+tournaments; recombination is uniform crossover over coordinates; mutation perturbs one coordinate within its
+legal set. The refutation log contributes two things to the genetics: it \emph{seeds} the initial population
+away from known-dead regions, and it \emph{masks} operators that only produce dead offspring (e.g.\ the
+coopmat-with-f16-accumulator direction, or BM${\ge}128$ on this device).
+
+\begin{algorithm}[h]
+\caption{\textsc{EvoSchedule} --- multi-fidelity search over comptime schedules}
+\label{alg:evo}
+\begin{algorithmic}[1]
+\Require op $o$, shape $s$, device $d$, budget $B$, log $L$, population size $\mu$, offspring $\lambda$
+\State $P \gets \textsc{SeedPopulation}(o, d, L)$ \Comment{negative priors; mask dead operators}
+\State $\mathit{best} \gets \textsc{Incumbent}(o, s, d)$
+\While{$B$ not exhausted}
+  \State $Q \gets \varnothing$
+  \For{$i \gets 1 \dots \lambda$}
+     \State $(a,b) \gets \textsc{Tournament}(P),\ \textsc{Tournament}(P)$
+     \State $c \gets \textsc{Mutate}(\textsc{UniformCrossover}(a,b))$ \Comment{or \textsc{LlmMutate}$(a,L)$, \S\ref{sec:llmop}}
+     \If{$\textsc{Spill}(c,d) > 0 \ \textbf{or}\ \textsc{Lds}(c,d) > \textsc{OccBudget}(d)$}
+        \State \textbf{continue} \Comment{FREE static reject; no GPU time} \label{ln:static}
+     \EndIf
+     \State $Q \gets Q \cup \{c\}$
+  \EndFor
+  \For{$c \in Q$} \Comment{only static survivors reach the GPU}
+     \If{$\textsc{ScaleRel}(c, \textsc{Oracle}(s)) > \tau$}
+        \State $c.\mathit{fit} \gets \infty$ \Comment{infeasible: viability, not a penalty} \label{ln:viability}
+     \Else
+        \State $c.\mathit{fit} \gets \textsc{SustainedPerOp}(c, s, d)$ \Comment{honest instrument, $\pm0.4\%$} \label{ln:fit}
+     \EndIf
+  \EndFor
+  \State $P \gets \textsc{ElitistSelect}(P \cup Q,\ \mu)$
+  \State $\mathit{best} \gets \arg\min_{c} c.\mathit{fit}$
+  \State $\textsc{Migrate}(d, \mathit{best})$ \Comment{island model: publish winner to the fleet, \S\ref{sec:islands}}
+\EndWhile
+\State \textbf{assert} \textsc{FullBenchWin}$(\mathit{best})$ vs \code{llama}, same run, $\pm0.8\%$ \Comment{final gate}
+\State \Return $\mathit{best}$
+\end{algorithmic}
+\end{algorithm}
+
+Three design choices distinguish this from a generic evolutionary tuner. Line~\ref{ln:static} makes static
+rejection \emph{free and first}: no fitness is defined for a candidate that spills or overflows LDS, so those
+never consume GPU time. Line~\ref{ln:viability} treats bit-exactness as \emph{viability, not a soft penalty}
+--- an incorrect kernel does not get a discounted fitness, it does not reproduce. Line~\ref{ln:fit} scores on
+sustained in-engine per-op time, never a cache-warm microbenchmark, because for memory-bound kernels the warm
+number systematically overstates the real regime (the campaign burned several otherwise-correct kernels on
+exactly that lie).
+
+\subsection{Island model over a heterogeneous fleet}
+\label{sec:islands}
+
+Because fitness is device-specific (\S\ref{sec:nonadditive}), the search is an island model: one deme per
+box (evo/gfx1151, spark/GB10, dbc/M4~Max), each evolving against its own hardware. Migration carries a
+winning \emph{genome}, not a fitness --- an immigrant is always re-evaluated locally, because a schedule that
+tops one island can be the worst on another. Migration is therefore a source of good \emph{structure} to
+recombine, not a claim of cross-device optimality. This is the fleet-level view whose coordination we
+formalize in \S\ref{sec:meanfield}.
+
+\subsection{LLM-guided mutation as an optional operator}
+\label{sec:llmop}
+
+The mutation operator can be replaced or augmented by a language model that proposes a new genome from the
+parent plus the refutation log --- the pattern of program-search systems such as FunSearch~\cite{funsearch}
+and AlphaEvolve~\cite{alphaevolve}, where an LLM proposes and an external evaluator selects. Here the
+selector is exactly the gate ladder of~\cite{refutation}: an LLM proposal enjoys no privilege, it must pass
+static rejection, the bit-exact oracle, and sustained timing like any other candidate. The LLM supplies
+search \emph{bias} (informed guesses about which joint assignments to try, drawn from the log's mechanisms);
+the hardware supplies \emph{truth}. This keeps the creative operator unfalsifiable-proof: it can only ever
+propose, never accept.
+
+\subsection{Eval-budget arithmetic}
+\label{sec:budget}
+
+The point of cost-ordering is a favorable generation budget. Take $\lambda=16$ offspring per generation. The
+campaign's static-rejection experience (spills and LDS-overflows were common among hand-tried variants)
+puts the free-reject rate near $50\%$, so $\sim$8 candidates per generation reach the GPU. Each GPU
+evaluation is a bit-exact check plus a 25-iteration sustained per-op timing --- seconds of GPU time --- plus
+a monomorphization/relink amortized across the batch. At an effective few minutes per surviving candidate, a
+single box clears on the order of a few hundred configurations in an overnight window; against the
+$\sim$15 the campaign evaluated by hand over weeks, that is a $10$--$20\times$ throughput increase in
+schedules examined, with the full-bench rung (minutes, $\pm0.8\%$) reserved for the handful of per-op
+finalists. The arithmetic is a projection from measured constants, not a measured result
+(\S\ref{sec:limits}); its purpose is to show the search is budget-feasible on existing hardware, not to
+promise a specific speedup.
+
+\section{The continual-improvement loop}
+\label{sec:loop}
+
+The search consumes agent-run optimization campaigns and, in turn, those campaigns produce data that
+improves the agents. The loop has four stages.
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt,topsep=2pt]
+\item \textbf{Run} campaigns (human- or agent-driven) under the gate ladder, logging every decision point:
+the evidence on the table, the action space, and the measured outcome.
+\item \textbf{Distil} each transcript into \emph{decision-point} triples $\langle$evidence-snapshot,
+action-space, measured-outcome$\rangle$. These become (a)~new evaluation cases and (b)~process-supervision
+targets.
+\item \textbf{Select} training signal with an evaluation that rewards the right \emph{process}, not only the
+right answer (trap-resistance and an overthink penalty as auxiliary rewards).
+\item \textbf{Improve} the models, which become better mutation operators (\S\ref{sec:llmop}) and better
+campaign agents --- closing the loop.
+\end{enumerate}
+
+\subsection{Decision-point distillation and its schema}
+\label{sec:distill}
+
+The pipeline's pilot already ships: the 22-case \code{roofline} benchmark is decision-point distillation run
+by hand over the campaign of~\cite{refutation}. Each case is one record:
+\begin{quote}\small
+\code{\{id, category, trap, question:\{evidence, choices\}, answer, rationale\}}
+\end{quote}
+where \code{answer} is the hardware-verified outcome and the distractors are the campaign's \emph{actual}
+refuted theories. Categories span \code{diagnosis}, \code{experiment}, \code{trap}, \code{update},
+\code{calculation}, \code{discipline}, and \code{synthesis}; 6 of 22 are traps (the prompt asserts a false
+premise the evidence contradicts). Ground truth is unpublished,
+so the set is uncontaminated by pretraining. Crucially, the standard results JSONL already logs
+\code{usages.completion\_tokens} per item, so two post-hoc metrics need no new instrumentation: the
+\emph{overthink index} (mean completion tokens on \emph{correct} answers) and \emph{trap resistance}
+(accuracy on the trap subset).
+
+\subsection{Reward shaping}
+\label{sec:reward}
+
+Selection optimizes a shaped reward rather than raw accuracy, so that a model is rewarded for reasoning
+\emph{to} the measurement and penalized for reasoning \emph{past} it:
+\[
+R \;=\; \underbrace{\mathbb{1}[\hat a = a^\star]}_{\text{accuracy}}
+\;+\; \lambda_{\mathrm{trap}}\cdot \mathbb{1}[\text{trap} \wedge \hat a = a^\star]
+\;-\; \lambda_{\mathrm{ot}}\cdot \frac{\mathrm{tokens\_on\_correct}}{T_{\mathrm{ref}}} .
+\]
+The trap term overweights the cases where the prompt's framing is adversarial (verify-before-comply); the
+overthink term, normalized by a reference length $T_{\mathrm{ref}}$, taxes the models that talk themselves
+back into a refuted theory. The \code{rationale} field supplies process-supervision targets: the reward is
+not only on the boxed letter but on recovering the decisive experiment. This is implementable directly
+against the existing harness --- the arms are the answer letters, the results JSONL carries the token usages,
+and the golds are the hardware-verified answers.
+
+\subsection{Calibrated judge flocks}
+\label{sec:judges}
+
+Selecting training signal at scale needs judges, and LLM-as-judge pipelines are usually \emph{preference-only}:
+they rank outputs by what a model prefers, inheriting position, verbosity, and self-preference
+biases~\cite{judgebias}. This stack has a rarer asset --- \emph{anchored calibration}: subsets with measured
+ground truth against which a judge's reliability is a fact, not an opinion. Four anchors exist today: the 22
+hardware-verified \code{roofline} answers (6 of them traps); the router corpus of \textbf{2{,}981}
+counterfactual outcomes (373 prompts $\times$ 8 model arms); the bit-exact kernel gates; and the enso-bench
+golds. The router corpus is
+concrete evidence that calibration is separable from preference: a first learned routing head scored
+$\mathrm{AIQ}=0.6248$ against a $0.7427$ heuristic and was \emph{not} shipped; after a train/serve featurizer
+skew was fixed (it had trained without prompt text), the head reached held-out decision quality
+$0.9215\,{\pm}\,0.011$ versus the rule's $0.9162\,{\pm}\,0.007$, with an oracle ceiling of $0.9402$. The
+anchored eval, not a preference signal, is what exposed the skew.
+
+\begin{algorithm}[h]
+\caption{\textsc{CalibratedJudgeFlock} --- anchored, diverse, disagreement-aware judging}
+\label{alg:flock}
+\begin{algorithmic}[1]
+\Require judges $J$ (family-diverse), anchored sets $A_{1..m}$ with golds, candidate pool $C$, student $\theta$
+\For{$j \in J$, domain $k$} \Comment{(1) reliability from measured truth, per domain}
+  \State $w_{j,k} \gets \textsc{Reliability}\bigl(j \text{ on } A_k\bigr)$ \Comment{accuracy vs golds; also tokens/correct-verdict}
+\EndFor
+\For{$x \in C$}
+  \State $\{s_{j}\}_{j\in J} \gets \textsc{Verdicts}(J, x)$
+  \State $\bar s(x) \gets \dfrac{\sum_j w_{j,\mathrm{dom}(x)}\, s_j}{\sum_j w_{j,\mathrm{dom}(x)}}$ \Comment{(3) reliability-weighted aggregation}
+  \If{$\textsc{Var}_j(s_j) > \eta$} \Comment{(4) disagreement-as-curriculum}
+     \State escalate $x$ to a debate round or human; route to the high-value training pool \label{ln:escalate}
+  \EndIf
+\EndFor
+\State $\theta' \gets \textsc{Finetune}_{\mathrm{DPO/RLAIF}}(\theta,\ \bar s,\ \text{anchored items overweighted})$ \Comment{(5)}
+\If{$\textsc{Anchored}(\theta') < \textsc{Anchored}(\theta) \ \wedge\ \textsc{FlockPref}(\theta') > \textsc{FlockPref}(\theta)$}
+  \State \textbf{halt}; recalibrate \Comment{(6) Goodhart tripwire: judge-hacking detected} \label{ln:goodhart}
+\EndIf
+\State \textbf{re-measure} $w_{j,k}$ next cycle; version the flock \Comment{(7) a frozen flock is the student's ceiling}
+\State \Return $\theta'$
+\end{algorithmic}
+\end{algorithm}
+
+Five properties are load-bearing. \textbf{Diversity is not decoration}: same-family judges share correlated
+blind spots that vote aggregation cannot remove, so the flock is drawn across model families --- consistent
+with the Panel-of-LLM-evaluators result that a small, diverse jury beats a single frontier judge on both bias
+and cost~\cite{poll}. \textbf{Reliability is per-domain}: a judge trustworthy on kernel-perf reasoning is not
+automatically trustworthy on prose, so weights are conditioned on the domain of the item. \textbf{Disagreement
+is a hardness detector} (line~\ref{ln:escalate}): high inter-judge variance marks the items worth escalating
+to a debate round~\cite{debate} or a human --- averaging them away discards the highest-value training data.
+\textbf{The Goodhart tripwire} (line~\ref{ln:goodhart}) is the anchored holdout's job: a student that improves
+on flock \emph{preference} while regressing on measured \emph{truth} is hacking the judges, and the cycle
+halts. \textbf{The flock is versioned and re-measured} each cycle, because a frozen flock is a hard ceiling on
+the student it trains. Judges are themselves scored on tokens-per-correct-verdict --- the overthink index of
+\S\ref{sec:distill} applies to judges too, keeping the panel cheap.
+
+This training-time flock is the mirror of a shipped inference-time one: the \code{enso-ultra} product line's
+verify-then-select over a diverse candidate set \emph{is} a flock at inference. The contribution here is to
+run the same diverse-panel discipline at training time, and to anchor it --- because we can --- on measured
+ground truth rather than preference alone. The base techniques are external and cited plainly: learning from
+AI feedback~\cite{cai}, preference optimization~\cite{dpo}, and the judge-bias and debate literatures
+\cite{judgebias,debate}; the anchoring and the Goodhart tripwire are what the measured corpora add.
+
+\section{Generalization: the oracle-substitution rule}
+\label{sec:general}
+
+The architecture --- cheap-reject ladder, honest instrument, refutation-log prior, evolutionary search under
+a viability gate, distillation into decision-point evals --- is not specific to kernels. It ports wherever
+two things exist: a \emph{trustworthy fitness oracle} and a \emph{cheap rejection ladder} beneath it. Only
+the oracle changes.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt,topsep=2pt]
+\item \textbf{Coding agents.} Fitness oracle: the test suite, the type checker, the runtime verifier. Cheap
+rejects: compile failure and static analysis stand in for shaderstats; a failing test stands in for a
+bit-exactness miss. Verified-campaign transcripts distil into decision-point evals exactly as here, and the
+process-supervision target is the sequence of decisive checks, not just the final diff.
+\item \textbf{Marketing agents.} Fitness oracle: an A/B conversion metric. The \emph{same} disciplines
+transfer unchanged --- contended-measurement refusal (a concurrent campaign contaminates the lift the way a
+foreign GPU job contaminates a kernel A/B), a noise floor below which a lift is unreadable, and a
+refutation log of dead creative directions. What changes is only the oracle: a \emph{statistical-significance
+gate} replaces bit-exactness. Viability becomes ``the lift clears the significance threshold,'' not ``the
+bits match.''
+\end{itemize}
+
+The rule has a hard boundary, which we state rather than paper over: the architecture works wherever fitness
+is \emph{measurable and cheap enough to gate on}, and it fails where fitness is not. A task whose only
+signal is diffuse long-horizon human judgment, with no anchor and no cheap reject, has no honest instrument
+for the ladder to escalate through --- and there the search degenerates into preference-chasing, precisely
+the failure mode the judge flock (\S\ref{sec:judges}) is built to detect. The method is as strong as its
+weakest oracle.
+
+\section{Mean-field coordination of the agent fleet}
+\label{sec:meanfield}
+
+The search (\S\ref{sec:islands}), the judge flock (\S\ref{sec:judges}), and the campaigns themselves are run
+by a fleet of agents sharing scarce resources. The campaign wrote its coordination laws by hand; we formalize
+them here as the small-$N$ precursor of a mean-field game, and are explicit about where the analogy holds and
+where it does not.
+
+\subsection{The observed game}
+\label{sec:mf-game}
+
+$N$ agents contend for shared resources: GPUs (a hard ``one agent per box'' law), the \code{git main}
+version queue (publish sequencing), \code{cargo} locks, and the search-space basins themselves. The log
+records two failures of \emph{pairwise} coordination and one success of \emph{field} coordination.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt,topsep=2pt]
+\item \textbf{Failure --- the patch-line race.} An agent's local \code{[patch.crates-io]} redirect raced into
+a peer's release commit; a pre-commit grep passed, then the line was re-added before the commit landed, so
+the tagged release did not build off-box until a follow-up fixed it. A pairwise ``check then act'' lost to a
+concurrent writer.
+\item \textbf{Failure --- branch-delete before merge.} An agent deleted a remote feature branch before
+verifying the merge had landed; the fast-forward had aborted because \code{main} moved under it, and the
+commits had to be rescued from the local object store and re-landed. Again: the shared state moved between
+one agent's fetch and its act.
+\item \textbf{Success --- the front map.} Publishing a \emph{population-level} summary --- which fronts had
+explorers, which trees were owned --- caused a peer agent to \emph{stand down} of its own accord, twice,
+leaving its checkout clean and detached. The peer best-responded to the field (the occupancy of fronts), not
+to any individual agent.
+\end{itemize}
+
+The pattern is exactly the mean-field intuition: pairwise coordination is $O(N^2)$ interactions and races on
+shared mutable state; field coordination is each agent best-responding to an aggregate, at $O(N)$
+communication.
+
+\subsection{The formalism}
+\label{sec:mf-formalism}
+
+Let $\mu$ be the \emph{field}: a distribution over resource states --- per-box GPU occupancy, per-tree
+ownership density, the version queue, and per-basin explorer density in schedule space. Each agent solves a
+best-response
+\[
+\pi^\star \;=\; \arg\max_{\pi}\; \mathbb{E}\bigl[\, \underbrace{V(\pi)}_{\text{lever value}}
+\;-\; \underbrace{c\bigl(\mu(\pi)\bigr)}_{\text{congestion}}
+\;-\; \underbrace{\kappa\!\cdot\!\mathrm{switch}(\pi)}_{\text{switching cost}} \,\bigr],
+\]
+and an equilibrium is a field $\mu^\star$ induced by the agents' best responses to $\mu^\star$ --- a fixed
+point, in the sense of the mean-field game limit of Lasry and Lions~\cite{lasrylions} and the Nash-certainty-equivalence
+of Huang, Malhamé and Caines~\cite{hmc}. The solver the campaign already ran is \emph{fictitious play}:
+publish the current field, let agents best-respond, republish. Convergence is expected under monotone
+congestion costs (the Lasry--Lions monotonicity condition): a second agent on a box, a second explorer in a
+basin, is strictly worse for everyone there, which is the ``one agent per box'' and anti-crowding rules made
+quantitative.
+
+\begin{algorithm}[h]
+\caption{\textsc{MeanFieldFleetCoordinator} --- interact through the field, not pairwise}
+\label{alg:mfc}
+\begin{algorithmic}[1]
+\Require agents $\{1..N\}$, resources $\mathcal{R}$ (boxes, trees, version queue, basins)
+\Loop \Comment{fictitious play: the publish/respond cycle the campaign ran}
+  \State $\mu \gets \textsc{Field}(\mathcal{R})$: \{GPU busy, tree-ownership density, version queue, basin explorer density\}
+  \For{agent $a$ \textbf{in parallel}} \Comment{$O(N)$ communication: each reads $\mu$, none reads peers}
+     \State $a.\pi \gets \arg\max_{\pi}\ V_a(\pi) - c(\mu(\pi)) - \kappa\,\mathrm{switch}_a(\pi)$
+     \State \textbf{if} $\mu(\text{box}(\pi)) > 0$ \textbf{then} best-respond elsewhere \Comment{one agent per box}
+  \EndFor
+  \State \textsc{Publish}$(\mu')$ \Comment{next field; version-queue writes take the next free patch, index-verified}
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The router is a textbook congestion game}
+\label{sec:mf-router}
+
+The same structure appears one level down, at inference routing. A population of requests routed to a set of
+model arms degrades those arms' latency and cost as load rises --- a congestion game whose equilibrium is
+Wardrop routing~\cite{wardrop}: traffic distributes so that no request can lower its own cost by switching
+arms, i.e.\ each request best-responds to the \emph{arm-load field}. This is directly implementable on the
+existing seam: the \code{hanzo-router} replica layer already tracks per-arm load and prefix affinity, so the
+learned routing head of \S\ref{sec:judges} need only take expected-load arguments in its SLO terms to route
+against the field rather than against a static cost table.
+
+\subsection{Search and judges as low-density equilibria}
+\label{sec:mf-searchjudge}
+
+Two earlier constructions are special cases. The island search (\S\ref{sec:islands}) becomes an
+\emph{anti-crowding} field over schedule-space basins --- explorers are pushed toward under-occupied basins ---
+of which the refutation log is the static, infinite-density limit (a killed basin has permanent congestion
+cost $\infty$, so no agent ever re-enters). The judge flock (\S\ref{sec:judges}) is a low-density equilibrium
+in \emph{error-correlation} space: the diversity premium is exactly a congestion cost that penalizes adding a
+judge whose blind spots correlate with the panel's, driving the flock toward independent error.
+
+\subsection{Honest boundaries}
+\label{sec:mf-bounds}
+
+Two caveats are mandatory. First, this is \emph{mean-field control} (MFC), not a true mean-field
+\emph{game}: we own every agent's policy, so the fleet is a cooperative planner minimizing a shared cost, not
+a population of selfish players. The genuine-game regime --- selfish agents, external model arms, multi-tenant
+SaaS pricing --- is where the Nash rather than the social-optimum solution matters, and we do not claim the
+equilibrium analysis there. Second, the fleet is \emph{small}: $N\approx3$--$6$. Mean-field approximation
+error scales as $O(1/\sqrt{N})$, so at this scale the equilibrium \emph{guarantees} are asymptotic and not in
+force. What \emph{is} validated at small $N$ is the \emph{architecture}: interact through a published field,
+$O(N)$ communication, no pairwise races --- which turned the two $O(N^2)$ coordination failures above into
+the one $O(N)$ success. The asymptotics are the reason to keep the architecture as the fleet grows, not a
+claim about today's fleet.
+
+\section{Limitations}
+\label{sec:limits}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt,topsep=2pt]
+\item \textbf{The search is designed, and its first hunt is only now in progress.} Algorithm~\ref{alg:evo}
+and its budget (\S\ref{sec:budget}) are derived from measured constants (the fidelity noise floors, the
+static-reject experience, the non-additivity and non-transfer of the sample); no completed evolutionary run
+exists yet, and its result against the hand-search is exactly the controlled experiment that will confirm or
+refute the loop's value over an expert (\cite{refutation}, velocity section). The $\sim$15-config manual
+search is the only empirical schedule-search data in this paper, and it is a convenience sample from one
+campaign, not a controlled sweep.
+\item \textbf{The compile-cost constant is modeled.} The per-config compile time used in the budget is an
+order-of-magnitude estimate from build observations, not a logged measurement; the $\pm0.4\%$/$\pm0.8\%$
+noise floors and the ``shaderstats is free'' rung are the sourced constants.
+\item \textbf{The LLM operator is unproven here.} We adopt the propose-and-select pattern on external
+evidence (FunSearch~\cite{funsearch}, AlphaEvolve~\cite{alphaevolve}); we have not measured an LLM mutation
+operator against random mutation on our own search.
+\item \textbf{The judge flock is specified, partially anchored.} The four anchor corpora are real and sized
+(notably the 2{,}981-event router corpus), but the full flock loop --- disagreement escalation, the Goodhart
+tripwire, multi-cycle reliability re-measurement --- is specified, not yet run end-to-end.
+\item \textbf{Mean-field is small-$N$.} As \S\ref{sec:mf-bounds} states, the equilibrium guarantees are
+asymptotic; at $N{=}3$--$6$ only the architecture is validated, by three logged anecdotes (two failures, one
+success), which is illustration, not proof.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conc}
+
+The schedule is a value, the space of schedules is searchable, and the campaign proved the search worth
+automating by showing its winners were non-obvious, non-additive, and non-transferable. We specified a
+multi-fidelity evolutionary search that spends GPU time only on candidates already past a free static filter
+and a correctness gate, seeded by a log of what is already known to be dead. We embedded it in a loop that
+turns campaign transcripts into decision-point evaluations and process supervision, selects training signal
+through a judge flock anchored on measured ground truth under a Goodhart tripwire, and coordinates the whole
+agent fleet through a shared field rather than pairwise. The through-line is a single discipline: build the
+honest instrument first, let it --- not intuition, not the reference, not a preference model --- decide, and
+write down every refutation so it is never bought twice. The search and the flock are that discipline made
+mechanical; the mean-field frame is that discipline made to scale.
+
+\begin{thebibliography}{99}
+\small
+\bibitem{refutation} Hanzo AI Research. \emph{Refutation-Driven Performance Engineering: An Empirical Study
+of a Multi-Week GPU Kernel Campaign.} hanzo-kernel Paper 08 (companion).
+\bibitem{tunepaper} Hanzo AI Research. \emph{The Schedule Is a Value: Comptime-Specialized Autotuning.}
+hanzo-kernel Paper 07.2. The \code{Variant}/\code{Tuned}/\code{Tuner} algebra of \S\ref{sec:tuners}.
+\bibitem{cubecl} Tracel AI. \emph{CubeCL: multi-platform GPU compute in Rust.}
+\url{https://github.com/tracel-ai/cubecl}. Comptime monomorphization; the studied \code{cubecl\_runtime::tune}.
+\bibitem{llamacpp} G.~Gerganov and the \code{ggml}/\code{llama.cpp} contributors. \emph{\code{llama.cpp}.}
+\url{https://github.com/ggml-org/llama.cpp}. The same-box baseline and tile-family reference.
+\bibitem{funsearch} B.~Romera-Paredes, M.~Barekatain, A.~Novikov, et al. \emph{Mathematical discoveries from
+program search with large language models.} Nature \textbf{625}, 468--475 (2024). LLM-proposes /
+evaluator-selects.
+\bibitem{alphaevolve} Google DeepMind. \emph{AlphaEvolve: A coding agent for scientific and algorithmic
+discovery.} Technical report (2025). Evolutionary program search with an LLM mutation operator.
+\bibitem{ansor} L.~Zheng, C.~Jia, M.~Sun, et al. \emph{Ansor: Generating High-Performance Tensor Programs for
+Deep Learning.} OSDI (2020). Schedule search over tensor programs.
+\bibitem{tvm} T.~Chen, T.~Moreau, Z.~Jiang, et al. \emph{TVM: An Automated End-to-End Optimizing Compiler for
+Deep Learning.} OSDI (2018).
+\bibitem{opentuner} J.~Ansel, S.~Kamil, K.~Veeramachaneni, et al. \emph{OpenTuner: An Extensible Framework
+for Program Autotuning.} PACT (2014). Ensemble search over program-configuration spaces.
+\bibitem{atlas} R.~C.~Whaley and J.~Dongarra. \emph{Automatically Tuned Linear Algebra Software (ATLAS).}
+Supercomputing (1998). Empirical per-machine tuning of a numeric kernel library.
+\bibitem{poll} P.~Verga, S.~Hofstatter, S.~Althammer, et al. \emph{Replacing Judges with Juries: Evaluating
+LLM Generations with a Panel of Diverse Models (PoLL).} Cohere (2024). Small diverse juries beat a single
+frontier judge on bias and cost.
+\bibitem{cai} Y.~Bai, S.~Kadavath, S.~Kundu, et al. \emph{Constitutional AI: Harmlessness from AI Feedback.}
+Anthropic (2022). Learning from model feedback (RLAIF).
+\bibitem{dpo} R.~Rafailov, A.~Sharma, E.~Mitchell, et al. \emph{Direct Preference Optimization.} NeurIPS
+(2023).
+\bibitem{judgebias} L.~Zheng, W.-L.~Chiang, Y.~Sheng, et al. \emph{Judging LLM-as-a-Judge with MT-Bench and
+Chatbot Arena.} NeurIPS (2023). Documents position, verbosity, and self-preference bias in LLM judges.
+\bibitem{debate} G.~Irving, P.~Christiano, and D.~Amodei. \emph{AI Safety via Debate.} arXiv:1805.00899
+(2018). Escalation of hard items to a debate round.
+\bibitem{lasrylions} J.-M.~Lasry and P.-L.~Lions. \emph{Mean field games.} Japanese Journal of Mathematics
+\textbf{2}, 229--260 (2007).
+\bibitem{hmc} M.~Huang, R.~P.~Malhamé, and P.~E.~Caines. \emph{Large-population stochastic dynamic games:
+closed-loop McKean--Vlasov systems and the Nash certainty equivalence principle.} Communications in
+Information and Systems \textbf{6}(3), 221--252 (2006).
+\bibitem{wardrop} J.~G.~Wardrop. \emph{Some theoretical aspects of road traffic research.} Proceedings of the
+Institution of Civil Engineers \textbf{1}(3), 325--362 (1952). Equilibrium routing under congestion.
+\end{thebibliography}
+
+\end{document}

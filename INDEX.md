@@ -29,8 +29,11 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-zap-protocol` | ✓ | `defense/hanzo-zap-protocol.tex` |
 | `logo-convert` | — | `defense/logo-convert.tex` |
 | `earle-genetic-marketing` | ✓ | `earle-genetic-marketing/earle-genetic-marketing.tex` |
+| `enso` | ✓ | `enso/main.tex` |
+| `evolutionary-schedule-search` | ✓ | `evolutionary-schedule-search.tex` |
 | `hanzo-4-0-launch` | ✓ | `hanzo-4-0-launch/hanzo-4-0-launch.tex` |
 | `hanzo-aci` | ✓ | `hanzo-aci/hanzo-aci.tex` |
+| `hanzo-adversarial-mean-field-feedback` | ✓ | `hanzo-adversarial-mean-field-feedback.tex` |
 | `hanzo-agent-grpo` | ✓ | `hanzo-agent-grpo/hanzo-agent-grpo.tex` |
 | `hanzo-agent-sdk` | ✓ | `hanzo-agent-sdk/hanzo-agent-sdk.tex` |
 | `hanzo-agi-platform` | ✓ | `hanzo-agi-platform/hanzo-agi-platform.tex` |
@@ -48,6 +51,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-chat` | ✓ | `hanzo-chat/hanzo-chat.tex` |
 | `hanzo-checkout` | ✓ | `hanzo-checkout/hanzo-checkout.tex` |
 | `hanzo-cloud-infrastructure` | ✓ | `hanzo-cloud-infrastructure/hanzo-cloud-infrastructure.tex` |
+| `hanzo-cloud-network-bench` | — | `hanzo-cloud-network-bench.tex` |
 | `hanzo-collapse-methodology` | ✓ | `hanzo-collapse-methodology.tex` |
 | `hanzo-commerce-payments` | ✓ | `hanzo-commerce-payments.tex` |
 | `hanzo-comptime-autotune` | ✓ | `hanzo-comptime-autotune.tex` |
@@ -68,6 +72,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-edge-inference` | ✓ | `hanzo-edge-inference.tex` |
 | `hanzo-encryption-security` | ✓ | `hanzo-encryption-security/hanzo-encryption-security.tex` |
 | `hanzo-engine-ml` | ✓ | `hanzo-engine-ml.tex` |
+| `hanzo-evolutionary-orchestration` | ✓ | `hanzo-evolutionary-orchestration.tex` |
 | `hanzo-exchange-architecture` | ✓ | `hanzo-exchange-architecture/hanzo-exchange-architecture.tex` |
 | `hanzo-federated-agents` | ✓ | `hanzo-federated-agents/hanzo-federated-agents.tex` |
 | `hanzo-fhe-inference` | ✓ | `hanzo-fhe-inference/hanzo-fhe-inference.tex` |
@@ -97,6 +102,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-llm-gateway` | ✓ | `hanzo-llm-gateway/hanzo-llm-gateway.tex` |
 | `hanzo-longform-media` | ✓ | `hanzo-longform-media.tex` |
 | `hanzo-mcp-server` | ✓ | `hanzo-mcp-server/hanzo-mcp-server.tex` |
+| `hanzo-mean-field-alignment` | ✓ | `hanzo-mean-field-alignment.tex` |
 | `hanzo-ml-framework` | ✓ | `hanzo-ml-framework/hanzo-ml-framework.tex` |
 | `hanzo-native-stack-thesis` | ✓ | `hanzo-native-stack-thesis.tex` |
 | `hanzo-native-training` | ✓ | `hanzo-native-training.tex` |
@@ -128,7 +134,9 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hip-0302-replicate` | ✓ | `hip-0302-replicate/hip-0302-replicate.tex` |
 | `lightspeed-dex` | ✓ | `lightspeed-dex/lightspeed-dex.tex` |
 | `ntt-transform` | ✓ | `ntt-transform/ntt-transform.tex` |
+| `refutation-driven-perf` | ✓ | `refutation-driven-perf.tex` |
 | `verus-analytics` | ✓ | `verus-analytics/verus-analytics.tex` |
+| `training-without-retention` | ✓ | `zen/training-without-retention.tex` |
 | `zen-3d` | ✓ | `zen/zen-3d.tex` |
 | `zen3-embedding_whitepaper` | ✓ | `zen/zen3-embedding_whitepaper.tex` |
 | `zen3-guard_whitepaper` | ✓ | `zen/zen3-guard_whitepaper.tex` |
@@ -215,8 +223,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `ZEN_WHITEPAPER_2025` | ✓ | `zen/ZEN_WHITEPAPER_2025.tex` |
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
-**Total**: 210 papers, 204 with compiled PDFs
-
-| `hanzo-mean-field-alignment` | ✓ | `hanzo-mean-field-alignment.tex` |
-| `hanzo-evolutionary-orchestration` | ✓ | `hanzo-evolutionary-orchestration.tex` |
-| `hanzo-adversarial-mean-field-feedback` | ✓ | `hanzo-adversarial-mean-field-feedback.tex` |
+**Total**: 218 papers, 211 with compiled PDFs

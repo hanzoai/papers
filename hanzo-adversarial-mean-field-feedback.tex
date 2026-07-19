@@ -1,0 +1,438 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+% --- Paper 03 local additions: theorem apparatus + notation ---
+\usepackage{amsthm}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\mpi}{m_{\pi}}
+\newcommand{\mJ}{m_{J}}
+\newcommand{\Prob}{\mathcal{P}}
+\newcommand{\Xspace}{\mathcal{X}}
+\newcommand{\Jspace}{\mathcal{J}}
+
+\title{\textbf{The Reward Is a Flock:\\ A Two-Population Mean-Field Adversarial Game for Fleet Training}}
+\author{Hanzo AI --- ML Systems}
+\date{hanzo-agentic Paper 03 --- the \emph{Continually Improving Fleets} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Reinforcement learning on language models is usually drawn as a policy optimizing against a reward. The
+reward is treated as furniture --- a fixed function handed in from outside. This paper takes the reward as
+the object of study and argues it should be neither fixed nor singular. A single learned judge is a
+\emph{proxy}: optimize it hard enough and Goodhart's law guarantees the policy finds where the proxy and
+the truth disagree. We replace the judge with a \emph{flock} --- a population of diverse judges whose
+aggregate verdict is the reward --- and show three things. First, the flock is itself a mean-field system,
+but run in the \emph{anti-ferromagnetic} regime: judges are rewarded for covering the judgment space, not
+for agreeing, so the flock's stable configuration maximizes independence, and independence is exactly what
+Condorcet's jury theorem needs and what shrinks the exploitable surface to the intersection of blind spots.
+Second, the generator fleet (the ferromagnetic policy population of the companion paper) and the
+discriminator flock couple through each other's mean fields with \emph{opposite sign}: the pair is a
+two-population mean-field game, which is a generative adversarial network taken to the mean-field limit,
+and its equilibrium is a Nash \emph{saddle} rather than a proxy peak. We make the anti-hacking claim
+formal: a static judge field admits the reward-hacking maximizer as a stationary point, and a co-evolving
+judge field does not, because the region the policy over-concentrates on is re-judged until the incentive
+to stay there vanishes. Third, none of this is safe without an \emph{exogenous verifiable potential} ---
+compile, test, benchmark, ship-and-stay-live --- a common term on both populations that breaks the
+degenerate equilibrium in which flock and policy collude on a self-consistent but reality-detached reward.
+We show the whole construction collapses, in the discrete per-group limit, onto the group-relative
+advantage already computed by the shipped \texttt{hanzo-ml} GRPO trainer~\cite{shao2024grpo}: the flock's
+anchored verdict is the per-group mean field, and GRPO's existing weighted multi-reward sum is the
+non-adversarial, fixed-weight special case of a flock. We give an honest accounting of what is real in the
+training substrate today and what the adversarial, anchored, co-evolving generalization still needs.
+\end{abstract}
+
+\section{The reward is the hard part}
+\label{sec:intro}
+
+A policy-gradient trainer is only as good as the number it climbs. The companion papers treat the
+\emph{population} of policies: how a fleet aligns (Paper~01, \cite{hanzo-mfa}) and how it searches
+(Paper~02, \cite{hanzo-evo}). Both assume a field to align to and a fitness to select on. This paper is
+about that field. Where does it come from, and why is a single source of it dangerous?
+
+The danger is Goodhart's law in its sharpest form. Let $q:\Xspace\to\R$ be the true quality of an output
+$x$ (unknown, possibly undefinable pointwise) and let $h:\Xspace\to\R$ be a learned proxy for it. Optimizing
+$\max_{x} h(x)$ does not return the $x$ that maximizes $q$; it returns the $x$ that maximizes $h-q$ plus
+$q$, i.e.\ it seeks out and concentrates on the \emph{disagreement} between proxy and truth. A capable
+policy is a very good optimizer, so it is a very good finder of that disagreement. This is reward hacking,
+and it is not a bug in a particular reward model --- it is the generic behavior of maximizing a proxy.
+
+Two structural moves defuse it, and this paper is about combining them. \textbf{Make the reward a
+population} (a flock of judges, Section~\ref{sec:flock}), so that the exploitable disagreement must be
+shared by many independent proxies at once. \textbf{Make the reward move} (co-evolve the flock against the
+policy, Section~\ref{sec:twopop}), so that no static exploit is stationary. And underneath both,
+\textbf{anchor the reward to something real} (a verifiable potential, Section~\ref{sec:anchor}), so the
+flock cannot drift as a bloc.
+
+\section{The flock, and why independence is the whole game}
+\label{sec:flock}
+
+\begin{definition}[Flock reward]
+Let $\Jspace$ be a space of judges; a judge $j\in\Jspace$ maps an output to a scalar verdict
+$j(x)\in\R$. Let $\mJ\in\Prob(\Jspace)$ be a probability measure over judges (the \emph{flock}). The flock
+reward is a functional of the flock,
+\[
+  r(x;\mJ) \;=\; \mathrm{Agg}_{j\sim\mJ}\, j(x),
+\]
+with $\mathrm{Agg}$ the mean $\int j(x)\,d\mJ(j)$ in the simplest case, and a robust statistic (median,
+trimmed mean, reliability-weighted mean) in practice.
+\end{definition}
+
+The mean case exposes the essential fact. Write judge $j$'s verdict as truth plus error,
+$j(x)=q(x)+\varepsilon_j(x)$, with $\E[\varepsilon_j]=b$ (a shared bias) and
+$\mathrm{Var}(\varepsilon_j)=\sigma^2$, and let $\bar\rho$ be the mean pairwise correlation of the
+$\varepsilon_j$ across a flock of $K$ judges.
+
+\begin{proposition}[Diversity is the reward's temperature]
+\label{prop:condorcet}
+The variance of the mean flock reward is
+\[
+  \mathrm{Var}\!\Big(\tfrac1K\textstyle\sum_{j=1}^K j(x)\Big)
+  \;=\; \sigma^2\Big(\bar\rho + \tfrac{1-\bar\rho}{K}\Big)
+  \;\xrightarrow[K\to\infty]{}\; \bar\rho\,\sigma^2 .
+\]
+Independent judges ($\bar\rho\to 0$) drive the variance to $0$; perfectly correlated judges
+($\bar\rho\to 1$) leave it at $\sigma^2$ --- no gain from any number of them. The shared bias $b$ is
+\emph{not} reduced by averaging at all; only decorrelated error is.
+\end{proposition}
+
+\begin{proof}
+The variance of an average of $K$ unit-variance, mean-$\bar\rho$-correlated variables is
+$\frac1{K^2}\big(K + K(K-1)\bar\rho\big)=\bar\rho+\frac{1-\bar\rho}{K}$; scale by $\sigma^2$. The bias term
+is common to every judge and survives the average unchanged.
+\end{proof}
+
+Proposition~\ref{prop:condorcet} is the discriminative form of Condorcet's jury
+theorem~\cite{condorcet1785}: a jury of weak but \emph{independent} voters converges to certainty, and a
+jury of clones does nothing. Two consequences set the entire design.
+
+\begin{corollary}[The exploitable surface is an intersection]
+\label{cor:intersection}
+A policy hacks a single judge $j$ by concentrating on $x$ where $\varepsilon_j(x)>0$. It hacks the flock
+only on $x$ where $\varepsilon_j(x)>0$ for enough $j$ simultaneously --- a set that shrinks with judge
+diversity, and vanishes for the components of error that are independent across the flock. Only the shared
+bias $b$ (the common blind spot) remains hackable; Section~\ref{sec:anchor} is how we remove it.
+\end{corollary}
+
+\begin{remark}[Judge diversity is Paper~01's temperature]
+Independence is not free: it must be produced. Judges drawn from one model family, one rubric, one
+persona, one decoding temperature are near-clones ($\bar\rho\to1$). Diversity across model families,
+prompts, rubrics, and sampling temperatures is what keeps $\bar\rho$ low --- and $\bar\rho$ plays exactly
+the role of the alignment order parameter $m$ in Paper~01~\cite{hanzo-mfa}. A flock that has aligned into
+consensus is a flock frozen below its Curie point: coherent, and useless.
+\end{remark}
+
+\section{The flock is an anti-ferromagnet}
+\label{sec:antiferro}
+
+If Paper~01 asks the policy population to align --- a ferromagnetic mean field with coupling $J>0$, whose
+stable state is consensus --- then the flock must want the opposite. We give the judges a mean-field
+interaction with \emph{negative} coupling.
+
+\begin{definition}[Anti-ferromagnetic flock objective]
+Each judge minimizes a cost with three terms,
+\[
+  c_J(j;\mJ,V)
+   \;=\; \underbrace{\alpha\,\ell_{\text{ver}}\!\big(j,V\big)}_{\text{agree on the verifiable}}
+   \;-\; \underbrace{|J|\!\!\int\! K(j,j')\,d\mJ(j')}_{\text{repel on the subjective, }J<0}
+   \;+\; \underbrace{\lambda\,\Omega(j)}_{\text{regularizer}} ,
+\]
+where $\ell_{\text{ver}}$ penalizes disagreement with the verifiable potential $V$ of
+Section~\ref{sec:anchor}, $K(j,j')$ is a similarity kernel on judges, and the middle term \emph{rewards}
+being far from the rest of the flock (a repulsive, $J<0$, mean-field interaction).
+\end{definition}
+
+The flock's equilibrium is therefore \emph{structured}: ferromagnetic (agreeing, $J>0$ effectively) on
+the axis $V$ can measure, and anti-ferromagnetic (diverse, $J<0$) on the subjective axis it cannot. This is
+the correct anisotropy. On ``does it compile,'' we want the judges to agree, because there is a truth to
+agree on. On ``is the abstraction clean,'' we want them to spread, because the aggregate of diverse
+subjective reads is a better estimator than any one, and because a spread flock is unhackable where a
+consensus flock is a single point of failure. The repulsive term is what actively \emph{produces} the low
+$\bar\rho$ that Proposition~\ref{prop:condorcet} needs; diversity stops being a hope and becomes an
+optimized quantity.
+
+\section{Two populations, opposite signs: the mean-field GAN}
+\label{sec:twopop}
+
+Now couple them. Let $\mpi\in\Prob(\Xspace)$ be the policy population's output measure (the generator) and
+$\mJ\in\Prob(\Jspace)$ the flock (the discriminator). Each population runs a mean-field game --- a
+Hamilton--Jacobi--Bellman equation for the individual's optimal behavior against the population, coupled to
+a Fokker--Planck--Kolmogorov equation for how the population evolves under that behavior~\cite{lasry2007mfg}
+--- and the two are coupled through each other's mean fields.
+
+The generator's individual cost \emph{falls} with reward:
+$c_\pi(x;\mJ) = -\,r(x;\mJ) + \tfrac1\beta\,\mathrm{KL}(\pi\,\|\,\pi_{\text{ref}})$, where the KL-to-reference
+term is the temperature $1/\beta$ (Paper~01). The flock's cost \emph{rises} with the reward's error against
+truth: it is paid to make $r(\cdot;\mJ)$ track $q$ (anchored by $V$) and to deny the generator any free
+lunch. The two objectives meet with opposite sign in $r$: the generator pushes $\mpi$ toward high $r$; the
+flock moves $\mJ$ to keep $r$ honest exactly where $\mpi$ has gone.
+
+\begin{definition}[Two-population adversarial MFG]
+An equilibrium is a pair $(\mpi^\ast,\mJ^\ast)$ such that $\mpi^\ast$ is a mean-field best response to
+$\mJ^\ast$ in the generator game and $\mJ^\ast$ is a mean-field best response to $\mpi^\ast$ in the flock
+game. Equivalently it is a saddle of the min--max functional
+\[
+  \min_{\mJ}\ \max_{\mpi}\ \; \E_{x\sim\mpi}\big[\,r(x;\mJ)\,\big]\;-\;\gamma\, D\big(r(\cdot;\mJ),\,q\big),
+\]
+the generator maximizing the reward it is scored by, the flock minimizing the divergence $D$ of that reward
+from truth.
+\end{definition}
+
+This is a generative adversarial network~\cite{goodfellow2014gan} written at the mean-field limit:
+generator population vs.\ discriminator population, each a distribution rather than a single network. Its
+value is a saddle, not a maximum --- and that distinction is the entire anti-hacking argument.
+
+\begin{theorem}[Existence under monotone coupling]
+\label{thm:existence}
+Suppose the running costs are convex and Lipschitz in the control, the coupling functionals
+$\mpi\mapsto c_J$ and $\mJ\mapsto c_\pi$ are continuous for the Wasserstein topology and satisfy the
+Lasry--Lions monotonicity condition, and the state spaces are compact. Then the two-population system
+admits at least one equilibrium $(\mpi^\ast,\mJ^\ast)$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Each single-population game is a standard MFG whose best-response map is well defined and continuous under
+the stated assumptions~\cite{lasry2007mfg}. The joint best-response
+$(\mpi,\mJ)\mapsto(\mathrm{BR}_\pi(\mJ),\mathrm{BR}_J(\mpi))$ is then a continuous self-map of the product
+of two convex, compact Wasserstein-ball measure sets; Schauder's fixed-point theorem gives a fixed point,
+which is by definition an equilibrium. Monotonicity gives uniqueness in the standard one-population
+regularity class; we do \emph{not} claim uniqueness here, because the adversarial (opposite-sign) coupling
+is generically \emph{non}-monotone --- see Remark~\ref{rem:limitcycle}.
+\end{proof}
+
+\begin{remark}[Honest boundary: non-monotone coupling can cycle]
+\label{rem:limitcycle}
+The opposite-sign coupling that makes this a game rather than a potential-minimization is exactly what
+breaks Lasry--Lions monotonicity. Without the anchor of Section~\ref{sec:anchor}, the flow
+$(m_{\pi,t},m_{J,t})$ can limit-cycle --- the generator chases the reward, the flock chases the generator,
+neither settles --- the mean-field echo of GAN training instability. The verifiable potential is what turns
+the cycle into a pinned saddle; it is not decoration, it is the well-posedness.
+\end{remark}
+
+\section{Why a moving reward cannot be hacked}
+\label{sec:saddle}
+
+Here is the payoff, stated as sharply as it deserves.
+
+\begin{proposition}[Static field admits the hack; co-evolving field does not]
+\label{prop:hack}
+Fix the flock at $\mJ^0$, so the reward is a static field $h(x)=r(x;\mJ^0)$. The generator's problem
+$\max_{\mpi}\E_{\mpi}[h]$ is a linear program on $\Prob(\Xspace)$; its optimum places all mass on
+$\arg\max_x h(x)$. If $x^\star\in\arg\max h$ has $q(x^\star)<h(x^\star)$ --- a proxy--truth gap, which by
+Corollary~\ref{cor:intersection} exists wherever the flock's shared bias is nonzero --- then the reward-hacking
+concentration on $x^\star$ is the \emph{stationary point} of the generator dynamics.
+
+Now let the flock co-evolve: $\mJ=\mJ[\mpi]$ is the flock's best response to the current policy
+population. The generator faces $\max_{\mpi}\E_{\mpi}\big[r(x;\mJ[\mpi])\big]$, in which the field is a
+functional of the very measure being optimized. The former stationary point $x^\star$ is \emph{not}
+stationary: as $\mpi$ concentrates on $x^\star$, the flock's best response (i) increases judge coverage
+near $x^\star$ (the anti-ferromagnetic repulsion drives judges into the newly dense, newly important
+region) and (ii) is pulled by the verifiable term toward $V(x^\star)$, which is low. Both lower
+$r(x^\star;\mJ[\mpi])$ until the generator's incentive to remain at $x^\star$ vanishes. No pure exploit is
+a fixed point of the coupled system; the only fixed points are saddles where the generator can no longer
+improve the reward without the flock immediately correcting it.
+\end{proposition}
+
+The one-line reading: \emph{a target that re-aims at wherever you aimed last cannot be shot with a fixed
+aim.} Reward hacking is optimization against a stationary proxy; remove the stationarity and you remove the
+hack. This is the formal content of ``rotate the judges,'' ``adversarial judges,'' and ``the discriminator
+must keep up with the generator,'' unified as one property of the coupled equilibrium.
+
+\section{The anchor: a verifiable potential on both populations}
+\label{sec:anchor}
+
+A flock of \emph{AI} judges has a failure mode that no amount of diversity fixes: it can drift as a bloc.
+If the shared bias $b$ of Proposition~\ref{prop:condorcet} is itself learned and shared --- a common
+sycophancy, a common taste, a hallucinated notion of quality --- then the flock and the policy can settle
+into a self-consistent equilibrium that is internally coherent and externally false. In game terms, the
+min--max of Section~\ref{sec:twopop} without an external term has a degenerate family of equilibria: any
+mutually-consistent $(\mpi,\mJ)$ pair, including collapsed and reality-detached ones.
+
+\begin{definition}[Verifiable potential]
+Let $V:\Xspace\to\R$ be an \emph{exogenous}, non-learned reward computable by execution: the code compiles;
+the tests pass; the benchmark clears its bit-exact gate; the change ships and stays live. $V$ is a common
+potential added to \emph{both} populations --- it is a term in the flock's $\ell_{\text{ver}}$ (judges are
+penalized for verdicts inconsistent with $V$) and a term in the generator's reward.
+\end{definition}
+
+\begin{proposition}[Anchoring breaks the degeneracy]
+\label{prop:anchor}
+With $V$ present, every equilibrium $(\mpi^\ast,\mJ^\ast)$ must be consistent with $V$ on the verifiable
+axis: the flock's $V$-inconsistent verdicts carry strictly positive cost, so no equilibrium can place mass
+on outputs that fail $V$ while claiming high reward. The set of equilibria is pinned to the
+$V$-consistent manifold, eliminating the collapsed/hallucinated family and turning
+Remark~\ref{rem:limitcycle}'s cycle into a bounded saddle.
+\end{proposition}
+
+This is the RLVR (reinforcement learning from verifiable rewards) anchor married to RLAIF (reinforcement
+learning from AI feedback~\cite{bai2022constitutional}): the \emph{verifiable} axis is judged by execution, ferromagnetically (there is
+a truth, the judges should agree with it and each other); the \emph{subjective} axis is judged by the
+anti-ferromagnetic flock. $V$ does not have to be dense or complete --- it only has to be \emph{real} and
+\emph{present}, enough to make reality a term the equilibrium cannot ignore.
+
+\begin{remark}[Judges graduate through the gate]
+The co-evolution is closed by promoting judges: a fine-tuned enso model may \emph{join} the flock, but only
+after clearing the verifiable gate on a held-out battery, and it is admitted with a reliability weight
+proportional to its historical agreement with $V$. A judge that keeps losing to the anchor is down-weighted.
+This is how the flock improves without eating its own tail: new judges enter through reality, not through
+consensus.
+\end{remark}
+
+\section{Both populations live at criticality; the GA moves them}
+\label{sec:crit}
+
+Paper~01 argues each population should sit just below its ordering transition --- coherent enough to
+converge, hot enough to correct. That applies to both here: a generator fleet frozen into one output has no
+exploration, and a flock frozen into one opinion has no robustness. The control knobs are the same
+temperatures --- decoding temperature and KL coefficient for the generator, judge diversity ($1-\bar\rho$)
+and coverage weight for the flock --- annealed over training, never quenched. Paper~02's genetic
+search~\cite{hanzo-evo} operates on \emph{both} populations: it evolves the policy variants (crossover of
+partial solutions) and it evolves the flock (recombine rubrics, retire drifted judges, breed diverse new
+ones). The three papers are therefore one coupled master system: a \textbf{generator fleet}
+$\otimes$ \textbf{discriminator flock}, \textbf{searched} by a genetic algorithm, \textbf{anchored} by a
+verifiable potential, all closing on a single mean-field number.
+
+\section{The grounding: it collapses onto GRPO}
+\label{sec:grounding}
+
+The construction above is not a proposal to build a new trainer. It is the adversarial, anchored,
+co-evolving generalization of the loop the \texttt{hanzo-ml} stack already runs. The shipped GRPO
+trainer~\cite{hanzo-native-training,shao2024grpo} samples a \emph{group} of $G$ rollouts per prompt, scores
+each, and forms the group-relative advantage
+\[
+  A_i \;=\; \frac{r_i - \mathrm{mean}_{k\le G}\, r_k}{\mathrm{std}_{k\le G}\, r_k}
+  \qquad(\texttt{math::batch\_advantages},\ \text{ddof}=1),
+\]
+then a length-normalized policy-gradient loss with an optional $k3$ KL penalty to a frozen reference. Read
+this against Sections~\ref{sec:flock}--\ref{sec:twopop}:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{$r_i$ is the anchored flock verdict} on rollout $i$: the aggregate of the diverse judges
+        plus the verifiable term $V$. GRPO's existing ``weighted multi-reward sum'' (\texttt{score()},
+        \texttt{trainer.rs:119}) is precisely a flock with \emph{fixed weights and no adversary} --- the
+        non-adversarial special case. Turning those fixed weights into a co-evolving, diversity-optimizing,
+        $V$-anchored flock is the whole delta.
+  \item \textbf{The group mean is the mean field.} $\mathrm{mean}_{k}\,r_k$ is the finite-sample estimator
+        of $\E_{\mpi}[r]$; subtracting it is the mean-field coupling of Paper~01 computed per group. The
+        $\mathrm{std}$ normalization is the local temperature. GRPO is, structurally, a per-group
+        discretization of the mean-field game.
+  \item \textbf{The $k3$ KL is $1/\beta$.} The frozen-reference penalty is the generator temperature that
+        Section~\ref{sec:twopop} keeps at criticality.
+\end{itemize}
+
+\paragraph{Cost.} A flock of $K$ judges is $K\times$ the eval cost per rollout. Two mitigations, both
+structural. \emph{Cascade}: score with one cheap judge first; escalate to the full flock only on high stakes
+or when the cheap judge's uncertainty (or disagreement with $V$) is high. \emph{Uncertainty gating}: the
+flock spread is an epistemic-uncertainty estimate (Proposition~\ref{prop:condorcet}); train hard where the
+flock agrees and $V$ confirms, and treat high-spread rollouts as exploration signal rather than gradient.
+
+\paragraph{Where it lives.} The eval-to-finetune bridge is the \texttt{/v1/evals} product (Hanzo's
+LLM-as-a-judge / observability plane): the flock scores every output there, the verifiers anchor it, and
+the aggregate is emitted as the reward stream the GRPO loop consumes. The judge population, its diversity
+objective, and its recalibration schedule are configuration on that plane, not new infrastructure.
+
+\section{What is real, what needs building, what is out of scope}
+\label{sec:accounting}
+
+\paragraph{Real (in the substrate today).} The GRPO five-phase loop --- rollout, weighted multi-reward,
+group-relative advantage with $\text{ddof}=1$, length-normalized policy-gradient loss, $k3$ KL, AdamW step ---
+is ported and tested~\cite{hanzo-native-training}. The verifiable signals ($V$) exist as CI / harness
+outcomes (compile, test, benchmark gates, ship-and-live telemetry). The \texttt{/v1/evals} plane hosts
+LLM-as-a-judge scoring. Multi-model consensus primitives exist in the tool layer.
+
+\paragraph{Needs building.} The judge population as a first-class object: a diversity (anti-ferromagnetic)
+objective that actively minimizes $\bar\rho$; the co-evolution loop (flock best-responds to the policy
+population, drifted judges down-weighted, graduated judges admitted through the $V$ gate); the cascade /
+uncertainty-gated escalation; and the wiring that turns the flock's anchored verdict into the per-group
+reward stream on \texttt{/v1/evals}. Today's ``weighted multi-reward'' is the fixed-weight, non-adversarial
+stub of the flock.
+
+\paragraph{Out of scope.} A full Lasry--Lions well-posedness proof for this specific non-monotone coupling
+(we invoke existence under monotonicity, Theorem~\ref{thm:existence}, and are explicit that the adversarial
+coupling is non-monotone and can cycle without the anchor, Remark~\ref{rem:limitcycle}); learned
+\emph{optimal} judge weights and kernels; and any human-in-the-loop calibration schedule beyond the
+verifiable gate.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The reward is not furniture. A single judge is a stationary proxy and will be hacked; a flock of diverse
+judges shrinks the exploitable surface to the intersection of blind spots
+(Proposition~\ref{prop:condorcet}, Corollary~\ref{cor:intersection}), a flock that repels into diversity
+(anti-ferromagnetic, Section~\ref{sec:antiferro}) actively produces the independence that shrinkage needs,
+a flock that co-evolves with the policy removes the stationarity that hacking requires
+(Proposition~\ref{prop:hack}), and a verifiable potential pins the whole adversarial equilibrium to reality
+so the flock cannot drift as a bloc (Proposition~\ref{prop:anchor}). Structurally it is a two-population
+mean-field game --- a GAN at the mean-field limit --- and it collapses, per rollout group, onto the
+group-relative advantage the \texttt{hanzo-ml} GRPO trainer already computes, with today's fixed-weight
+multi-reward as its non-adversarial special case. Together with the fleet's ferromagnetic alignment
+(Paper~01) and the genetic search over both populations (Paper~02), it completes one system:
+\emph{compass, engine, thermostat} --- generator fleet $\otimes$ discriminator flock, searched, anchored,
+and closing on a single mean field.
+
+\begin{thebibliography}{10}
+
+\bibitem{hanzo-mfa}
+Hanzo AI --- ML Systems. (2026).
+\textit{Critical Alignment of Agentic Fleets: Mean-Field Games and Ferromagnetic Order}.
+hanzo-agentic Paper~01, the \emph{Continually Improving Fleets} series.
+
+\bibitem{hanzo-evo}
+Hanzo AI --- ML Systems. (2026).
+\textit{Evolutionary Orchestration: Population Search over Agentic Fleets}.
+hanzo-agentic Paper~02, the \emph{Continually Improving Fleets} series.
+
+\bibitem{hanzo-native-training}
+Hanzo AI --- ML Systems. (2026).
+\textit{Native Training in hanzo-ml/hanzo-engine: One Engine, One Quant Format, One Backend}.
+Hanzo Industries Research.
+
+\bibitem{hanzo-consensus-zap}
+Hanzo AI --- ML Systems. (2026).
+\textit{The Three-Plane Compute Fabric: Consensus and ZAP Compute}.
+\emph{One Source, Every Backend} series.
+
+\bibitem{shao2024grpo}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., et al. (2024).
+\textit{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}.
+arXiv:2402.03300. (Group Relative Policy Optimization.)
+
+\bibitem{lasry2007mfg}
+Lasry, J.-M., \& Lions, P.-L. (2007).
+\textit{Mean Field Games}.
+Japanese Journal of Mathematics, 2(1), 229--260.
+
+\bibitem{condorcet1785}
+de Condorcet, N. (1785).
+\textit{Essai sur l'application de l'analyse \`a la probabilit\'e des d\'ecisions rendues \`a la pluralit\'e des voix}.
+Imprimerie Royale, Paris. (The jury theorem.)
+
+\bibitem{goodfellow2014gan}
+Goodfellow, I., Pouget-Abadie, J., Mirza, M., Xu, B., Warde-Farley, D., Ozair, S., Courville, A., \& Bengio, Y. (2014).
+\textit{Generative Adversarial Networks}.
+NeurIPS 2014.
+
+\bibitem{skalse2022reward}
+Skalse, J., Howe, N.~H.~R., Krasheninnikov, D., \& Krueger, D. (2022).
+\textit{Defining and Characterizing Reward Hacking}.
+NeurIPS 2022.
+
+\bibitem{bai2022constitutional}
+Bai, Y., Kadavath, S., Kundu, S., et al. (2022).
+\textit{Constitutional AI: Harmlessness from AI Feedback}.
+arXiv:2212.08073.
+
+\end{thebibliography}
+
+\end{document}

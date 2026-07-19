@@ -216,3 +216,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
 **Total**: 210 papers, 204 with compiled PDFs
+
+| `hanzo-mean-field-alignment` | ✓ | `hanzo-mean-field-alignment.tex` |
+| `hanzo-evolutionary-orchestration` | ✓ | `hanzo-evolutionary-orchestration.tex` |
+| `hanzo-adversarial-mean-field-feedback` | ✓ | `hanzo-adversarial-mean-field-feedback.tex` |

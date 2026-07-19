@@ -95,6 +95,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-intrinsic-islands` | ✓ | `hanzo-intrinsic-islands.tex` |
 | `hanzo-jin-architecture` | ✓ | `hanzo-jin-architecture/hanzo-jin-architecture.tex` |
 | `hanzo-jin` | ✓ | `hanzo-jin/hanzo-jin.tex` |
+| `hanzo-judge-panel-ablation` | ✓ | `hanzo-judge-panel-ablation.tex` |
 | `hanzo-kernel-dsl` | ✓ | `hanzo-kernel-dsl.tex` |
 | `hanzo-kernel-optimization` | ✓ | `hanzo-kernel-optimization.tex` |
 | `hanzo-kms-secrets` | ✓ | `hanzo-kms-secrets.tex` |
@@ -223,4 +224,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `ZEN_WHITEPAPER_2025` | ✓ | `zen/ZEN_WHITEPAPER_2025.tex` |
 | `zen-world` | ✓ | `zen/zen-world.tex` |
 
-**Total**: 218 papers, 211 with compiled PDFs
+**Total**: 219 papers, 211 with compiled PDFs

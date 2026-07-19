@@ -1,0 +1,539 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\title{\textbf{Refutation-Driven Performance Engineering:\\
+An Empirical Study of a Multi-Week GPU Kernel Campaign}}
+\author{Hanzo AI Research}
+\date{hanzo-kernel Paper 08 --- part of the \emph{One Source, Every Backend} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report an observational study of a single multi-week campaign to close the inference-throughput gap
+against \code{llama.cpp} on three accelerators (AMD gfx1151 RDNA3.5 APU, NVIDIA GB10 Blackwell, Apple M4
+Max), conducted inside a one-source GPU kernel DSL. The campaign's primary artifact is not a kernel but a
+\emph{refutation log}: twenty-five numbered hypotheses, most of them plausible and several of them
+our own, each killed by a cheap decisive experiment. We formalize the practice behind it. First, the
+quantified outcomes: a Vulkan-prefill \emph{win ladder} of $212\to1734$ tok/s ($8.2\x$ of the gap closed in
+a single $\sim$36-hour release cadence, from $11.6\x$ behind the reference to $1.40\x$), decomposed per
+lever; a CUDA decode gap closed $1.23\x\to1.003\x$ by a single model-eligibility list entry with
+\emph{zero} kernel work; and an instrument fix that collapsed
+prefill benchmark noise from $\pm42\%$ to $\pm0.8\%$ ($52\x$) and thereby made the second half of the win
+ladder measurable at all. Second, three algorithms that recur across the log: a multi-fidelity
+\emph{Gate Ladder} that rejects candidates cheapest-first (free static rejection $\to$ bit-exact oracle
+$\to$ sustained per-op timing $\to$ in-engine wall $\to$ coherence); a \emph{decisive-experiment}
+selection rule (the cheapest single-variable control that can falsify a live hypothesis); and
+\emph{refutation-log-as-prior}, negative constraints injected into later work, which provably prevented at
+least nine documented re-chases. Third, the measurement doctrine as testable claims (same-run ratios only;
+sustained-vs-sustained; contended-timing refusal; warm-microbench distrust). We close by describing how the
+discipline was operationalized as a 22-case language-model evaluation whose distractors are the campaign's
+own refuted theories. We do not overclaim the standing: across the measured fronts the campaign holds two
+wins (ROCm decode $1.07\x$; a $470\x$ margin over the fork's upstream on Metal), one parity (CUDA decode),
+and three open gaps (Vulkan prefill/decode, CUDA prefill) --- ``beat everywhere'' is the objective, not the
+achieved state. This is an $N{=}1$ study with no control group; we state that boundary explicitly.
+\end{abstract}
+
+\section{Thesis: the refutation is the deliverable}
+\label{sec:thesis}
+
+Conventional performance write-ups report wins. This campaign's ledger is dominated by \emph{kills}: of the
+levers seriously proposed and evaluated, the majority were refuted, and refuting them was the value
+produced --- because a refuted lever, recorded with its mechanism, removes an entire branch of future work.
+The campaign ran against a fixed external baseline (\code{llama.cpp}, the reference LLM inference engine)
+on the same silicon and the same model files, so every claim reduces to a measured ratio on shared
+hardware. The engineering question was never ``is our kernel fast?'' but ``\emph{which} of these competing
+stories about the bottleneck survives contact with an instrument?''
+
+The stakes are concrete. On the AMD gfx1151 APU (evo), our Vulkan prefill began at $212$ tok/s against a
+same-box \code{llama.cpp} figure of $2459$ --- an $11.6\x$ deficit. Twenty-five refutations later it stood
+at $1739.6\,{\pm}\,7.4$ vs $2441.9\,{\pm}\,22.2$ same-run, $1.40\x$ behind. The distance between those endpoints is a
+sequence of decisions, and most of the decisions were \emph{not to do the attractive thing}. This paper is
+about how those decisions were made and what they cost.
+
+\paragraph{Environment.} Three self-hosted boxes, each its own backend: \textbf{evo} --- AMD Ryzen AI
+Max+~395 / Radeon 8060S, gfx1151 (RDNA3.5 APU, unified memory), bare-metal Linux 6.17, ROCm 7.2.4, Vulkan
+via RADV; \textbf{spark} --- NVIDIA GB10, compute capability 12.1 (sm\_121, Blackwell), aarch64;
+\textbf{dbc} --- Apple M4 Max, 40-core GPU, macOS~26. Models: \code{zen-eco-4b} (a Qwen2-3B derivative)
+Q4\_K\_M, and Qwen3-30B-A3B-Instruct Q4\_K\_M (18.5\,GB). Reference: \code{llama.cpp} (Vulkan/CUDA/Metal/HIP
+backends) and its \code{llama-bench}, run on the identical box and GGUF file. All comparisons in this paper
+are same-box, same-model; cross-box numbers are labelled as such.
+
+\section{The refutation dataset}
+\label{sec:dataset}
+
+Table~\ref{tab:refutations} is the study's core observation: a census of the campaign's hypotheses,
+classified by the \emph{kind} of story each told and annotated with the decisive experiment that settled
+it, its approximate cost to kill, and what killing it saved. We use four hypothesis classes:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+\item \textbf{mechanistic-kernel} --- a claim that some change to a compute kernel (fuse these ops, cut this
+dispatch count, use tensor cores, enlarge the tile) will move the wall clock.
+\item \textbf{configuration-gap} --- the bottleneck is not the kernel but a build flag, an eligibility
+list, a harness setting, or a dispatch-orchestration pattern.
+\item \textbf{measurement-artifact} --- the ``finding'' was an instrument lie: a warm microbenchmark, a
+warmup-shape mismatch, contended timing, or mixed-phase telemetry sampling.
+\item \textbf{hardware-story} --- a narrative about the silicon: thermal throttling, a DVFS
+utilization spiral, a sustained power limit.
+\end{itemize}
+
+\begin{table}[t]
+\centering\scriptsize
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.205\textwidth}>{\raggedright\arraybackslash}p{0.115\textwidth}>{\raggedright\arraybackslash}p{0.30\textwidth}>{\raggedright\arraybackslash}p{0.075\textwidth}>{\raggedright\arraybackslash}p{0.175\textwidth}@{}}
+\toprule
+\textbf{Hypothesis} & \textbf{Class} & \textbf{Decisive experiment} & \textbf{Cost} & \textbf{What it saved} \\
+\midrule
+Cut router GPU$\to$CPU$\to$GPU id syncs ($144$/tok) speeds decode & mechanistic-kernel & Removed the syncs; \code{VK\_PROFILE} decode A/B & minutes & Retired ``sync count'' as a decode lever (8.97$\to$9.14, flat) \\
+Fuse the MoE router op-chain (softmax+argsort) & mechanistic-kernel & Fused to one kernel; dispatches $55272\to43656$ ($-21\%$); measure t/s & hours & Retired ``cheap-dispatch count'' (decode $\sim$9$\to$8.56, flat) \\
+Fused GQA flash attention is the decode lever & mechanistic-kernel & Built \code{sdpa\_blk} (roofline $284$ GB/s); fused ON/OFF A/B & days & ``Attention was never the lever'' (2.2 vs 2.3 t/s, identical) \\
+Prefill is submission-bound; a command graph is the fix & measurement-artifact & \code{fence\_wait}$=$per-op GPU sum $\Rightarrow$ GPU is computing & minutes & Graph saves $\sim$0.6\% of prefill, not the $11.6\x$; redirected to the GEMM \\
+Q6\_K prefill needs a tiled GEMM (not a column matvec) & mechanistic-kernel & Per-op profile: \code{mul\_mat\_q6k} $=76\%$ of prefill & minutes & The first real lever: $212\to704$ t/s \\
+32KB accumulator spill caps occupancy & mechanistic-kernel & shaderstats before/after (scratch $32768\to0$) & free & occupancy $2\to6$; op $1722\to1634\,\mu$s \\
+\code{llama} 64$\times$64 tile (RN4) is better (max occupancy) & mechanistic-kernel & Sustained per-op: RN4 $1915$ vs RN8 $1634\,\mu$s & hours & Occupancy-maximalism killed; kept RN8 \\
+Sustained power throttle / DVFS spiral (29\%@713 vs 77\%@2431 MHz) & hardware-story & Pin clock 2900 MHz; forward still $540$ ms & minutes & Throttle + downclock narratives both dead \\
+Per-forward state accumulates (``120ms$\to$523ms'') & measurement-artifact & \code{warmup=0}: forward \#1 $=573$ ms, all flat & minutes & Killed the ``memory leak'' hunt \\
+The ``120ms fast window'' is real GPU capability & measurement-artifact & Byte counters: $334.6$ vs $8364$ MB at equal dispatch count & minutes & 32-tok warmup phantom; killed 3 theories at once \\
+Brief: port \code{llama}'s BK=64 into our coopmat & configuration-gap & Read source: \code{:3968} overrides BK=32 for coopmat & minutes & Refuted the brief; BK=64 later tried and lost \\
+f16 accumulators raise occupancy past 8 & mechanistic-kernel & shaderstats: LDS-limited (20480B), VGPR $168\to180$ & minutes & ``\code{llama} does it'' is not a mechanism \\
+Double-buffer the K-tile to hide latency & mechanistic-kernel & Weight stream $=10.8\%$ of peak (no latency crisis) & hours & Single-buffer: occ $6\to8$; $1383\to1734$ t/s \\
+Coopmat (tensor cores) beats \code{dp4a} on gfx1151 & mechanistic-kernel & Cache-cold in-engine: coopmat $4\x$ worse e2e & hours & Killed until the access pattern, not the cores, was fixed \\
+Bigger BM tile cuts cold-weight re-reads & mechanistic-kernel & \code{VK\_Q4K\_BM} A/B: BM128/256 $2.4\x$ slower & minutes & Occupancy collapse; BM64 is the sweet spot \\
+Coalesced-cooperative layout will speed Q4\_K matvec too & mechanistic-kernel & In-engine A/B: $115$ vs $169$ GB/s ($1.46\x$ slower) & hours & Lever value $=$ distance-from-wall; Q4\_K already at 83\% \\
+CUDA prefill needs the \code{flash-attn} feature & configuration-gap & Idle-window A/B: flash-ON $3.6\%$ slower & hours & Redirected to \code{flashinfer} + glue, not v2 flash \\
+CUDA decode is $1.23\x$ because of a slow kernel & configuration-gap & \code{Model::Qwen} absent from graph-eligibility list & minutes & One arm $\Rightarrow$ $1.23\x\to1.003\x$, no kernel touched \\
+Metal is $21\x$ behind: the tiled GEMM was never written & configuration-gap & Read backend: \code{kernel\_mul\_mm\_*} exists for every quant & minutes & Refused to port an existing kernel; re-measure first \\
+Quantize-fusion (drop 96 dispatches/tok) is a perf win & mechanistic-kernel & Decode A/B: $+2.2\%$, error bars touching & hours & Kept as cleanliness, not perf; ``10 for 10'' on counts \\
+\bottomrule
+\end{tabular}
+\caption{The refutation census (representative subset of the log). ``Cost'' is order-of-magnitude
+engineer time to the decisive result. The modal class is \emph{mechanistic-kernel} (the attractive story
+is almost always ``write a better kernel''); the modal \emph{outcome} is refutation. Several rows kill our
+own prior conclusions --- the log is adversarial toward its author.}
+\label{tab:refutations}
+\end{table}
+
+Two structural facts fall out of the census. (1)~The attractive hypothesis is nearly always
+mechanistic-kernel --- ``fuse it,'' ``use the tensor cores,'' ``cut the dispatches'' --- and it is the
+class most often refuted. (2)~The largest single wins were \emph{configuration-gap}: a Cargo feature, an
+enum arm, a warmup shape. Kernels get the glory; configuration eats the throughput. This asymmetry is the
+study's headline qualitative finding, and \S\ref{sec:findings} quantifies it.
+
+\section{Five quantified findings}
+\label{sec:findings}
+
+\subsection{The win ladder: $212\to1734$ tok/s, per lever}
+\label{sec:ladder}
+
+Table~\ref{tab:ladder} attributes the Vulkan-prefill gain to individual shipped levers. The kernel-level
+mechanism of each is recorded so the ladder is auditable, not a single aggregate number. Every rung is
+bit-exact-gated against the CPU oracle and coherence-checked before shipping.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}l >{\raggedright\arraybackslash}p{0.28\textwidth} r >{\raggedright\arraybackslash}p{0.34\textwidth}@{}}
+\toprule
+\textbf{Ship} & \textbf{Lever} & \textbf{pp512 (t/s)} & \textbf{Op-level result} \\
+\midrule
+--- start     & column Q6\_K matvec, no tiled path        & $212$ & $11.6\x$ behind \code{llama} \\
+ml 0.11.64    & Q6\_K 2D-tiled \code{dp4a} GEMM           & $704$ & Q6\_K op $7.5$--$29.8\x$; it was $76\%$ of prefill \\
+eng v1.7.60   & warmup-shape bench fix $+$ Q4\_K coalesced coopmat & $946.5\,{\pm}\,7.6$ & noise $\pm42\%\!\to\!\pm0.8\%$; prefill A/B now legible \\
+ml 0.11.69    & packed f16vec2 LDS (wide \code{ds\_load}) & $1264.8\,{\pm}\,4.1$ & Q4\_K GEMM $356\!\to\!233$ ms ($1.53\x$); VGPR $204\!\to\!168$ \\
+ml 0.11.70    & Q6\_K \code{dp4a}$\to$coopmat             & $1383.1\,{\pm}\,5.0$ & Q6\_K op $104\!\to\!62$ ms ($1.67\x$) \\
+ml 0.11.71    & single-buffer, BK=32                      & $1734.4\,{\pm}\,4.4$ & Q4\_K $232\!\to\!181$ ms (occ $6\!\to\!8$); Q6\_K $62\!\to\!38.7$ ms \\
+\bottomrule
+\end{tabular}
+\caption{Vulkan prefill win ladder on evo (gfx1151, \code{zen-eco-4b} Q4\_K\_M), CTO-frozen figures.
+$212\to1734.4$ is $8.2\x$ shipped in one campaign; the same-run gap to \code{llama} went $11.6\x$ to
+$1.40\x$ behind. Current standing (ml 0.11.72 / engine v1.7.65): $1739.6\,{\pm}\,7.4$ vs \code{llama}
+$2441.9\,{\pm}\,22.2$ same run ($0.71\x$ of the reference). The $704$ rung predates the warmup-shape harness
+fix (\S\ref{sec:variance}); $946.5$ onward are on the $\pm0.8\%$ honest bench. Every rung is bit-exact-gated
+and coherence-checked.}
+\label{tab:ladder}
+\end{table}
+
+The ladder's shape is itself evidence for the thesis. The first rung ($3.3\x$, Q6\_K tiling) was found not
+by intuition but by a per-op profiler that named \code{mul\_mat\_q6k} as $76\%$ of prefill GPU time --- a
+quant type that had no tiled path because it appears in only $\sim$2 tensors per layer (\code{attn\_v},
+\code{ffn\_down}) and was therefore invisible to attention aimed at the dominant Q4\_K weights. Every later
+rung was a small, measured, single-variable change read out of the reference implementation's source and
+A/B'd in-engine. No rung came from a redesign.
+
+\subsection{The CUDA gap decomposition: configuration vs kernel}
+\label{sec:cuda}
+
+The CUDA front is the cleanest natural experiment separating configuration from kernel work, because its two
+phases resolved differently. On spark (GB10, \code{zen-eco-4b} Q4\_K\_M, same-run):
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+\item \textbf{Decode} began at $63.3\,{\pm}\,0.2$ vs \code{llama} $77.6\,{\pm}\,0.9$ ($1.23\x$). The
+profiler (\code{nsys}) showed $\sim$1{,}110 kernel launches per token against \code{llama}'s $\sim$1 graph
+launch. The engine already had a decode command-graph path, fail-closed behind a bit-exact gate and a
+\emph{model-eligibility list}. \code{Model::Qwen} was simply not in the list (and decode RoPE read a
+host-side offset that freezes under graph capture --- fixed by the device-positions pattern the eligible
+models already used). Adding the one arm collapsed launches to $\sim$1 per token and took decode to the
+CTO-frozen $81.9\,{\pm}\,0.6$ vs \code{llama} $82.15\,{\pm}\,1.76$ --- $1.23\x\to1.003\x$ \textbf{parity,
+with zero kernel rewrites}.
+\item \textbf{Prefill} remains open at $5003.4\,{\pm}\,23.0$ vs \code{llama} $6079\,{\pm}\,326$ ($0.82\x$)
+and is glue-bound: naive attention \code{softmax\_f32} $\sim$13--15\%, \code{badd\_bf16} $10.5\%$, dtype
+casts $6.2\%$, \code{ucopy} $4.2\%$. Here the attractive lever was itself refuted (\#25): building with the
+\code{flash-attn} feature made prefill $3.6\%$ \emph{slower} ($4820.8\,{\pm}\,166.3$), because the paged
+bench's gather path forces naive attention regardless and Ampere-era flash-v2 kernels do not win on
+Blackwell. The residual is genuine kernel/dtype work (route \code{flashinfer} prefill, tighten
+bf16$\leftrightarrow$f32 discipline) --- in progress.
+\end{itemize}
+
+The decomposition is stark: the \emph{entire} CUDA decode deficit was configuration (a graph-eligibility
+list entry plus a device-placement fix), closed to statistical parity without touching a compute kernel;
+the CUDA prefill deficit is what is actually left for kernel engineering. When a fresh front is opened, the
+prior that ``the gap is plumbing'' pays before the prior that ``the gap is a slow kernel.''
+
+\subsection{Instrument variance collapse: $\pm42\% \to \pm0.8\%$}
+\label{sec:variance}
+
+For much of the campaign the prefill benchmark was unusable for A/B testing: repeated runs of the same
+configuration reported $728\,{\pm}\,306$ tok/s ($\pm42\%$), and in the worst observations $\pm48$--$62\%$.
+The cause was a harness defect, not the GPU: warmup ran a fixed 32-token prefill while the measured batch
+was 512 tokens, so the first measured forward paid a one-time Vulkan pipeline compile and the warmup
+touched a different shape than the measurement. The fix (engine v1.7.60) warms the \emph{measured} shapes;
+prefill went to $946.5\,{\pm}\,7.6$ ($\pm0.8\%$) --- a $\mathbf{52\x}$ variance collapse.
+
+The downstream effect is what makes this a headline rather than a footnote. A change worth $+5\%$ is
+invisible under $\pm42\%$ noise (the ratio of signal to noise is $0.12$); it is unambiguous under
+$\pm0.8\%$. Decode was always tight ($\pm1.3\%$), so decode A/Bs were resolvable throughout --- which is
+exactly why the decode wins landed earlier. Prefill A/Bs became resolvable \emph{only after} the harness
+fix, and the entire second half of the win ladder ($946\to1734$, the packed-LDS, Q6\_K-coopmat, and
+single-buffer rungs, each a $1.2$--$1.7\x$ op-level change) was A/B-decided on the honest bench. The
+instrument fix did not speed up a kernel; it made three subsequent kernel wins \emph{legible}.
+
+\subsection{The 32-token warmup phantom: one artifact, three dead theories}
+\label{sec:phantom}
+
+The most expensive single artifact of the campaign was the same warmup-shape bug viewed from the other
+side. A profiler labelled every prefill batch \code{dispatch=1949} --- because dispatch count is
+per-layer-ops $\times$ 36 layers, hence \emph{token-count-independent}. The 32-token warmup batches
+therefore printed an identical dispatch count to the 512-token measured batches while doing $16\x$ less
+work (byte counters: $334.6$ vs $8364$ MB). The visible symptom --- ``the first $\sim$5 forwards run
+$\sim$120 ms, then collapse to $\sim$523 ms'' --- looked like accumulating degradation, and spawned three
+competing hardware/leak stories:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt,topsep=2pt]
+\item a \emph{DVFS utilization death-spiral} (mixed-phase telemetry read $29\%$ busy @ 713 MHz for us vs
+$77\%$ @ 2431 MHz for \code{llama} on the same silicon);
+\item \emph{accumulating engine state} / a per-forward memory leak;
+\item a \emph{sustained power throttle}.
+\end{enumerate}
+
+All three were killed by two single-variable controls plus one counter read. Pinning the clock at 2900 MHz
+left the 512-token forward at $540$ ms (throttle and downclock require the clock to move --- it did not).
+Running \code{warmup=0} made forward \#1 $573$ ms and every subsequent forward $\sim$545--561 ms flat (no
+accumulation; stable from the first forward). And the byte counters showed the ``fast'' forwards were
+simply smaller. The tell, in hindsight, was that \emph{the fast-window length always equalled the warmup
+count}. One mislabelled invariant --- treating a shape-independent dispatch count as workload identity ---
+manufactured three plausible mechanisms and consumed multi-agent effort until the counters ended it. The
+lesson entered the log as a rule: \emph{dispatch count is not workload identity; check tokens and bytes
+before comparing two batches.}
+
+\subsection{Optimization velocity: the campaign clock}
+\label{sec:velocity}
+
+If the tooling of \S\ref{sec:algorithms} has a reason to exist, it is velocity: the loop must close gaps
+faster than unaided hand-tuning, or it is ceremony. The campaign's release history is the direct evidence,
+and its timestamps are real (Table~\ref{tab:velocity}, from the \code{ml} and \code{engine} git logs). The
+Vulkan-prefill ladder of \S\ref{sec:ladder} --- $212\to1734.4$ tok/s, $8.2\x$ of gap closed --- shipped
+across nine tagged releases spanning $\sim$36 hours, and its four consecutive coopmat rungs
+($946.5\to1734.4$) landed inside a single window of $\sim$5.5 hours (11:28--14:58 on 2026-07-18). The CUDA
+decode close to parity (\S\ref{sec:cuda}) shipped the same evening. Twenty-five numbered refutations gate
+this cadence, each with a cost-to-kill of minutes to hours (Table~\ref{tab:refutations}).
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l l >{\raggedright\arraybackslash}p{0.23\textwidth} >{\raggedright\arraybackslash}p{0.27\textwidth}@{}}
+\toprule
+\textbf{Release} & \textbf{Landed (PDT)} & \textbf{Change} & \textbf{Measured effect} \\
+\midrule
+ml 0.11.64             & 07-17         & Q6\_K tiled GEMM              & pp512 $212\to704$ \\
+ml 0.11.67 / eng 1.7.58 & 07-17 21{:}23 & coalesced coopmat Q4\_K      & Q4\_K GEMM $473\to369$ ms \\
+eng v1.7.60            & 07-18 09{:}45 & warmup-shape bench fix       & noise $\pm42\%\to\pm0.8\%$ \\
+ml 0.11.69 / eng 1.7.61 & 07-18 11{:}28 & packed f16vec2 LDS          & pp512 $946.5\to1264.8$ \\
+ml 0.11.70 / eng 1.7.62 & 07-18 12{:}30 & Q6\_K coopmat               & pp512 $1264.8\to1383.1$ \\
+ml 0.11.71 / eng 1.7.63 & 07-18 14{:}58 & single-buffer coopmat       & pp512 $1383.1\to1734.4$ \\
+ml 0.11.72 / eng 1.7.64 & 07-18 17{:}07 & coalesced Q6\_K decode matvec & decode $43.0\to50.6$ \\
+eng v1.7.65            & 07-18 17{:}18 & qwen2 CUDA/ROCm decode graph & CUDA decode $\to 1.003\x$ parity \\
+\bottomrule
+\end{tabular}
+\caption{Release cadence with real git commit timestamps (\code{ml} and \code{engine} logs, PDT). Nine
+releases in $\sim$36 hours; the four coopmat prefill rungs within a single $\sim$5.5-hour window. This is
+the ``why the tooling exists'' evidence: the loop's throughput is in the timestamps.}
+\label{tab:velocity}
+\end{table}
+
+\paragraph{The honest contrast.} It is tempting to set this cadence against the maturity of the baseline,
+and the comparison must be made carefully. \code{llama.cpp}'s Vulkan matmul lead was built incrementally by
+many contributors over roughly two years: its Vulkan shader path dates to mid-2024, cooperative-matrix
+support to December 2024 (PRs \#10206/\#10713), the DP4A MMQ + Q8\_1 quantization shader to March 2025
+(PR \#12135), and a \code{mul\_mm} shader cleanup to September 2025 (PR \#15987), among others --- dates read
+directly from the local \code{llama.cpp} checkout's git history. We closed $8.2\x$ of the gap to that
+artifact in $\sim$36 hours. This is \textbf{not} a claim that our method is hundreds of times more
+productive than theirs: the comparison is method-versus-method \emph{on different starting points}. They
+pioneered the kernels with no map; we chased, using their shipped source as the map (the BK, tile, and
+buffering constants were read out of their code, then A/B'd on our silicon). \textbf{Chasing a known-good
+target is strictly easier than pioneering it}, and the velocity figure reflects that asymmetry as much as it
+reflects the loop.
+
+\paragraph{The falsification path.} The velocity claim --- that the loop out-paces hand-tuning --- is
+falsifiable, and two controlled experiments are the honest way to settle it, both listed here rather than
+assumed. (a)~The in-flight automated schedule search~\cite{tune} is machine-search against our own
+hand-search on the \emph{same} kernels: if the machine cannot match or beat the hand-picked schedules per
+unit compute, the loop's marginal value over an expert is refuted. (b)~A from-zero replication on an
+untouched front (Metal, currently blocked by an offline box) measures time-to-parity with no prior map on
+that backend; a slow replication would show the $36$-hour figure was mostly borrowed from the reference,
+not generated by the loop. Until those run, the honest statement is narrow: \emph{on this campaign, the
+measured cadence out-paced this team's prior hand-tuning}, and the mechanism (cheap refutation plus a map)
+is legible in the timestamps.
+
+\section{Three algorithms}
+\label{sec:algorithms}
+
+The practices above are not ad hoc; they instantiate three procedures that recur throughout the log.
+
+\subsection{The Gate Ladder}
+\label{sec:gateladder}
+
+Verification is multi-fidelity: each candidate passes through gates ordered by increasing cost, and is
+rejected at the cheapest gate that can reject it. Free static analysis (compile + shader statistics) filters
+occupancy-killers and register spills before any GPU time is spent; the bit-exact oracle enforces
+correctness as \emph{viability} (an incorrect kernel is not a slow candidate, it is a non-candidate);
+sustained per-op timing on the honest instrument decides ``is it a win''; the in-engine wall A/B and a
+coherence check confirm the win survives to the deployed regime.
+
+\begin{algorithm}[h]
+\caption{\textsc{GateLadder} --- multi-fidelity acceptance, cheapest rejection first}
+\label{alg:gate}
+\begin{algorithmic}[1]
+\Require candidate schedule $C$, shape $s$, device $d$, incumbent time $t_\star$
+\State $(\mathit{spill}, \mathit{lds}, \mathit{occ}) \gets \textsc{Compile+ShaderStats}(C, d)$ \Comment{free; no GPU}
+\If{$\mathit{spill} > 0$ \textbf{or} $\mathit{lds} > \textsc{OccBudget}(d)$} \State \Return \textsc{Reject}(``static'') \EndIf
+\State $y_C \gets \textsc{Run}(C, s, d)$; \; $y_{\mathrm{ref}} \gets \textsc{CpuOracle}(s)$
+\If{$\textsc{ScaleRel}(y_C, y_{\mathrm{ref}}) > \tau$} \State \Return \textsc{Reject}(``not bit-exact'') \Comment{viability, not penalty} \EndIf
+\State $t_C \gets \textsc{SustainedPerOp}(C, s, d)$ \Comment{median of 25, $\pm0.4\%$, in-engine} \label{ln:sustained}
+\If{$t_C \ge t_\star$} \State \Return \textsc{Reject}(``no op-level win'') \EndIf
+\State $(w_C, w_\star, w_{\mathrm{ref}}) \gets \textsc{SameRunWall}(C, \text{incumbent}, \text{llama})$ \Comment{$\pm0.8\%$}
+\If{$w_C \not> w_\star$} \State \Return \textsc{Reject}(``no wall win'') \EndIf
+\If{\textbf{not} \textsc{Coherent}(C)} \State \Return \textsc{Reject}(``incoherent output'') \EndIf
+\State \Return \textsc{Accept}(C) \Comment{ship: bit-exact $\wedge$ op-win $\wedge$ wall-win $\wedge$ coherent}
+\end{algorithmic}
+\end{algorithm}
+
+The ladder's economic point is the ordering. Static rejection is free and, empirically, disqualified a
+large fraction of hand-tried variants (register spills, LDS over the occupancy budget) before they ever
+reached the GPU. Line~\ref{ln:sustained} is deliberately \emph{not} a cache-warm microbenchmark
+(\S\ref{sec:doctrine}); the honest per-op timer is the first gate that costs real GPU seconds, and it is
+placed after the two free/cheap gates for that reason.
+
+\subsection{Decisive-experiment selection}
+\label{sec:decisive}
+
+Given a set of live hypotheses, the campaign repeatedly chose the \emph{cheapest single-variable
+experiment that could falsify the most of them at once}. The pinned-clock control (\S\ref{sec:phantom})
+is the exemplar: one knob, minutes, and it bears on both the throttle and the downclock stories
+simultaneously. The rule prefers controls that change exactly one variable, because a confounded
+experiment cannot cleanly kill anything.
+
+\begin{algorithm}[h]
+\caption{\textsc{DecisiveExperiment} --- maximize hypotheses-killed per unit cost}
+\label{alg:decisive}
+\begin{algorithmic}[1]
+\Require live hypotheses $H$, available experiments $X$
+\State $\mathit{best} \gets \varnothing$; \; $\mathit{score}_\star \gets \infty$
+\For{$x \in X$ \textbf{such that} $x$ varies exactly one factor} \Comment{single-variable controls only}
+  \State $K_x \gets \{\, h \in H : x \text{ can falsify } h \,\}$ \Comment{the kill set}
+  \If{$|K_x| = 0$} \State \textbf{continue} \EndIf
+  \State $\mathit{score} \gets \textsc{Cost}(x) \,/\, |K_x|$ \Comment{cost per hypothesis killed}
+  \If{$\mathit{score} < \mathit{score}_\star$} \State $\mathit{score}_\star \gets \mathit{score}$; \; $\mathit{best} \gets x$ \EndIf
+\EndFor
+\State \Return $\mathit{best}$ \Comment{e.g.\ pin-clock kills throttle \emph{and} downclock in one run}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Refutation-log-as-prior}
+\label{sec:logprior}
+
+A refutation is only worth its cost if it is not re-purchased. Every kill was written to a durable log with
+its mechanism, and subsequent task briefs were seeded with the log's negative constraints: forbidden
+re-chases and masked dead operators. This converts a one-time experiment into a permanent search-space
+restriction.
+
+\begin{algorithm}[h]
+\caption{\textsc{SeedBrief} --- inject refutations as negative priors}
+\label{alg:seed}
+\begin{algorithmic}[1]
+\Require task $T$, refutation log $L$
+\State $\mathit{forbid} \gets \varnothing$; \; $\mathit{deadOps} \gets \varnothing$
+\For{$r \in L$}
+  \If{$\textsc{Class}(r) \in \{\text{mechanistic-kernel}, \text{hardware-story}\}$}
+     \State $\mathit{forbid} \gets \mathit{forbid} \cup \{(\,r.\text{lever},\ r.\text{mechanism}\,)\}$
+  \EndIf
+  \If{$r.\text{outcome} = \text{regress}$} \State $\mathit{deadOps} \gets \mathit{deadOps} \cup \{r.\text{operator}\}$ \EndIf
+\EndFor
+\State \Return \textsc{Brief}$(T,\ \mathbf{forbid}{=}\mathit{forbid},\ \mathbf{mask}{=}\mathit{deadOps})$
+\end{algorithmic}
+\end{algorithm}
+
+The log records at least nine re-chases this prior provably prevented, each carrying an explicit ``do NOT
+re-chase'' marker traceable to a prior measurement: coopmat on gfx1151 (killed, then partially un-refuted
+only when the access pattern --- not the tensor cores --- was identified as the cause); \code{BM}${\ge}128$
+tiles ($2.4\x$ slower, occupancy collapse); \code{BK}${=}64$ on the coopmat path (llama's override read
+correctly); the RN4 / BM=64 tile family (best occupancy, worst time); f16 accumulators (LDS-limited, not
+register-limited); the per-shape tile family (skinny projections are $1.9\%$ of Q4\_K time); the Q4\_K
+coalesced-cooperative rewrite (already at $83\%$ of peak); dispatch/instruction-count reduction as a
+\emph{perf} lever (``10 for 10 --- counts never predict wall-clock on this decode path''); and Ampere-era
+\code{flash-attn} v2 on Blackwell ($3.6\%$ slower). Each avoided re-chase is a multi-hour experiment not
+re-run.
+
+\section{The measurement doctrine, as testable claims}
+\label{sec:doctrine}
+
+The doctrine is four falsifiable rules, each earned by a specific scar.
+
+\paragraph{Same-run ratios only.} The same \code{llama.cpp} on the same box and model reported prefill
+figures of $2390.1$, $2404.1$, $2417.8$, $2441.9$, $2459$, $2465.3$, and $2486$ tok/s across the campaign's
+days --- a $\pm2\%$ spread from run conditions alone. A ratio computed from our number today against a
+\code{llama} number from last week is therefore uninterpretable; only both sides measured in the same
+session count. Every ratio in this paper obeys this.
+
+\paragraph{Sustained-vs-sustained.} On the gfx1151 APU, a kernel's \emph{burst} per-op time ($\sim$416 $\mu$s)
+and its \emph{sustained} per-op time ($\sim$1634 $\mu$s) differ by $\sim$$4\x$ --- an intrinsic power-limiting
+swing confirmed under a pinned clock. Comparing a burst measurement of one variant to a sustained
+measurement of another manufactures a $4\x$ phantom. All A/Bs compare sustained to sustained.
+
+\paragraph{Contended-timing refusal.} When a foreign 7\,GB job held the GPU at $94\%$ utilization, the
+candidate-vs-baseline A/B returned ``candidate $\approx$ baseline.'' The correct report is not ``refuted''
+but ``blocked'': symmetric contention does not make a masked signal fair, it makes it \emph{absent}.
+Contention-independent facts (compiles, engages, produces correct output) are still reported as fact; the
+timing is deferred to an idle window.
+
+\paragraph{Warm-microbench distrust.} For a memory-bound kernel the cache-warm microbenchmark systematically
+lies. The dense \code{dp4a} matvec measured $74\to255$ GB/s ($3.4\x$) with weights hot in the 32 MB
+last-level cache, but only $74\to97$ GB/s ($\sim$1.3$\x$) in-engine, where decode reads each weight once,
+cold, from unified memory. In the other direction, a warm microbenchmark rated the f16 coopmat GEMM at
+$0.07$--$0.20\x$ of \code{dp4a} and it was written off --- yet with a coalesced access pattern the same
+matrix-core path became the shipping prefill default. Benchmarks are proxies for deployment; when they
+disagree, deployment governs.
+
+\section{Operationalizing the discipline as an evaluation}
+\label{sec:eval}
+
+The campaign's reasoning discipline is itself a measurable property, and we operationalized it as a
+22-case multiple-choice evaluation (\code{roofline}) distilled directly from the log. Every case is a real
+decision point: the evidence shown is what was on the table at that moment; the gold answer is what
+hardware measurement subsequently proved; and the distractors are the \emph{actual} refuted theories from
+Table~\ref{tab:refutations} --- power throttling, occupancy-maximalism, ``port what the reference does,''
+warm-microbench trust, contended-timing acceptance, dispatch-count-as-identity. Six of the 22 are
+\emph{traps}: the prompt itself asserts a false premise that the provided evidence contradicts, testing
+whether a model verifies before it complies. Ground truth is hardware-verified and unpublished, so the set
+is uncontaminated by pretraining.
+
+Beyond accuracy, two post-hoc metrics fall out of the standard results log, whose per-item token usages are
+already recorded:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt,topsep=2pt]
+\item \textbf{overthink index} --- mean completion tokens on \emph{correct} answers. A discipline that
+trusts a decisive measurement answers in hundreds of tokens; an overthinker burns thousands and, on the
+trap cases, sometimes reasons its way back \emph{into} the refuted theory.
+\item \textbf{trap resistance} --- accuracy on the trap subset alone, where the prompt's own framing is
+adversarial.
+\end{itemize}
+
+This turns ``measure, don't theorize'' from a slogan into a benchmark: the same skill the campaign
+rewarded in engineers is scored, per model, on held-out decision points. It is the pilot instance of a
+distillation pipeline (a companion paper develops the loop in full).
+
+\section{Limitations}
+\label{sec:limits}
+
+This is an observational $N{=}1$ study and we do not overclaim from it.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt,topsep=2pt]
+\item \textbf{No control group.} We did not run a parallel team practising non-refutation-driven
+engineering on the same problem. We cannot attribute the $11.6\x\to1.40\x$ compression to the methodology
+versus the specific people, tools, or the mere passage of time. The claim is that the recorded decisions
+were sound given the evidence, not that an alternative method would have failed.
+\item \textbf{Single campaign, one team.} All data come from one multi-week effort by one group against one
+reference implementation. The hypothesis-class distribution (mechanistic-kernel dominant, configuration-gap
+highest-yield) may not generalize beyond low-level GPU work against a mature baseline.
+\item \textbf{Hardware specificity.} The mechanisms are tied to particular silicon: gfx1151's unified
+memory and LDS-limited occupancy, GB10's Blackwell scheduling, the APU's utilization-slaved DVFS. A
+lever's sign can flip across devices (\S on the RN4 tile; the Q4\_K coalescing reversal), so the specific
+verdicts do not transfer even though the \emph{method} may.
+\item \textbf{Survivorship in the log.} The log records hypotheses that were seriously evaluated. Ideas
+discarded before measurement, or never conceived, leave no trace; the census is of considered hypotheses,
+not of the full space.
+\item \textbf{The win ladder mixes measurement bases.} Its early rungs predate the instrument fix of
+\S\ref{sec:variance}; we mark this in Table~\ref{tab:ladder} rather than silently splicing two noise
+regimes. The endpoints ($212$ and $1734$) are individually defensible, but the intermediate slope should be
+read with the basis change in mind.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Across a multi-week campaign the reliable path to throughput was not a better idea about kernels but a
+cheaper way to be wrong about them. The largest wins were configuration gaps that a profiler named in
+minutes; the most expensive costs were measurement artifacts that dressed as hardware physics; and the most
+durable asset produced was a log of refutations that stopped the same attractive mistakes from being bought
+twice. The three procedures --- a cost-ordered gate ladder, a decisive-experiment rule, and
+refutation-as-prior --- are simple, and their simplicity is the point: they make the discipline auditable
+and, as \S\ref{sec:eval} shows, measurable. The companion paper closes the loop by turning the same gate
+ladder into the selector of an automated search, and the same decision log into training signal.
+
+Finally, the standing must be stated without inflation (Table~\ref{tab:scoreboard}). The campaign holds two
+wins (ROCm decode $1.07\x$ over \code{llama}-ROCm; a $470\x$ margin over the fork's own upstream on Metal),
+one parity (CUDA decode, $1.003\x$), and three still-open gaps (Vulkan prefill $0.71\x$, Vulkan decode
+$0.55\x$, CUDA prefill $0.82\x$), with the Metal-vs-\code{llama} front blocked by an offline box. ``Beat
+\code{llama} everywhere'' is the standing objective, not the achieved state, and this paper claims only what
+the same-run measurements support.
+
+\begin{table}[h]
+\centering\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}llllc@{}}
+\toprule
+\textbf{Front (backend, phase)} & \textbf{Ours} & \textbf{Baseline, same box} & \textbf{Ratio} & \textbf{Standing} \\
+\midrule
+ROCm gfx1151, decode      & $70.9$               & \code{llama}-ROCm $66.5$          & $1.07\x$   & win \\
+Metal M4 Max, decode      & $94.4$               & upstream \code{mistral.rs} $0.20$ & $470\x$    & win \\
+CUDA GB10, decode         & $81.9\,{\pm}\,0.6$   & \code{llama} $82.15\,{\pm}\,1.76$ & $1.003\x$  & parity \\
+CUDA GB10, prefill        & $5003\,{\pm}\,23$    & \code{llama} $6079\,{\pm}\,326$   & $0.82\x$   & open \\
+Vulkan gfx1151, prefill   & $1739.6\,{\pm}\,7.4$ & \code{llama} $2441.9\,{\pm}\,22.2$ & $0.71\x$  & open \\
+Vulkan gfx1151, decode    & $50.6\,{\pm}\,0.1$   & \code{llama} $92.6\,{\pm}\,0.2$   & $0.55\x$   & open \\
+Metal M4 Max, vs \code{llama} & \multicolumn{4}{l}{\emph{blocked} --- box offline; last (stale) reading decode $0.80\x$, prefill $0.047\x$} \\
+\bottomrule
+\end{tabular}
+\caption{Standing scoreboard, CTO-frozen same-run figures (\code{zen-eco-4b} Q4\_K\_M except the Metal rows,
+Qwen3-30B-A3B). The $470\x$ is measured against the fork's \emph{upstream} \code{mistral.rs} on Metal, not
+against \code{llama}. Two wins, one parity, three open; Metal-vs-\code{llama} blocked.}
+\label{tab:scoreboard}
+\end{table}
+
+\begin{thebibliography}{9}
+\small
+\bibitem{llamacpp} G.~Gerganov and the \code{ggml}/\code{llama.cpp} contributors. \emph{\code{llama.cpp}:
+LLM inference in C/C++.} \url{https://github.com/ggml-org/llama.cpp}. Reference implementation and
+\code{llama-bench} baseline; \code{ggml-vulkan.cpp} coopmat pipeline referenced by line in \S\ref{sec:dataset}.
+\bibitem{cubecl} Tracel AI. \emph{CubeCL: multi-platform GPU compute in Rust.}
+\url{https://github.com/tracel-ai/cubecl}. The DSL substrate lowered to SPIR-V / HIP / PTX / MSL.
+\bibitem{oracle} Hanzo AI Research. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law and How It
+Is Enforced.} hanzo-kernel Paper 07.4. The bit-exact gate of Algorithm~\ref{alg:gate}.
+\bibitem{tune} Hanzo AI Research. \emph{Evolutionary Schedule Search in a One-Source Kernel DSL.}
+hanzo-kernel Paper 09 (companion). The automated successor to the manual gate ladder.
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,395 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\usepackage{amsthm}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\avg}[1]{\langle #1 \rangle}
+
+\title{\textbf{Evolutionary Orchestration of Agentic Fleets:\\ Population Search, Recombination, and the Explore--Exploit Anneal}}
+\author{Hanzo AI --- ML Systems}
+\date{hanzo-agentic Paper 02 --- the \emph{Continually Improving Fleets} series}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+An agentic fleet is a population of candidate behaviours acting on a shared solution space. We argue that
+the natural control law for such a fleet is not command but \emph{evolution}: selection, recombination, and
+mutation applied to the population, generation over generation. The claim is made precise by placing three
+folk mechanisms on one object --- a probability distribution $p_t$ over solution space --- and showing they
+are the same dynamics at three timescales. A mean-field game (companion paper,
+\emph{Mean-Field Alignment}) is the fast inner loop: each agent best-responds to the population mean and the
+fleet equilibrates. Ferromagnetic criticality is the thermostat: it sets how aligned the population is.
+A genetic algorithm (GA) is the slow outer loop: it moves $p_t$ itself uphill on fitness. We show a GA is a
+fitness-driven Fokker--Planck flow --- selection is replicator drift, mutation is diffusion, crossover is a
+mixing operator --- and that when fitness is frequency-dependent, replicator drift \emph{is} the mean-field
+coupling of the game. The one operator the other two lack is crossover, and it is the source of the speedup:
+by the schema theorem it recombines above-average building blocks, so on a \emph{separable} landscape it
+assembles the global optimum in time polynomial in the number of blocks where mutation-only takes
+exponential time (Proposition~\ref{prop:speedup}); the honest boundary is deception, where crossover is
+disruptive. Premature convergence is exactly the ferromagnetic ordered phase (groupthink), and the cure is
+annealing, not quenching. We then ground the framework twice against real Hanzo systems: the GRPO rollout
+\emph{group} of \cite{hanzo-native-training} is a GA population and its group-relative advantage is selection;
+AnyMoE experts are building blocks and expert recombination is crossover; the island model of
+\cite{hanzo-intrinsic-islands} is a coarse-grained GA. In the agentic harness the population is a set of
+solution \emph{variants}, fitness is the adversarial critic together with a green build, crossover is a
+synthesis agent that grafts the fittest module from each parent, and generations are the loop-until-dry
+rounds. We keep the accounting honest: this is a control lens, not a literal energy function, but the
+building-block argument is a genuine reason recombination accelerates the decomposable problems --- files,
+modules, tools --- that engineering fleets actually solve.
+\end{abstract}
+
+\section{The pain: a fleet that averages when it should assemble}
+\label{sec:pain}
+
+Run $N$ agents at a hard problem and the two obvious control laws both disappoint. Make them independent and
+they duplicate each other's dead ends; nobody's partial success helps anybody else, and the fleet is a set of
+lonely random walks. Make them agree --- align them to a running consensus --- and they converge, but only to
+the \emph{mean} of what they already believed; consensus averages, it does not invent. Neither law does the
+thing a research group does when it is working well: take the best idea from one line of attack, the best idea
+from another, and \emph{combine} them into something better than either.
+
+That combining operation has a name. It is crossover, and it is the defining move of a genetic algorithm.
+This paper's thesis is that an agentic fleet should be run as a population under evolutionary search, that
+crossover is precisely the operator the ``independent'' and ``aligned'' regimes lack, and that it is fast for
+a concrete, checkable reason: the problems a software fleet solves are \emph{decomposable} into modules, and
+crossover is the operator that exploits decomposition. We make each of those claims formal, then show the
+same three knobs already live inside Hanzo's model-training loop and its agent harness --- so ``continually
+improving fleets'' is not an aspiration bolted on the side but the loop the substrate already runs, named.
+
+\section{One population, three timescales}
+\label{sec:frame}
+
+Fix a solution space $\mathcal{S}$ (policies, programs, tool implementations --- whatever a unit of the fleet
+emits) and let the state of the fleet be a distribution $p_t \in \Delta(\mathcal{S})$. Everything below is a
+map $p_t \mapsto p_{t+1}$. Three such maps act at separated timescales, and separation of timescales is what
+lets them compose without fighting.
+
+\begin{definition}[The three loops]
+\label{def:loops}
+\emph{Inner (fast) --- the game.} Holding $p_t$ fixed, each agent chooses a best response to the induced mean
+field; iterating to the fixed point is a mean-field-game (MFG) Nash equilibrium. This is the subject of the
+companion paper \cite{hanzo-mean-field-alignment} and is treated here as a black box that, given a
+population, returns an equilibrated one.
+
+\emph{Middle (medium) --- the thermostat.} A scalar \emph{order parameter} $m \in [0,1]$ measures how
+concentrated $p_t$ is (how aligned the fleet is). A coupling $J$ (how strongly each agent heeds the mean) and
+a temperature $T$ (how much independent noise each agent injects) set $m$ through a ferromagnetic
+self-consistency; the companion paper shows the useful operating point is \emph{critical}, $T \lesssim T_c$.
+
+\emph{Outer (slow) --- the search.} A selection--recombination--mutation operator moves $p_t$ toward higher
+fitness across \emph{generations}. This is the genetic algorithm and is the subject of this paper.
+\end{definition}
+
+The rest of the paper studies the outer loop and its coupling to the other two. The organising fact is that
+all three are transport of the \emph{same} $p_t$; they differ only in the vector field they impose on it.
+
+\section{A genetic algorithm is a fitness-driven Fokker--Planck flow}
+\label{sec:ga-fpk}
+
+Let $f:\mathcal{S}\to\R$ be fitness and write $\phi(p)=\E_{x\sim p}[f(x)]$ for the population-mean fitness.
+A generational GA applies, in order: (i) \emph{selection}, reweighting $p$ toward high $f$; (ii)
+\emph{crossover}, recombining sampled pairs; (iii) \emph{mutation}, perturbing offspring. Take the
+weak-selection, small-step continuum limit of one generation. Selection and mutation become, respectively, a
+drift and a diffusion of $p_t$ --- a Fokker--Planck equation --- and selection's drift is exactly the
+replicator field.
+
+\begin{proposition}[Selection is replicator drift; mutation is diffusion]
+\label{prop:replicator}
+In the weak-selection continuum limit, fitness-proportional (or Boltzmann, or tournament) selection on a
+population $x=(x_i)$ of type frequencies induces the replicator dynamics \cite{taylor1978,hofbauer1998}
+\begin{equation}
+\dot{x}_i \;=\; x_i\bigl(f_i(x) - \phi(x)\bigr), \qquad \phi(x)=\sum_j x_j f_j(x),
+\label{eq:replicator}
+\end{equation}
+and mutation at rate $\mu$ adds a diffusion term $\mu\,\Delta x_i$ (in genotype space), giving a
+replicator--mutator (Fokker--Planck) flow. For frequency-independent $f$, mean fitness is non-decreasing
+along \eqref{eq:replicator}: $\dot{\phi} = \mathrm{Var}_x(f) \ge 0$.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Fitness-proportional selection maps $x_i \mapsto x_i f_i/\phi$; subtracting $x_i$ and taking the small-step
+limit gives $\dot x_i = x_i(f_i-\phi)/\phi$, which is \eqref{eq:replicator} after the standard time
+reparametrisation $dt \mapsto \phi\,dt$. Boltzmann and tournament selection agree to first order in selection
+strength (they differ only in the effective inverse temperature multiplying $f$). For the variance identity,
+$\dot\phi=\sum_i \dot x_i f_i = \sum_i x_i f_i (f_i-\phi) = \E[f^2]-\E[f]^2$ when $f$ does not depend on $x$;
+frequency dependence adds the cross term $\sum_i x_i f_i'\!\cdot\!\dot x$, which is where the game enters.
+\end{proof}
+
+The cross term is not a nuisance; it is the bridge. When fitness is \emph{frequency-dependent} ---
+$f_i=f_i(x)$, an agent's payoff depends on what the rest of the fleet is doing --- \eqref{eq:replicator} is
+evolutionary game theory, and its rest points are the Nash equilibria of the underlying game. That is the
+inner loop of Definition~\ref{def:loops}: \textbf{replicator selection with frequency-dependent fitness is the
+mean-field coupling.} The GA outer loop and the MFG inner loop are the same equation read at two speeds ---
+selection slow, best-response fast --- so composing them is legitimate, not a metaphor. Mutation supplies the
+diffusion that keeps $p_t$ full-support so selection has variance to act on (Proposition~\ref{prop:replicator}
+stalls at $\mathrm{Var}=0$); crossover is the operator neither \eqref{eq:replicator} nor the mean field
+contains, and it is where the speed comes from.
+
+\section{Crossover is the speedup: compositionality and the schema theorem}
+\label{sec:crossover}
+
+A \emph{schema} $H$ is a subset of $\mathcal{S}$ fixing some coordinates and leaving others free; its
+\emph{order} $o(H)$ is the number fixed and its \emph{defining length} $\delta(H)$ the span between the
+outermost fixed coordinates. Holland's schema theorem \cite{holland1975} bounds the next-generation count $m(H,t)$ of individuals
+matching $H$ under proportional selection, one-point crossover rate $p_c$, and mutation rate $p_m$:
+\begin{equation}
+\E\bigl[m(H,t+1)\bigr] \;\ge\; m(H,t)\,\frac{f(H)}{\phi}
+\left(1 - p_c\,\frac{\delta(H)}{\ell-1} - o(H)\,p_m\right),
+\label{eq:schema}
+\end{equation}
+where $\ell$ is the genome length and $f(H)$ the mean fitness of matching individuals. Read
+\eqref{eq:schema} as a statement about \emph{building blocks}: a schema that is short ($\delta$ small),
+low-order ($o$ small), and above average ($f(H)>\phi$) is disrupted little by crossover and grows roughly
+geometrically. Crossover's job is to take two such blocks --- carried by different parents --- and place them
+in one child.
+
+Averaging (the mean field) cannot do this: it returns a convex combination of parents, which for a
+combinatorial optimum is typically \emph{worse} than either. Independent search cannot do it either: it has
+no channel to move a good block from one lineage to another. Crossover is the unique operator among the three
+that transports building blocks \emph{between} lineages, and on a decomposable landscape that is decisive.
+
+\begin{proposition}[Separable speedup]
+\label{prop:speedup}
+Let the fitness decompose additively over $M$ disjoint blocks, $f(x)=\sum_{b=1}^{M} g_b(x_b)$, each block of
+size $k$ with a unique optimal setting. Suppose selection preserves any block already at its optimum in some
+individual (each block-optimum is an above-average, short, low-order schema). Then uniform crossover assembles
+the global optimum in $O(M\ln M)$ expected recombination events (coupon-collector over blocks), i.e.\ time
+polynomial in $M$. A mutation-only search with no inter-block fitness gradient (the ``royal road'' class)
+requires expected time exponential in $M$ to first reach the joint optimum.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Once each block's optimal setting is present in \emph{some} member of the population (which selection
+maintains, since flipping a block off its optimum is selected against), a recombination event copies a parent's
+optimal block into a child with constant probability per block. Collecting all $M$ optimal blocks into one
+individual is the coupon-collector problem with $M$ coupons: expected $M H_M = O(M\ln M)$ draws, each a
+recombination. For mutation-only on a flat-between-blocks (royal-road) landscape, no partial credit is
+visible: the search is a random walk on $\{0,1\}^{Mk}$ whose only fitness signal is the all-optimal point, so
+the hitting time is $\Theta(2^{\Theta(Mk)})$ up to the fraction of the space selection can prune, which the
+royal-road construction makes vanishing. Hence polynomial versus exponential.
+\end{proof}
+
+\begin{remark}[The honest boundary: deception]
+\label{rem:deception}
+Proposition~\ref{prop:speedup} assumes block optima are \emph{above average in isolation}. A \emph{deceptive}
+fitness \cite{goldberg1989} is built so that the block schemata leading toward the local optimum out-compete those
+leading toward the global one; there crossover assembles the wrong blocks faster, and the GA converges
+confidently to the trap. The correct fallback is mutation-and-diversity (raise $T$, Section~\ref{sec:order}),
+not more crossover. The reason the framework nonetheless earns its keep for us is empirical: the fleet's
+problems --- ``add these three actions to that tool,'' ``wire this module into the registry,'' ``port these
+nine tools'' --- are \emph{separable by construction} (one file, one module, one tool per unit of work), which
+is the regime where Proposition~\ref{prop:speedup}, not Remark~\ref{rem:deception}, governs.
+\end{remark}
+
+\section{The order parameter: premature convergence is the ordered phase}
+\label{sec:order}
+
+A GA's classic failure is \emph{premature convergence}: the population collapses onto one genotype, variance
+vanishes, and by Proposition~\ref{prop:replicator} selection stalls --- the search freezes in a local optimum.
+This is not a separate pathology from the companion paper's groupthink; it is the same event. Identify the
+GA's population homogeneity with the ferromagnetic order parameter $m$: $m\to 1$ is a fully converged
+population and a fully aligned fleet, one and the same ordered phase. Selection pressure is inverse
+temperature; strong selection is cold and quenches, weak selection is hot and drifts. The cure is therefore
+the cure for a quench: \emph{anneal}. Run hot early --- high mutation, weak coupling, diverse variants, so
+crossover has distinct building blocks to find --- and cool toward criticality as fitness climbs, never all
+the way to $m=1$. Simulated annealing \cite{kirkpatrick1983} is exactly this temperature schedule, and the companion paper's
+critical operating point $T\lesssim T_c$ is where the annealed GA should spend its late generations:
+correlated enough to converge, hot enough that a single high-fitness variant (or a single refuting critic) can
+still tip the population out of a bad basin. The external field --- the directive --- breaks the symmetry so
+the descent aims at the intended optimum rather than a merely-agreed one. \textbf{The GA is the search, the
+ferromagnetic thermostat is how you keep the search from freezing, and they share one knob: $m$.}
+
+\section{Embedding in enso training: the rollout group is a population}
+\label{sec:enso}
+
+The framework is not new machinery for the training stack; it is a name for a loop the stack already runs.
+Group Relative Policy Optimization (GRPO) \cite{shao2024grpo}, implemented in the trainer of
+\cite{hanzo-native-training} (\code{ml/hanzo-training/src/grpo/}), samples, for each
+prompt, a \emph{group} of $G$ rollouts, scores them, and forms the group-relative advantage
+$A_i=(r_i-\avg{r})/\mathrm{std}(r)$ before a length-normalised policy-gradient step with an optional $k3$ KL
+penalty to a frozen reference. Read through Sections~\ref{sec:ga-fpk}--\ref{sec:order}:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Population $=$ the rollout group.} The $G$ samples are the generation; the policy is the
+distribution $p_t$ they are drawn from.
+\item \textbf{Selection $=$ the group-relative advantage.} $A_i$ is $f_i-\avg{f}$ with a variance
+normaliser --- the replicator drift of \eqref{eq:replicator} verbatim: rollouts above the group mean are
+reinforced, below are suppressed, and the group mean is the mean-field baseline. GRPO is replicator selection
+with a frequency-defined baseline.
+\item \textbf{Temperature $=$ sampling temperature; coupling $=$ the KL coefficient.} The $k3$ KL to the
+reference is the coupling that keeps the group from quenching away from a sane prior; the sampling temperature
+is $T$. Group size $G$ sets how well $\avg{r}$ estimates the mean field.
+\item \textbf{Crossover $=$ expert recombination.} The AnyMoE in-engine gate trainer of
+\cite{hanzo-native-training} (\code{amoe.rs}) trains gates over \emph{frozen quantized experts}: the experts
+are reusable building blocks --- and, as the companion \emph{Streaming Mixture-of-Experts}
+\cite{hanzo-streaming-experts} shows, independently addressable, byte-exact banks, exactly the substrate a
+module-level crossover needs --- and the gate learns which to compose per token. Recombining experts across a
+population of gates is crossover on the MoE genome; the island model of \cite{hanzo-intrinsic-islands} ---
+independent sub-populations with occasional migration --- is the coarse-grained GA that keeps that
+recombination from collapsing to one basin.
+\item \textbf{Generations $=$ expert iteration.} Distilling the group's winning rollouts back into
+\code{enso} (expert iteration / STaR \cite{zelikman2022star}) is the generational update --- the fittest
+phenotypes of generation $t$ become the genotype prior of generation $t{+}1$; the harness of
+Section~\ref{sec:harness} supplies the fitness that scores them.
+\end{itemize}
+
+\noindent\emph{The prescription that follows.} Because premature convergence is the ordered phase, the
+training knobs $(G,\,T,\,\text{KL})$ should be \emph{annealed}, not fixed: start with large $G$, high $T$, low
+KL (a hot, diverse group that finds building blocks), and cool $T$ and raise KL as reward climbs, holding the
+group near criticality rather than driving the advantage to a spike. This is the training-time reading of
+Section~\ref{sec:order}, and it is a config change over the existing GRPO loop, not new kernels.
+
+\section{Embedding in the agentic harness: variants, critics, and grafts}
+\label{sec:harness}
+
+Inference-time, the fleet upgrades from \emph{align-and-best-respond} to
+\emph{align-and-best-respond-and-evolve}. The mapping is exact and already partially in place in the workflow
+engine that runs Hanzo's swarms:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{GA operator} & \textbf{Harness realisation} \\
+\midrule
+population & $N$ solution \emph{variants}, not merely $N$ agents on one attempt \\
+fitness $f$ & adversarial critics $+$ a green build $+$ the shipped-live outcome \\
+selection & keep the variants the critics do not refute \\
+\textbf{crossover} & a \emph{synthesis} agent: split candidates into modules, graft the fittest of each \\
+mutation & a fresh-lens agent perturbing one module to escape a local optimum \\
+generations & the loop-until-dry rounds; the completeness gap is the fitness gap \\
+temperature & anneal coupling/selection each round: diverse early, aligned late \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Crucially this fitness is largely \emph{ground truth}, not a learned reward model that can be gamed: the
+build either compiles or it does not, the tests either pass or they do not, and the ultimate signal is
+whether the change ships and survives in production. That is what makes the harness landscape verifiable and
+its separable component real, the low-epistasis regime Proposition~\ref{prop:speedup} needs.
+
+Note the economy: \emph{the same critic is three things at once} --- the ferromagnetic fluctuation that stops
+groupthink (Section~\ref{sec:order}), the GA's selection operator (Section~\ref{sec:ga-fpk}), and, when its
+verdict is a scalar reward, the training signal of Section~\ref{sec:enso}. One mechanism, three roles, which
+is why the flywheel closes.
+
+\paragraph{A worked instance.} A hard tool port --- a browser tool with a $\sim$90-action surface and a
+persistent-session requirement --- is exactly a separable problem with two hard blocks: the session model and
+the action coverage. Generation~1 with no crossover (one agent, one attempt) tends to nail one block and stub
+the other. The GA move is to spawn three variant implementations, score each by \{compiles, matches the
+reference behaviour, survives the critic\}, and then \emph{crossover}: graft the best session model from one
+variant onto the best action-coverage from another. By Proposition~\ref{prop:speedup} this reaches a correct
+tool in generations logarithmic in the block count, where one agent grinding a single lineage does not.
+
+\paragraph{The three-layer controller.} Stacking the loops of Definition~\ref{def:loops} gives a single
+orchestrator: a \textbf{GA outer} loop (variants, critic-fitness, synthesis-crossover, annealed rounds) over a
+\textbf{ferromagnetic middle} loop (hold $m$ near criticality, aim with the directive field) over an
+\textbf{MFG inner} loop (each variant's agents best-respond to the shared mean). One knob --- $m$ / population
+diversity --- threads all three, and the whole craft is annealing it from hot-diverse to critical-aligned
+without quenching to $m=1$, with the directive aiming the descent. The companion paper builds the middle
+layer; this paper builds the outer.
+
+\section{What is real, what needs building, what is out of scope}
+\label{sec:status}
+
+\paragraph{Real.} The GRPO group, its group-relative advantage, the AnyMoE expert-gate trainer, and the
+island decomposition are shipped and tested (\cite{hanzo-native-training}, \cite{hanzo-intrinsic-islands}); the
+harness already runs populations of agents with adversarial critics as gates and a loop-until-dry completeness
+check. Read as this paper prescribes, that is a genetic algorithm with selection and a fitness function.
+
+\paragraph{Needs building.} The two operators the harness under-uses are \emph{crossover} (a synthesis agent
+that decomposes candidates and grafts modules, rather than tournament-selecting a single winner) and an
+explicit \emph{temperature schedule} (annealing coupling, mutation, and selection pressure round over round
+with $m$ measured each generation). Both are orchestration logic over the existing workflow engine, not model
+or kernel work.
+
+\paragraph{Out of scope.} We do not claim a literal energy function for a fleet, nor that every task is
+separable (Remark~\ref{rem:deception}); deceptive or strongly non-separable objectives fall back to
+mutation-and-diversity and lose the crossover speedup. We do not treat multi-objective Pareto fronts, novelty
+search, or open-ended evolution here; the target is the decomposable engineering objective with a scalar
+gate, which is the fleet's daily work.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+A fleet run as independent search wastes its members' partial wins; run as pure consensus it only averages.
+Run as a genetic algorithm it does the thing neither can: recombine. We placed selection, mutation, and
+crossover on one distribution $p_t$, showed selection is replicator drift and that frequency-dependent
+selection is the mean-field coupling of the companion game (Proposition~\ref{prop:replicator}), and isolated
+crossover as the operator responsible for the speedup --- provably superlinear on the separable landscapes the
+fleet actually faces (Proposition~\ref{prop:speedup}), with deception as the named boundary
+(Remark~\ref{rem:deception}). Premature convergence turned out to be the companion paper's ordered phase, so
+the two papers share one control variable and one prescription: anneal $m$ toward criticality, never quench,
+and aim with the directive. The framework is not speculative: GRPO's rollout group is the population, its
+group-relative advantage is selection, AnyMoE experts are the building blocks, and the harness's critics are
+already the fitness. What remains is to name and add the two missing operators --- a crossover-by-synthesis
+step and an annealing schedule --- and let the fleet that trains the model, and the model that runs the fleet,
+climb the same landscape together.
+
+\begin{thebibliography}{9}
+
+\bibitem{hanzo-native-training}
+Hanzo AI --- ML Systems.
+\newblock \emph{Native Training in hanzo-ml/hanzo-engine: One Engine, One Quant Format, One Backend}.
+\newblock Hanzo Papers, 2026. Companion in the native-stack series.
+
+\bibitem{hanzo-intrinsic-islands}
+Hanzo AI --- ML Systems.
+\newblock \emph{Intrinsic Islands: An Oracle-Anchored Escape Hatch for a Portable Kernel}.
+\newblock hanzo-kernel Paper 07.3, \emph{One Source, Every Backend} series, 2026.
+
+\bibitem{hanzo-streaming-experts}
+Hanzo AI --- ML Systems.
+\newblock \emph{Streaming Mixture-of-Experts: Bit-Exact Low-Memory Inference by Demand-Paging Routed Experts
+from NVMe}.
+\newblock Hanzo Papers, 2026. (Experts as independently addressable, byte-exact banks.)
+
+\bibitem{hanzo-mean-field-alignment}
+Hanzo AI --- ML Systems.
+\newblock \emph{Mean-Field Alignment: Ferromagnetic Order and Critical Control of Agentic Fleets}.
+\newblock hanzo-agentic Paper 01, \emph{Continually Improving Fleets} series, 2026. Companion to this paper.
+
+\bibitem{shao2024grpo}
+Z.\ Shao, P.\ Wang, Q.\ Zhu, et al.
+\newblock DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+\newblock \emph{arXiv:2402.03300}, 2024. (Group Relative Policy Optimization, GRPO.)
+
+\bibitem{zelikman2022star}
+E.\ Zelikman, Y.\ Wu, J.\ Mu, and N.\ D.\ Goodman.
+\newblock STaR: Bootstrapping Reasoning with Reasoning.
+\newblock \emph{NeurIPS}, 2022. (Distil winning rollouts back into the model.)
+
+\bibitem{holland1975}
+J.\ H.\ Holland.
+\newblock \emph{Adaptation in Natural and Artificial Systems}.
+\newblock University of Michigan Press, 1975. (Schema theorem; building-block hypothesis.)
+
+\bibitem{goldberg1989}
+D.\ E.\ Goldberg.
+\newblock \emph{Genetic Algorithms in Search, Optimization, and Machine Learning}.
+\newblock Addison-Wesley, 1989. (Deception; the royal-road and building-block analyses.)
+
+\bibitem{taylor1978}
+P.\ D.\ Taylor and L.\ B.\ Jonker.
+\newblock Evolutionarily stable strategies and game dynamics.
+\newblock \emph{Mathematical Biosciences}, 40(1--2):145--156, 1978. (The replicator equation.)
+
+\bibitem{hofbauer1998}
+J.\ Hofbauer and K.\ Sigmund.
+\newblock \emph{Evolutionary Games and Population Dynamics}.
+\newblock Cambridge University Press, 1998. (Replicator dynamics; frequency-dependent selection.)
+
+\bibitem{kirkpatrick1983}
+S.\ Kirkpatrick, C.\ D.\ Gelatt, and M.\ P.\ Vecchi.
+\newblock Optimization by Simulated Annealing.
+\newblock \emph{Science}, 220(4598):671--680, 1983. (The temperature schedule.)
+
+\end{thebibliography}
+
+\end{document}

@@ -320,6 +320,38 @@ export const siteConfig: SiteConfig = {
       tags: ['Cloud', 'Multi-Tenancy', 'SQLite', 'Benchmarks'],
     },
 
+    // --- One Source, Every Backend (kernel-DSL campaign) ---
+    {
+      id: 'refutation-driven-perf',
+      title: 'Refutation-Driven Performance Engineering',
+      subtitle: 'An Empirical Study of a Multi-Week GPU Kernel Campaign',
+      abstract: 'An N=1 observational study of a multi-week campaign to close the llama.cpp inference gap on three accelerators (AMD gfx1151 RDNA3.5, NVIDIA GB10 Blackwell, Apple M4 Max) inside a one-source GPU kernel DSL. The primary artifact is not a kernel but a refutation log: twenty-five numbered hypotheses, most plausible, each killed by a cheap decisive experiment. Reports a Vulkan-prefill win ladder (212→1734 tok/s, 8.2× of the gap closed in one ~36-hour cadence), a CUDA decode gap closed to parity by a single model-eligibility entry with zero kernel work, and an instrument fix that collapsed prefill benchmark noise from ±42% to ±0.8% (52×). Formalizes three recurring algorithms — a multi-fidelity Gate Ladder, a decisive-experiment selection rule, and refutation-log-as-prior — and a measurement doctrine of same-run, sustained-only ratios. Honest about standing: two wins, one parity, three open gaps.',
+      pdfUrl: '/pdfs/refutation-driven-perf.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/refutation-driven-perf.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-07-18',
+      authors: ['Hanzo AI Research'],
+      tags: ['Engine', 'GPU Kernels', 'Benchmarks', 'Methodology'],
+      relatedLinks: [
+        { label: 'Companion: Evolutionary Schedule Search', url: 'https://papers.hanzo.ai/evolutionary-schedule-search' },
+      ],
+    },
+    {
+      id: 'evolutionary-schedule-search',
+      title: 'Evolutionary Schedule Search in a One-Source Kernel DSL',
+      subtitle: 'And the Continual-Improvement Loop It Anchors',
+      abstract: 'A one-source kernel DSL exposes each operation\'s schedule — tile dimensions, buffering depth, vector width, per-shape selection — as compile-time knobs, so schedule search becomes a discrete search over monomorphized, bit-exact kernels. Building on an existing per-(device, op, shape) winner cache, this paper extracts the constants such a search must respect from the campaign\'s ~15 hand-evaluated configurations (free static rejection, a ±0.4% per-op fitness signal, strongly non-additive lever interaction, and hard device non-transfer), specifies a multi-fidelity evolutionary schedule search (~300 configurations/night against ~15 by hand), and embeds it in a continual-improvement loop where a calibrated judge flock — weighted by measured ground truth rather than preference — selects training signal under a Goodhart tripwire, framed as the small-N precursor of a mean-field game. The search is specified, not yet run; that boundary is marked throughout.',
+      pdfUrl: '/pdfs/evolutionary-schedule-search.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/evolutionary-schedule-search.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-07-18',
+      authors: ['Hanzo AI Research'],
+      tags: ['Engine', 'Autotuning', 'Evolutionary Search', 'Kernels'],
+      relatedLinks: [
+        { label: 'Companion: Refutation-Driven Performance Engineering', url: 'https://papers.hanzo.ai/refutation-driven-perf' },
+      ],
+    },
+
     // --- Hanzo Core Papers ---
     {
       id: 'aso',

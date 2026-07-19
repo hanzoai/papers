@@ -1,0 +1,677 @@
+\documentclass[11pt]{article}
+% Unique hyperref destinations for the many unlabelled [H] tables in this paper.
+\PassOptionsToPackage{hypertexnames=false}{hyperref}
+\input{shared/kernel-preamble.tex}
+
+\usepackage{amsthm}
+\usepackage{float}
+\theoremstyle{definition}
+\newtheorem{finding}{Finding}
+
+\newcommand{\rhobar}{\ensuremath{\bar{\rho}}}
+\newcommand{\mfjp}{\textsc{Mfjp}}
+
+\title{\textbf{Does the Mean-Field Machinery Earn Its Keep?}\\[2mm]
+\large An ablation of calibration and reputation in a production LLM judge panel}
+\author{Hanzo AI --- ML Systems}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Hanzo ships a Mean-Field Judge Panel (\mfjp): a population of diverse LLM judges whose raw
+scores are per-judge z-score calibrated and then combined with multiplicative-weights
+reputation. We ask whether the two mean-field mechanisms --- calibration and reputation ---
+earn their keep against the obvious alternatives, and we set out to falsify rather than
+confirm. Two tracks: 164 HumanEval candidates labelled by \emph{executing} their tests,
+scored by three real judges from different model families under the verbatim production
+rubric; and a Monte-Carlo study ($400$ replicates) that drives the \emph{shipped}
+\texttt{panelScore} through regimes chosen so the panel can lose. The ablation is surgical:
+identical online calibration with reputation weights pinned to $1$ isolates reputation, and a
+plain mean of raw scores isolates calibration.
+\textbf{The headline is negative, and it holds on real data.} On the real judges, a plain mean
+of the same three scores significantly outperforms the shipped panel (AUC $0.859$ vs $0.824$,
+paired $\Delta=+0.035$, 95\% CI $[+0.014,+0.057]$), while the calibration-only ablation is
+indistinguishable from \mfjp{} --- so reputation contributes nothing and calibration actively
+costs. Two measured properties explain it: the production judges differ in bias but barely in
+\emph{scale} (sd ratio $1.19$), and their errors are strongly correlated ($\rhobar=0.729$)
+despite spanning three model families. In simulation the same picture holds --- under the
+panel's own assumptions a plain mean matches \mfjp{} to $0.0004$ Spearman and cost-matched
+self-consistency beats it --- and we identify scale heterogeneity as the \emph{necessary
+condition} for the machinery to pay: when we manufacture it, the ladder is clean
+($0.938 \to 0.948 \to 0.958$), but a batch Gaussian EM estimator and the best single judge at
+one third the cost both still beat \mfjp{}. At the correlation production actually exhibits, a
+single judge at one third the cost is statistically indistinguishable from the panel
+($\Delta$AUC $-0.004$, $[-0.055,+0.045]$).
+Reputation is actively \emph{harmful} when the majority is systematically biased: it
+down-weights the one accurate dissenter to $0.26$ while the two confounded judges keep
+$0.41$--$0.46$, costing $0.039$ Spearman versus calibration alone. The panel's one clear,
+large win is adversarial: when responses are engineered to game a single judge, \mfjp{} scores
+$0.918$ against $0.553$ for cost-matched self-consistency --- diversity, not the mean-field
+machinery, is what buys this. We also report that the claimed ``free confidence signal'' is
+uninformative in benign simulation ($\rho = 0.036$) and \emph{negative} under distribution
+drift, though it does work on real data ($+0.331$); and that z-scoring destroys absolute
+calibration: at a realistic $0.9$ base rate \mfjp{} attains $0.657$ accuracy and $0.456$ ECE
+where a plain mean attains $0.979$ and $0.190$. Finally, three defects in the shipped code: the live config names a retired model so
+the ``3-judge'' panel silently runs as two; the process-global mutex is held across all
+sequential judge HTTP calls, serialising judged traffic for up to $90$\,s; and calibration
+state is in-process only, so every deploy re-enters cold start.
+\end{abstract}
+
+\section{The question}
+
+A single LLM judge has one model's bias, one point of failure, and one thing to game. The
+shipped answer at Hanzo is the Mean-Field Judge Panel, live as
+\texttt{[claude-3-5-haiku, gpt-4o-mini, llama-3.1-8b]} at \texttt{sample 0.10}. It does two
+things beyond averaging a committee:
+
+\begin{enumerate}[nosep]
+\item \textbf{Calibration.} Each judge's raw score is z-scored against that judge's own
+running mean and standard deviation (Welford, online) and logistic-squashed, so a harsh
+judge's $0.6$ and a lenient judge's $0.8$ both read as ``above my own bar.''
+\item \textbf{Reputation.} Each judge carries a reliability weight updated multiplicatively,
+$w \leftarrow (1-\pi)\,w e^{-\lambda|c-r|} + \pi$, with $\lambda=2.0$, $\pi=0.1$,
+$w_{\min}=0.05$. A judge that tracks the calibrated consensus keeps its weight; one that
+drifts is exponentially suppressed.
+\end{enumerate}
+
+The reward is the reliability-weighted calibrated consensus; panel disagreement is returned as
+a free confidence signal. The design is computationally cheap by construction --- four floats
+per judge, $O(1)$ per call.
+
+The question this paper answers is not ``does a panel beat one judge'' (it usually does, and a
+companion paper measured that). It is narrower and more consequential:
+\textbf{does the mean-field machinery earn its keep over simply averaging the same diverse
+judges?} And at equal budget --- three judges cost three times one judge --- does the panel
+beat what else that budget could buy?
+
+\subsection{What the prior work established, and what it did not}
+
+A companion Hanzo study measured judge panels against executable ground truth and found that a
+panel buys \emph{variance}, not accuracy: a five-judge majority reached $0.750$ against a mean
+single-judge $0.685$, but the best single rubric alone reached $0.787$. It also reported a
+negative: a mean-field construction in which judges \emph{see} the aggregate and revise
+\emph{herds}, scoring below plain majority.
+
+Two things leave our question open. First, that study's five judges shared one model and
+differed only by rubric, so it measured rubric diversity, not model diversity --- a limitation
+it flagged itself. Second, and more importantly, its ``mean-field'' arm is a
+\emph{different algorithm} from the shipped \mfjp{}: it exposes the consensus to the judges,
+whereas \mfjp{} aggregates independent scores post hoc and never lets judges see each other.
+The herding result therefore says nothing about the shipped code. Nobody has ablated it.
+
+\subsection{The shipped test begs the question}
+
+The repository already contains a Monte-Carlo test,
+\texttt{TestMFJPRecoversGroundTruth}. It is confirmatory in three ways, and we flag this
+because it is the existing evidence base. Its judges have \emph{independent} Gaussian errors
+around the truth --- which is precisely the panel's own generative assumption. Its single
+adversary emits \emph{pure noise}, the easiest possible case for reputation to suppress. Its
+metric is Spearman rank correlation, which is invariant to exactly the per-judge additive bias
+that calibration removes, so calibration cannot be penalised. It then \emph{asserts} that
+\mfjp{} wins, comparing only against a naive mean that conflates calibration and reputation
+into one arm. We do not assert. We measure, and we choose conditions that can falsify.
+
+\section{Method}
+
+\subsection{Provenance}
+
+All results drive the shipped algorithm. \texttt{router\_judge\_panel.go} was copied verbatim
+from the published module \texttt{github.com/hanzoai/ai@v1.826.4} --- checksum-verified from
+the module zip, byte-identical below the \texttt{package} line --- into a standalone harness
+whose only addition is a shim supplying the two external symbols the file references. The
+algorithm is untouched; \texttt{panelScore} is the production function.
+
+\subsection{Track A --- real judges, executed ground truth}
+
+We take 164 HumanEval problems and the candidate program generated for each by
+Qwen2.5-Coder-7B, with pass/fail labels obtained by \emph{executing} the evalplus test suite
+($89$ pass, $75$ fail; base rate $0.543$, so a constant-\textsc{pass} predictor scores
+$0.543$). Three judges from genuinely different model families score each candidate using the
+\emph{verbatim} production rubric from \texttt{judgeRubric} --- same system prompt, same strict
+JSON contract, \texttt{temperature 0}, \texttt{max\_tokens 256}. No judge sees the tests or
+the labels. This closes the model-diversity gap the prior study flagged.
+
+One substitution was forced on us and is itself a finding (\S\ref{sec:defects}): the live
+config names \texttt{claude-3-5-haiku}, which the gateway no longer serves. We substituted its
+successor \texttt{claude-haiku-4.5}.
+
+\subsection{Track B --- simulation that can falsify}
+
+Track A gives one point in the space. Only simulation can \emph{sweep} the inter-judge error
+correlation \rhobar{} and locate the boundary where the panel stops paying. We generate
+
+\[
+\text{raw}_{ij} \;=\; \mathrm{clip}_{[0,1]}\!\left(q_i + b_j + g_j c_i + \varepsilon_{ij}\right),
+\qquad \varepsilon_{ij}\sim\mathcal N(0,s_j^2),\quad c_i\sim\mathcal N(0,1),
+\]
+
+where $q_i$ is latent quality, $b_j$ is judge $j$'s bias, and $c_i$ is a \emph{shared
+confound} --- a property such as verbosity or fluency that judges reward but that is
+orthogonal to quality. The error $e_{ij}=b_j+g_jc_i+\varepsilon_{ij}$ is independent across
+judges only when $g=0$. The pairwise error correlation is
+$\rho_{jk} = g_jg_k/\sqrt{(g_j^2+s_j^2)(g_k^2+s_k^2)}$, so $g$ is the dial that moves us from
+the panel's assumed world to the one real LLM judges inhabit, where shared pretraining and
+shared RLHF make errors correlate. Dawid--Skene assumes conditional independence too, so it
+should degrade alongside. We report the \emph{realized} \rhobar{} measured from the generated
+data, not the nominal target, because clipping attenuates it.
+
+$400$ independent replicates of $600$ items each. Online arms are scored on the post-warmup
+half so that calibration and reputation have converged --- a choice that \emph{favours}
+\mfjp{}; cold start is reported separately.
+
+\subsection{The surgical ablation}
+
+This is the core of the design. Three arms differ by exactly one mechanism each:
+
+\begin{itemize}[nosep]
+\item \textbf{raw mean} --- unweighted mean of raw scores. No calibration, no reputation.
+\item \textbf{z-mean} --- \emph{identical} online calibration to \mfjp{}: the same
+\texttt{calibrateScore} function, the same \texttt{judgeStat} Welford state, the same
+score-then-observe ordering. Reputation weights pinned to $1$.
+\item \mfjp{} --- the shipped \texttt{panelScore}.
+\end{itemize}
+
+Any \mfjp{}\,--\,z-mean gap is attributable to \emph{reputation alone}; any z-mean\,--\,raw-mean
+gap to \emph{calibration alone}. The shipped test conflates both into a single ``naive mean''
+comparison and so cannot attribute credit.
+
+\subsection{Competing arms}
+
+Beyond the ablation ladder: \textbf{majority vote} (each judge votes against its own running
+mean); \textbf{Dawid--Skene}, the classical latent-confusion-matrix EM aggregator, run in
+\emph{batch} over all items --- a deliberate advantage over the online arms;
+\textbf{Gaussian EM}, the principled continuous competitor, which is the maximum-likelihood
+estimator under \emph{exactly the panel's own assumed model} (per-judge additive bias plus
+per-judge Gaussian noise, conditionally independent) and therefore performs bias removal plus
+inverse-variance weighting --- \mfjp{} is best understood as a cheap online heuristic
+approximating this batch optimum; \textbf{cascade} (cheap judge first, escalate to the panel
+only near its decision boundary); and two \textbf{cost-matched} arms that spend the panel's
+three-call budget on one judge --- \textbf{self-consistency} (one judge sampled three times,
+averaged) and a \textbf{homogeneous panel} (three samples of one judge fed to \mfjp{}).
+
+\subsection{Metrics}
+
+Spearman correlation with latent quality (ranking); AUC; Brier score and expected calibration
+error over 10 bins (the confidence claim); accuracy; cost in judge calls. For the confidence
+signal we correlate \mfjp{}'s returned confidence against \emph{rank} error --- $|{\rm
+rank}(\hat q)-{\rm rank}(q)|$ --- because \mfjp{}'s z-squashed output is not on the same scale
+as $q$ and a raw $|\hat q - q|$ would be scale-confounded and unfair to it. Differences are
+reported as \emph{paired} deltas versus \mfjp{} with 95\% bootstrap confidence intervals
+(4000 resamples over replicates; 5000 over items for Track A).
+
+\section{Results}
+
+\subsection{Track A --- real judges on executed ground truth}
+\label{sec:trackA}
+
+Three real judges scored 164 execution-labelled candidates. $44$ of $492$ calls ($8.9\%$)
+failed to yield a parseable score even after retries and are recorded as abstentions. All arms
+--- including \mfjp{} --- were run on the same matrix with abstentions imputed at the judge's
+own mean, so no arm sees more information than another.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrr}
+\toprule
+judge & mean & sd & AUC & best acc & abstentions \\
+\midrule
+\texttt{claude-haiku-4.5} & 0.487 & 0.323 & 0.800 & 0.744 & 18 \\
+\texttt{gpt-4o-mini}      & 0.734 & 0.343 & 0.821 & 0.805 & 16 \\
+\texttt{llama-3.1-8b}     & 0.763 & 0.386 & 0.750 & 0.750 & 10 \\
+\bottomrule
+\end{tabular}
+\caption{Per-judge behaviour on 164 items, base rate $0.543$.}
+\end{table}
+
+Two measurements decide how the rest of this paper applies to production.
+
+\begin{finding}
+\label{f:scale}
+\textbf{The production judges differ in bias but not in scale.} Their means span $0.487$ to
+$0.763$ --- a large $0.28$ offset gap, with Haiku much harsher --- but their standard
+deviations are $0.323$, $0.343$, $0.386$, a max/min ratio of only $\mathbf{1.19}$. R8
+established that scale heterogeneity is the \emph{necessary condition} for calibration and
+reputation to pay. It is absent here. The mean-field machinery is deployed in precisely the
+regime where the simulation predicts it is inert.
+\end{finding}
+
+\begin{finding}
+\label{f:rho}
+\textbf{The real judges are heavily correlated: $\rhobar = 0.729$}, with pairwise score
+correlations of $0.575$, $0.533$ and $0.655$. Model-family diversity does \emph{not} deliver
+error independence --- shared pretraining data and shared preference tuning dominate. Reading
+$\rhobar=0.73$ off the R2 sweep places production near the far end of the curve, where the
+diversity premium has decayed from $0.044$ to $0.026$.
+\end{finding}
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+arm & AUC & best acc & acc@0.5 & Brier & ECE & cost \\
+\midrule
+\mfjp{} (calib+reputation)   & 0.824 & 0.774 & 0.738 & 0.183 & 0.135 & 3.00 \\
+z-mean diverse (calib only)  & 0.827 & 0.780 & 0.738 & 0.181 & 0.131 & 3.00 \\
+\textbf{raw mean diverse}    & \textbf{0.859} & \textbf{0.817} & 0.750 & \textbf{0.166} & 0.121 & 3.00 \\
+\textbf{Gaussian EM (batch)} & \textbf{0.863} & \textbf{0.823} & \textbf{0.799} & 0.177 & 0.140 & 3.00 \\
+Dawid--Skene (batch EM)      & 0.736 & 0.732 & 0.457 & 0.542 & 0.542 & 3.00 \\
+majority vote                & 0.821 & 0.750 & 0.750 & 0.175 & \textbf{0.096} & 3.00 \\
+cascade                      & 0.806 & 0.756 & 0.738 & 0.187 & 0.132 & \textbf{1.50} \\
+single: \texttt{claude-haiku-4.5} & 0.800 & 0.744 & 0.732 & 0.190 & 0.123 & 1.00 \\
+single: \texttt{gpt-4o-mini} & 0.821 & 0.805 & 0.652 & 0.201 & 0.204 & 1.00 \\
+single: \texttt{llama-3.1-8b}& 0.750 & 0.750 & 0.701 & 0.257 & 0.251 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{Real judges, executed ground truth, $n=164$, $\rhobar=0.729$.}
+\end{table}
+
+Paired bootstrap over items ($5000$ resamples), $\Delta$AUC versus \mfjp{}:
+raw mean $+0.0348$ $[+0.0142,+0.0567]^{*}$;
+Gaussian EM $+0.0381$ $[+0.0072,+0.0699]^{*}$;
+z-mean $+0.0022$ $[-0.0054,+0.0099]$;
+majority $-0.0039$ $[-0.0323,+0.0240]$;
+\texttt{gpt-4o-mini} alone $-0.0039$ $[-0.0551,+0.0447]$;
+\texttt{claude-haiku-4.5} alone $-0.0247$ $[-0.0693,+0.0207]$;
+Dawid--Skene $-0.0884$ $[-0.1401,-0.0356]^{*}$.
+
+\begin{finding}
+\textbf{On real judges and real executed ground truth, a plain mean of the same three judges
+significantly outperforms the shipped panel}: AUC $0.859$ versus $0.824$, $\Delta=+0.0348$
+with the interval excluding zero. The z-mean ablation is statistically indistinguishable from
+\mfjp{} ($+0.0022$), so reputation contributes nothing; the raw-mean-versus-z-mean gap shows
+the loss is attributable to \emph{calibration}, which --- consistent with
+Finding~\ref{f:scale} --- has no scale heterogeneity to correct and merely discards
+information.
+\end{finding}
+
+\begin{finding}
+\textbf{At $\rhobar=0.73$, a single judge at one third the cost is statistically
+indistinguishable from the panel.} \texttt{gpt-4o-mini} alone scores AUC $0.821$ against the
+panel's $0.824$ ($\Delta=-0.0039$, $[-0.0551,+0.0447]$), and on best-threshold accuracy it is
+higher ($0.805$ vs $0.774$). This is the cost-matched boundary the simulation predicted: the
+diversity premium does not survive the error correlation that real judges actually exhibit.
+\end{finding}
+
+\paragraph{Robustness.} Dropping every item on which any judge abstained leaves $122$
+complete cases and no imputation anywhere. The conclusions are unchanged: raw mean
+$+0.0280$ $[+0.0072,+0.0503]^{*}$, Gaussian EM $+0.0415$ $[+0.0104,+0.0767]^{*}$, z-mean
+$+0.0016$ $[-0.0074,+0.0110]$ versus \mfjp{}. The result is not an artifact of how
+abstentions were handled.
+
+\paragraph{The confidence signal does work here.} On real data \mfjp{}'s disagreement signal
+correlates $+0.331$ with correctness: mean absolute error is $0.344$ on the high-confidence
+half against $0.448$ on the low-confidence half. This is the one component that survives Track
+A intact, and it is consistent with the simulation --- $\rhobar=0.73$ with a $0.28$ spread in
+judge means is exactly the structural disagreement the signal is able to detect.
+
+\paragraph{Dawid--Skene fails on real data} (AUC $0.736$, Brier $0.542$). Binarising a
+continuous judge score at each judge's median discards the magnitude information that carries
+most of the signal here. The classical aggregator is the wrong tool when judges emit graded
+scores rather than categorical labels --- a point worth recording, since it is the aggregator
+the literature would nominate.
+
+\subsection{R1 --- the panel's own assumptions}
+
+Independent errors, homogeneous scales, realized $\rhobar = 0.047$: the regime the design
+assumes and the shipped test simulates.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+arm & Spearman & AUC & Brier & ECE & acc & cost \\
+\midrule
+\mfjp{} (calib+reputation)      & 0.970 & 0.990 & 0.112 & 0.258 & 0.943 & 3.00 \\
+z-mean diverse (calib only)     & 0.971 & 0.990 & 0.112 & 0.258 & 0.943 & 3.00 \\
+raw mean diverse                & 0.971 & 0.990 & 0.092 & 0.209 & 0.943 & 3.00 \\
+Gaussian EM (batch)             & 0.933 & 0.972 & 0.099 & 0.163 & 0.906 & 3.00 \\
+Dawid--Skene (batch EM)         & 0.901 & 0.976 & 0.059 & 0.051 & 0.934 & 3.00 \\
+majority vote                   & 0.903 & 0.976 & 0.052 & 0.030 & 0.935 & 3.00 \\
+cascade                         & 0.947 & 0.987 & 0.106 & 0.243 & 0.943 & 1.74 \\
+\textbf{self-consistency ($\times$3)} & \textbf{0.973} & \textbf{0.991} & 0.088 & 0.197 & 0.945 & 3.00 \\
+homogeneous panel ($\times$3)   & 0.972 & 0.990 & 0.113 & 0.260 & 0.944 & 3.00 \\
+single judge (best, oracle)     & 0.932 & 0.973 & 0.115 & 0.172 & 0.846 & 1.00 \\
+single judge (random draw)      & 0.926 & 0.972 & 0.121 & 0.176 & 0.829 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{R1, independent errors, $\rhobar=0.047$, 400 replicates.}
+\end{table}
+
+\begin{finding}
+Under its own assumptions the mean-field machinery adds \textbf{nothing}. Paired deltas versus
+\mfjp{}: z-mean $+0.0002$ $[+0.0001,+0.0002]$, raw mean $+0.0004$ $[+0.0004,+0.0005]$. Both
+intervals exclude zero --- so the plain mean is \emph{significantly better} --- but the effect
+size is four ten-thousandths of a correlation unit. The honest statement is that they are
+indistinguishable in practice, and that neither calibration nor reputation buys anything here.
+\end{finding}
+
+The reason is structural rather than empirical. Constant per-judge bias shifts every item
+equally, so it cannot affect \emph{ranking}; Spearman is invariant to it. Calibration's stated
+purpose --- removing each judge's standard --- is therefore irrelevant to rank quality when
+judges differ only in offset. That leaves absolute level, which z-scoring actively destroys
+(\S\ref{sec:abs}).
+
+\begin{finding}
+At equal cost the panel loses. Self-consistency --- one judge sampled three times --- scores
+$0.973$ versus $0.970$ ($+0.0023$, $[+0.0020,+0.0026]$). Three calls spent on one judge beat
+three calls spread across three judges in benign conditions.
+\end{finding}
+
+\subsection{R2 --- sweeping \rhobar{}: where the premium goes}
+
+\begin{table}[H]\centering
+\begin{tabular}{rrrrrr}
+\toprule
+\rhobar{} & \mfjp{} & z-mean & Gaussian EM & 1 judge & self-cons. \\
+\midrule
+0.047 & 0.970 & 0.971 & 0.933 & 0.926 & 0.973 \\
+0.124 & 0.962 & 0.963 & 0.925 & 0.919 & 0.965 \\
+0.203 & 0.953 & 0.953 & 0.916 & 0.911 & 0.955 \\
+0.284 & 0.941 & 0.941 & 0.904 & 0.900 & 0.943 \\
+0.367 & 0.926 & 0.926 & 0.890 & 0.887 & 0.927 \\
+0.452 & 0.906 & 0.906 & 0.871 & 0.868 & 0.907 \\
+0.540 & 0.877 & 0.878 & 0.845 & 0.842 & 0.878 \\
+0.632 & 0.835 & 0.835 & 0.806 & 0.803 & 0.836 \\
+0.728 & 0.764 & 0.764 & 0.740 & 0.738 & 0.764 \\
+0.831 & 0.621 & 0.621 & 0.607 & 0.602 & 0.621 \\
+\bottomrule
+\end{tabular}
+\caption{Spearman versus realized inter-judge error correlation. 400 replicates per row.}
+\end{table}
+
+Two readings. First, the \textbf{diversity premium} --- \mfjp{} minus a randomly drawn single
+judge --- decays monotonically from $0.044$ at $\rhobar=0.05$ to $0.019$ at $\rhobar=0.83$: as
+judges correlate, the third judge stops adding information, exactly as theory predicts.
+Second, and more damaging, \mfjp{} and z-mean are \textbf{identical to three decimal places at
+every \rhobar{}}, and cost-matched self-consistency equals or beats \mfjp{} at every
+\rhobar{}. The reputation mechanism contributes nothing anywhere along this sweep.
+
+\subsection{R3 --- reputation is harmful when the majority is biased}
+
+Two judges load on the shared confound ($g=0.35$); one is accurate ($g=0$). Realized
+$\rhobar=0.315$.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+arm & Spearman & AUC & Brier & ECE & acc & cost \\
+\midrule
+\mfjp{}                        & 0.768 & 0.890 & 0.155 & 0.131 & 0.794 & 3.00 \\
+\textbf{z-mean (calib only)}   & \textbf{0.807} & 0.910 & 0.149 & 0.151 & 0.814 & 3.00 \\
+raw mean                       & 0.790 & 0.900 & 0.132 & 0.069 & 0.809 & 3.00 \\
+Gaussian EM (batch)            & 0.629 & 0.818 & 0.182 & 0.096 & 0.737 & 3.00 \\
+Dawid--Skene (batch EM)        & 0.727 & 0.875 & 0.220 & 0.222 & 0.775 & 3.00 \\
+majority vote                  & 0.756 & 0.891 & 0.134 & 0.111 & 0.777 & 3.00 \\
+self-consistency ($\times$3)   & 0.632 & 0.820 & 0.178 & 0.088 & 0.742 & 3.00 \\
+\textbf{single judge (best)}   & \textbf{0.928} & \textbf{0.972} & 0.096 & 0.149 & \textbf{0.904} & \textbf{1.00} \\
+single judge (random)          & 0.720 & 0.865 & 0.155 & 0.116 & 0.791 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{R3, biased majority with one accurate dissenter, $\rhobar=0.315$, 400 replicates.}
+\end{table}
+
+\begin{finding}
+Reputation \textbf{actively hurts}: \mfjp{} $0.768$ against z-mean $0.807$, a loss of $0.039$
+attributable to the reputation mechanism alone. The mechanism is visible in the weights. After
+600 items the accurate dissenter holds weight $\mathbf{0.260}$ while the two confounded judges
+hold $\mathbf{0.412}$ and $\mathbf{0.460}$. Reputation cannot distinguish ``drifting from the
+consensus because it is wrong'' from ``drifting from the consensus because the consensus is
+wrong,'' so it suppresses the only judge telling the truth by a factor of $1.7$.
+\end{finding}
+
+Note also that the best single judge --- the honest one --- scores $0.928$ at \emph{one third}
+the cost, beating every three-judge arm. When a shared bias exists and one judge is free of
+it, aggregation is the wrong move entirely; judge selection is the right one.
+
+\subsection{R4 --- adversarial gaming: the panel's real win}
+
+$12\%$ of items are engineered to spike one judge while true quality is low.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrr}
+\toprule
+arm & Spearman & AUC & acc & cost \\
+\midrule
+\mfjp{}                       & \textbf{0.918} & \textbf{0.990} & 0.946 & 3.00 \\
+z-mean (calib only)           & 0.910 & 0.989 & 0.945 & 3.00 \\
+raw mean                      & 0.902 & 0.987 & 0.944 & 3.00 \\
+Gaussian EM (batch)           & 0.928 & 0.977 & 0.915 & 3.00 \\
+Dawid--Skene (batch EM)       & 0.868 & 0.979 & 0.930 & 3.00 \\
+majority vote                 & 0.841 & 0.974 & 0.941 & 3.00 \\
+\textbf{self-consistency ($\times$3)} & \textbf{0.553} & \textbf{0.797} & 0.833 & 3.00 \\
+homogeneous panel ($\times$3) & 0.551 & 0.796 & 0.819 & 3.00 \\
+single judge (random)         & 0.793 & 0.914 & 0.809 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{R4, reward hacking against one judge, $\rhobar=0.101$, 400 replicates.}
+\end{table}
+
+\begin{finding}
+This is the panel's genuine, large win, and the only regime where reputation clearly pays.
+\mfjp{} $0.918$ versus cost-matched self-consistency $0.553$ --- a gap of $0.365$
+$[-0.371,-0.360]$. Sampling one judge three times is fooled every time, because it is the same
+judge with the same exploitable bias. Reputation also earns its keep here: \mfjp{} beats
+z-mean by $+0.0089$ and raw mean by $+0.0168$, both intervals excluding zero.
+\end{finding}
+
+The credit belongs mostly to \emph{diversity}, not to the mean-field machinery: raw mean over
+diverse judges already reaches $0.902$ of the $0.918$. But the machinery does add a real
+increment here, and this is the argument that justifies the panel's existence.
+
+\subsection{R5 --- z-scoring destroys absolute calibration}
+\label{sec:abs}
+
+Quality $\sim\mathrm{Beta}(5,1)$: most responses are genuinely good, which is the regime a
+production serving path actually occupies.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrr}
+\toprule
+arm & Spearman & AUC & Brier & ECE & acc \\
+\midrule
+\mfjp{}                       & 0.830 & 0.991 & 0.240 & 0.456 & 0.657 \\
+z-mean (calib only)           & 0.831 & 0.991 & 0.240 & 0.456 & 0.655 \\
+\textbf{raw mean}             & 0.828 & 0.992 & \textbf{0.056} & \textbf{0.190} & \textbf{0.979} \\
+Gaussian EM (batch)           & 0.762 & 0.972 & 0.055 & 0.184 & 0.970 \\
+Dawid--Skene (batch EM)       & 0.708 & 0.840 & 0.464 & 0.571 & 0.371 \\
+\textbf{self-consistency}     & 0.845 & 0.992 & \textbf{0.048} & \textbf{0.159} & \textbf{0.981} \\
+single judge (random)         & 0.691 & 0.972 & 0.080 & 0.182 & 0.907 \\
+\bottomrule
+\end{tabular}
+\caption{R5, base rate $\approx 0.9$, $\rhobar=0.031$, 400 replicates.}
+\end{table}
+
+\begin{finding}
+\mfjp{}'s reward is \textbf{purely relative} and its absolute calibration is catastrophic
+where it matters most. Because \texttt{calibrateScore} z-scores against the judge's own running
+mean and logistic-squashes, the output is forced toward a spread around $0.5$ regardless of how
+good the responses actually are. When $90\%$ of responses are good, \mfjp{} attains accuracy
+$0.657$ and ECE $0.456$; a plain mean of the same judges attains $0.979$ and $0.190$. Note
+that AUC is \emph{identical} ($0.991$ vs $0.992$) --- ranking is preserved, absolute level is
+destroyed. A reward consumer that thresholds the score, rather than only ranking by it, is
+being misled on roughly one third of good responses.
+\end{finding}
+
+This is not a tuning problem; it is what z-scoring means. Any downstream use of the \mfjp{}
+scalar as a probability or as an absolute quality gate is unsound by construction.
+
+\subsection{R8 --- the one regime where the machinery earns its keep}
+
+To avoid rigging the ablation, we constructed the case calibration is \emph{for}: judges that
+differ in \emph{spread}, not merely offset (noise $s = 0.30$, $0.05$, $0.12$). A raw mean is
+dominated by whichever judge swings widest; calibration equalises influence.
+
+\begin{table}[H]\centering
+\begin{tabular}{lrrrrr}
+\toprule
+arm & Spearman & AUC & Brier & ECE & cost \\
+\midrule
+\mfjp{}                        & 0.958 & 0.987 & 0.117 & 0.254 & 3.00 \\
+z-mean (calib only)            & 0.948 & 0.983 & 0.120 & 0.246 & 3.00 \\
+raw mean                       & 0.938 & 0.977 & 0.100 & 0.183 & 3.00 \\
+\textbf{Gaussian EM (batch)}   & \textbf{0.983} & \textbf{0.995} & 0.089 & 0.223 & 3.00 \\
+Dawid--Skene (batch EM)        & 0.883 & 0.982 & 0.045 & 0.041 & 3.00 \\
+self-consistency ($\times$3)   & 0.860 & 0.940 & 0.117 & 0.130 & 3.00 \\
+\textbf{single judge (best)}   & \textbf{0.983} & \textbf{0.995} & 0.116 & 0.228 & \textbf{1.00} \\
+\bottomrule
+\end{tabular}
+\caption{R8, heterogeneous judge scales, $\rhobar=0.089$, 400 replicates.}
+\end{table}
+
+\begin{finding}
+Both mechanisms do earn their keep here, and the ladder is clean and monotone:
+raw mean $0.938 \to$ z-mean $0.948$ (calibration, $+0.0099$) $\to$ \mfjp{} $0.958$
+(reputation, $+0.0099$), both intervals excluding zero. \textbf{Scale heterogeneity is the
+necessary condition for the mean-field machinery to pay.} But even here \mfjp{} is beaten by
+Gaussian EM ($0.983$, $+0.0259$) and matched by the best single judge at one third the cost.
+\end{finding}
+
+This makes the design decision empirical rather than theoretical: the machinery pays only if
+the deployed judges actually differ in scale. \S\ref{sec:trackA} measures whether they do.
+
+\subsection{The confidence signal}
+
+Panel disagreement is advertised as a free confidence signal. Correlating it against rank
+error across regimes:
+
+\begin{table}[H]\centering
+\begin{tabular}{lr}
+\toprule
+regime & $\rho(\text{confidence},\,-|\text{rank error}|)$ \\
+\midrule
+R1 independent errors            & $+0.036$ \\
+R3 biased majority               & $+0.561$ \\
+R4 reward hacking                & $+0.256$ \\
+R5 high base rate                & $+0.034$ \\
+R6 non-stationary quality        & $\mathbf{-0.143}$ \\
+R8 heterogeneous scales          & $+0.271$ \\
+\bottomrule
+\end{tabular}
+\caption{Informativeness of the returned confidence.}
+\end{table}
+
+\begin{finding}
+The confidence signal is \textbf{uninformative in benign conditions} ($+0.036$) and
+\textbf{actively misleading under drift} ($-0.143$: the panel is most confident when it is
+most wrong). It is genuinely informative only when there is structural disagreement to detect
+--- a biased faction ($+0.561$), an adversarial item ($+0.256$), or scale heterogeneity
+($+0.271$). It should be used as a \emph{disagreement detector}, which is what it measures,
+and never as a general-purpose reliability estimate.
+\end{finding}
+
+\subsection{Cold start}
+
+Scored on the first $8\%$ of the stream with no warmup, \mfjp{} falls to $0.965$ while the
+stateless raw mean holds $0.971$ and self-consistency $0.973$. The online state is a small
+liability before it converges, which matters more than it appears (\S\ref{sec:defects}).
+
+\section{Three defects in the shipped code}
+\label{sec:defects}
+
+These are independent of the statistics and were found by reading and exercising the shipped
+artifact.
+
+\paragraph{1. The panel silently runs with two judges, not three.}
+The live configuration names \texttt{claude-3-5-haiku}. That model was retired on 2026-02-19
+and the gateway returns HTTP 400 for it. In \texttt{panelScore} a judge whose call fails is
+skipped by \texttt{continue} --- ``an erroring judge abstains; the panel stays resilient.''
+The resilience is real, and it is precisely what conceals the fault: the advertised three-judge
+mean-field panel has been running as a two-judge panel with no error surfaced. Judge
+abstentions need a metric.
+
+\paragraph{2. A process-global mutex is held across all judge network calls.}
+\texttt{panelScore} takes \texttt{panelState.mu.Lock()} and \texttt{defer}s the unlock
+\emph{before} the loop that issues the judge HTTP requests. The judges are called
+\textbf{sequentially} --- there are no goroutines in the function --- and \texttt{judgeClient}
+carries a $30$\,s timeout. So a single judged turn can hold a process-wide lock for up to
+$3\times30 = 90$\,s, during which every other judged turn in the process blocks. Panel latency
+is additive ($\sum$, not $\max$) and the panel is a global serialisation point. The fix is to
+issue the calls concurrently outside the lock and take it only to fold results into state.
+
+\paragraph{3. Calibration state is in-process and unpersisted, so every deploy resets it.}
+\texttt{panelState} is a package-level variable with no persistence. Every pod restart returns
+all judges to $n{=}0$, where \texttt{std()} falls back to a $0.2$ prior and the first score is
+z-scored against a mean of zero --- a raw $0.7$ calibrates to $0.97$. At the production
+\texttt{sample 0.10} rate, only one turn in ten contributes state, so the panel spends a long
+window after every rollout in the cold-start regime of \S3.8, emitting inflated rewards.
+
+\section{Recommendation}
+
+The evidence supports one recommendation, in three parts.
+
+\textbf{Keep the diverse panel; drop the mean-field machinery.} Replace the
+reliability-weighted calibrated consensus with a plain mean of raw diverse judge scores. On
+real judges against executed ground truth it beats \mfjp{} by $0.035$ AUC with the interval
+excluding zero; in simulation it matches \mfjp{} to $0.0004$ Spearman under benign conditions,
+beats it by $0.039$ when the majority is biased, and is dramatically better calibrated in
+absolute terms ($0.056$ vs $0.240$ Brier, $0.979$ vs $0.657$ accuracy at a realistic base
+rate). The necessary condition for the machinery to pay --- judges differing in scale --- is
+measurably absent from the deployed panel (sd ratio $1.19$). Diversity is doing the
+work that matters --- the entire adversarial robustness result survives, since raw mean over
+diverse judges reaches $0.902$ of \mfjp{}'s $0.918$ in R4. Calibration and reputation are
+worth reinstating only if the deployed judges are measured to differ in \emph{scale}, and
+reputation only if adversarial gaming is an active threat; if it is, weight by
+\emph{held-out agreement with ground truth}, never by agreement with the current consensus,
+which is what makes R3 fail.
+
+\textbf{Do not use the score as a probability.} The z-scored output is a ranking signal.
+Any consumer thresholding it as an absolute quality gate should consume a raw mean instead.
+
+\textbf{Fix the three defects} in \S\ref{sec:defects} regardless of the aggregation choice;
+the concurrency one is a live production risk independent of this study.
+
+If the goal is peak accuracy rather than architectural simplicity, the batch Gaussian EM
+estimator dominated \mfjp{} in every regime where the machinery mattered at all
+($+0.026$ in R8) and is the principled version of what \mfjp{} approximates --- \mfjp{}'s
+defensible claim was never accuracy but that it is an $O(1)$-state streaming approximation to
+it. That claim is true; the measurements show the approximation is not buying enough over a
+plain mean to justify its failure modes.
+
+\section{Threats to validity}
+
+Track B is \emph{simulation} and its conclusions are conditional on the generative model. We
+chose that model to be able to falsify the panel --- correlated errors, a systematically biased
+majority, non-stationarity --- rather than to reproduce its assumptions, and we report the
+regime (R8) where the machinery wins. But a real judge population may be structured in ways
+this parameterisation does not capture; the R2 sweep is a statement about a one-parameter
+confound family, not about all forms of dependence. Latent quality is a scalar, which
+understates multi-dimensional disagreement.
+
+Track A is $n=164$ single-seed with three judges in one domain (code) where an oracle exists;
+the extrapolation to non-verifiable work is exactly the extrapolation the method cannot test.
+Its candidates come from one generator, so failure modes are not representative of all model
+errors. Substituting \texttt{claude-haiku-4.5} for the retired \texttt{claude-3-5-haiku} means
+Track A measures the panel as \emph{intended}, not the panel as \emph{currently running}.
+
+Bootstrap intervals quantify sampling variability only; they do not cover model
+misspecification, which is the dominant uncertainty in Track B. Finally, several deltas here
+are statistically significant and practically negligible --- that is a property of $400$
+replicates, and we have tried throughout to report effect sizes rather than lean on interval
+exclusion.
+
+\section{Conclusion}
+
+The Mean-Field Judge Panel's population of diverse judges is worth keeping: it is what defeats
+reward hacking, and by a large margin. The mean-field machinery layered on top of that
+population is not. On real judges against executed ground truth, plainly averaging the same
+three scores beats the shipped panel by $0.035$ AUC; the calibration-only ablation is
+indistinguishable from the full mechanism, so reputation contributes nothing and calibration
+costs. In simulation the mechanisms are worth four ten-thousandths of a correlation unit, in
+the wrong direction, and are inert across the whole \rhobar{} sweep; reputation is
+affirmatively harmful when the majority shares a bias, for the structural reason that
+agreement with the consensus is not evidence when the consensus is what is in error; and the
+calibration step destroys the absolute scale that a thresholding reward consumer depends on.
+The machinery earns its keep in exactly one measured condition --- judges that differ in scale
+--- and that condition is measurably absent from the deployed panel, whose judges differ in
+bias but share a scale to within a factor of $1.19$ and whose errors correlate at
+$\rhobar=0.729$ despite three distinct model families. Diverse judges, plainly averaged, is
+the configuration the evidence supports.
+
+\section*{Reproduction}
+
+The harness drives the shipped \texttt{panelScore} copied verbatim from the checksum-verified
+module \texttt{github.com/hanzoai/ai@v1.826.4}. It contains the generative regimes, the
+surgical ablation, all competing arms, the paired bootstrap, and the Track A collector that
+records the per-judge per-item score matrix --- an artifact the prior instrument computed in
+memory and discarded.
+
+\end{document}

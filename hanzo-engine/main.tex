@@ -45,9 +45,10 @@
 \pend{rMetalEffBW}\pend{rMetalRoofBW}\pend{rMetalReach}
 % Architecture row: prompt-lookup speculation (the accepted-draft multiple), reported BESIDE
 % the kernel rows, never blended -- it is an algorithmic speedup, orthogonal to kernel efficiency.
-\pend{rSpecGroundAccept}\pend{rSpecGroundMult}\pend{rSpecGroundSpeedup}
-\pend{rSpecNovelAccept}\pend{rSpecNovelMult}\pend{rSpecNovelSpeedup}
+\pend{rSpecSustainMult}\pend{rSpecSustainVsLl}\pend{rSpecCodeMult}\pend{rSpecCodeVsLl}
+\pend{rSpecNovelMult}\pend{rSpecNovelVsLl}\pend{rSpecGamma}
 \IfFileExists{results-data.tex}{\input{results-data.tex}}{}
+\IfFileExists{results-spec.tex}{\input{results-spec.tex}}{}
 
 \title{hanzo-engine: A Portable Single-Binary LLM Inference Engine, Measured Against llama.cpp Across Four GPU Backends}
 \author{Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
@@ -353,30 +354,39 @@ recall at 256, gated by a 6-test CPU oracle; the default cache is byte-unchanged
 
 \textbf{Architecture row: prompt-lookup speculation.} Table~\ref{tab:spec} is reported
 \emph{beside}, and never blended into, the kernel board: it measures an \emph{algorithmic}
-speedup---the accepted-draft multiple---orthogonal to the per-token kernel efficiency of
-Table~\ref{tab:board}. Prompt-lookup drafts $\gamma{=}8$ tokens from the sequence's own
-$n$-gram history and the batched verifier accepts only what greedy decode would itself emit,
-so output is byte-identical with speculation on or off (a lossless guarantee, not a
-quality/speed trade). The realized multiple is workload-dependent by construction, so we
-report both regimes at sampling parity (greedy): a \emph{grounded} prompt whose spans recur
-in-history (where drafts land) and a \emph{novel} prompt with little recurrence (where they do
-not, and the method correctly stands down to $\sim\!1\times$). The wall-clock payoff is
-additionally bandwidth-regime dependent---a wide verify forward streams the weights once for
-$\gamma$ tokens---so it compounds with, but is distinct from, the decode rows above. Protocol
-is shared with the Metal lane measuring the method concurrently, so the row is comparable
-across backends.
+speedup---the accepted-draft multiple over non-speculative decode---orthogonal to the
+per-token kernel efficiency of Table~\ref{tab:board}. Prompt-lookup drafts $\gamma$ tokens from
+the sequence's own $n$-gram history ($n_{\max}{=}3$), and the batched verifier accepts only
+what greedy decode would itself emit, so output is byte-identical with speculation on or off---a
+lossless guarantee we assert by hashing the completion (SHA-256 equal, lookup on vs off), not a
+quality/speed trade. The realized multiple is workload-dependent by construction, so following
+the shared cross-backend protocol we measure three verbatim classes at sampling parity (greedy):
+\emph{sustained-reuse} (a repeating log whose tail $n$-gram recurs, where drafts land),
+\emph{code-copy} (verbatim then novel, mixed reuse), and \emph{novel} (free generation, little
+recurrence, where the method correctly stands down toward $1\times$). Gamma is swept per backend
+($4,8,16$) on the reuse class: a fixed per-verify-round overhead must be amortized over accepted
+tokens, so the break-even $\gamma$ is backend-specific. On Metal the reuse class reaches
+$\rSpecSustainMult\times$ the non-speculative rate at $\gamma{=}\rSpecGamma$
+($\rSpecSustainVsLl\times$ \texttt{llama.cpp}, a WIN), while novel holds
+$\rSpecNovelVsLl\times$; the same protocol runs on the other backends for a comparable row.
+These spec figures are stamped to the spec cut and re-measured at battery time (the manifest
+version disambiguates): a verify-round matvec fix landing as ml~0.11.91 lifts the novel floor
+to $\sim\!0.71\times$, lossless, without touching the kernel board.
 
 \begin{table}[t]\centering\small
-\caption{Architecture row: prompt-lookup speculative decoding, greedy (byte-identical to
-non-speculative). Multiple is emitted tokens per target forward; speedup is decode wall-clock,
-prompt-lookup on/off. Reported beside, not blended into, Table~\ref{tab:board}.}
+\caption{Architecture row: prompt-lookup speculative decoding, greedy, lossless (completion
+SHA-256 identical with lookup on/off). Multiple is speculative $\div$ non-speculative decode
+t/s (best over the $\gamma$ sweep); vs-llama is speculative t/s $\div$ \texttt{llama.cpp}
+greedy. Metal shown; other backends run the same verbatim protocol. Reported beside, not
+blended into, Table~\ref{tab:board}.}
 \label{tab:spec}
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrr@{}}
 \toprule
-prompt & draft acceptance & tokens/forward & decode speedup \\
+workload & best multiple ($\gamma$) & vs.\ \texttt{llama.cpp} \\
 \midrule
-grounded & \rSpecGroundAccept & \rSpecGroundMult & \rSpecGroundSpeedup \\
-novel    & \rSpecNovelAccept  & \rSpecNovelMult  & \rSpecNovelSpeedup  \\
+sustained-reuse & \rSpecSustainMult$\times$ & \rSpecSustainVsLl$\times$ \\
+code-copy       & \rSpecCodeMult$\times$    & \rSpecCodeVsLl$\times$    \\
+novel           & \rSpecNovelMult$\times$   & \rSpecNovelVsLl$\times$   \\
 \bottomrule
 \end{tabular}
 \end{table}

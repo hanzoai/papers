@@ -76,14 +76,16 @@
   nuanced. Prefill is at parity: a clean WIN on CUDA at long context
   (\rCudaPrefillMaxR$\times$), parity-to-slightly-behind on Metal and ROCm, and a
   size-sensitive weakness on Vulkan that we root-cause (\S\ref{sec:results}). Decode, on the
-  1.7B headline, trails \texttt{llama.cpp} on all four backends---\rCudaDecodeR$\times$ (CUDA),
+  1.7B headline and \emph{greedy-vs-greedy} (a sampling-parity control added mid-study to correct
+a stochastic-sampler artifact, \S\ref{sec:results}), trails \texttt{llama.cpp}---modestly except
+on Vulkan---on all four backends---\rCudaDecodeR$\times$ (CUDA),
   \rMetalDecodeR$\times$ (Metal), \rRocmDecodeR$\times$ (ROCm), \rVulkanDecodeR$\times$
   (Vulkan)---and we decompose that gap rather than dress it. On the integrated APU it is
   bandwidth \emph{utilization}: we sustain \rVulkanReach\ (Vulkan) and \rRocmReach\ (ROCm) of
   the effective bandwidth \texttt{llama.cpp} itself extracts, against a \emph{measured}
   213~GB/s device peak---a coalescing-and-submission gap, not an ALU deficit
   (\S\ref{sec:bw}). On discrete memory (CUDA, Metal) it is a fixed per-layer overhead that
-  amortizes with model size, and a Qwen3-4B control narrows it. We do not claim a performance
+  amortizes only slightly with model size once sampling parity is enforced. We do not claim a performance
   crown; we claim a portable single binary whose exact standing against the portable baseline
   is now measured, reproducible, and reported without varnish. Where a measurement is
   not yet in hand we typeset it as \emph{run pending} rather than invent a number.
@@ -226,9 +228,15 @@ competitor (profiler, compiler, another engine) is running; desktop CPU load is 
 advisory. Because decode is GPU-compute-bound, its timing is robust to CPU load, which the
 coefficient-of-variation flag confirms empirically.
 
-\textbf{Greedy, deterministic.} Sampling is greedy argmax (no top-$k$/$p$, no penalties) so
-the measured rate isolates model evaluation, not sampler cost; the prefix cache and EOS
-stop are disabled so every run does the full work.
+\textbf{Sampling parity (a required control).} Both engines must decode under the same
+sampler, stated next to every rate. \texttt{llama-bench} decodes greedily; we therefore force
+greedy argmax on our side too (top-$k{=}1$, device path), so the measured rate isolates
+model evaluation, not sampler cost. This control is not optional: an unset temperature
+defaults to $1.0$ and, absent top-$k$, routes decode through a full-vocabulary CPU multinomial
+whose per-token tax (backend-variable, $1.5\text{--}1.8$~ms on CPU-sampled backends, $\approx 0$
+where the sampler is on-device) silently inflates the apparent decode gap---an artifact we hit
+and corrected (\S\ref{sec:results}). The prefix cache and EOS stop are disabled so every run
+does the full work.
 
 \textbf{Ragged shapes.} Aligned-only prompt lengths hide alignment-dependent kernel bugs
 (the $m \bmod 16$ class). We measure prefill at an aligned size (512), a ragged size (500),
@@ -270,11 +278,29 @@ backend & phase & $n$ & hanzo & llama & ratio & verdict \\\midrule
 \end{tabular}}
 \end{table}
 
-\textbf{Decode.} Decode is the latency-critical, memory-bound phase. hanzo-engine reaches
-\rCudaDecodeR$\times$ \texttt{llama.cpp} on CUDA (\rCudaDecodeV), \rMetalDecodeR$\times$ on
-Metal (\rMetalDecodeV), \rRocmDecodeR$\times$ on ROCm (\rRocmDecodeV), and
-\rVulkanDecodeR$\times$ on Vulkan (\rVulkanDecodeV). Where the ratio is below one on the
-integrated APU (ROCm, Vulkan), \S\ref{sec:bw} shows the cause is bandwidth, not kernels.
+\textbf{A sampling-parity correction (erratum).} An earlier cut of this board measured our
+decode with a \emph{stochastic} sampler while \texttt{llama-bench} measured greedy---an
+apples-to-oranges control we had not stated, and a real artifact we correct here in the open.
+Our harness left \texttt{temperature} unset; the engine defaults an unset temperature to
+\(1.0\) and, with no top-\(k\), samples the full \(151{,}936\)-token vocabulary by a
+\emph{CPU} multinomial each step---a per-token tax that idles the GPU and is absent from
+greedy \texttt{llama-bench}. Corrected to greedy-vs-greedy (top-\(k{=}1\), device argmax),
+decode rises materially: Metal \(0.72\!\to\!0.92\), ROCm \(0.72\!\to\!0.85\), Vulkan
+\(0.52\!\to\!0.60\). CUDA is unchanged at \(0.84\): its sampler runs on-device (a cuda-gated
+top-1 path), so the multinomial never fires---measured tax \(\approx\!0\) vs
+\(1.5\text{--}1.8\)~ms/token on the CPU-sampled backends, which also explains why the tax was
+backend-variable. Table~\ref{tab:board} is the corrected greedy-vs-greedy measurement;
+the stochastic figures are retained in the run logs (\texttt{ARTIFACT-stochastic-*.json}).
+Sampling config for \emph{both} engines is now a required, stated control (\S\ref{sec:method}).
+Prefill is unaffected---it scores one generated token, so the tax is negligible. We report the
+artifact rather than silently restate the numbers; the discipline, not the erratum, is the point.
+
+\textbf{Decode.} Decode is the latency-critical, memory-bound phase. Greedy-vs-greedy,
+hanzo-engine reaches \rMetalDecodeR$\times$ \texttt{llama.cpp} on Metal (near parity),
+\rRocmDecodeR$\times$ on ROCm, \rCudaDecodeR$\times$ on CUDA, and \rVulkanDecodeR$\times$ on
+Vulkan---a loss on all four, but a modest one except on Vulkan. On the integrated APU
+(ROCm, Vulkan) the residual is bandwidth utilization (\S\ref{sec:bw}); on discrete memory
+(CUDA, Metal) it is a small fixed per-layer overhead, not a kernel-quality gap.
 
 \textbf{Prefill.} Prefill is compute-bound (a batched GEMM over the prompt). The whole-request
 sampler charges prefill with a fixed per-request overhead that \texttt{llama-bench}'s pure
@@ -309,12 +335,13 @@ cache is argmax-identical to f16 at 128 greedy tokens and preserves exact ordere
 recall at 256, gated by a 6-test CPU oracle; the default cache is byte-unchanged.
 
 \textbf{Model size.} The 1.7B headline is a deliberately unforgiving choice: a small model
-amortizes our fixed per-layer glue (an unfused bias/cast, a per-step submission) over the
-least compute, so it is where our ratios are \emph{worst}. Table~\ref{tab:size} measures the
-same backends on Qwen3-4B-Q4\_K\_M to size that effect. Decode improves with model size on
-both discrete-memory backends, consistent with the fixed overhead being amortized---the
-honest reading of why an internal claim measured on a larger configuration can sit above our
-1.7B board.
+amortizes our fixed per-layer glue over the least compute. Table~\ref{tab:size} measures the
+same backends on Qwen3-4B-Q4\_K\_M, greedy-vs-greedy. Decode improves with size but only
+slightly---Metal $0.92\!\to\!0.94$, CUDA $0.84\!\to\!0.88$---once sampling parity is enforced.
+This is itself a correction: in the stochastic board the apparent size effect looked far
+larger (Metal $0.72\!\to\!0.81$) because the CPU-sampler tax is a bigger \emph{fraction} of a
+faster small-model decode, so removing it shrinks the small model's deficit and most of the
+gap with it. The real model-size effect is modest; the large one was mostly the artifact.
 
 \begin{table}[t]\centering\small
 \caption{Model-size effect, Qwen3-4B-Q4\_K\_M (per-box, native GGUF). Same protocol as
@@ -339,12 +366,12 @@ bytes streamed per token, hanzo-engine sustains \rVulkanEffBW~GB/s on Vulkan aga
 vs.\ \rRocmRoofBW~GB/s on ROCm. The engine's device-to-device roofline probe measures the
 APU's sustainable peak at \(213\)~GB/s (the LPDDR5X-8000 / 256-bit theoretical peak is
 \(256\)~GB/s), and against that measured peak \texttt{llama.cpp}'s Vulkan decode already
-sustains \(198\)~GB/s---\(93\%\) of peak, effectively \emph{at} the wall.
+sustains \(199\)~GB/s---\(93\%\) of peak, effectively \emph{at} the wall.
 
 We, by contrast, do not claim to be at the wall. We reach \rVulkanReach\ (Vulkan) and
 \rRocmReach\ (ROCm) of the bandwidth \texttt{llama.cpp} extracts from this APU---about
-\(48\%\) of the measured peak on Vulkan---so roughly half of the achievable bandwidth is
-left on the table. That residual is a bandwidth \emph{utilization} gap---uncoalesced
+\(56\%\) of the measured peak on Vulkan---so about \(40\%\) of the bandwidth
+\texttt{llama.cpp} reaches is left on the table. That residual is a bandwidth \emph{utilization} gap---uncoalesced
 global-memory traffic and per-step command record/submit overhead---not an ALU gap: at the
 kernel level our dp4a decode matvec already matches \texttt{llama.cpp}'s. It is therefore
 improvable engineering (memory coalescing to raise cache-cold GTT bandwidth; a CPU-side
@@ -386,10 +413,11 @@ log, and the derived board. The appendix lists the exact invocation per backend.
 One binary, one kernel source, four GPU backends. Measured against \texttt{llama.cpp}'s
 strongest per-target build under a protocol designed for hostile review, hanzo-engine holds
 parity on prefill---a WIN on CUDA at long context---and trails on 1.7B decode across all
-four backends, by a margin we localize rather than dress: bandwidth \emph{utilization} on the
+four backends---modestly, near parity on Metal, wider only on Vulkan---by a margin we localize
+rather than dress: bandwidth \emph{utilization} on the
 integrated APU (memory-bound, not ALU-bound, improvable by coalescing and command-graph
 submission and bounded by a measured 213~GB/s ceiling), and an amortizing fixed per-layer
-overhead on discrete memory that a 4B control already narrows. That is a more modest result
+overhead on discrete memory that a 4B control narrows only slightly. That is a more modest result
 than the internal claims it was written to audit, several of which it overturns against a
 properly-built baseline---which is the point. The honest board, losses and all, is the
 credibility; the reproducible harness makes every number in it checkable from the committed

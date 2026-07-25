@@ -14,5 +14,5 @@ RUN npm run build          # next.config.mjs: output:'export' → writes ./out
 # hanzoai/static: FROM scratch, ENTRYPOINT ["/static"], serves -root (default
 # /public) on -port (set by the operator Service CR args). Pinned to the tag the
 # cluster already runs (see universe crs/cdn.yaml).
-FROM ghcr.io/hanzoai/static:v0.3.0
+FROM ghcr.io/hanzoai/static:v0.5.1
 COPY --from=build /app/out /public

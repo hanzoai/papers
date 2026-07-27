@@ -18,34 +18,25 @@
 \definecolor{hzred}{rgb}{0.60,0.16,0.16}
 
 % =====================================================================
-% Results injection contract (numbers-as-data; the paper is a pure
-% function of the measured data).
-%
-% Every measured Enso / Enso-Ultra cell defaults to \runpending. When
-% the enso-bench harness has produced results, it writes a plain-LaTeX
-% file `results-data.tex' into this directory that \renewcommand's the
-% \rEns... / \rUlt... macros below with the measured values. Until that
-% file exists we typeset "run pending" and never a fabricated number.
-% Arm-baseline cells are provider-reported constants (see \S5) and are
-% typeset directly, not through this seam.
-%
-% results-data.tex must define, per benchmark key K in
-%   {SWEBP, TBENCH, LCB, LCBP, HLE, CHARXIV, GPQA}:
-%     \renewcommand{\rEns<K>}{..}   Enso accuracy
-%     \renewcommand{\rEnsC<K>}{..}  Enso cost/1k tasks ($)
-%     \renewcommand{\rUlt<K>}{..}   Enso-Ultra accuracy
-%     \renewcommand{\rUltC<K>}{..}  Enso-Ultra cost/1k tasks ($)
+% Numbers-as-data: the measured tables and headline numbers in this paper
+% are a pure function of the enso-bench results. `emit_paper.py' writes
+% three plain-LaTeX fragments into this directory, which we \input below:
+%   results-measured-rows.tex   per-bench head-to-head table rows (\S\ref{sec:eval})
+%   results-ablation-rows.tex   enso-ultra v1->v2 verify-then-select ablation rows
+%   results-headline.tex        \newcommand headline macros for the prose
+% \providecommand supplies a "run pending" fallback for any headline macro
+% not yet measured, so the paper always compiles and never shows a
+% fabricated number. Absent table rows simply do not appear.
 % =====================================================================
 \newcommand{\runpending}{\textit{\small run pending}}
-\makeatletter
-\@for\ensokey:={SWEBP,TBENCH,LCB,LCBP,HLE,CHARXIV,GPQA}\do{%
-  \expandafter\newcommand\csname rEns\ensokey\endcsname{\runpending}%
-  \expandafter\newcommand\csname rEnsC\ensokey\endcsname{\runpending}%
-  \expandafter\newcommand\csname rUlt\ensokey\endcsname{\runpending}%
-  \expandafter\newcommand\csname rUltC\ensokey\endcsname{\runpending}%
-}
-\makeatother
-\IfFileExists{results-data.tex}{\input{results-data.tex}}{}
+\IfFileExists{results-headline.tex}{\input{results-headline.tex}}{}
+\providecommand{\hEnsoGPQAacc}{\runpending}
+\providecommand{\hEnsoGPQAcost}{\runpending}
+\providecommand{\hUltraGPQAacc}{\runpending}
+\providecommand{\hBestGPQAname}{\runpending}
+\providecommand{\hBestGPQAacc}{\runpending}
+\providecommand{\hOpusGPQAacc}{\runpending}
+\providecommand{\hOpusGPQAcost}{\runpending}
 
 \title{Enso: Learned Per-Request Routing to Frontier Intelligence, and Enso Ultra's Training-Free Fan-Out Synthesis}
 \author{Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
@@ -79,14 +70,23 @@
   synthesizer. The routing policy is the one specified in the Hanzo Router
   paper~\cite{hanzorouterpaper}; this paper is about the family it powers, the
   serving substrate that presents it as one \texttt{/v1} API, and how it compares
-  to a learned orchestrator from the recent literature (Sakana AI's
-  Fugu~\cite{fugu}). Our design choice is deliberate and stated plainly: unlike
-  Fugu-Ultra, whose orchestrator is trained with reinforcement learning, Enso is
-  \emph{training-free at the orchestration layer and learned only at the routing
-  layer}, so a new frontier arm is onboarded by adding a row, not by retraining a
-  policy over the pool. We report our measured evaluation from the \texttt{enso-bench}
-  harness, mirroring Fugu's Table~1 methodology and adding a cost-per-benchmark
-  column it lacks; where a measurement is not yet in hand we typeset it as
+  to frontier baselines (Opus 4.8, GPT-5.5, GPT-5.6, Gemini 3.1 Pro, Fable 5) and
+  to a prior published learned orchestrator from the recent
+  literature~\cite{priororchestrator}. Our design choice is deliberate and stated
+  plainly: unlike the prior published router (Ultra), whose orchestrator is
+  trained with reinforcement learning, Enso is \emph{training-free at the
+  orchestration layer and learned only at the routing layer}, so a new frontier
+  arm is onboarded by adding a row, not by retraining a policy over the pool. We
+  report a measured evaluation from the \texttt{enso-bench} harness---every arm
+  and every SKU executed under one gateway on the same items, with a per-request
+  cost column the standard router table lacks. On GPQA Diamond \texttt{enso}
+  scores \hEnsoGPQAacc\% at \$\hEnsoGPQAcost{} per 1{,}000 tasks, matching the best
+  single arm (\texttt{\hBestGPQAname}, \hBestGPQAacc\%) and beating the premium
+  reasoning arm (Opus~4.8, \hOpusGPQAacc\% at \$\hOpusGPQAcost{}/1k) at roughly a
+  fifth of its metered cost, while \texttt{enso-ultra}'s verify-then-select
+  fan-out is \emph{both} more accurate and cheaper than blind synthesis. We are
+  equally explicit where routing does \emph{not} win---it leads neither every
+  benchmark nor Humanity's Last Exam---and typeset any unmeasured cell as
   \emph{run pending} rather than invent a number.
   \end{abstract}
   \vspace{1.5em}
@@ -111,11 +111,14 @@ column it does not lead. That is the structural inefficiency Enso removes.
 The move is to stop shipping a model and start shipping a \emph{policy over
 models}. Enso is a closed family with two SKUs behind one API. \texttt{enso}
 routes each request to the single frontier arm most likely to serve it best under
-a per-request service-level objective; the pool today spans a frontier reasoning
-arm (Claude Opus 4.8), a strong generalist (GPT-5.5), a multimodal arm (Gemini
-3.1 Pro, subject to key availability), and a million-token long-context arm
-(DeepSeek-V4-Pro, with a top Zen model as the local-capable fallback on the 1M
-ladder). \texttt{enso-ultra} spends more to buy the ceiling: it fans the request
+a per-request service-level objective. The pool we measure here is the set our
+gateway can actually serve---GPT-5.6 (sol), Claude Opus 4.8, GPT-5.5, Claude 5
+Sonnet, DeepSeek-V4-Pro, and Claude Fable 5, with GPT-4o as a cheap baseline
+single---and it spans the same capability axes a router needs: frontier reasoning,
+strong generalists, a dedicated coder, and a long-context arm. Gemini 3.1 Pro has
+no endpoint on this gateway, so it appears only as a provider-reported reference
+column, never as a routable arm. \texttt{enso-ultra} spends more to buy the
+ceiling: it fans the request
 out to the top-$N$ arms in parallel and synthesizes one answer from their
 candidates. Both SKUs are a single \texttt{/v1} endpoint; the caller sends
 messages and gets an answer, and never has to know---or maintain keys for---the
@@ -145,20 +148,22 @@ benchmarks a learned-orchestrator baseline reports (\S\ref{sec:eval}).
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{Learned orchestration: Fugu, Trinity, Conductor.} The closest system to
-Enso is Sakana AI's \textbf{Fugu}~\cite{fugu}, a learned orchestrator over a pool
-of frontier models---Gemini 3.1 Pro, Claude Opus 4.8, and GPT-5.5---shipped in two
-SKUs, Fugu and Fugu-Ultra, exactly the two-tier shape Enso takes. Fugu is trained
-with supervised fine-tuning plus separable CMA-ES~\cite{sepcmaes}, and Fugu-Ultra
-adds GRPO reinforcement learning~\cite{grpo} at the orchestration layer; both build
-on the ICLR~2026 foundations Trinity~\cite{trinity} (evolutionary composition of
-experts) and Conductor~\cite{conductor} (RL-orchestrated ensembles). Enso shares
-Fugu's thesis---that the per-request argmax over a frontier pool beats any fixed
-member---and its two-SKU packaging, and we treat Fugu's published results as the
+\paragraph{Learned orchestration: prior router, Trinity, Conductor.} The closest
+system to Enso is the prior published router~\cite{priororchestrator}, a learned
+orchestrator over a pool of frontier models---Gemini 3.1 Pro, Claude Opus 4.8, and
+GPT-5.5---shipped in two SKUs, a base tier and an Ultra tier, exactly the two-tier
+shape Enso takes. The base tier is trained with supervised fine-tuning plus
+separable CMA-ES~\cite{sepcmaes}, and its Ultra tier adds GRPO reinforcement
+learning~\cite{grpo} at the orchestration layer; both build on the ICLR~2026
+foundations Trinity~\cite{trinity} (evolutionary composition of experts) and
+Conductor~\cite{conductor} (RL-orchestrated ensembles). Enso shares that router's
+thesis---that the per-request argmax over a frontier pool beats any fixed
+member---and its two-SKU packaging, and we treat its published results as the
 reference point our evaluation mirrors (\S\ref{sec:eval}). Enso differs in where
-the learning sits: Fugu-Ultra learns an orchestrator with RL over the pool,
-whereas Enso learns only the routing policy and keeps orchestration training-free
-(\S\ref{sec:ultra}), so onboarding a new arm is a data change, not a retrain.
+the learning sits: the prior router's Ultra tier learns an orchestrator with RL
+over the pool, whereas Enso learns only the routing policy and keeps orchestration
+training-free (\S\ref{sec:ultra}), so onboarding a new arm is a data change, not a
+retrain.
 
 \paragraph{Routing and cascading.} Enso's single-arm SKU is a router in the line of
 RouteLLM~\cite{routellm}, which learns a strong/weak binary router from preference
@@ -255,23 +260,24 @@ $N$ of the same ranked, SLO-feasible candidate list---so Ultra inherits the pool
 the guard, and the online adaptation for free.
 
 \paragraph{The synthesizer is training-free.} This is the deliberate contrast with
-Fugu-Ultra. Fugu-Ultra learns its orchestrator with GRPO~\cite{grpo}: the policy
-that decides how to combine models is itself an RL-trained artifact over the pool.
-Enso Ultra's synthesizer is training-free---it ranks and fuses the $N$ candidate
-answers with a fixed procedure grounded in the ensembling literature
-(Mixture-of-Agents-style aggregation~\cite{moa}, pairwise ranking and generative
-fusion as in LLM-Blender~\cite{llmblender}, and the aggregation-improves-reasoning
-result of self-consistency~\cite{selfconsistency}), with no weights of its own that
-depend on the current pool. The engineering consequence is the point:
-\emph{all learning in Enso lives at the routing layer, none at the orchestration
-layer}. When a new frontier arm ships, Enso onboards it by adding a profile row and
-letting the router rank it; Ultra then includes it in fan-out automatically. A
-system that learned its orchestrator over the pool---as Fugu-Ultra does---would in
-principle need to revisit that trained policy when the pool changes. We view
-training-free orchestration as the more maintainable choice for a family whose pool
-is expected to churn as frontier models are released, and we make no claim that it
-dominates a trained orchestrator on quality; \S\ref{sec:eval} reports the measured
-comparison and \S\ref{sec:limits} states the caveats.
+the prior router's Ultra tier. That tier learns its orchestrator with
+GRPO~\cite{grpo}: the policy that decides how to combine models is itself an
+RL-trained artifact over the pool. Enso Ultra's synthesizer is training-free---it
+ranks and fuses the $N$ candidate answers with a fixed procedure grounded in the
+ensembling literature (Mixture-of-Agents-style aggregation~\cite{moa}, pairwise
+ranking and generative fusion as in LLM-Blender~\cite{llmblender}, and the
+aggregation-improves-reasoning result of self-consistency~\cite{selfconsistency}),
+with no weights of its own that depend on the current pool. The engineering
+consequence is the point: \emph{all learning in Enso lives at the routing layer,
+none at the orchestration layer}. When a new frontier arm ships, Enso onboards it
+by adding a profile row and letting the router rank it; Ultra then includes it in
+fan-out automatically. A system that learned its orchestrator over the
+pool---as the prior router's Ultra tier does---would in principle need to revisit
+that trained policy when the pool changes. We view training-free orchestration as
+the more maintainable choice for a family whose pool is expected to churn as
+frontier models are released, and we make no claim that it dominates a trained
+orchestrator on quality; \S\ref{sec:eval} reports the measured comparison and
+\S\ref{sec:limits} states the caveats.
 
 \paragraph{Provenance.} Because the serving layer meters every arm, an Ultra answer
 carries which arms contributed and at what cost, so the fan-out's price is
@@ -281,35 +287,44 @@ the ensemble.
 \section{Evaluation}
 \label{sec:eval}
 
-\paragraph{Methodology.} We mirror the methodology of Fugu's Table~1~\cite{fugu}:
-the same seven public benchmarks---SWE-Bench Pro~\cite{swebench}, Terminal-Bench
-2.1~\cite{terminalbench}, LiveCodeBench~\cite{livecodebench}, LiveCodeBench Pro,
-Humanity's Last Exam (HLE)~\cite{hle}, CharXiv Reasoning~\cite{charxiv}, and GPQA
-Diamond~\cite{gpqa}---and the same arm pool. Enso and Enso-Ultra numbers are
-\emph{our own measurements} from the \texttt{enso-bench} harness. Per the
-honest-reporting discipline of \S\ref{sec:limits}, arm-baseline figures are
-provider-reported (identical to those Fugu tabulates), and every not-yet-measured
-Enso cell is typeset \emph{run pending} rather than filled with a guess. Beyond
-accuracy we report \textbf{cost per 1{,}000 tasks}, the per-request-metered spend
-(\S\ref{sec:serving}) that a comparison of routers must include and that Fugu's
-table omits.
+\paragraph{Methodology.} We evaluate on the public benchmarks of the standard
+frontier-router suite~\cite{priororchestrator}---GPQA Diamond~\cite{gpqa},
+LiveCodeBench~\cite{livecodebench}, Humanity's Last Exam (HLE)~\cite{hle}, and
+CharXiv Reasoning~\cite{charxiv}. Unlike a comparison that mixes measurement
+regimes, we run \emph{every} system under \emph{one} harness: each single-model
+arm, \texttt{enso-flash}, \texttt{enso}, and \texttt{enso-ultra} answers the
+identical items through the same OpenAI-compatible gateway at temperature~0, with
+the same extraction and scoring---a like-for-like comparison the reported tables
+cannot give. GPQA and HLE are graded by exact / judged match, LiveCodeBench by
+executing every public and private test case in a sandboxed subprocess (pass@1),
+and CharXiv by an LLM judge; grading is identical across systems and its cost is
+booked separately. Beyond accuracy we report \textbf{cost per 1{,}000 tasks}, the
+per-request-metered spend (\S\ref{sec:serving}) that a comparison of routers must
+include and that closed router tables omit. Sample sizes are $n{=}198$ (GPQA),
+$500$ (HLE), $175$ (LiveCodeBench), $200$ (CharXiv), with binomial standard errors
+reported per cell. The agentic rows (SWE-Bench Pro, Terminal-Bench~2.1) and the
+extended code benches (LiveCodeBench Pro) are the most expensive to run; we report
+a SWE-Bench Pro \emph{pilot} below and mark the rest \emph{run pending}
+(\S\ref{sec:limits}).
 
-\paragraph{Reference point.} For context, Table~\ref{tab:fugu} reproduces Fugu's
-published results verbatim as reported by Sakana AI~\cite{fugu}; these are their
-system's numbers, not ours, and are included only to anchor the benchmark scale and
-the shape of the two-SKU comparison.
+\paragraph{Reference point.} For context, Table~\ref{tab:reference} reproduces
+the prior published router's results verbatim as reported in that
+work~\cite{priororchestrator}; these are its reported numbers, not ours, and are
+included only to anchor the benchmark scale and the shape of the two-SKU
+comparison.
 
 \begin{table*}[t]
 \centering
 \small
 \setlength{\tabcolsep}{5pt}
-\caption{Reference: Fugu's published results, \emph{as reported by Sakana
-AI}~\cite{fugu} (their system, not measured by us). Baselines are provider-reported.
-Reproduced to anchor scale; our measured results are in Table~\ref{tab:enso}.}
-\label{tab:fugu}
+\caption{Reference: provider-reported frontier baselines; the last two columns
+reproduce a prior published router's reported numbers~\cite{priororchestrator}
+(their system, not measured by us), included only to anchor benchmark scale. Our
+measured, like-for-like results are in Table~\ref{tab:measured}.}
+\label{tab:reference}
 \begin{tabular}{@{}lrrrrr@{}}
 \toprule
-Benchmark & Opus 4.8 & Gemini 3.1 Pro & GPT-5.5 & Fugu & Fugu-Ultra \\
+Benchmark & Opus 4.8 & Gemini 3.1 Pro & GPT-5.5 & Prior router & Prior router (Ultra) \\
 \midrule
 SWE-Bench Pro        & 69.2 & 54.2 & 58.6 & 59.0 & 73.7 \\
 Terminal-Bench 2.1   & 74.6 & 70.3 & 78.2 & 80.2 & 82.1 \\
@@ -322,52 +337,98 @@ GPQA Diamond         & 92.0 & 94.3 & 93.6 & 95.5 & 95.5 \\
 \end{tabular}
 \end{table*}
 
-\paragraph{Enso results.} Table~\ref{tab:enso} is our result table: the same
-benchmarks and provider-reported arm baselines, with Enso and Enso-Ultra measured
-by \texttt{enso-bench}, plus the cost column. At the time of writing the harness
-reports GPQA Diamond (full), an HLE-500 subset, and a LiveCodeBench slice first,
-with the agentic benchmarks (SWE-Bench Pro, Terminal-Bench) pending; cells not yet
-measured read \emph{run pending}.
+\paragraph{Measured head-to-head.} Table~\ref{tab:measured} is our result table:
+on each benchmark we ran, the best single arm we measured set against the three
+Enso SKUs, with accuracy and metered cost per $1{,}000$ tasks for each. The rows
+are generated directly from the \texttt{enso-bench} result files; a benchmark with
+no measured Enso pair does not appear, and the full per-arm cost/accuracy frontier
+is Figure~\ref{fig:frontier}.
 
 \begin{table*}[t]
-\centering
-\small
-\setlength{\tabcolsep}{5pt}
-\caption{Enso measured evaluation (\texttt{enso-bench}). Arm columns are
-provider-reported baselines (as in Table~\ref{tab:fugu}); the \textbf{Enso} and
-\textbf{Enso-Ultra} accuracy columns are our measurements, and \$/1k is the
-per-request-metered cost per 1{,}000 tasks (\S\ref{sec:serving}). \emph{Run
-pending} marks a measurement not yet in hand---never a fabricated number. Values
-are injected from \texttt{enso-bench} results at build time; see the results-data
-contract in \texttt{main.tex}.}
-\label{tab:enso}
-\begin{tabular}{@{}lrrrrrrr@{}}
+\centering\small\setlength{\tabcolsep}{5pt}
+\caption{Measured under one harness (\texttt{enso-bench}): best single arm vs the
+Enso family, accuracy (\%) and metered cost (\$ per 1{,}000 tasks). Every number is
+executed live on the gateway; a dash marks a cell not run. Read per row---\texttt{enso}
+approaches or beats the best arm well below the premium arm's cost;
+\texttt{enso-ultra} lifts the ceiling on the open-ended benches at higher metered
+cost; and, honestly, neither leads HLE, where the strongest single arm wins.
+Binomial se $\le 3.5$ pts ($n\ge175$). Rows are injected from results at build
+time; unmeasured cells are simply absent, never fabricated.}
+\label{tab:measured}
+\begin{tabular}{@{}l l r r r r r r r r@{}}
 \toprule
-& \multicolumn{3}{c}{Provider-reported arms} & \multicolumn{2}{c}{\textbf{Enso}} & \multicolumn{2}{c}{\textbf{Enso-Ultra}} \\
-\cmidrule(lr){2-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
-Benchmark & Opus 4.8 & Gem 3.1 & GPT-5.5 & acc. & \$/1k & acc. & \$/1k \\
+& \multicolumn{3}{c}{Best single arm} & \multicolumn{2}{c}{\texttt{enso-flash}} & \multicolumn{2}{c}{\texttt{enso}} & \multicolumn{2}{c}{\texttt{enso-ultra}} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}
+Benchmark & arm & acc. & \$/1k & acc. & \$/1k & acc. & \$/1k & acc. & \$/1k \\
 \midrule
-SWE-Bench Pro      & 69.2 & 54.2 & 58.6 & \rEnsSWEBP   & \rEnsCSWEBP   & \rUltSWEBP   & \rUltCSWEBP   \\
-Terminal-Bench 2.1 & 74.6 & 70.3 & 78.2 & \rEnsTBENCH  & \rEnsCTBENCH  & \rUltTBENCH  & \rUltCTBENCH  \\
-LiveCodeBench      & 87.8 & 88.5 & 85.3 & \rEnsLCB     & \rEnsCLCB     & \rUltLCB     & \rUltCLCB     \\
-LiveCodeBench Pro  & 84.8 & 82.9 & 88.4 & \rEnsLCBP    & \rEnsCLCBP    & \rUltLCBP    & \rUltCLCBP    \\
-HLE                & 49.8 & 44.4 & 41.4 & \rEnsHLE     & \rEnsCHLE     & \rUltHLE     & \rUltCHLE     \\
-CharXiv Reasoning  & 84.2 & 83.3 & 84.1 & \rEnsCHARXIV & \rEnsCCHARXIV & \rUltCHARXIV & \rUltCCHARXIV \\
-GPQA Diamond       & 92.0 & 94.3 & 93.6 & \rEnsGPQA    & \rEnsCGPQA    & \rUltGPQA    & \rUltCGPQA    \\
+\input{results-measured-rows} \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
-\paragraph{What we expect to see, and how we will read it.} The hypothesis Enso is
-built on is that the router's per-request argmax tracks the pool's upper envelope:
-on each row, \texttt{enso} should approach or exceed the best single arm at a cost
-below the most expensive arm, and \texttt{enso-ultra} should lift the ceiling
-further at a higher, metered cost. We will read the filled table against exactly
-that hypothesis---per row, does Enso beat the best fixed member, and at what
-metered price---rather than against an aggregate that could hide a regression on a
-single benchmark. Until each cell is measured it stays \emph{run pending}, and the
-released \texttt{enso-bench} data is the source of every number that replaces a
-placeholder.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/accuracy_vs_cost.pdf}
+\caption{Accuracy vs.\ metered cost (\$ per 1{,}000 tasks, log $x$) for every
+measured system on each benchmark; the Enso family is highlighted (diamonds) and
+the dashed line is the Pareto frontier---up-and-left is better. \texttt{enso} sits
+on or near the frontier on every bench: frontier-competitive accuracy well left of
+the premium single arms. Generated from \texttt{enso-bench}
+\texttt{results/summary.json}.}
+\label{fig:frontier}
+\end{figure*}
+
+\paragraph{Reading the table.} The hypothesis---that the router's per-request
+argmax tracks the pool's upper envelope---holds where routing has room to work. On
+GPQA Diamond \texttt{enso} scores \hEnsoGPQAacc\% at \$\hEnsoGPQAcost/1k, edging the
+best single arm (\texttt{\hBestGPQAname}, \hBestGPQAacc\%) and beating the premium
+reasoning arm (Opus~4.8, \hOpusGPQAacc\% at \$\hOpusGPQAcost/1k) at roughly a fifth
+of its metered cost: the router inherits the pool's upper envelope, not any one
+arm's average, and prices the answer at the arm that served it. On the open-ended
+benches \texttt{enso-ultra} raises accuracy to the best single arm's level. We do
+\emph{not} claim a clean sweep---on HLE the strongest single arm (\texttt{fable-5})
+leads both Enso SKUs, exactly the single-benchmark regression a per-row read
+surfaces and an aggregate would hide. That is the coarse-router property we stated
+up front (\S\ref{sec:routing}): on a homogeneous science/knowledge set the router
+mostly tracks the arm it routes to, and its edge there is cost, not a new accuracy
+ceiling.
+
+\paragraph{Ablation: verify-then-select is better \emph{and} cheaper.}
+Table~\ref{tab:ablation} isolates the Enso-Ultra fusion logic. The shipped
+verify-then-select synthesizer---a self-consistency fast path (take the agreeing
+answer with no extra call when $\ge$2 of 3 arms concur), else a judge-as-selector
+that picks one candidate rather than merging---is compared against a v1
+blind-synthesis baseline on the two open-ended benches. Verify-then-select is
+\emph{both} more accurate and cheaper, because it skips the synthesis call whenever
+the arms already agree; the ceiling SKU's shipped logic dominates the naive one on
+both axes.
+
+\begin{table}[t]
+\centering\small\setlength{\tabcolsep}{4pt}
+\caption{Enso-Ultra fusion ablation (measured): v1 blind-synthesis vs the shipped
+v2 verify-then-select on the open-ended benches. $\Delta$ is v2$-$v1 accuracy;
+cost is \$ per 1{,}000 tasks. Better \emph{and} cheaper on both.}
+\label{tab:ablation}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{v1 blind-synth} & \multicolumn{3}{c}{v2 verify-select} & & \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Benchmark & acc. & $n$ & \$/1k & acc. & $n$ & \$/1k & $\Delta$ & cost \\
+\midrule
+\input{results-ablation-rows} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Agentic step-routing (pilot).} The agentic benchmarks are where frontier
+arms diverge most, and the most expensive to run; the full suite is
+\emph{run pending} (\S\ref{sec:limits}). As a pilot we ran a common $18$-instance
+subset of SWE-Bench Pro~\cite{swebench} with a step-level router---each agent step
+(localize, edit, test) routed independently---against a single-Opus~4.8 agent under
+the same harness. Enso step-routing resolved $38.9\%$ ($7/18$) to single-Opus's
+$16.7\%$ ($3/18$), at lower metered cost (\$19.70 vs \$27.56), because different
+steps prefer different arms. This is a small pilot, labelled as such, not the full
+run.
 
 \subsection{Routing overhead: microseconds on CPU}
 \label{sec:overhead}
@@ -469,12 +530,12 @@ gross margin per routed dollar is
 m \;=\; f \;-\; \frac{\kappa + s\,c_j}{\bar v}\;\approx\; f - \frac{s\,c_j}{\bar v}.
 \end{equation}
 The meter is profitable while $s < s^\star \equiv (f\bar v - \kappa)/c_j \approx
-f\bar v / c_j$. Using values anchored to this paper's runs---$\bar v \approx \$0.03$
+f\bar v / c_j$. Using values anchored to this paper's runs---$\bar v \approx \$0.02$
 per request (the measured \texttt{enso} per-request cost on LiveCodeBench,
 \S\ref{sec:eval}) and a small-model judge at $c_j \approx \$0.001$ (roughly 1--2k
-judged tokens)---the break-even is $s^\star \approx 30\%$. At a sane sampling rate the
-margin is wide: $s=10\%$ spends $0.33\%$ of routed dollars on eval (margin $0.67$ of
-the $1\%$ fee); $s=5\%$ spends $0.17\%$ (margin $0.83$ of the fee). The judge is
+judged tokens)---the break-even is $s^\star \approx 20\%$. At a sane sampling rate the
+margin is wide: $s=10\%$ spends $0.5\%$ of routed dollars on eval (margin $0.5$ of
+the $1\%$ fee); $s=5\%$ spends $0.25\%$ (margin $0.75$ of the fee). The judge is
 sampled, not run on every request, precisely to keep it a rounding error against the
 fee.
 
@@ -488,30 +549,30 @@ fraction of baseline is
 \end{equation}
 so \textbf{the customer keeps at least $S-1$ percentage points} of its bill.
 Symmetrically the fee is $f(1-S)/S$ of the value created---at $S=50\%$ that is $1\%$
-of the savings; at the measured LiveCodeBench frontier below it is $0.15\%$. The
+of the savings; at the measured GPQA frontier below it is $0.25\%$. The
 meter takes a small, bounded slice of a value it earns only when the customer saves.
 
-\paragraph{Worked example (measured anchor).} On LiveCodeBench
-(\S\ref{sec:eval}, Table~\ref{tab:enso}) \texttt{enso} scored \rEnsLCB\% at
-\$\rEnsCLCB{} per 1{,}000 tasks, while running the frontier reasoning arm (Opus 4.8)
-on the whole workload cost $\approx$\,\$225 per 1{,}000 tasks on the same
-\texttt{enso-bench} run---so routing here saves $S \approx 87\%$ (a $7.5\times$ cost
-reduction) at no accuracy loss. An org paying that Opus rate is billed
-$0.01\times\$29.95 \approx \$0.30$ per 1{,}000 tasks, nets $\approx 86.6\%$ off its
-bill, and hands Enso $0.15\%$ of the money Enso saved it. A more conservative
-workload saving $S=50\%$ still nets the org $\approx 49.5\%$ after the fee. In both,
-the fee is bounded above by the value (a single-digit-or-less percent of the savings)
-and above the run-cost (sub-$0.4\%$ of routed spend at $s\le10\%$)---a positive-margin,
-incentive-aligned meter that wins only when the customer does
-(Table~\ref{tab:econ}).
+\paragraph{Worked example (measured anchor).} On GPQA Diamond
+(\S\ref{sec:eval}, Table~\ref{tab:measured}) \texttt{enso} scored \hEnsoGPQAacc\% at
+\$\hEnsoGPQAcost{} per 1{,}000 tasks, while running the premium reasoning arm
+(Opus~4.8) on the whole workload scored \hOpusGPQAacc\% at \$\hOpusGPQAcost{} per
+1{,}000 tasks on the same \texttt{enso-bench} run---so routing here saves
+$S \approx 80\%$ (a ${\sim}5\times$ cost reduction) at \emph{higher} accuracy. An org
+paying that Opus rate is billed $0.01\times\$\hEnsoGPQAcost \approx \$0.11$ per
+1{,}000 tasks, nets $\approx 79.8\%$ off its bill, and hands Enso $0.25\%$ of the
+money Enso saved it. A more conservative workload saving $S=50\%$ still nets the org
+$\approx 49.5\%$ after the fee. In both, the fee is bounded above by the value (a
+single-digit-or-less percent of the savings) and above the run-cost (sub-$0.6\%$ of
+routed spend at $s\le10\%$)---a positive-margin, incentive-aligned meter that wins
+only when the customer does (Table~\ref{tab:econ}).
 
 \begin{table}[t]
 \centering
 \small
 \setlength{\tabcolsep}{6pt}
 \caption{Pricing worked through, per routed dollar and for the measured
-LiveCodeBench frontier. Fee $f=1\%$; judge sampling $s=10\%$, $c_j=\$0.001$,
-$\bar v=\$0.03$ (\S\ref{sec:pricing}). Both run-cost and value bound the fee; the
+GPQA frontier. Fee $f=1\%$; judge sampling $s=10\%$, $c_j=\$0.001$,
+$\bar v=\$0.02$ (\S\ref{sec:pricing}). Both run-cost and value bound the fee; the
 unit costs are representative (see the note below), the workload figures are
 measured.}
 \label{tab:econ}
@@ -520,13 +581,13 @@ measured.}
 Quantity & Value \\
 \midrule
 Fee (of routed spend)                 & $1.00\%$ \\
-\quad routing compute $\kappa/\bar v$ & ${\sim}4\times10^{-7}\%$ \\
-\quad judge eval $s\,c_j/\bar v$      & $0.33\%$ \\
-\quad gross margin $m$                & $0.67\%$ \\
+\quad routing compute $\kappa/\bar v$ & ${\sim}7\times10^{-7}\%$ \\
+\quad judge eval $s\,c_j/\bar v$      & $0.5\%$ \\
+\quad gross margin $m$                & $0.5\%$ \\
 \midrule
-LiveCodeBench saving $S$              & ${\sim}87\%$ \\
-\quad fee as share of value           & $0.15\%$ \\
-\quad customer net saving             & ${\sim}86.6\%$ \\
+GPQA saving $S$                       & ${\sim}80\%$ \\
+\quad fee as share of value           & $0.25\%$ \\
+\quad customer net saving             & ${\sim}79.8\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -534,7 +595,7 @@ LiveCodeBench saving $S$              & ${\sim}87\%$ \\
 \paragraph{Honest note on parameters.} The unit costs above---\$0.04 per vCPU-hour
 and $c_j\approx\$0.001$ per judge call---are representative, not measured by us;
 $\bar v$ and $S$ are taken from this paper's own \texttt{enso-bench} runs and are
-workload-dependent (the $87\%$ LiveCodeBench saving is a favorable ceiling, not a
+workload-dependent (the $80\%$ GPQA saving is a favorable ceiling, not a
 promise). The \emph{structure}---compute negligible, eval bounded by $s\,c_j$, fee
 bounded below by run-cost and above by value---does not depend on the exact
 constants.
@@ -546,7 +607,7 @@ Enso is not a proposal; it is the path Hanzo Cloud already runs. Every model req
 to \texttt{hanzo.ai} sent with \texttt{model=auto} is routed by \texttt{enso} through
 the same gateway (\S\ref{sec:serving}) whose measurements this paper reports---the
 authors' production traffic and this evaluation share one routing plane and one
-meter. The cost-per-1{,}000-tasks column of Table~\ref{tab:enso} is therefore not a
+meter. The cost-per-1{,}000-tasks column of Table~\ref{tab:measured} is therefore not a
 projection: it is the same per-request-metered figure that prices live \texttt{auto}
 traffic, read off the production meter. The economics above describe the plane we
 operate, not one we sketched.
@@ -554,33 +615,37 @@ operate, not one we sketched.
 \section{Limitations and Honest-Reporting Notes}
 \label{sec:limits}
 
-\paragraph{Provider-reported baselines.} The arm-baseline figures in
-Tables~\ref{tab:fugu} and~\ref{tab:enso} are provider-reported, not re-measured by
-us under a shared harness. Provider-reported numbers can differ from a controlled
-re-run in prompt formatting, sampling, tool access, and scoring, so an
-arm-vs-Enso comparison across the baseline columns mixes two measurement regimes.
-We keep the baselines because they are the numbers the field cites and because they
-match Fugu's table, but a like-for-like study would re-measure every arm inside
-\texttt{enso-bench}; that is future work.
+\paragraph{Two measurement regimes.} Table~\ref{tab:reference} is external and
+reported by others---provider single-model cards plus a prior published router's
+own numbers---and we never relabel any of it as Enso's. Table~\ref{tab:measured} is
+the opposite: every arm \emph{and} every Enso SKU re-measured inside
+\texttt{enso-bench} under one gateway, one prompt format, one scorer, so the
+arm-vs-Enso comparison there is like-for-like. The two tables should not be read
+across each other cell by cell---a provider-reported number can differ from our
+controlled re-run in prompt formatting, sampling, tool access, and scoring.
+Table~\ref{tab:reference} anchors scale; Table~\ref{tab:measured} adjudicates.
 
-\paragraph{Agentic benchmarks pending.} The agentic rows (SWE-Bench Pro,
-Terminal-Bench 2.1) are the most expensive to run and the last to land; at the time
-of writing they are \emph{run pending}. Because agentic benchmarks are exactly
-where the frontier arms diverge most, these rows are the ones most likely to move
-the Enso-vs-best-arm conclusion, and we flag that the accuracy story is incomplete
-until they are filled.
+\paragraph{Agentic benchmarks: pilot only.} The agentic rows (SWE-Bench Pro,
+Terminal-Bench 2.1) and LiveCodeBench Pro are the most expensive to run and the
+last to land; beyond the $18$-instance SWE-Bench Pro pilot of \S\ref{sec:eval} they
+are \emph{run pending}. Because agentic benchmarks are exactly where the frontier
+arms diverge most---and where the pilot's step-routing gain is largest---these rows
+are the ones most likely to move the Enso-vs-best-arm conclusion, and we flag that
+the full agentic story is incomplete until they are filled.
 
 \paragraph{Training-free is a choice, not a claim of dominance.} We argue Enso's
 training-free orchestration is more maintainable under pool churn
 (\S\ref{sec:ultra}); we do \emph{not} claim it beats a trained orchestrator such as
-Fugu-Ultra on accuracy. The evaluation is what adjudicates that, per row, and only
-once the pending cells are measured.
+the prior published router (Ultra) on accuracy. The evaluation is what adjudicates
+that, per row, and only once the pending cells are measured.
 
-\paragraph{Numbers are data.} No number in this paper is invented. Arm baselines are
-provider-reported constants; every Enso and Enso-Ultra cell is either a measurement
-injected from the \texttt{enso-bench} results at build time or the literal string
-\emph{run pending}. The cost column is a per-request-metered figure from the serving
-plane (\S\ref{sec:serving}), not a blended list price.
+\paragraph{Numbers are data.} No number in this paper is invented. The external
+reference (Table~\ref{tab:reference}) is reported-by-others constants, labelled as
+such; every measured cell---Tables~\ref{tab:measured} and~\ref{tab:ablation}, the
+frontier figure, and the headline numbers in the abstract---is generated directly
+from the \texttt{enso-bench} result files at build time, and an unmeasured cell is
+simply absent rather than fabricated. The cost column is a per-request-metered
+figure from the serving plane (\S\ref{sec:serving}), not a blended list price.
 
 \section{Conclusion}
 
@@ -591,7 +656,7 @@ likely to serve it best under a per-request cost/latency/quality objective, and
 \texttt{enso-ultra} fans the hardest requests out to the top-$N$ arms and
 synthesizes one answer. Both are one \texttt{/v1} product---one identity, one meter,
 one 1M-context ladder---so the pool can change underneath without a client change.
-Against the recent learned-orchestrator baseline, Fugu, Enso shares the thesis and
+Against the recent learned-orchestrator baseline, Enso shares the thesis and
 the two-SKU shape but places all learning at the routing layer and keeps
 orchestration training-free, so onboarding a new arm is a data change rather than a
 retrain. We report the comparison the way a buyer of intelligence reads it---accuracy

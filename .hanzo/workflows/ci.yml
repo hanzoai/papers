@@ -1,0 +1,90 @@
+name: ci
+
+# Compiles every paper and fails when one does not come out. Restored from the
+# deleted .github/workflows/build-papers.yml, minus the two steps that wrote to
+# GitHub: a v<run_number> Release and a commit of the PDFs back to the branch.
+# GitHub is a mirror now, so neither belongs here — the PDFs are the run's
+# artifact and the site image bakes its own copies.
+#
+# The predecessor could not fail. Every rule in the Makefile ends in `|| true`
+# and prints "FAIL" rather than exiting, so `make all` returned 0 with any
+# number of papers missing. The compile is therefore run with -k (attempt every
+# paper, do not stop at the first break) and the result is checked against
+# `make manifest`, which is the Makefile's own ALL_PDFS — one definition of the
+# paper set, read rather than restated.
+
+on:
+  push:
+    branches: [main]
+    paths: ['**.tex', '**.bib', 'Makefile', '.hanzo/workflows/ci.yml']
+  pull_request:
+    paths: ['**.tex', '**.bib', 'Makefile', '.hanzo/workflows/ci.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  papers:
+    runs-on: hanzo-build-linux-amd64
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install latex
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y texlive-full
+
+      - name: compile
+        run: make -k all
+
+      - name: compile defense papers
+        run: |
+          set -euo pipefail
+          mkdir -p pdfs/defense
+          cd defense
+          rc=0
+          for tex in *.tex; do
+            case "$tex" in
+              hanzo-defense.sty|logo-convert.tex) continue ;;
+            esac
+            name="${tex%.tex}"
+            echo "compiling defense/$tex"
+            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
+            bibtex "$name" >/dev/null 2>&1 || true
+            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
+            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
+            if [ -f "${name}.pdf" ]; then
+              mv "${name}.pdf" ../pdfs/defense/
+              echo "  ok   defense/${name}.pdf"
+            else
+              echo "  fail defense/${name}.pdf"
+              rc=1
+            fi
+            rm -f ./*.aux ./*.log ./*.bbl ./*.blg ./*.out ./*.toc
+          done
+          exit "$rc"
+
+      - name: check every paper came out
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r pdf; do
+            [ -n "$pdf" ] || continue
+            if [ ! -f "$pdf" ]; then
+              echo "::error file=${pdf%.pdf}::did not compile: $pdf"
+              missing=$((missing + 1))
+            fi
+          done < <(make --no-print-directory manifest)
+          echo "missing: ${missing}"
+          [ "$missing" -eq 0 ]
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: papers
+          path: pdfs/**/*.pdf
+          retention-days: 90

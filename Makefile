@@ -63,6 +63,13 @@ clean-all:
 	@rm -rf pdfs
 	@echo "Done"
 
+# The expected PDFs, one per line, for a reader that is not a human: the gate in
+# .hanzo/workflows/ci.yml checks this list rather than restating which papers
+# exist, so ALL_PDFS above stays the single definition of the paper set.
+.PHONY: manifest
+manifest:
+	@printf '%s\n' $(ALL_PDFS)
+
 # List papers
 .PHONY: list
 list:

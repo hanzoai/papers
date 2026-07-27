@@ -1,0 +1,41 @@
+name: deploy
+
+# Builds papers.hanzo.ai and publishes the image the operator runs. Restored
+# from the deleted .github/workflows/deploy-site.yml, which was the sole
+# producer of ghcr.io/hanzoai/papers and went away with no replacement — the
+# host has been frozen at its last build since, with no failing run to say so.
+#
+# The image tag is the run's commit, and the operator CR in hanzoai/universe
+# names which tag is live — a build never deploys itself.
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', '.hanzo/workflows/deploy.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: hanzo-build-linux-amd64
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and push
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REGISTRY_TOKEN:-}" ]; then
+            echo "::error::REGISTRY_TOKEN is unset, so nothing was published. Add the org secret."
+            exit 1
+          fi
+          tag="$(git rev-parse --short HEAD)"
+          image="ghcr.io/hanzoai/papers:${tag}"
+          echo "${REGISTRY_TOKEN}" | docker login ghcr.io -u hanzo-dev --password-stdin
+          docker build -t "${image}" ./site
+          docker push "${image}"

@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Insights, a privacy-first product analytics platform built on the Umami framework with ClickHouse as the analytical backend. Insights provides real-time event tracking, funnel analysis, cohort retention, and feature flag management without collecting personally identifiable information (PII). The system processes over 50 million events daily with sub-second query latency on dashboards spanning 90-day windows. Key innovations include: (1) a cookie-less visitor identification scheme using salted hashing of request attributes, (2) a feature flag engine with percentage rollouts, user targeting, and A/B experiment support, and (3) a streaming ingestion pipeline with at-most-once deduplication. Insights replaces Google Analytics and LaunchDarkly in the Hanzo stack, eliminating third-party data sharing while providing equivalent functionality.
+We present Hanzo Insights, a privacy-first product analytics platform built on the Umami framework with Hanzo Datastore---our Apache-2.0 ClickHouse fork---as the analytical backend. Insights provides real-time event tracking, funnel analysis, cohort retention, and feature flag management without collecting personally identifiable information (PII). The system processes over 50 million events daily with sub-second query latency on dashboards spanning 90-day windows. Key innovations include: (1) a cookie-less visitor identification scheme using salted hashing of request attributes, (2) a feature flag engine with percentage rollouts, user targeting, and A/B experiment support, and (3) a streaming ingestion pipeline with at-most-once deduplication. Insights replaces Google Analytics and LaunchDarkly in the Hanzo stack, eliminating third-party data sharing while providing equivalent functionality.
 \end{abstract}
 
 \section{Introduction}
@@ -57,7 +57,7 @@ Hanzo Insights resolves this tension by combining Umami's~\cite{umami2020} cooki
 \paragraph{Contributions.}
 \begin{itemize}
     \item A cookie-less visitor identification scheme using daily-rotated salted hashes of IP address, User-Agent, and site identifier.
-    \item A ClickHouse-backed analytical engine supporting sub-second queries over billions of events.
+    \item A Datastore-backed analytical engine supporting sub-second queries over billions of events.
     \item An integrated feature flag system with percentage rollouts, targeting rules, and automatic experiment analysis.
     \item A real-time dashboard with live visitor counts, event streams, and configurable metric widgets.
 \end{itemize}
@@ -76,7 +76,7 @@ Hanzo Insights resolves this tension by combining Umami's~\cite{umami2020} cooki
 \node[box] (sdk) {Client SDK\\(JS/React)};
 \node[box, below=of sdk] (collect) {Collection\\API};
 \node[box, below=of collect] (stream) {Event\\Stream};
-\node[box, below left=0.6cm and 0.3cm of stream] (ch) {ClickHouse};
+\node[box, below left=0.6cm and 0.3cm of stream] (ch) {Datastore};
 \node[box, below right=0.6cm and 0.3cm of stream] (rt) {Real-Time\\Aggregator};
 \node[box, right=1.5cm of collect] (flags) {Feature\\Flag Engine};
 \node[box, left=1.5cm of collect] (dash) {Dashboard\\API};
@@ -93,7 +93,7 @@ Hanzo Insights resolves this tension by combining Umami's~\cite{umami2020} cooki
 \label{fig:insights}
 \end{figure}
 
-Events flow through a three-stage pipeline (Figure~\ref{fig:insights}): collection, streaming, and storage. The client SDK sends events to the Collection API, which validates, deduplicates, and forwards them to an event stream. ClickHouse consumes the stream for persistent storage, while the Real-Time Aggregator maintains in-memory counters for live dashboards.
+Events flow through a three-stage pipeline (Figure~\ref{fig:insights}): collection, streaming, and storage. The client SDK sends events to the Collection API, which validates, deduplicates, and forwards them to an event stream. Datastore consumes the stream for persistent storage, while the Real-Time Aggregator maintains in-memory counters for live dashboards.
 
 \subsection{Visitor Identification}
 
@@ -107,7 +107,7 @@ The daily salt $\text{salt}_d$ rotates at midnight UTC, ensuring that visitor id
 
 \subsection{Event Schema}
 
-Events are stored in a ClickHouse MergeTree table:
+Events are stored in a Datastore MergeTree table:
 
 \begin{lstlisting}[language=TypeScript]
 interface Event {
@@ -170,11 +170,11 @@ ClickHouse's \texttt{windowFunnel} function evaluates multi-step funnels in a si
 
 \subsection{Real-Time Dashboard}
 
-The dashboard displays live metrics using Server-Sent Events (SSE). The Real-Time Aggregator maintains sliding window counters in memory, flushed to ClickHouse every 10 seconds. Dashboard widgets include: active visitors, pageviews per minute, top pages, referrer breakdown, geographic distribution, and device/browser splits.
+The dashboard displays live metrics using Server-Sent Events (SSE). The Real-Time Aggregator maintains sliding window counters in memory, flushed to Datastore every 10 seconds. Dashboard widgets include: active visitors, pageviews per minute, top pages, referrer breakdown, geographic distribution, and device/browser splits.
 
 \section{Implementation}
 
-Insights is implemented as a Go service (18,000 lines) with a React dashboard (12,000 lines). The collection endpoint processes events in batches of 1,000, inserting into ClickHouse via the native protocol for maximum throughput.
+Insights is implemented as a Go service (18,000 lines) with a React dashboard (12,000 lines). The collection endpoint processes events in batches of 1,000, inserting into Datastore via the native protocol for maximum throughput.
 
 \begin{table}[h]
 \centering
@@ -195,9 +195,9 @@ Feature flag impact & 150 & 520 \\
 
 \section{Security}
 
-\paragraph{No PII Storage.} IP addresses are used only for visitor hashing and geolocation, then discarded. User-Agent strings are parsed into device/browser/OS categories and discarded. The raw identifiers never reach ClickHouse.
+\paragraph{No PII Storage.} IP addresses are used only for visitor hashing and geolocation, then discarded. User-Agent strings are parsed into device/browser/OS categories and discarded. The raw identifiers never reach Datastore.
 
-\paragraph{Data Isolation.} Each tenant's data is scoped by \texttt{siteId}. ClickHouse queries include a mandatory \texttt{siteId} predicate enforced at the API layer. Cross-tenant queries are impossible by construction.
+\paragraph{Data Isolation.} Each tenant's data is scoped by \texttt{siteId}. Datastore queries include a mandatory \texttt{siteId} predicate enforced at the API layer. Cross-tenant queries are impossible by construction.
 
 \paragraph{Collection Security.} The collection endpoint validates the origin header against registered site domains, preventing unauthorized event submission. Events exceeding 8KB are rejected.
 
@@ -205,7 +205,7 @@ Feature flag impact & 150 & 520 \\
 
 \section{Conclusion}
 
-Hanzo Insights demonstrates that privacy-first analytics need not sacrifice functionality. By combining cookie-less visitor identification with ClickHouse's columnar storage, Insights provides funnel analysis, cohort retention, and feature flag management with sub-second query latency---all without storing personally identifiable information. The integrated feature flag engine eliminates the need for a separate service, reducing infrastructure complexity while enabling data-driven product decisions.
+Hanzo Insights demonstrates that privacy-first analytics need not sacrifice functionality. By combining cookie-less visitor identification with Datastore's columnar storage, Insights provides funnel analysis, cohort retention, and feature flag management with sub-second query latency---all without storing personally identifiable information. The integrated feature flag engine eliminates the need for a separate service, reducing infrastructure complexity while enabling data-driven product decisions.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}

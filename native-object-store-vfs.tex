@@ -370,15 +370,45 @@ The fix queues per stream and wakes the reader, so delivery never blocks the
 read loop; a bound fails one stream rather than the connection everyone
 shares.
 
-\subsection{What the three have in common}
+\subsection{A configuration that could not say ``I don't know''}
 
-Two of the three were latent properties of \emph{connection pooling}---a
+The change that exposed the fsync cost also broke the filesystem mount, and
+the mechanism generalises past this codebase.
+
+The mount's metadata cache supplies its own implementation of the store
+configuration interface, and that implementation returned its own directory
+path for \emph{every} key that did not end in \texttt{backend}. Reading a
+newly-added \texttt{syncWrites} option therefore yielded
+\texttt{/tmp/<id>/meta}, the store correctly rejected it as neither true nor
+false, and the mount died at startup. The store was right; the configuration
+was wrong to invent an answer.
+
+The defect is not the one key. A configuration object that cannot express
+absence will mis-answer whichever option is added next, and it does so
+silently at the call site that is furthest from the mistake. The fix is that
+unknown keys return empty, and the regression test asserts the \emph{silence}
+rather than any particular key.
+
+Two contributing details are worth naming because both are habits rather than
+bugs. The reading side used a variadic parameter, which made a positional
+mistake compile; it is now explicit, so a caller that forgets the argument
+fails to build. And the interface offers no ``is this set?'' predicate, which
+is what pushed a three-state question (absent / true / false) through a
+two-state type---the same shape as the downstream bug in
+Section~\ref{sec:defects-common}, one layer up.
+
+\subsection{What they have in common}
+\label{sec:defects-common}
+
+Two of the four were latent properties of \emph{connection pooling}---a
 sharing optimisation that converts an isolated stall into a global one---and
-all three were invisible to unauthenticated smoke tests, to fresh-dataset
-tests, and to green unit suites. The tests that found them were: an
-adversarial reproduction with a deliberately slow consumer; a restore
-exercised against data written by the \emph{previous} release; and a
-goroutine dump taken while production was hung.
+two were three-state questions forced through two-state types, where
+``unset'' and ``false'' became indistinguishable. All were invisible to
+unauthenticated smoke tests, to fresh-dataset tests, and to green unit suites.
+The tests that found them were: an adversarial reproduction with a
+deliberately slow consumer; a restore exercised against data written by the
+\emph{previous} release; a goroutine dump taken while production was hung; and
+an A/B harness built to measure something else entirely.
 
 \section{Store Migration}
 \label{sec:migration}

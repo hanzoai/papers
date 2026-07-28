@@ -211,22 +211,54 @@ The bulk-data path is strong and would satisfy most streaming workloads. The
 namespace path is not: creating a file costs approximately 37\,ms and
 \texttt{stat} approximately 5\,ms.
 
-\paragraph{Where the cost actually is.} Driving the identical operation
-against the filer's own HTTP API on a reused connection---bypassing FUSE
-entirely---creates files in \textbf{8.36\,ms}, or 120/s. The same create
-through the mount costs \(\approx 37\,\)ms. \textbf{The projection layer
-accounts for roughly \(4.4\times\) of the cost; the store accounts for the
-rest.} This matters for where effort should go: the mount, not the object
-store, is the first thing to optimise, and the store's own 8.36\,ms create is
-a second, separate question (we did not determine whether it is
-\texttt{fsync}-bound).
+\paragraph{Decomposing the cost, layer by layer.} We measured the same
+logical operation---create one metadata entry---at three depths, using a
+purpose-built client that speaks ZAP directly to the filer.
 
-We attempted one tuning experiment---enabling the driver's file-chunk read
-cache, which ships disabled---and report it as inconclusive rather than as a
-result: the knob caches \emph{chunks} for reads while this workload is bound
-by \emph{metadata} operations, our two runs did not time identical scopes,
-and mount daemons restarted mid-measurement. A serious tuning pass remains
-open work, and nothing here should be read as establishing a floor.
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Path & Create & Lookup \\
+\midrule
+ZAP, RAM-backed store   & \textbf{1.41\,ms} & \textbf{1.14\,ms} \\
+ZAP, block-backed store & 11.39\,ms & 6.61\,ms \\
+Filer HTTP, block store &  8.36\,ms & --- \\
+Through the FUSE mount  & \(\approx\)37\,ms & \(\approx\)5\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Identical operation at four depths. Only the backing store differs
+between rows one and two: same binary, same transport, same client.}
+\end{table}
+
+Three things follow, and they redirect the entire optimisation effort.
+
+\textbf{First, the transport is not the bottleneck.} ZAP's own floor is
+1.41\,ms per create and 1.14\,ms per lookup---712 and 879 operations per
+second. It also beats the filer's HTTP surface (5.97--11.39\,ms vs
+8.36\,ms) on the same storage. The binary protocol is doing its job.
+
+\textbf{Second, the store is disk-sync bound by roughly \(8\times\).}
+Moving the data directory from network block storage to \texttt{tmpfs} takes
+creates from 11.39\,ms to 1.41\,ms with no other change. Entries are written
+one \texttt{Put} at a time; a batch path exists in the store but the
+single-entry insert does not use it, so every metadata write pays a separate
+durable commit to a network block device. \emph{Lookups} show the same shape
+(6.61\,ms vs 1.14\,ms), meaning hot entries are not being served from memory
+either.
+
+\textbf{Third, only then does FUSE matter}---and it matters a lot, adding
+roughly \(3\times\) on top of the block-backed store. Since each filesystem
+operation costs several filer round trips, any reduction in per-round-trip
+latency is multiplied by that fan-out. That makes the store-layer fix the
+higher-leverage one even though FUSE is the larger single term.
+
+\paragraph{A tuning attempt we are not counting.} We enabled the driver's
+file-chunk read cache, which ships disabled. It is inconclusive and we report
+it as such: the knob caches \emph{chunks} for reads while this workload is
+bound by \emph{metadata}, our two runs did not time identical scopes, and
+mount daemons restarted mid-measurement. It was the wrong knob, chosen before
+the decomposition above existed.
 
 \section{The Metadata Cost, Made Concrete}
 
@@ -377,10 +409,18 @@ we have not attempted.
 
 What survives as a claim is narrower and, we think, more useful: a dependent
 metadata chain pays one round trip per link, and no amount of bulk throughput
-compensates for that. Whether the per-link cost is 37\,ms or 4\,ms decides
-whether a workload like Git is impossible or merely expensive---so the number
-has to be measured, per layer, before an architecture is built on an
-assumption about it.
+compensates for that. But the per-link cost is not a constant of the design.
+Decomposed, it is 1.41\,ms of transport, plus \(\approx 10\,\)ms of durable
+commit to a network block device, plus a FUSE multiplier on top. Two of those
+three terms are addressable without changing the architecture at all:
+group-commit the metadata writes (the batch path already exists, unused by the
+single-entry insert), and serve hot entries from memory rather than disk.
+
+That is the difference between a workload being impossible and merely
+expensive, and it is why the number has to be measured per layer before an
+architecture is built on an assumption about it. We began this work believing
+the object store was too slow for a filesystem projection. It is not: it
+sustains 712 creates per second when it is not waiting on a disk.
 
 Bulk, sequential, immutable data belongs in the object store. Namespaces with
 dependent metadata chains---Git foremost---do not, and should not be moved

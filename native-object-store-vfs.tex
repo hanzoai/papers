@@ -61,19 +61,25 @@
   native ZAP transport rather than gRPC. All figures are taken from the
   production deployment, in-cluster, against authenticated requests.
 
-  The object store performs as an object store should: 265.9\,MiB/s on
-  16\,MiB reads, 12.81\,ms median metadata lookups, and stable
-  latency under mixed concurrent load. The filesystem projection sustains
-  287\,MB/s sequential writes and 685\,MB/s sequential reads.
+  The object store is fast: \textbf{2.26\,ms} per read on a reused
+  connection, 265.9\,MiB/s on 16\,MiB objects, and stable latency under
+  mixed concurrent load. The filesystem projection sustains 287\,MB/s
+  sequential writes and 685\,MB/s sequential reads.
 
-  Its metadata plane does not follow. The mount performs \emph{27 file
-  creations per second} and \emph{201 stats per second}, three orders of
-  magnitude below local block storage. We quantify the consequence on a real
-  metadata-bound workload---a Git repository---and find slowdowns of
-  \(27\times\) to \(278\times\). We therefore argue against the common
-  instinct to relocate a Git forge onto an object-store-backed mount, and
-  state the boundary we believe generalises: \textbf{project an object store
-  into POSIX for bulk data, never for namespaces}.
+  Its metadata plane does not follow, and we locate the cost precisely. The
+  store creates files at \textbf{120/s} (8.36\,ms) when driven directly over
+  its own API; the same operation through the FUSE mount costs \(\approx\)
+  37\,ms, so \textbf{the projection layer adds \(4.4\times\)}, not the
+  store. On a real metadata-bound workload---a Git repository---the mount is
+  \(27\times\) to \(278\times\) slower than local disk.
+
+  We therefore do not recommend relocating a Git forge onto this mount as it
+  stands, while being explicit that \emph{this is a tuning ceiling we have
+  not established}: the FUSE layer's parameters are unexplored, and the
+  store's own 8.36\,ms create is itself unexamined. The durable boundary we
+  do claim is narrower: \textbf{bulk sequential data projects well into
+  POSIX; dependent metadata chains pay a per-operation round trip that must
+  be measured before it is designed around.}
 
   We also document three defects found while bringing this path to
   production---two in connection-pooled RPC and one silently destroying data
@@ -134,9 +140,18 @@ protocol, remains future work rather than shipped behaviour.
 Measurements were taken from pods inside the same cluster as the store, to
 exclude ingress and WAN effects. Object-store figures use SigV4-signed
 requests through the service DNS name; the driver and the store were the
-production instances serving live traffic. Each latency figure is the mean of
-ten repetitions; metadata figures are means over 20--500 operations.
-Filesystem figures use \texttt{dd} with \texttt{conv=fsync} for writes.
+production instances serving live traffic. Filesystem figures use
+\texttt{dd} with \texttt{conv=fsync} for writes.
+
+\paragraph{A correction, and the reason it matters.} Our first pass reported
+per-operation latencies roughly \(7\times\) too high. It invoked a fresh
+client process per request, so each measurement included a DNS resolution and
+a TCP handshake. A breakdown of one \(15.2\,\)ms request showed
+\(9.0\,\)ms of name lookup, \(2.0\,\)ms of connect, and only
+\(4.1\,\)ms of server work. The tell was visible in the data before we
+looked for it: a 1\,KiB PUT measured \emph{slower} than a 64\,KiB PUT, which
+no server-side cost model explains. Figures below use a single reused
+connection and are reported per operation.
 
 The Git comparison runs an identical script against the CSI mount and against
 the pod's local disk, so the delta isolates the storage path.
@@ -158,10 +173,11 @@ Object size & PUT (ms) & GET (ms) & GET (MiB/s) \\
 \caption{Signed request latency, in-cluster, mean of 10.}
 \end{table}
 
-Metadata lookups (\texttt{HEAD} on an existing object) average
-12.81\,ms over 20 repetitions. Latency is dominated by a fixed
-per-request cost of roughly 15\,ms until objects exceed 1\,MiB,
-after which transfer dominates and throughput climbs to 265.9\,MiB/s.
+The table above retains the per-connection figures, which are what a client
+that does not pool connections actually experiences. With a \textbf{reused
+connection}, 200 sequential reads average \textbf{2.263\,ms} each
+(max 20.3\,ms), so roughly \(13\,\)ms of the naive figure is connection
+setup rather than service time. Any client in this cluster should pool.
 
 Under a sustained mixed load---eight rounds of four concurrent
 1000-key \texttt{LIST} operations interleaved with
@@ -193,8 +209,24 @@ File creation & --- & \textbf{27 files/s} \\
 
 The bulk-data path is strong and would satisfy most streaming workloads. The
 namespace path is not: creating a file costs approximately 37\,ms and
-\texttt{stat} approximately 5\,ms. Both are network round trips to the
-filer with no client-side namespace cache that survives them.
+\texttt{stat} approximately 5\,ms.
+
+\paragraph{Where the cost actually is.} Driving the identical operation
+against the filer's own HTTP API on a reused connection---bypassing FUSE
+entirely---creates files in \textbf{8.36\,ms}, or 120/s. The same create
+through the mount costs \(\approx 37\,\)ms. \textbf{The projection layer
+accounts for roughly \(4.4\times\) of the cost; the store accounts for the
+rest.} This matters for where effort should go: the mount, not the object
+store, is the first thing to optimise, and the store's own 8.36\,ms create is
+a second, separate question (we did not determine whether it is
+\texttt{fsync}-bound).
+
+We attempted one tuning experiment---enabling the driver's file-chunk read
+cache, which ships disabled---and report it as inconclusive rather than as a
+result: the knob caches \emph{chunks} for reads while this workload is bound
+by \emph{metadata} operations, our two runs did not time identical scopes,
+and mount daemons restarted mid-measurement. A serious tuning pass remains
+open work, and nothing here should be read as establishing a floor.
 
 \section{The Metadata Cost, Made Concrete}
 
@@ -335,11 +367,20 @@ freshly-created-object checks pass while the store is broken.
 
 \section{Conclusion}
 
-The native object store is fast, and its POSIX projection is fast for bulk
-data and slow for namespaces by three orders of magnitude. That asymmetry is
-not an implementation defect to be optimised away; it is the cost of
-emulating a filesystem over a network metadata service, and it decides which
-workloads may cross the boundary.
+The native object store is fast---2.26\,ms per pooled read---and its POSIX
+projection is fast for bulk data and slow for namespaces. But the asymmetry is
+\emph{not} simply the inherent cost of emulating a filesystem over a network
+metadata service, and we were wrong to frame it that way in an earlier draft.
+Measured layer by layer, the store creates at 120/s and the mount at 27/s: most
+of the gap is the projection layer, which is implementation subject to tuning
+we have not attempted.
+
+What survives as a claim is narrower and, we think, more useful: a dependent
+metadata chain pays one round trip per link, and no amount of bulk throughput
+compensates for that. Whether the per-link cost is 37\,ms or 4\,ms decides
+whether a workload like Git is impossible or merely expensive---so the number
+has to be measured, per layer, before an architecture is built on an
+assumption about it.
 
 Bulk, sequential, immutable data belongs in the object store. Namespaces with
 dependent metadata chains---Git foremost---do not, and should not be moved

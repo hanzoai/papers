@@ -90,9 +90,10 @@ cd <paper-slug>
 TEXINPUTS=".:..:" latexmk -pdf <paper-slug>.tex
 ```
 
-Or build all:
+Or build all — every paper, and a nonzero status naming any that did not
+compile:
 ```bash
-make all
+make -k all
 ```
 
 ## Index

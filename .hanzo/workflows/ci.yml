@@ -6,19 +6,27 @@ name: ci
 # GitHub is a mirror now, so neither belongs here — the PDFs are the run's
 # artifact and the site image bakes its own copies.
 #
-# The predecessor could not fail. Every rule in the Makefile ends in `|| true`
-# and prints "FAIL" rather than exiting, so `make all` returned 0 with any
-# number of papers missing. The compile is therefore run with -k (attempt every
-# paper, do not stop at the first break) and the result is checked against
-# `make manifest`, which is the Makefile's own ALL_PDFS — one definition of the
-# paper set, read rather than restated.
+# This could not fail, at four depths. Every rule in the Makefile ended in
+# `|| true` and printed "FAIL" rather than exiting, so `make all` returned 0
+# over any number of broken papers. The defense papers were compiled by a second
+# copy of the same swallowing loop, written inline in this file. The step that
+# checked the PDFs
+# existed was satisfied by the 100 stale PDFs that used to be committed under
+# pdfs/, which the checkout supplied before the build ran. And discovery covered
+# only the root, zen/ and defense/, so 69 of the repo's 219 papers were compiled
+# by nothing at all.
+#
+# So: pdfs/ is a build output and is no longer tracked, the Makefile discovers
+# every .tex with a \documentclass, and `make -k all` is the whole gate — -k to
+# attempt every paper rather than stopping at the first break, and a nonzero
+# status if any of them did not come out.
 
 on:
   push:
     branches: [main]
-    paths: ['**.tex', '**.bib', 'Makefile', '.hanzo/workflows/ci.yml']
+    paths: ['**.tex', '**.bib', '**.sty', 'Makefile', '.hanzo/workflows/ci.yml']
   pull_request:
-    paths: ['**.tex', '**.bib', 'Makefile', '.hanzo/workflows/ci.yml']
+    paths: ['**.tex', '**.bib', '**.sty', 'Makefile', '.hanzo/workflows/ci.yml']
   workflow_dispatch:
 
 concurrency:
@@ -41,53 +49,10 @@ jobs:
       - name: compile
         run: make -k all
 
-      - name: compile defense papers
-        run: |
-          set -euo pipefail
-          mkdir -p pdfs/defense
-          cd defense
-          rc=0
-          for tex in *.tex; do
-            case "$tex" in
-              hanzo-defense.sty|logo-convert.tex) continue ;;
-            esac
-            name="${tex%.tex}"
-            echo "compiling defense/$tex"
-            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
-            bibtex "$name" >/dev/null 2>&1 || true
-            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
-            pdflatex -interaction=nonstopmode "$tex" >/dev/null 2>&1 || true
-            if [ -f "${name}.pdf" ]; then
-              mv "${name}.pdf" ../pdfs/defense/
-              echo "  ok   defense/${name}.pdf"
-            else
-              echo "  fail defense/${name}.pdf"
-              rc=1
-            fi
-            rm -f ./*.aux ./*.log ./*.bbl ./*.blg ./*.out ./*.toc
-          done
-          exit "$rc"
-
-      - name: check every paper came out
-        run: |
-          set -euo pipefail
-          missing=0
-          while read -r pdf; do
-            [ -n "$pdf" ] || continue
-            if [ ! -f "$pdf" ]; then
-              echo "::error file=${pdf%.pdf}::did not compile: $pdf"
-              missing=$((missing + 1))
-            fi
-          done < <(make --no-print-directory manifest)
-          echo "missing: ${missing}"
-          [ "$missing" -eq 0 ]
-
       # v3, NOT v4. This forge is Gitea, which presents as GHES, and the v4
       # action refuses outright:
       #   @actions/artifact v2.0.0+, upload-artifact@v4+ and download-artifact@v4+
       #   are not currently supported on GHES
-      # Every paper compiled ("missing: 0") — this step alone failed the run, so
-      # the red badge was reporting an unusable action, not a broken paper.
       - uses: actions/upload-artifact@v3
         if: always()
         with:

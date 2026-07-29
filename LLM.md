@@ -1,8 +1,8 @@
 # Papers
 
 Hanzo's research papers: LaTeX sources at the repo root and in `zen/` and
-`defense/`, compiled PDFs under `pdfs/`, indexed by `INDEX.md`, and the site at
-https://papers.hanzo.ai built from `site/`.
+`defense/`, built to `pdfs/` by `make -k all`, indexed by `INDEX.md`, and the
+site at https://papers.hanzo.ai built from `site/`.
 
 ## How this ships
 
@@ -45,17 +45,35 @@ directory.
 
 ## What ci.yml checks
 
-`make -k all` compiles all 131 discovered papers, `-k` so one broken paper does
-not hide the rest, then the gate asserts every expected PDF exists.
+`make -k all` compiles all 219 papers in the repo and that is the entire gate.
+`-k` so one broken paper does not hide the rest; a nonzero status if any of them
+did not come out. A paper is any `.tex` with a `\documentclass`, wherever it
+lives — one definition, in the `Makefile`, which `scripts/gen-index.sh` reads
+rather than restates.
 
-The predecessor could not fail. Every rule in the `Makefile` ends in `|| true`
-and prints `FAIL` instead of exiting, so `make all` returned 0 no matter how many
-papers were missing. The gate reads `make manifest` — the Makefile's own
-`ALL_PDFS` — so the paper set has one definition and the check cannot drift from
-the build.
+A paper compiles when `latexmk` says so. The rule runs it once per paper with
+`-halt-on-error` (stop at the first error rather than nonstopmode's "carry on and
+emit a PDF anyway"), `-bibtex` (a declared bibliography must resolve, rather than
+being silently skipped when the `.bib` is absent), `-Werror` (an undefined
+citation or cross-reference is a defect in a paper, not a note in a log nobody
+reads) and `-cd` (each paper compiles from its own directory, so its relative
+paths mean to make what they mean to a human reading the file).
 
-Adding a paper therefore requires it to compile: drop `foo.tex` at the root or in
-`zen/`, and `pdfs/foo.pdf` is expected from then on.
+**The gate this replaced could not fail, at four depths.** Every rule in the
+`Makefile` ended in `|| true` and printed `FAIL` instead of exiting, so
+`make all` returned 0 over any number of broken papers. The `defense/` papers
+were compiled by a second copy of the same swallowing loop, written inline in
+`ci.yml`. The step that checked the PDFs existed was satisfied by the 100 stale
+PDFs that used to be committed under `pdfs/` — the checkout handed the gate its
+answer before anything was compiled. And discovery was three wildcards over the
+root, `zen/` and `defense/`, so 69 of the 219 papers were compiled by nothing at
+all. Run against the tree it was guarding, the honest gate fails 24 papers.
+
+`pdfs/` is therefore a build output and is no longer tracked.
+
+Adding a paper requires it to compile: drop a `.tex` with a `\documentclass`
+anywhere but `sections/`, `shared/`, `site/` or `pdfs/`, and its PDF is expected
+from then on.
 
 `ci.yml` does not write to the repo. The predecessor pushed a `v<run_number>`
 GitHub Release and committed the PDFs back to `main`; both wrote to what is now a

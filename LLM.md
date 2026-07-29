@@ -8,20 +8,28 @@ site at https://papers.hanzo.ai built from `site/`.
 
 One way, and it runs on our own stack:
 
-    push  ->  github.com/hanzoai/papers      (a mirror)
-              .github/workflows/sync.yml      carries refs onward
-      ->  git.hanzo.ai/hanzoai/papers         CANONICAL
+    push  ->  git.hanzo.ai/hanzoai/papers    CANONICAL — push here
               .hanzo/workflows/ci.yml         compiles every paper
               .hanzo/workflows/deploy.yml     builds ghcr.io/hanzoai/papers
+      ->  github.com/hanzoai/papers           a mirror, fed by the forge
       ->  hanzoai/universe crs/papers.yaml    names the tag that is live
       ->  hanzoai/operator                    reconciles the App
       ->  hanzoai/static behind hanzoai/ingress serves papers.hanzo.ai
 
-**git.hanzo.ai is canonical; GitHub is a mirror.** `.github/workflows/` holds
-exactly one file, `sync.yml`, and its only job is getting refs to the forge. Every
-build, check and deploy is a workflow under `.hanzo/workflows/`, which the forge
-reads. `.hanzo/workflows` uses GitHub Actions syntax, so a workflow moves between
-the two by changing directory and nothing else.
+**git.hanzo.ai is canonical; GitHub is a mirror, and refs travel forge to
+GitHub, not the other way.** The forge holds a push mirror on this repo that
+sends `main` to github.com on commit. There is no path back: `.github/workflows/`
+holds no workflow at all — `bb8ad96` ("ci: drop the Gitea mirror-sync nudge")
+removed the `sync.yml` that used to nudge the forge to pull.
+
+**So a commit pushed to GitHub reaches no CI.** It is not built, and the forge
+never learns of it. As of this commit the forge is at `fec5ac6` while GitHub
+`main` is two commits ahead, which is what pushing to the mirror buys. Push to
+git.hanzo.ai.
+
+Every build, check and deploy is a workflow under `.hanzo/workflows/`, which the
+forge reads. `.hanzo/workflows` uses GitHub Actions syntax, so a workflow moves
+between the two by changing directory and nothing else.
 
 No GitHub Pages and no Cloudflare Pages. The site is an image the operator runs,
 like every other Hanzo surface.

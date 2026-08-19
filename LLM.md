@@ -12,8 +12,9 @@ One way, and it runs on our own stack:
               .hanzo/workflows/ci.yml         compiles every paper
               .hanzo/workflows/deploy.yml     builds ghcr.io/hanzoai/papers
       ->  github.com/hanzoai/papers           a mirror, fed by the forge
-      ->  hanzoai/universe crs/papers.yaml    names the tag that is live
-      ->  hanzoai/operator                    reconciles the App
+      ->  hanzoai/universe charts/app/values/hanzo/papers.yaml
+                                                pins the live tag + digest
+      ->  fleet CD / hanzoai/operator          reconciles the App
       ->  hanzoai/static behind hanzoai/ingress serves papers.hanzo.ai
 
 **git.hanzo.ai is canonical; GitHub is a mirror, and refs travel forge to
@@ -90,13 +91,13 @@ mirror. The PDFs are the run's artifact, and the site image bakes its own.
 ## Deploying the site
 
 A build never deploys itself. `deploy.yml` publishes
-`ghcr.io/hanzoai/papers:<sha>` from `site/Dockerfile`; a human sets
-`spec.image.tag` in `hanzoai/universe`
-`infra/k8s/operator/crs/papers.yaml` and adds `- papers.yaml` to that directory's
-`kustomization.yaml`. The CR is inert until both are done, which is deliberate:
-an App promoted with an empty tag takes the host down instead of leaving it
-alone.
+`ghcr.io/hanzoai/papers:<short-sha>` from `site/Dockerfile`. Promotion is declarative:
+set both `image.tag` and `image.digest` in
+`hanzoai/universe/charts/app/values/hanzo/papers.yaml`, push universe `main`, and let
+fleet CD reconcile the release. The older operator-CR path is historical and is not the
+deployment source of truth.
 
-Order: publish an image -> set the tag -> add the line -> confirm the pod is
-Running -> only then repoint `papers.hanzo.ai` off Cloudflare Pages, which today
-still answers from `infra/cf-zones/hanzo-ai.yaml` and `site/public/CNAME`.
+The website is a curated, externally checkable catalog rather than an automatic dump of
+every TeX file. Publishing a new paper therefore requires both its card in
+`site/src/config/papers.ts` and its compiled artifact in `site/public/pdfs/`. The root
+`pdfs/` directory remains CI output and is ignored.

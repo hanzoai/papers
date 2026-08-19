@@ -39,6 +39,22 @@ export const siteConfig: SiteConfig = {
   accentColor: '#00D9FF',
   logo: '/logos/hanzo-logo.svg',
   papers: [
+    {
+      id: 'hanzo-ai-chain',
+      title: 'Hanzo AI Chain (AIVM)',
+      subtitle: 'Useful-Work Mining, the Native AI Coin, and Post-Quantum Omnichain Settlement',
+      abstract: 'The canonical Proof-of-AI architecture: a real workload is admitted before mining, any conforming CPU or GPU executes its deterministic integer profile, and A-Chain alone validates the canonical transcript, consumes the global work nullifier, and authorizes AI. Z-Chain compresses finalized receipts through P3Q while Lux Quasar supplies post-quantum finality; destination chains consume receipts and never become mining authorities.',
+      pdfUrl: '/pdfs/hanzo-ai-chain.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-ai-chain/hanzo-ai-chain.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-08-18',
+      authors: ['Zach Kelling'],
+      tags: ['Proof of AI', 'A-Chain', 'P3Q', 'AI Mining'],
+      relatedLinks: [
+        { label: 'Lux AIVM settlement paper', url: 'https://papers.lux.network' },
+        { label: 'Hanzo Network', url: 'https://hanzo.network' },
+      ],
+    },
     // --- Sovereign AI, Security & Infrastructure ---
     {
       id: 'hanzo-cloud-economics',

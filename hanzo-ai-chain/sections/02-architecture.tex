@@ -1,139 +1,138 @@
 \section{Architecture}
 \label{sec:arch}
 
-\subsection{AI Chain = A-Chain, Reframed}
+\subsection{AI Chain is the Lux A-Chain}
 
-The Hanzo AI Chain is the Lux A-Chain (LP-134), the unified global
-attestation ledger, viewed as the AI Virtual Machine. There is exactly one
-chain; the term ``AI Chain'' is the public-facing identity of A-Chain when
-it is acting as the open AI protocol for the Hanzo Network. This avoids the
-proliferation of ledgers that has plagued every prior decentralized AI
-proposal: a single canonical chain hosts attestations for value-settlement
-chains (P/Q/Z lanes), and it hosts the AI registry, agent registry,
-compute markets, and AI coin economics described in this paper.
+Hanzo AI Chain is the public identity of the Lux A-Chain when it operates the
+open AI protocol. There is not a Hanzo proof chain beside A-Chain. A single
+canonical state machine owns job admission, proof policy, challenge state, work
+nullifiers, reward authorization, and receipt roots.
 
 \begin{figure}[h]
 \centering
+\resizebox{\linewidth}{!}{%
 \begin{tikzpicture}[
-    node distance=0.9cm and 1.1cm,
-    box/.style={rectangle, draw, minimum width=2.4cm, minimum height=0.7cm,
+    node distance=0.8cm and 0.85cm,
+    box/.style={rectangle, draw, minimum width=2.3cm, minimum height=0.7cm,
                 font=\small, rounded corners=1pt},
     arrow/.style={->, thick}
 ]
-\node[box] (achain) {A-Chain (= AI Chain / AIVM)};
-\node[box, below left=of achain] (lux) {Lux Quasar 3.0 (LP-105)};
-\node[box, below right=of achain] (gpu) {QuasarGPU (LP-132)};
-\node[box, below=of achain] (stm) {QuasarSTM (LP-010)};
-\node[box, above=of achain] (hmm) {HMM Registry};
-\node[box, left=of hmm] (mkts) {Compute Markets};
-\node[box, right=of hmm] (agents) {Agent Registry};
-\draw[arrow] (achain) -- (lux);
-\draw[arrow] (achain) -- (gpu);
-\draw[arrow] (achain) -- (stm);
-\draw[arrow] (hmm) -- (achain);
-\draw[arrow] (mkts) -- (achain);
-\draw[arrow] (agents) -- (achain);
+\node[box] (job) {Demand-backed AI job};
+\node[box, right=of job] (exec) {CPU/GPU execution};
+\node[box, right=of exec] (a) {A-Chain PoAI};
+\node[box, right=of a] (z) {Z-Chain P3Q};
+\node[box, right=of z] (receipt) {Settled receipt};
+\node[box, below=of z] (lux) {Lux Quasar + PQ policy};
+\node[box, below=of receipt] (dest) {Bound destination};
+\draw[arrow] (job) -- (exec);
+\draw[arrow] (exec) -- node[above,font=\scriptsize]{commit + proof} (a);
+\draw[arrow] (a) -- (z);
+\draw[arrow] (z) -- (receipt);
+\draw[arrow] (lux) -- (z);
+\draw[arrow] (receipt) -- (dest);
 \end{tikzpicture}
-\caption{The AI Chain is the AIVM persona of A-Chain. It is settled by
-Quasar 3.0, executed by QuasarGPU, and scheduled by QuasarSTM. On top of
-that single ledger sit the HMM registry, the agent registry, and the
-compute markets.}
+}
+\caption{PoAI validates useful work on A-Chain; P3Q settles it on Z-Chain; Lux
+supplies PQ-rooted finality; destinations consume receipts rather than raw work.}
 \label{fig:arch}
 \end{figure}
 
-\subsection{Settlement: Lux Quasar 3.0 (LP-105)}
+\subsection{PoAI useful-work state machine}
 
-Every block on the AI Chain is finalized by a single \emph{QuasarCert}
-that aggregates three independent post-quantum verification lanes:
+Each job progresses through
+
+\begin{equation}
+\begin{aligned}
+\textsc{Requested}&\rightarrow\textsc{Committed}
+\rightarrow\textsc{Verifying/Challengeable}\\
+&\rightarrow\textsc{Finalized}\;|\;\textsc{Rejected}\;|\;\textsc{Expired}.
+\end{aligned}
+\end{equation}
+
+A-Chain fixes the execution and proof policy before commitment. It derives any
+random challenge afterward, resolves the policy to final or rejected, checks
+metering and reward allowance, consumes the global nullifier, and creates the
+destination-bound receipt atomically. An optimistic result cannot become
+issuance-final while its challenge window remains open.
+
+\subsection{Z-Chain settlement and Lux base-layer finality}
+
+Z-Chain is the P3Q proof-compression and settlement rollup for finalized A-Chain
+receipt transitions. Its intended proof system is a Plonky3-derived,
+pairing-free STARK/FRI stack. Z-Chain does not admit jobs, determine usefulness,
+own the mining nullifier, or authorize subsidy; its proof must bind exactly to
+the finalized A-to-Z receipt transition.
+
+Lux Quasar orders and finalizes A-Chain and Z-Chain blocks. Exported roots must be
+authenticated under the validator and post-quantum policy that is actually
+activated. The security statement therefore names its assumptions: validator
+set, threshold, key lifecycle, downgrade prevention, and relay verification.
+Selecting ML-DSA in a registry does not by itself produce a threshold finality
+certificate.
+
+Pulsar and Corona explore threshold lattice signatures for consensus and
+custody. P3Q is the intended Z-Chain settlement substrate, but the exact PoAI
+AIR, recursion policy, state-transition binding, and verifier remain subject to
+protocol, audit, integration, and activation gates. This paper does not treat a
+repository or precompile address as deployment evidence.
+
+\subsection{Deterministic execution substrate}
+
+The public proof-bearing path admits a bounded deterministic graph whose
+operations define:
 
 \begin{itemize}[leftmargin=1.2em]
-  \item \textbf{P-lane} — BLS12-381 aggregate signature (classical fast path);
-  \item \textbf{Q-lane} — Corona two-round Ring-LWE threshold signature;
-  \item \textbf{Z-lane} — a Z-Chain Groth16 SNARK rolling up $N$ ML-DSA-65
-        validator signatures into a single 192-byte proof plus a 32-byte
-        public-inputs hash.
+  \item integer weights and activations, normally \texttt{int8};
+  \item wider accumulators with explicit overflow or saturation behavior;
+  \item canonical tensor layout, serialization, reduction, and rounding;
+  \item deterministic routing, normalization, sampling, and tie-breaking;
+  \item content-addressed model, input, output, runtime, and graph roots.
 \end{itemize}
 
-Lane independence guarantees that an adversary must simultaneously break
-the discrete logarithm on BLS12-381, Module-LWE for Corona, and
-Module-LWE/MSIS for ML-DSA to forge a certificate. Breaking any one or any
-two lanes leaves the third intact. See LP-105 for the formal definition,
-the certificate-subject binding, and the security proofs.
+Execution may occur on a CPU, GPU, NPU, or other backend that produces the same
+committed bytes. Accelerators improve throughput; they are not a consensus
+requirement for every validator.
 
-For the AI Chain, this means every inference receipt and every market
-state transition inherits the same three-lane post-quantum envelope used
-to settle LUX value transfers. There is no separate, weaker security tier
-for ``AI things.''
+\subsection{Evidence backends}
 
-\subsection{Execution: QuasarGPU (LP-132)}
-
-QuasarGPU is the GPU-resident execution substrate that verifies QuasarCerts
-and runs the AIVM. The same hardware that batches BLS aggregate verify
-($\sim$875\,$\mu$s for $n{=}100$), Corona batch verify ($O(1)$ amortized
-after DKG), and the single Groth16 pairing check (200--500\,$\mu$s) also
-hosts the inference kernels invoked by AIVM opcodes. Co-location is
-deliberate: a GPU that has already loaded a Hanzo model into HBM can
-service the next inference job without paging weights from main memory,
-and it can produce the TEE quote that anchors the result without leaving
-the trusted boundary.
-
-QuasarGPU exposes a small set of primitives the AIVM relies on:
-
-\begin{itemize}[leftmargin=1.2em]
-  \item \texttt{ATTEST(quote)} — produce a vendor-rooted attestation
-        quote (Intel TDX, AMD SEV-SNP, NVIDIA H100/H200/B100 confidential
-        compute, ARM CCA) covering the loaded model commitment and
-        runtime version;
-  \item \texttt{INFER(model\_root, input)} — run forward pass under the
-        attested boundary, returning $(\text{output}, \text{quote})$;
-  \item \texttt{VERIFY(quasarcert)} — verify a QuasarCert on GPU
-        (used by light clients and by cross-chain bridges).
-\end{itemize}
-
-\subsection{Scheduling: QuasarSTM Lanes (LP-010)}
-
-QuasarSTM (LP-010) is the lane-based software transactional memory model
-used by the Quasar pipeline. The AI Chain reuses the same lane
-abstraction: independent compute jobs that do not touch overlapping state
-run in parallel lanes; only state-touching transitions (operator stake
-updates, market settlement, model registry mutations) serialize. Because
-inference is read-mostly with respect to the chain (model commitments are
-read; only the receipt is written), the AI Chain achieves throughput
-limited by GPU capacity, not by chain serialization.
-
-\subsection{The AIVM Opcode Surface}
-
-The AIVM is a superset of the EVM with tensor-aware opcodes. Standard
-EVM opcodes execute unchanged. AI-specific operations are exposed as
-precompiles addressable from any EVM contract:
+The job selects one activated evidence profile:
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{lll}
+\begin{tabular}{p{0.23\linewidth}p{0.67\linewidth}}
 \toprule
-\textbf{Address} & \textbf{Name} & \textbf{Purpose} \\
+\textbf{Profile} & \textbf{Role} \\
 \midrule
-\texttt{0x0a01} & \texttt{HMM\_LOOKUP}    & Resolve model\_root → metadata \\
-\texttt{0x0a02} & \texttt{INFER\_REQUEST} & Submit inference job to market \\
-\texttt{0x0a03} & \texttt{INFER\_VERIFY}  & Verify TEE quote + receipt \\
-\texttt{0x0a04} & \texttt{TRAIN\_BOUNTY}  & Post training bounty \\
-\texttt{0x0a05} & \texttt{GPU\_LEASE}     & Lease GPU pool capacity \\
-\texttt{0x0a06} & \texttt{AGENT\_AUTH}    & Authorize agent action under cap \\
-\texttt{0x0a07} & \texttt{F\_CALL}        & Cross-chain call to F-Chain (FHE) \\
-\texttt{0x0a08} & \texttt{M\_CUSTODY}     & Cross-chain call to M-Chain (MPC) \\
+Exact replay & Canonical CPU or verifier-set recomputation for small jobs. \\
+Optimistic integer & Transcript commitment, data availability, watcher
+re-execution, and objective challenge openings. \\
+Succinct P3Q & Plonky3-derived Z-Chain settlement only after the exact PoAI AIR,
+A-to-Z binding, recursion policy, and verifier are audited and activated. \\
+Confidential compute & Optional vendor attestation for private prompts, weights,
+or outputs, combined with explicit TCB and revocation policy. \\
+Subjective quorum & Attributable judgment that may earn demand fees but cannot
+alone authorize mining subsidy. \\
 \bottomrule
 \end{tabular}
-\caption{AIVM precompile addresses. EVM contracts may call any of these
-to interact with the AI Chain registries and markets without leaving the
-solidity programming model.}
+\caption{Evidence profiles are selected by job policy; none creates another
+mining authority outside A-Chain.}
 \end{table}
 
-\subsection{Block Time and Throughput}
+\subsection{Canonical protocol objects}
 
-The AI Chain targets the same 500\,ms block time and $\geq$100\,K
-TPS-per-chain envelope as the rest of Quasar 3.0 (LP-105 §8). Inference
-throughput is bounded by aggregate operator GPU capacity, not by the
-chain itself; in practice each block can record thousands of inference
-receipts because each receipt is a fixed-size commitment, not a
-re-execution.
+The minimum consensus objects are \texttt{Mining\allowbreak Job},
+\texttt{Execution\allowbreak Commitment}, \texttt{Challenge},
+\texttt{Proof\allowbreak Finality}, \texttt{Work\allowbreak Nullifier}, and
+\texttt{Mining\allowbreak Receipt}. Public APIs are submission
+and query surfaces for these objects. An in-memory task server, GPU scheduler,
+or destination smart contract is not the canonical mining state machine.
+
+\subsection{Implementation status}
+
+The exact-integer arithmetic core, Go/Rust vectors, Solidity witness fixtures,
+and A-Chain receipt components exist as implementation evidence. The production
+system still requires a complete Zen model transcript, data-availability path,
+finalized-not-pending proof gate, verifiable metering, token-policy upgrade, PQ
+root export, Z-Chain settlement, and exactly-once destination consumption. Mining remains disabled
+until the launch gates in \S\ref{sec:deploy} pass.

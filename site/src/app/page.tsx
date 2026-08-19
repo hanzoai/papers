@@ -1,6 +1,6 @@
 import { siteConfig } from '@/config/papers'
 import { Header } from '@/components/Header'
-import { PaperCard } from '@/components/PaperCard'
+import { PaperLibrary } from '@/components/PaperLibrary'
 import { Footer } from '@/components/Footer'
 
 export default function Home() {
@@ -30,11 +30,7 @@ export default function Home() {
         {/* Papers Grid */}
         <div className="max-w-7xl mx-auto px-6 pb-20">
           {paperCount > 0 ? (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {siteConfig.papers.map((paper) => (
-                <PaperCard key={paper.id} paper={paper} />
-              ))}
-            </div>
+            <PaperLibrary papers={siteConfig.papers} />
           ) : (
             <div className="text-center py-20">
               <p className="text-muted-foreground">Papers coming soon...</p>

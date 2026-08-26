@@ -1,0 +1,236 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\input{../shared/market-preamble}
+
+\title{The Price of Certainty:\\Verification Tiers and Their Cost}
+
+\author{
+Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+\textit{Hanzo Industries Inc (Techstars '17)} \\
+Los Angeles, California \\
+\texttt{https://hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+\hanzocoverpage
+
+\begin{abstract}
+Verification is usually treated as a protocol constant: a system decides how
+work is checked and every participant lives with that choice. We argue it should
+be a purchased good with a published price curve, selected per job by the party
+bearing the loss.
+
+We enumerate six verification tiers, give each an honest cost model, and derive
+the indifference conditions that separate them. The central quantity is the
+ratio of value at risk to verification cost, and it varies over many orders of
+magnitude across the jobs a real market will carry --- which is exactly why a
+single protocol-wide soundness bar is either wasteful or unsafe, and usually
+both at once for different jobs.
+
+We also make a refinement to the claim that pricing and verification are
+orthogonal. They are orthogonal in \emph{mechanism} --- the allocator need not
+know whether the provider is honest, and the verifier need not know whether the
+price was fair. They are coupled in the \emph{objective}, because the cost of
+soundness is a term in the price. Getting this distinction right is what allows
+both to be designed independently without either being wrong.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Soundness as a demand-side parameter}
+
+A buyer posting a job faces an expected loss
+\begin{equation}
+\mathbb{E}[\text{loss}] \;=\; \pi \cdot (1 - \sigma) \cdot V,
+\end{equation}
+where $V$ is the value at risk if the answer is wrong, $\pi$ is the prior
+probability that a given provider defects, and $\sigma$ is the soundness of the
+verification tier --- the probability that a defection is caught. Buying tier
+$T$ costs $c(T)$. The buyer's problem is
+\begin{equation}
+\min_{T} \; \Big[ c(T) \;+\; \pi\,(1-\sigma(T))\,V \Big],
+\label{eq:tierchoice}
+\end{equation}
+and the optimum plainly depends on $V$, which is private to the buyer and
+differs by six or more orders of magnitude between a chat completion and a
+settlement instruction. No protocol constant can be right for both.
+
+\begin{remark}
+This is why we resist framing a market's verification level as a property of the
+market. The market's job is to make each tier available, priced, and honestly
+described. The choice belongs to whoever loses money when the answer is wrong.
+\end{remark}
+
+\section{The tiers}
+
+\subsection{T0 --- Recomputation by the buyer}
+
+The buyer runs the job itself. Soundness is total; cost is the job. Rational
+only when the buyer wanted the answer for reasons other than lacking the
+capacity to compute it --- audit sampling, spot checks at rate $q$, giving
+$\sigma = q$ at cost $q \cdot c_{\text{job}}$. Random audit at low $q$ combined
+with a large stake is often the cheapest adequate mechanism and is systematically
+underused.
+
+\subsection{T1 --- Byte equality and known-answer tests}
+
+Available only for determinism class $\mathsf{D}$. The provider's output is
+compared against a canonical implementation or a published vector set.
+Soundness is $1$ against output corruption; cost is $O(1)$ amortised when
+vectors are published, or one canonical execution otherwise. Adjudication yields
+a proof of misbehaviour rather than a vote.
+
+This tier is free in the only sense that matters --- it costs nothing beyond
+what the market already publishes --- and it is unavailable to anyone who has
+not done the work of making their kernels reproducible. That work is the subject
+of the companion paper.
+
+\subsection{T2 --- Freivalds and algebraic spot checks}
+
+For the matrix products that dominate inference, correctness of $AB = C$ is
+checkable without recomputing the product. Draw $r$ uniformly from
+$\{0,1\}^{n}$ and test
+\begin{equation}
+A(Br) \;\overset{?}{=}\; Cr .
+\end{equation}
+If $AB \neq C$ the test fails with probability at least $1/2$; after $k$
+independent rounds the soundness error is at most $2^{-k}$.
+
+The cost is three matrix--vector products, $6n^{2}$ operations, against $2n^{3}$
+for the product itself. At $n = 4096$:
+\begin{equation}
+\frac{2n^{3}}{6n^{2}} \;=\; \frac{n}{3} \;=\; \num{1365},
+\end{equation}
+so a single round costs $0.073\%$ of the product and twenty rounds --- soundness
+error below $10^{-6}$ --- costs $1.5\%$. For linear-algebra-heavy work this is
+the best value on the ladder by a wide margin, and it applies to class
+$\mathsf{S}$ where T1 does not.
+
+Its limits should be stated. Freivalds checks the linear algebra, not the
+nonlinearities, the sampling, or that the weights were the ones paid for. It is
+a strong check on the expensive part of the computation and silent about the
+rest. Combining it with a weight commitment --- the provider commits to a hash of
+the weight tensors, the buyer's job specification names the expected hash --- closes
+the most valuable of those gaps cheaply.
+
+\subsection{T3 --- Replication}
+
+Dispatch to $m$ independent providers, compare. With independent defection
+probability $\pi$ and no collusion, undetected corruption requires all $m$ to
+defect identically:
+\begin{equation}
+1 - \sigma \;=\; \pi^{m} \quad\text{(identical-defection model)},
+\qquad c(T3) \;=\; m \cdot c_{\text{job}}.
+\end{equation}
+Cost is linear in $m$; soundness is exponential. The independence assumption is
+the weak point and it is not a technicality: providers running the same image on
+the same cloud in the same region are not independent, and a market that
+allocates purely on price will systematically produce correlated committees.
+Diversity has to be an explicit allocation constraint or replication silently
+degrades to $m = 1$.
+
+\subsection{T4 --- Succinct proofs}
+
+The provider produces a proof $\pi$ that the buyer verifies in time polylogarithmic
+in the computation. Soundness is cryptographic and independent of any honesty
+assumption. Prover overhead relative to native execution is currently $10^{3}$
+to $10^{6}$, depending on arithmetization and how badly the computation fits the
+field.
+
+Rational when the same statement is verified many times, when verification must
+happen on-chain, or when $V$ is large enough that $10^{4} \times$ compute is
+still cheap insurance. For a single off-chain inference it is not close.
+
+One property matters for anything intended to outlive the current cryptographic
+era: a proof system resting on pairings or discrete logarithms is Shor-breakable,
+which makes it an odd foundation for a market that markets itself on quantum
+readiness. Groth16, KZG and PLONK all fall in that class. Our proof substrate is
+deliberately restricted to hash-based STARK/FRI with no elliptic-curve recursion
+and no pairings anywhere in the pipeline, using cSHAKE256, KMAC256 and
+TupleHash256 (FIPS 202 with SP 800-185) as the hash family throughout so that
+Merkle commitments, FRI folding and the Fiat--Shamir transform present one
+auditable surface. We note plainly that this substrate is at a stable-surface,
+audit-gated stage rather than a finished one; it should be pinned to a tagged
+release and treated as forward-looking rather than deployed.
+
+\subsection{T5 --- Hardware attestation}
+
+A trusted execution environment attests that the declared binary ran on
+unmodified hardware. Cost is near zero and soundness is high --- against a
+different adversary. The trust root moves to a silicon vendor, and the history of
+side-channel and fault attacks on such environments argues against using them as
+a sole tier for high $V$. As a cheap complement to T2, raising the cost of the
+easiest attacks, they are good value.
+
+\section{Choosing a tier}
+
+Substituting into~\eqref{eq:tierchoice}, tier $T$ dominates tier $T'$ when
+\begin{equation}
+c(T) - c(T') \;<\; \pi \, V \, \big[\sigma(T) - \sigma(T')\big].
+\end{equation}
+Writing $\rho = V / c_{\text{job}}$ for the value-to-compute ratio, the
+boundaries take a simple form.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Tier & Cost / $c_{\text{job}}$ & Soundness & Rational when \\
+\midrule
+T1 & $\approx 0$          & $1$ (class $\mathsf{D}$) & always, where available \\
+T5 & $\approx 0$          & vendor-dependent & complement, never sole \\
+T2 & $0.001k$             & $1 - 2^{-k}$ & $\rho \gtrsim 10^{2}$, linear algebra \\
+T0 & $q$                  & $q$ & $\rho \gtrsim 1/q$, with stake \\
+T3 & $m$                  & $1 - \pi^{m}$ & $\rho \gtrsim 10^{3}$, diverse committee \\
+T4 & $10^{3}$--$10^{6}$   & cryptographic & $\rho \gtrsim 10^{6}$, or on-chain \\
+\bottomrule
+\end{tabular}
+\caption{Tier selection by value-to-compute ratio $\rho$.}
+\end{table}
+
+The practical reading: most volume should sit at T1 or T2, replication should be
+reserved for jobs whose value genuinely warrants tripling the bill, and proofs
+should be reserved for statements that are settled on-chain or reused. A market
+that defaults everything to replication is burning two thirds of its compute for
+soundness that most of its jobs do not need.
+
+\section{Orthogonality, stated precisely}
+
+The claim that pricing and verification are orthogonal is right and worth
+defending, but it needs a sharper statement than it usually gets.
+
+\begin{proposition}[Mechanism orthogonality]
+The allocator requires no belief about provider honesty, and the verifier
+requires no belief about whether the clearing price was fair. Neither mechanism
+takes the other's state as input.
+\end{proposition}
+
+\begin{proposition}[Objective coupling]
+The cost of verification $c(T)$ appears as a term in the allocation objective.
+A buyer requiring T3 with a diversity constraint faces a different feasible set
+and a different clearing price than one requiring T1.
+\end{proposition}
+
+Both are true simultaneously, and the distinction is what makes the architecture
+work: because the coupling is only through a scalar cost term, the two
+mechanisms can be designed, audited, replaced and reasoned about separately.
+That is a stronger and more useful statement than unqualified independence,
+which would be false --- if verification were genuinely free of price
+consequences, no one would ever choose a cheaper tier.
+
+\section{What a market should publish}
+
+Three artifacts turn this from an analysis into infrastructure. A tier registry
+giving $c(T)$ and $\sigma(T)$ with stated assumptions, so buyers can compute
+their own optimum rather than trusting a recommendation. A per-provider
+capability declaration listing which tiers and determinism classes it honours,
+which the allocator treats as a hard constraint. And a public record of caught
+defections, which is what turns $\pi$ from a guess into a measurement --- without
+it, every buyer is solving~\eqref{eq:tierchoice} with an invented parameter.
+
+\end{document}

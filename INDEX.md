@@ -227,18 +227,21 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 ## Compute-market series
 
 Substrate, verification and economics for a decentralized market in heterogeneous
-compute. Read in any order; `surplus` states the joint arithmetic, `clearing` the
-mechanics, and the rest supply the primitives each depends on.
+compute. Start with `mechanism` (the Hamiltonian market maker we run) and `surplus` (the
+joint arithmetic); `clearing` gives the exchange mechanics and the rest supply the
+primitives each depends on.
 
 | Paper | TeX |
 |-------|-----|
 | `clearing` | `clearing/clearing.tex` |
 | `custody` | `custody/custody.tex` |
+| `mechanism` | `mechanism/mechanism.tex` |
 | `equality` | `equality/equality.tex` |
 | `residency` | `residency/residency.tex` |
 | `retrofit` | `retrofit/retrofit.tex` |
 | `search` | `search/search.tex` |
 | `soundness` | `soundness/soundness.tex` |
 | `surplus` | `surplus/surplus.tex` |
+| `training` | `training/training.tex` |
 
-**Total**: 227 papers
+**Total**: 229 papers

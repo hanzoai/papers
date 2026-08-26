@@ -1,0 +1,250 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\input{../shared/market-preamble}
+
+\title{Las Vegas Workloads:\\Verifiable Search in a Compute Market}
+
+\author{
+Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+\textit{Hanzo Industries Inc (Techstars '17)} \\
+Los Angeles, California \\
+\texttt{https://hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+\hanzocoverpage
+
+\begin{abstract}
+The obvious first workload for a decentralized compute market is inference,
+because inference is what people want to buy. It is also close to the worst
+workload the design could start with, because there is no cheap way to check it.
+
+Verifiable search is the opposite. A search job is enormous to compute and
+trivial to check, the check is binary, an invalid answer simply fails rather
+than requiring adjudication, the work is embarrassingly parallel across
+heterogeneous supply, and the input is public so provider selection carries no
+privacy constraint. Fraud is not detected --- it is impossible, which removes an
+entire layer of protocol.
+
+We formalise the class, contrast its market properties with inference, and work
+through a live example: hash-based signature search for quantum-resistant
+Bitcoin spends. The example is instructive beyond itself, because analysing it
+produces a design rule that generalises to every proof-of-work-flavoured
+construction, and because the block-space arithmetic shows how a scheme's
+container choice can dominate its cryptography.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{The class}
+
+\begin{definition}[Las Vegas workload]
+A job is a pair $(\mathcal{V}, p)$ where $\mathcal{V}(x, w) \in \{0,1\}$ is a
+predicate computable in time negligible against the search, and each independent
+trial succeeds with probability $p$. The provider's task is to find any $w$ with
+$\mathcal{V}(x,w) = 1$. Expected work is $1/p$ trials; verification cost is
+independent of the work performed.
+\end{definition}
+
+Four market properties follow directly, and together they are unusual enough to
+be worth listing.
+
+\paragraph{Verification is free.} $\mathcal{V}$ is by construction cheap. No
+proof system, no replication, no committee. The job sits at tier T1 of the
+verification ladder at zero marginal cost.
+
+\paragraph{Fraud is impossible rather than detectable.} A provider cannot submit
+a wrong answer that passes, because passing is the definition of right. There is
+nothing to slash for, because there is nothing a dishonest provider can gain.
+The worst available misbehaviour is doing nothing, which is a liveness problem
+and is priced by the deadline.
+
+\paragraph{Sharding is free.} The search space partitions cleanly. Ten thousand
+providers can work disjoint nonce ranges with no coordination beyond the initial
+assignment, and heterogeneous hardware simply contributes at whatever rate it
+manages.
+
+\paragraph{The input is public.} There is no confidential material to protect,
+so provider selection is unconstrained by privacy and the job can be broadcast
+openly. Private preimages, where the construction has them, never leave the
+owner's device --- only the public search is outsourced.
+
+\section{Why inference is harder}
+
+Inference has no cheap $\mathcal{V}$. Given a token stream, there is no
+sub-linear test that it came from the model that was paid for. Options are
+recomputation (as expensive as the job), replication (multiplies the bill),
+algebraic spot-checking of the matrix products (good, but silent about the
+nonlinearities and about which weights were used), or a succinct proof (three to
+six orders of magnitude of prover overhead).
+
+This is not an argument against building an inference market. It is an argument
+for not making the verification layer's first load-bearing test be its hardest
+case. A market that carries search volume from day one has real verified
+throughput while its inference verification story matures.
+
+\section{A worked example}
+
+\subsection{The construction}
+
+Consider a scheme that makes a Bitcoin spend's security rest on hash preimage
+resistance rather than on the discrete logarithm, using only opcodes already
+deployed --- so that coins can be protected against a Shor-capable adversary
+without waiting for a consensus change.
+
+The mechanism is forced by a limit. Bitcoin's legacy script cannot compute the
+index-selection function of a hash-based one-time signature within its
+201-opcode budget. So instead of computing which key indices a message selects,
+the script hardcodes the index set and the signer grinds the transaction ---
+varying a nonce field --- until its hash lands on that set. The grind is the
+mechanism, and it is a Las Vegas workload in exactly the sense defined above.
+
+\subsection{The arithmetic}
+
+For a scheme committing to 9 indices from 150 in a first round and 8 from the
+remaining 141 in a second:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Quantity & Value & Bits \\
+\midrule
+$\binom{150}{9}$ & \num{8.29e13} & $2^{46.2}$ \\
+$\binom{141}{8}$ & \num{3.17e12} & $2^{41.5}$ \\
+Sum, rounds sequential & \num{8.32e13} & $2^{46.2}$ \\
+Product, rounds joint & \num{2.63e26} & $2^{87.8}$ \\
+\bottomrule
+\end{tabular}
+\caption{Search size under the two possible round structures.}
+\end{table}
+
+Whether the rounds compose additively or multiplicatively is not a detail. At
+$1.5 \times 10^{10}$ hashes per second per accelerator, the additive reading is
+about \SI{1.5}{\hour} on a single device; the multiplicative reading is
+$5.6 \times 10^{8}$ device-years. Those are not two versions of the same product.
+One requires no marketplace at all; the other cannot be completed by any
+marketplace.
+
+\subsection{The design rule}
+
+The more interesting observation concerns the adversary. In a grind-secured
+scheme the honest signer's work and the attacker's work are the same
+computation: once a spend is broadcast, its preimages are public, and an
+adversary wishing to redirect the output must complete an identical search
+before the transaction confirms. Security is therefore
+\begin{equation}
+\text{margin} \;=\; \frac{\text{honest precomputation time}}{\text{confirmation window}} \cdot \frac{\text{honest rate}}{\text{adversary rate}} ,
+\end{equation}
+and the second factor is where such schemes die. Against an adversary holding
+SHA-256 application-specific silicon, a $10^{21}$ grind takes a mid-size mining
+pool about \SI{1000}{\second} and the whole network about \SI{1}{\second}, while
+ten thousand accelerators need \num{77} days.
+
+\begin{proposition}[Grind selection rule]
+Never grind a primitive for which your adversary owns dedicated silicon.
+\end{proposition}
+
+Applied here: if the ground function is a double SHA-256 the construction is
+unsound in practice regardless of its combinatorics, because the entire Bitcoin
+mining industry is an oracle for exactly that function. If it is
+RIPEMD-160 composed with SHA-256 --- the \code{HASH160} opcode --- no deployed
+miner accelerates it, general-purpose accelerators are the fastest available
+hardware, and the symmetry breaks in the defender's favour. One opcode decides
+whether the scheme works.
+
+\subsection{Container arithmetic}
+
+A second lesson is that where a script lives can dominate what it does.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+ & Bare script & Committed script path \\
+\midrule
+Funding output & \num{9661} vB & \num{43} vB \\
+Unspent-output-set cost until spent & \SI{9661}{\byte} & \SI{43}{\byte} \\
+Spend & \num{646} vB & \num{2645} vB \\
+Lifecycle total & \num{10318} vB & \num{2699} vB \\
+One million protected addresses & \SI{9.66}{\giga\byte} & \SI{43}{\mega\byte} \\
+\bottomrule
+\end{tabular}
+\caption{Block-space cost of a \SI{9650}{\byte} script by container, for one
+input and one output revealing seventeen 32-byte preimages.}
+\end{table}
+
+The inversion is instructive. The bare-script \emph{spend} is cheaper, because
+the script was already paid for when the output was created. That is precisely
+the problem: this construction is insurance, and the bare container charges the
+entire premium on day one, on chain, permanently, whether or not the policy is
+ever claimed. A committed script path defers about ninety-eight percent of the
+cost to the claim and reduces the permanent burden on every validating node by a
+factor of \num{225}.
+
+There is a caveat that outranks the table. If the construction depends on a
+script-evaluation quirk that exists only in legacy script and was removed by the
+segregated-witness upgrade, then it cannot be relocated at all, and the size
+ceiling, the opcode ceiling and the grind stop being implementation choices and
+become structural. That is the first thing to establish about any such design,
+because it determines whether the remaining questions are about tuning or about
+redesign.
+
+\subsection{The construction that needs no search}
+
+Worth stating because it reframes the whole exercise: the grind exists only
+because legacy script could not compute the index selection. The tapscript
+upgrade removed both the opcode limit and the script size limit, and hash-chain
+one-time signatures have since been implemented in that environment as bit
+commitments. Such a signature commits to the message digest directly. There is
+no index selection, therefore no grind, therefore no search job, therefore no
+compute market involvement --- and the construction is studied rather than
+bespoke.
+
+A market should want to know this. Selling compute for a search that a better
+construction eliminates is not a business; recognising it and pricing the
+remaining genuine search workloads is.
+
+\section{Market mechanics for search}
+
+\paragraph{Job specification.} Declare $\mathcal{V}$ as content-addressed code,
+the success probability $p$, the search domain, and a deadline. Expected cost is
+$1/p$ trials divided by the aggregate rate purchased.
+
+\paragraph{Partitioning.} Assign disjoint domain ranges. A provider can lie about
+which range it searched, but cannot fabricate a solution, so the worst outcome is
+duplicated effort rather than theft. Overlapping assignments with a modest
+redundancy factor are usually cheaper than the coordination needed to prevent
+overlap.
+
+\paragraph{Settlement.} Winner-take-all invites providers to hoard a solution
+until the last moment when a race is close, and pays nothing to the participants
+who bounded the risk. Proportional payment on assigned-and-attested range
+coverage plus a finder's bonus is better behaved, at the cost of needing a weak
+attestation of coverage --- which is one of the few places in this class where
+some trust re-enters.
+
+\paragraph{Pricing.} Expected work is known in advance, which makes search one of
+the few compute workloads that can be quoted as a fixed price with a genuine
+distribution rather than a guess. Variance is geometric with parameter $p$; the
+market can offer a fixed-price contract and absorb the variance across jobs,
+which is an insurance product and a real revenue line.
+
+\section{Summary}
+
+Search is the workload where a decentralized market's verification story is
+free, its adjudication story is empty, and its sharding story is trivial.
+Starting there is not a compromise; it is the case the architecture handles
+perfectly, and it buys the time needed to do inference verification properly.
+
+The example examined here also carries a warning worth generalising: a search
+workload created by a design limitation may evaporate when the limitation is
+lifted. The durable search workloads are the ones where the search is intrinsic
+to the problem, not an artifact of the container.
+
+\end{document}

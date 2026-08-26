@@ -1,0 +1,336 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\input{../shared/market-preamble}
+
+\title{Compute With Memory:\\Adapter Residency as a Price Term}
+
+\author{
+Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+\textit{Hanzo Industries Inc (Techstars '17)} \\
+Los Angeles, California \\
+\texttt{https://hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+\hanzocoverpage
+
+\begin{abstract}
+Proof of work rests on an assumption that is easy to miss because it is never
+stated: hashpower is memoryless. Any miner is interchangeable with any other
+miner at the same rate, and no miner is cheaper for one particular block than
+for another. That assumption is what permits a single scalar difficulty.
+
+Personalized agents break it. When an agent carries its own low-rank weight
+delta, a provider that has served that agent before is permanently cheaper for
+that agent than an otherwise identical provider that has not. Compute acquires
+memory, the supply side becomes non-fungible per buyer, and cost stops being a
+function of the endpoint and becomes a function of the path taken through
+resource space. That is precisely the condition under which a scalar price
+fails and a Hamiltonian formulation earns its keep.
+
+We quantify the effect. A rank-16 adapter on a 70B model is
+\SI{168}{\mega\byte} against a \SI{140}{\giga\byte} base --- a residency
+asymmetry of roughly three orders of magnitude. We derive the resulting cost
+functional, show that the na\"ive one-process-per-adapter deployment costs
+\num{175} accelerators where a batched deployment costs two, and state the
+single serving primitive that separates those two regimes. We report the exact
+state of that primitive in the Hanzo inference engine, including what is absent.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{The memorylessness assumption}
+
+Bitcoin's difficulty adjustment is a scalar because the resource it prices is
+one-dimensional and history-free. Write $h_i$ for miner $i$'s hash rate. The
+expected time for miner $i$ to find a block at difficulty $D$ is $D/h_i$,
+independent of which block, which transactions it contains, and everything
+miner $i$ has ever done before. Two consequences follow, and both are load-bearing:
+
+\begin{enumerate}[label=(\alph*)]
+\item \emph{Fungibility.} Miners at equal $h$ are perfect substitutes. There is
+no buyer-specific cost.
+\item \emph{Statelessness.} The cost of the next unit of work does not depend on
+the sequence of previous units. There is no path dependence.
+\end{enumerate}
+
+Together, (a) and (b) collapse the market to a single price per unit hash and a
+single difficulty. Neither survives contact with personalized inference.
+
+\section{Where the memory comes from}
+
+\subsection{Low-rank deltas}
+
+A low-rank adaptation replaces a frozen projection $W \in \mathbb{R}^{d_{\mathrm{out}} \times d_{\mathrm{in}}}$
+with
+\begin{equation}
+W' x = W x + s \cdot B A x,
+\qquad
+A \in \mathbb{R}^{r \times d_{\mathrm{in}}},\;
+B \in \mathbb{R}^{d_{\mathrm{out}} \times r},\;
+s = \frac{\alpha}{r},
+\end{equation}
+where $r \ll \min(d_{\mathrm{in}}, d_{\mathrm{out}})$. The pair $(A,B)$ is the
+agent's private state. Everything else is shared.
+
+This is the shape implemented in \repo{hanzo-train/src/lora.rs}, where the base
+is a frozen \code{Linear} and the delta is a separate tracked
+\code{LoraDelta \{ name, a, b, scale \}} carrying $A$ as $(r, d_{\mathrm{in}})$
+and $B$ as $(d_{\mathrm{out}}, r)$.
+
+\subsection{Parameter count and size}
+
+Adapting $T$ projections in each of $L$ layers of a model with hidden dimension
+$d$ costs
+\begin{equation}
+|\theta_{\text{adapter}}| \;=\; 2\,r\,L\,T\,d
+\end{equation}
+parameters when the adapted projections are square in $d$. At \code{bf16} the
+byte cost is twice that. Table~\ref{tab:sizes} gives the values that matter.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\toprule
+Model class & Targets & $r$ & Parameters & Size (\code{bf16}) \\
+\midrule
+7B ($d{=}4096$, $L{=}32$)  & q,k,v,o        & 8  & \num{8388608}   & \SI{16.8}{\mega\byte} \\
+7B                         & q,k,v,o        & 16 & \num{16777216}  & \SI{33.6}{\mega\byte} \\
+7B                         & q,k,v,o + mlp  & 16 & \num{29360128}  & \SI{58.7}{\mega\byte} \\
+7B                         & q,k,v,o        & 64 & \num{67108864}  & \SI{134.2}{\mega\byte} \\
+70B ($d{=}8192$, $L{=}80$) & q,k,v,o        & 8  & \num{41943040}  & \SI{83.9}{\mega\byte} \\
+70B                        & q,k,v,o        & 16 & \num{83886080}  & \SI{167.8}{\mega\byte} \\
+70B                        & q,k,v,o        & 64 & \num{335544320} & \SI{671.1}{\mega\byte} \\
+\bottomrule
+\end{tabular}
+\caption{Adapter parameter counts and sizes.}
+\label{tab:sizes}
+\end{table}
+
+\subsection{The asymmetry}
+
+Set against those figures, the base model is \SI{140}{\giga\byte} at
+\code{bf16} for a 70B, or roughly \SI{40}{\giga\byte} quantized to four bits.
+The ratio that governs everything downstream is
+\begin{equation}
+\frac{|\text{base}|}{|\text{adapter}|} \;\approx\; 10^{3}.
+\end{equation}
+
+An adapter is nearly free to move; the base it attaches to is, for practical
+purposes, immovable within any interactive latency budget. At
+\SI{10}{\giga\bit\per\second} a \SI{140}{\giga\byte} transfer takes
+\SI{112}{\second}. Against a \SI{3}{\second} service objective that is not
+expensive --- it is infeasible. Feasibility and price are therefore entangled
+through residency, which is the technical heart of this paper.
+
+\section{The cost functional}
+
+\begin{definition}[Residency state]
+For a provider $\bundle$ at time $t$, let $\beta(\bundle,t) \in \{0,1\}$
+indicate whether the base model required by job $\job$ is resident in
+accelerator memory, and $\alpha(\bundle,\job,t) \in \{0,1\}$ whether $\job$'s
+adapter is resident.
+\end{definition}
+
+The allocation objective in the heterogeneous market is then
+
+\begin{equation}
+\cost(\job,\bundle) \;=\;
+\underbrace{p(\bundle)\,\tau(\job,\bundle)}_{\text{compute}}
+\;+\; \lambda_{L}\,\ell
+\;+\; \lambda_{F}\,\phi
+\;+\; \lambda_{V}\,v
+\;+\; \underbrace{\mu_{1}\big(1-\beta\big) \;+\; \mu_{2}\big(1-\alpha\big)}_{\text{cold-start}},
+\label{eq:objective}
+\end{equation}
+
+with $\ell$ latency, $\phi$ failure risk, $v$ verification cost, and
+\begin{equation}
+\frac{\mu_{1}}{\mu_{2}} \;\approx\; \frac{|\text{base}|}{|\text{adapter}|} \;\approx\; 10^{3}.
+\end{equation}
+
+The last two terms are what a stateless spot market omits, and they are not a
+correction --- at interactive deadlines $\mu_1$ is frequently large enough to
+make the constraint binding rather than the price.
+
+\begin{proposition}[Cheapest capable is wrong]
+Let $\bundle_{1}$ be an accelerator priced at $p_{1}$ with $\beta = 1$, and
+$\bundle_{2}$ priced at $p_{2} \ll p_{1}$ with $\beta = 0$. If the deadline
+$\Delta$ satisfies $\Delta < |\text{base}| / \text{bw}(\bundle_{2})$, then
+$\bundle_{2}$ is infeasible regardless of $p_{2}$, and the correct allocation is
+$\bundle_{1}$ at arbitrarily large price ratio.
+\end{proposition}
+
+The worked instance: an accelerator at \$4/hour holding the model beats one at
+\$0.50/hour that must first fetch \SI{140}{\giga\byte}. Under a
+\SI{3}{\second} objective the cheaper machine is not in the feasible set at all.
+
+\section{Affinity, and what it implies for the market}
+
+Because $\mu_{1} \gg \mu_{2}$, agents develop \emph{affinity} for the nodes that
+already hold their base model, and their adapter follows cheaply. This produces
+structure a spot market cannot express:
+
+\paragraph{Stickiness is efficient, not rent-seeking.} Routing an agent back to
+the same provider is the cost-minimising choice, not a lock-in artifact. A
+market design that forces uniform random allocation across capable providers
+destroys real surplus.
+
+\paragraph{Eviction is a pricing decision.} An accelerator holding $k$ resident
+adapters faces a knapsack problem whenever a new agent arrives. The shadow price
+of a residency slot is the expected discounted future value of the agent
+occupying it, which is exactly the object a continuous market can quote and a
+discrete order book cannot.
+
+\paragraph{Residency is self-proving.} A provider cannot profitably lie about
+holding an agent's weights, because the lie is revealed by the deadline it then
+misses. This is unusual and useful: the market needs no attestation mechanism
+for this particular claim.
+
+\paragraph{State rent is a new instrument.} An agent may pay a small continuous
+fee to keep its adapter resident somewhere, converting a stochastic cold-start
+cost into a predictable stream. This is an option on locality. It has no
+analogue in a stateless compute market and it is a revenue line that does not
+exist today.
+
+\section{Capacity: how many agents fit}
+
+The reason this matters economically is that adapters are small enough that
+personalization is not, in fact, expensive --- once the delta stops dragging a
+base model behind it.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrr}
+\toprule
+Base & Free memory & Adapter & Resident agents \\
+\midrule
+70B \code{bf16} on \SI{180}{\giga\byte} & \SI{40}{\giga\byte} & \SI{17.2}{\mega\byte}  & \num{2326} \\
+70B \code{bf16} on \SI{180}{\giga\byte} & \SI{40}{\giga\byte} & \SI{137.4}{\mega\byte} & \num{291} \\
+70B 4-bit on \SI{80}{\giga\byte}        & \SI{40}{\giga\byte} & \SI{17.2}{\mega\byte}  & \num{2326} \\
+7B \code{bf16} on \SI{80}{\giga\byte}   & \SI{65}{\giga\byte} & \SI{17.2}{\mega\byte}  & \num{3779} \\
+\bottomrule
+\end{tabular}
+\caption{Resident agents beside one shared base, ignoring KV cache.}
+\label{tab:capacity}
+\end{table}
+
+Against that, the cost of \emph{not} sharing the base:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+100 personalized agents, 70B \code{bf16} & Memory & Accelerators \\
+\midrule
+One process per adapter & \SI{14000}{\giga\byte} & \num{175} \\
+Batched multi-adapter   & \SI{141.7}{\giga\byte} & \num{2} \\
+\bottomrule
+\end{tabular}
+\caption{The duplication cost, at \SI{80}{\giga\byte} per accelerator.}
+\label{tab:duplication}
+\end{table}
+
+An \(\approx 87\times\) reduction in the capital required to serve a
+personalized population is not an optimization. It sets the cost floor for the
+entire category, and whoever ships it first defines that floor for everyone else.
+
+\section{What exists, and the one thing that does not}
+
+We state the current position precisely, because the gap is narrow and specific
+and it is worth no one's time to mistake it for a research problem.
+
+\subsection{Training: complete}
+
+\repo{hanzo-train} is \num{2215} lines implementing trainable LoRA over frozen
+bases, AdamW, distillation, a data loader, and PEFT-format serialization whose
+tensor names match the inference-side merge. It is exposed over the serving API:
+
+\begin{lstlisting}
+POST   /v1/training/clients                       base model + LoRA injection
+GET    /v1/training/clients[/{id}]                list / inspect (+ loss history)
+POST   /v1/training/clients/{id}/forward_backward accumulate gradients
+POST   /v1/training/clients/{id}/optim_step       apply AdamW
+POST   /v1/training/clients/{id}/sample           decode from current base+delta
+POST   /v1/training/clients/{id}/save_weights     write the adapter for inference
+DELETE /v1/training/clients/{id}                  drop client, free memory
+\end{lstlisting}
+
+An agent can be given its own weights today, end to end.
+
+\subsection{Serving: co-residency yes, selection no}
+
+The inference side carries \repo{hanzo-engine/src/lora/loralinear.rs} and
+\code{qloralinear.rs}, an X-LoRA implementation under
+\repo{hanzo-engine/src/xlora\_models/}, and AnyMoE. X-LoRA is significant here
+for a reason unrelated to its purpose: it loads many adapters into one process
+simultaneously. \emph{Co-residency is solved.} What X-LoRA does with those
+adapters --- mix all of them for every token through a learned classifier --- is
+not what a market needs, but the memory management, shape handling and loading
+are done.
+
+What is absent is selection:
+
+\begin{itemize}[leftmargin=1.4em]
+\item \code{preload\_adapters} is a load-time \code{HashMap}, threaded through
+      the loaders as \code{Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>}.
+\item \code{with\_lora(adapters: Vec<String>)} is a pipeline-construction argument.
+\item \code{hanzo\_quant::lora::merge\_lora\_weights} folds the delta \emph{into}
+      the base weight at load, which destroys per-adapter separability by design.
+\item The OpenAI-compatible request in \repo{hanzo-server-core/src/openai.rs}
+      carries no adapter field.
+\end{itemize}
+
+One process therefore serves one adapter configuration, which is exactly the
+regime that costs \num{175} accelerators in Table~\ref{tab:duplication}.
+
+\subsection{The missing primitive}
+
+Batched multi-adapter serving requires that a single forward pass over a batch
+of sequences apply a \emph{different} delta per sequence:
+\begin{equation}
+y_{i} \;=\; W x_{i} \;+\; s_{a(i)} \, B_{a(i)} A_{a(i)} x_{i},
+\qquad a(i) \in \{1,\dots,k\},
+\end{equation}
+where $a(i)$ is the adapter index of sequence $i$ in the batch. Implemented as a
+segmented gather-matmul, the added cost over the shared base is
+$O(r(d_{\mathrm{in}}+d_{\mathrm{out}}))$ per token --- negligible against the
+$O(d_{\mathrm{in}}d_{\mathrm{out}})$ base projection at $r \le 64$.
+
+The unmerged forward already exists in the tree, on the training side:
+\code{LoraLinear} in \repo{hanzo-train/src/lora.rs} keeps \code{base} frozen and
+\code{delta: Option<LoraDelta>} separate, computing $s\,(x A^{\!\top}) B^{\!\top}$
+as its own path with tensor layouts documented as matching the inference merge.
+The work is to make that path batch-aware over $a(i)$, add an adapter field to
+the request, and place a cache with eviction in front of it. Every piece has a
+reference implementation in the same repository.
+
+\section{Consequence for a Hamiltonian market}
+
+With stateless homogeneous inference, a spot market for accelerator-hours is
+close to sufficient; the resource manifold is nearly a line and a price vector
+nearly spans it. Personalization is what makes the manifold genuinely coupled:
+the cost of serving a request depends on the trajectory the system has already
+taken, because that trajectory determines what is resident where.
+
+This is the concrete content of treating compute as a coupled resource system
+rather than a family of independent order books. The coupling is not between
+device types --- those really are close to substitutes at equal capability. The
+coupling is between \emph{a buyer's history} and \emph{a provider's current
+state}, and it is strong, asymmetric, and continuously varying. A scalar
+difficulty cannot express it. A Hamiltonian in $(q,p)$ over occupancy and price
+can.
+
+\section*{Availability}
+
+The inference engine, training crate, router and model catalog discussed here
+are open source under permissive licence. The adapter arithmetic in
+Tables~\ref{tab:sizes}--\ref{tab:duplication} is reproducible from the formulas
+given; no proprietary measurement is involved.
+
+\end{document}

@@ -1,0 +1,258 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\input{../shared/market-preamble}
+
+\title{Clearing Heterogeneous Compute}
+
+\author{
+Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+\textit{Hanzo Industries Inc (Techstars '17)} \\
+Los Angeles, California \\
+\texttt{https://hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+\hanzocoverpage
+
+\begin{abstract}
+An exchange for compute is not an exchange for a commodity. The thing being
+traded is a bundle --- device, memory, bandwidth, residency, locality, and the
+right to a deadline --- and the bundles are not substitutes for each other except
+under constraints that vary per job. Maintaining a separate order book per device
+class throws away the structure that matters, and quoting a single price per
+accelerator-hour throws away all of it.
+
+This paper is the mechanics. We define the job and bundle types, state the
+feasibility constraint, give the clearing objective including the residency
+terms, and show why the natural objective of minimising price is wrong in a way
+that is not marginal. We then define four order types --- including a rent on
+state, which has no analogue in a stateless market --- describe how the KV cache
+behaves as perishable inventory, and map each failure mode to a mechanism. We
+close by identifying which parts of this we already run in open source and can
+be lifted directly.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Jobs and bundles}
+
+\begin{definition}[Job]
+$\job = (m, c, \Delta, \kappa, \tau, V)$ with $m$ the model or computation
+required, $c$ the context or input size, $\Delta$ the deadline, $\kappa$ the
+determinism class, $\tau$ the required verification tier, and $V$ the buyer's
+value at risk.
+\end{definition}
+
+\begin{definition}[Bundle]
+$\bundle = (d, M, B, \beta, \alpha, \ell_{0})$ with $d$ the device, $M$ available
+accelerator memory, $B$ ingress bandwidth, $\beta \in \{0,1\}$ whether the base
+model for $m$ is resident, $\alpha \in \{0,1\}$ whether the buyer's adapter is
+resident, and $\ell_{0}$ the network round-trip to the buyer.
+\end{definition}
+
+Feasibility is a hard constraint and must be evaluated before price:
+\begin{equation}
+\bundle \models \mathrm{cap}(\job)
+\iff
+M \ge |w_{m}| + |\mathrm{kv}(c)|
+\;\wedge\;
+c \le c_{\max}(d)
+\;\wedge\;
+\kappa \in \mathcal{K}(d)
+\;\wedge\;
+\tau \in \mathcal{T}(\bundle)
+\;\wedge\;
+\hat{t}(\job,\bundle) \le \Delta .
+\end{equation}
+
+The last conjunct is where residency enters feasibility rather than cost:
+\begin{equation}
+\hat{t}(\job,\bundle) \;=\; \ell_{0}
+\;+\; (1-\beta)\frac{|w_{m}|}{B}
+\;+\; (1-\alpha)\frac{|a|}{B}
+\;+\; t_{\text{compute}} .
+\end{equation}
+
+\section{The objective, and why cheapest is wrong}
+
+\begin{equation}
+\bundle^{*} \;=\; \arg\min_{\bundle \,\models\, \mathrm{cap}(\job)}
+\Big[
+p(\bundle)\,t_{\text{compute}}
++ \lambda_{L}\ell
++ \lambda_{F}\phi
++ \lambda_{V}v(\tau)
++ \lambda_{D}\delta
++ \mu_{1}(1-\beta)
++ \mu_{2}(1-\alpha)
+\Big],
+\label{eq:clearing}
+\end{equation}
+with $\mu_{1}/\mu_{2} \approx 10^{3}$, the ratio of base-model size to adapter
+size.
+
+\begin{proposition}
+Minimising $p(\bundle)$ alone is not an approximation to~\eqref{eq:clearing}; it
+can select an infeasible bundle.
+\end{proposition}
+
+Take a job requiring a \SI{140}{\giga\byte} base under a \SI{3}{\second}
+deadline. A device at \SI{0.50}{\per\hour} without the model resident, on a
+\SI{10}{\giga\bit\per\second} link, needs \SI{112}{\second} to fetch the weights.
+It is not expensive relative to a device at \SI{4}{\per\hour} holding the model
+--- it is outside the feasible set, by a factor of \num{37} on the binding
+constraint. Any allocator that ranks by price and then filters will spend most of
+its time rejecting its own top choices.
+
+Two practical consequences. Feasibility must be evaluated first, and residency
+must be part of it. And $\mu_{1}$ is not a smooth penalty --- near an interactive
+deadline it behaves as a step, which is why a market for interactive inference
+looks less like a spot market and more like a market for scheduled capacity with
+warm state.
+
+\section{Order types}
+
+\subsection{Intent}
+
+The buyer states what it wants, not what to buy:
+\begin{lstlisting}
+intent:
+  want:        "best answer to <request>"
+  deadline:    4s
+  max_price:   0.08
+  min_tier:    T2
+  determinism: D_inf
+\end{lstlisting}
+The exchange solves~\eqref{eq:clearing}. This is the order type agents should
+use, and the reason is not convenience: an agent reasoning about device
+specifications is an agent whose behaviour breaks when the fleet changes.
+
+\subsection{Reserve}
+
+A commitment to capacity over a window, priced below spot in exchange for the
+provider's ability to plan. Standard, and it works here for the usual reasons.
+
+\subsection{Rent on state}
+
+New, and specific to this market. The buyer pays a continuous fee to keep its
+adapter --- or its model, or a conversation prefix --- resident somewhere
+capable.
+
+\begin{equation}
+\text{rent} \;=\; \rho \cdot |a| \cdot \mathrm{d}t
+\qquad\text{buys}\qquad
+\alpha = 1 \text{ with probability } \ge 1-\epsilon \text{ over the term.}
+\end{equation}
+
+The buyer converts a stochastic cold-start penalty into a predictable stream. The
+provider receives payment for memory it would otherwise hold speculatively or
+evict. This is an option on locality, it is continuously priceable, and it does
+not exist in a stateless compute market because there is no state to rent.
+
+For the provider it also resolves a real scheduling problem. An accelerator
+holding $k$ resident adapters faces a knapsack decision on every arrival, and the
+shadow price of a residency slot is the expected discounted value of its
+occupant. Rent makes that shadow price observable instead of guessed.
+
+\subsection{Search}
+
+For Las Vegas workloads: a domain, a predicate, a success probability, a
+deadline. Priced on expected work rather than measured time, settled on the first
+valid witness. Treated fully in the companion paper.
+
+\section{Cache as perishable inventory}
+
+Prefix caching means a conversation's accumulated key-value state has value that
+decays --- with time, as memory pressure evicts it, and with the conversation's
+own probability of continuing. Writing $\gamma$ for the per-turn continuation
+probability and $s$ for the saving from a cache hit, the expected value of
+retaining a prefix for one more turn is $\gamma s$, against a holding cost equal
+to the shadow price of the memory.
+
+This is an inventory problem with a known solution shape, and it is the second
+place --- after adapters --- where a continuous formulation earns its keep over
+discrete order books. The quantity being priced varies smoothly, decays
+predictably, and has a clean opportunity cost.
+
+\section{Failure modes and mechanisms}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Failure & Mechanism & Note \\
+\midrule
+Provider defects mid-job & escrow, deadline refund & no adjudication needed \\
+Deadline missed & automatic refund on timestamp & signing policy, not manual \\
+Wrong output, class $\mathsf{D}$ & byte equality & proof of misbehaviour \\
+Wrong output, class $\mathsf{S}$ & tier per job & buyer chooses \\
+Residency misreported & self-revealing & the deadline is missed \\
+Correlated committee & diversity as a constraint & otherwise $m$ collapses to 1 \\
+Price manipulation & many providers, open quotes & thin markets stay thin \\
+\bottomrule
+\end{tabular}
+\caption{Failure modes and the mechanism that addresses each.}
+\end{table}
+
+Residency deserves emphasis because it is unusually clean. A provider cannot
+profitably claim to hold weights it does not hold, since the claim is falsified
+by the deadline it then misses. The market needs no attestation for this, which
+is rare and should be exploited rather than replaced with a certificate.
+
+\section{What exists and can be lifted}
+
+Two components are in production, open source, and directly reusable.
+
+\paragraph{A model catalog with tiered routing.} Each model carries an ordered
+list of route rungs. Each rung names an upstream, a provider, a context limit,
+and two price pairs --- retail and cost --- so margin is explicit per rung rather
+than implied. Alternate arms and a synthesis route are first-class. The catalog
+validates its own invariants at load: a rung priced free may only route to a
+zero-priced upstream, a rung may not be configured to serve below cost, and every
+arm must name a known provider. Resolution maps a requested name to a concrete
+model and identifier.
+
+This is a working price-and-route layer over heterogeneous model supply. What it
+does not yet price is state locality --- the $\mu$ terms of~\eqref{eq:clearing}
+--- which is the extension this series argues for.
+
+\paragraph{A request router.} Classification maps a request to a task from
+extracted features --- text, approximate token count, media presence, explicit
+task and modality hints --- kept pure so that a learned classifier can replace the
+heuristic without touching policy. Downstream are policy, route, replica and
+ring, giving pool selection, replica choice and consistent hashing.
+
+The classifier boundary matters for an exchange: allocation quality depends on
+correctly typing incoming demand, and a market that cannot improve its
+classifier without redeploying its policy will not improve it.
+
+\paragraph{An inference engine with adapters and a training API.} Low-rank and
+quantized low-rank adapters, multi-adapter co-residency, mixture-of-adapters, and
+a training loop exposed over the serving API. The gap --- per-sequence adapter
+selection within a batch --- is stated precisely in the companion paper on
+residency.
+
+\paragraph{Settlement.} Threshold signing across twenty or more chains with
+per-job escrow and no key reconstruction, behind a signer-agnostic assembler
+boundary. Treated in the companion paper on custody.
+
+\section{Sequencing}
+
+The order that gets a market to real verified volume soonest, rather than the
+order that looks most complete on a diagram: carry search volume first, because
+verification is free and settlement is unambiguous. Add deterministic-class
+inference next, because byte equality gives it verification at no marginal cost.
+Add algebraic spot-checking for the general inference case. Add residency pricing
+and state rent once adapters are per-request selectable, because until then the
+$\mu$ terms are unobservable. Add succinct proofs last, for the statements that
+settle on chain.
+
+Every step in that order produces a market that works at the end of it, which is
+the property worth optimising for.
+
+\end{document}

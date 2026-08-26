@@ -224,4 +224,21 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `zen4-thinking_whitepaper` | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | `zen/zen4-ultra_whitepaper.tex` |
 
-**Total**: 219 papers
+## Compute-market series
+
+Substrate, verification and economics for a decentralized market in heterogeneous
+compute. Read in any order; `surplus` states the joint arithmetic, `clearing` the
+mechanics, and the rest supply the primitives each depends on.
+
+| Paper | TeX |
+|-------|-----|
+| `clearing` | `clearing/clearing.tex` |
+| `custody` | `custody/custody.tex` |
+| `equality` | `equality/equality.tex` |
+| `residency` | `residency/residency.tex` |
+| `retrofit` | `retrofit/retrofit.tex` |
+| `search` | `search/search.tex` |
+| `soundness` | `soundness/soundness.tex` |
+| `surplus` | `surplus/surplus.tex` |
+
+**Total**: 227 papers

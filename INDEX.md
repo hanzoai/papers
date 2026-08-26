@@ -234,6 +234,7 @@ primitives each depends on.
 | Paper | TeX |
 |-------|-----|
 | `clearing` | `clearing/clearing.tex` |
+| `coinage` | `coinage/coinage.tex` |
 | `custody` | `custody/custody.tex` |
 | `mechanism` | `mechanism/mechanism.tex` |
 | `equality` | `equality/equality.tex` |
@@ -244,4 +245,4 @@ primitives each depends on.
 | `surplus` | `surplus/surplus.tex` |
 | `training` | `training/training.tex` |
 
-**Total**: 229 papers
+**Total**: 230 papers

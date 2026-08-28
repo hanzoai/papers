@@ -27,7 +27,7 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 ```latex
 \author{
     Zach Kelling\thanks{Corresponding author: research@lux.network} \\
-    \textit{Lux Partners} \\
+    \textit{Lux Industries Inc} \\
     \textit{A subsidiary of Hanzo Industries Inc} \\
     \texttt{https://lux.network}
 }
@@ -62,7 +62,7 @@ For papers spanning multiple organizations:
     Zach Kelling\textsuperscript{1,2,3}\thanks{Corresponding author: research@hanzo.ai} \\
     \\
     \textsuperscript{1}\textit{Hanzo Industries Inc (Techstars '17), Los Angeles, CA} \\
-    \textsuperscript{2}\textit{Lux Partners, \texttt{research@lux.network}} \\
+    \textsuperscript{2}\textit{Lux Industries Inc \texttt{research@lux.network}} \\
     \textsuperscript{3}\textit{Zoo Labs Foundation (501(c)(3)), \texttt{research@zoo.ngo}}
 }
 ```
@@ -73,7 +73,7 @@ For papers spanning multiple organizations:
 |-------------|----------------|---------|
 | Hanzo Industries | research@hanzo.ai | hanzo.ai |
 | Hanzo AI (subsidiary) | research@hanzo.ai | hanzo.ai |
-| Lux Partners | research@lux.network | lux.network |
+| Lux Industries Inc | research@lux.network | lux.network |
 | Zoo Labs Foundation | research@zoo.ngo | zoo.ngo |
 | Zen LM | research@hanzo.ai | zenlm.ai |
 

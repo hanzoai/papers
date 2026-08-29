@@ -1,20 +1,9 @@
 import type { Metadata } from 'next'
-import { Geist, Geist_Mono } from 'next/font/google'
+import { Zen } from '@hanzo/font/sans'
+import { ZenMono } from '@hanzo/font/mono'
 import { ThemeProvider } from 'next-themes'
 import { siteConfig } from '@/config/papers'
 import './global.css'
-
-const geist = Geist({
-  subsets: ['latin'],
-  variable: '--font-geist',
-  display: 'swap',
-})
-
-const geistMono = Geist_Mono({
-  subsets: ['latin'],
-  variable: '--font-geist-mono',
-  display: 'swap',
-})
 
 export const metadata: Metadata = {
   title: `${siteConfig.name} Research Papers`,
@@ -41,7 +30,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geist.variable} ${geistMono.variable}`}
+      className={`${Zen.variable} ${ZenMono.variable}`}
       suppressHydrationWarning
     >
       <head>

@@ -48,7 +48,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-ai-chain/hanzo-ai-chain.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-08-18',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Proof of AI', 'A-Chain', 'P3Q', 'AI Mining'],
       relatedLinks: [
         { label: 'Lux AIVM settlement paper', url: 'https://papers.lux.network' },
@@ -65,7 +65,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/defense/hanzo-cloud-economics.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Sovereign AI', 'Cloud Economics', 'Sovereign Stack', 'OSS'],
     },
 
@@ -79,7 +79,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-native-stack-thesis.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Inference', 'On-Device', 'Privacy'],
     },
     {
@@ -91,7 +91,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-rocm-inference.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'ROCm', 'Inference', 'Benchmarks'],
     },
     {
@@ -103,7 +103,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-cross-backend-inference.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Inference', 'Edge', 'Benchmarks'],
     },
     {
@@ -115,7 +115,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-native-training.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Training', 'QLoRA', 'On-Device'],
     },
     {
@@ -127,7 +127,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-continuous-learning-privacy.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Privacy', 'Continual Learning', 'On-Device'],
     },
     {
@@ -139,7 +139,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-platform-infra-desktop.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-06-15',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Economics', 'Platform', 'On-Device'],
     },
 
@@ -152,7 +152,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-unified-tenant-cloud.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-07-08',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Cloud', 'Multi-Tenancy', 'SQLite', 'Benchmarks'],
     },
 
@@ -196,7 +196,7 @@ export const siteConfig: SiteConfig = {
       latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-router/main.tex',
       githubUrl: 'https://github.com/hanzoai/papers',
       date: '2026-07-07',
-      authors: ['Zach Kelling'],
+      authors: ['Hanzo AI Research'],
       tags: ['Router', 'Routing', 'Economics', 'On-Device', 'SLO'],
     },
 

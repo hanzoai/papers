@@ -5,6 +5,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | Paper | Path |
 |-------|------|
 | `astle-reactive-sdk` | `astle-reactive-sdk/astle-reactive-sdk.tex` |
+| `attestation` | `attestation/attestation.tex` |
 | `cloud-unified-binary` | `cloud-unified-binary/main.tex` |
 | `code-trajectory` | `code-trajectory/code-trajectory.tex` |
 | `cover-hanzo` | `cover-hanzo.tex` |

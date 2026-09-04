@@ -1,0 +1,1113 @@
+% Settlement — the compute ledger of the Hanzo sovereign L1 on Lux.
+\documentclass[11pt,a4paper]{article}
+\usepackage{../shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\input{../shared/lstlang}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{invariant}{Invariant}[section]
+\newtheorem{observation}{Observation}[section]
+\newtheorem{parameter}{Parameter}[section]
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  numbers=none,
+  xleftmargin=1.2em,
+  columns=fullflexible,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+% File paths and identifiers do not hyphenate, so a paragraph of them needs
+% extra interword stretch rather than a hyphenation rule that would break
+% names in misleading places.
+\sloppy
+\emergencystretch=3em
+\newcommand{\Ord}{\omega}
+\newcommand{\Claim}{c}
+\newcommand{\Ops}{\mathcal{O}}
+\newcommand{\Buyers}{\mathcal{B}}
+\newcommand{\Admit}{\textsc{Admit}}
+
+\title{Settlement\\[6pt]
+\large The Compute Ledger of the Hanzo Sovereign L1 on Lux}
+
+\author{
+Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai}\\
+\textit{Hanzo Industries, Inc.\ (Techstars '17)}\\
+\texttt{research@hanzo.ai}
+}
+
+\date{2026}
+
+\begin{document}
+
+\hanzocoverpage
+
+\begin{abstract}
+Hanzo settles paid AI compute. Buyers put credit in; operators who serve
+attested work take rewards out. This document specifies the ledger that
+connects those two flows, the predicate that decides whether a served-compute
+claim is admitted, the bond an operator posts and the conditions under which it
+is reduced, and the exact boundary between what the chain records and what stays
+off it.
+
+The chain is a sovereign L1 on Lux. No consensus, cryptography, or
+validator-set machinery is introduced here: ordering and finality are Lux
+Quasar, the post-quantum primitives are the Lux precompile block, the
+attestation verifier is the one already compiled into that block, and the L1 is
+born by \code{CreateChainTx} + \code{AddValidatorTx} + \code{ConvertNetworkTx}
+against the Lux P-chain and then runs on its own validator set with an on-chain
+manager. The contribution of this document is the accounting rules and the
+admission predicate, not a chain.
+
+We separate two money flows that the current implementation braids together. A
+buyer's escrowed credit pays an operator for work the buyer ordered: a transfer,
+conserved, bounded by the order. A protocol emission additionally rewards
+attested work: a mint, bounded by a per-epoch pool and distributed pro-rata.
+Reading the deployed code, the second flow is presently unbounded --- a single
+genuinely attested device can compute a reward of up to $6.44 \times 10^{9}$~AI
+from one claim, and can produce unboundedly many distinct claims, because the
+reward magnitude is read from an attacker-chosen field of the work proof and the
+replay key is derived from an attacker-chosen nonce. We give the specific
+predicate and accounting changes that close this, each expressed as a
+composition of primitives already present in \code{luxfi/precompile}: the
+existing ML-DSA verifier, the existing TEE device binding, and the existing
+spent set.
+
+Throughout we mark what is observed in code from what is proposed, and cite the
+file and symbol for every claim about current behaviour.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Scope and method}
+
+\subsection{What this document specifies}
+
+Five things, and nothing else:
+
+\begin{enumerate}[label=(\arabic*),leftmargin=2.2em]
+\item the ledger --- pay-per-use compute credit in, AI-work reward out;
+\item operator bonds and the conditions under which a bond is reduced,
+      including a missing or invalid attestation;
+\item the distribution of reward for served, attested compute;
+\item the admission of a served-compute claim: the attestation proof carried
+      from the serving daemon or its TEE, the predicate that accepts it, and
+      the settlement that follows;
+\item the boundary between on-chain and off-chain state.
+\end{enumerate}
+
+\subsection{What this document does not do}
+
+It does not design a chain. Ordering, finality, the validator wire, the
+post-quantum signature suite, the threshold suite, the TEE certificate-chain
+verifier, and the cross-chain message format are all Lux machinery, cited where
+used and not restated. It does not set token supply or an emission schedule: the
+published record disagrees with itself on both (\S\ref{sec:disagreement}), so we
+specify the invariant the schedule must satisfy and leave the schedule to
+governance. It does not specify the market that decides which operator serves
+which order; that is the clearing problem, treated separately.
+
+\subsection{Evidential conventions}
+
+Every statement about current behaviour is labelled and carries a file
+reference. \textbf{Observed} means the behaviour is present in code we read.
+\textbf{Derived} means it follows from observed code by an argument we give.
+\textbf{Proposed} means it does not exist and is put forward here.
+\textbf{Assumed} means it is a security or economic premise we do not prove.
+Repository roots: \code{luxfi/node}, \code{luxfi/precompile}, \code{luxfi/evm},
+\code{luxfi/consensus} under \code{\textasciitilde/work/lux}; the off-chain
+plane is \code{hanzoai/cloud}.
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be interpreted
+as in RFC 2119.
+
+%=====================================================================
+\section{The chain}
+\label{sec:chain}
+
+\subsection{Birth on the Lux P-chain}
+
+\textbf{Observed.} The Lux P-chain distinguishes the construction of a network
+from its promotion. \code{CreateNetworkTx} is the constructor
+($\emptyset \to \text{Network}$); \code{ConvertNetworkTx} is the endomorphism
+($\text{Network} \to \text{Network}$) that changes a network's security from
+inherited to sovereign and re-anchors its parent
+(\code{node/vms/platformvm/txs/convert\_network\_tx.go}). Its documentation is
+explicit that this is the L2-to-L1 promotion.
+
+The security configuration carried by that transaction is a value with two
+orthogonal axes (\code{node/vms/platformvm/security/mode.go}):
+
+\begin{lstlisting}[language=Go]
+type Mode struct {
+    RestakeParent bool
+    Admission     Admission // NoOwnSet | Open | Gated
+    Threshold     uint64    // minimum stake for Open admission
+    Manager       Manager   // PChain | Contract
+}
+func (m Mode) Sovereign() bool { return m.Admission != NoOwnSet }
+\end{lstlisting}
+
+\code{SyntacticVerify} refuses a conversion whose resulting mode is not
+sovereign (\code{ErrConvertMustEstablishOwnSet}), refuses one with no genesis
+validators (\code{ErrConvertMustHaveValidators}), and refuses
+\code{Manager == Contract} without a manager address
+(\code{ErrContractManagerNeedsAddress}).
+
+\textbf{Observed.} \code{AddValidatorTx} is the universal entry point for
+adding a validator to a network; \code{AddChainValidatorTx} carries a
+deprecation notice stating that under LP-018 validators join a network and never
+a chain, and that ``a sovereign L1 IS a primary network at its own networkID''
+(\code{add\_chain\_validator\_tx.go}). \code{CreateChainTx} creates a blockchain
+on a network.
+
+\textbf{Specification.} Hanzo is born by the sequence \code{CreateNetworkTx}
+(once, if the network does not already exist), \code{CreateChainTx},
+\code{AddValidatorTx}, \code{ConvertNetworkTx}, executed against the upstream
+Lux P-chain, with
+
+\[
+\texttt{Mode} = \{\ \texttt{RestakeParent}: \text{false},\
+\texttt{Admission}: \texttt{Open},\
+\texttt{Threshold}: \tau_{\min},\
+\texttt{Manager}: \texttt{Contract}\ \}
+\]
+
+and \code{ManagerChainID} equal to the Hanzo EVM chain, \code{ManagerAddress}
+equal to the staking contract of \S\ref{sec:bond}. After the conversion the L1
+runs on its own validator set; the Lux P-chain is used at runtime only as the
+registry that mirrors that set.
+
+\subsection{Network identity}
+
+\textbf{Convention.} A sovereign L1 runs its own primary network whose network
+identifier equals its EVM chain identifier, one identifier per environment. This
+makes staking-key derivation paths globally unique and removes wallet ambiguity.
+The node's own source states the first half of this directly: ``a sovereign L1
+IS a primary network at its own networkID''.
+
+\textbf{Observed.} Two identifiers are already assigned and in use: mainnet
+$36963$ (\code{hanzo-genesis.json} \code{config.chainId}; deployment records in
+\code{hanzo/node/contracts/lib/standard/DEPLOYMENTS.md}) and testnet $36962$
+(HIP-0024). \textbf{Proposed.} Devnet and localnet identifiers are unassigned;
+they MUST be allocated through the chain registry (HIP-1020) before use, and
+this document does not assign them.
+
+\subsection{What finality authorises}
+
+\textbf{Observed.} Lux finality is a ladder, not a boolean, and each rung
+authorises a strictly larger class of action
+(\code{consensus/engine/chain/finality.go}):
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Rung & Condition & Authorises \\
+\midrule
+Photon  & vote in flight & nothing \\
+Wave    & forming preference & nothing \\
+Nova    & $\beta$-ignition, majority stake & local execution; reorgable \\
+Quasar  & $>\!2/3$ stake certificate & export: bridges, cross-chain, settlement \\
+Horizon & post-quantum seal of that certificate & irreversible settlement \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The predicates are \code{AuthorizesLocalExecution() \{ return f >= Nova \}},
+\code{AuthorizesExport() \{ return f >= Quasar \}} and
+\code{AuthorizesIrreversibleSettlement() \{ return f >= Horizon \}}. The stake
+floors have single definitions, \code{config.TwoThirdsStakeFloor} and
+\code{config.HalfStakeFloor}, that the certificate verifier enforces.
+
+\textbf{Specification.} Each money movement in this document is bound to a rung
+in \S\ref{sec:finality}. The rule is that a movement which another party can act
+on irreversibly requires the rung that authorises irreversibility, and no
+movement is bound to a rung looser than the consequence it enables.
+
+\subsection{What is reused, and where it lives}
+
+Packages below are in \code{luxfi/precompile} unless the row names another
+repository; slot addresses are given by their significant prefix.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Concern & Mechanism & Location \\
+\midrule
+Ordering, finality & Quasar & \code{consensus}, \code{engine/chain} \\
+Signature over a claim & ML-DSA (FIPS 204) & \code{ai}, slot \code{0x012202} \\
+TEE quote verification & X.509 chain to root & \code{ai/tee\_attest.go} \\
+Attestation ABI & selectors \code{0x01}--\code{0x05} & \code{attestation}, \code{0x0300\ldots01} \\
+Replay prevention & spent set & \code{ai}, \code{IsSpent}/\code{MarkSpent} \\
+Model commitment & versioned registry & \code{modelregistry}, \code{0x0300\ldots02} \\
+Deterministic re-execution & integer transformer & \code{inference}, \code{0x0300\ldots03} \\
+Market state & provider/job records & \code{compute}, \code{0x0300\ldots10} \\
+Validator stake read & signed ballot & \code{evm}: \code{stakeweight}, \code{0x0200\ldots06} \\
+Cross-chain message & Warp & \code{evm}: \code{warp}, \code{0x0200\ldots05} \\
+Off-chain state commitment & anchor roots & \code{anchor}, \code{0x0700\ldots10} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Observed.} All of these except \code{stakeweight} are activated on Lux
+mainnet: \code{genesis/configs/mainnet/upgrade.json} lists 49
+\code{precompileUpgrades} keys at \code{blockTimestamp 1766708400}, including
+\code{aiMiningConfig}, \code{attestationConfig}, \code{computeMarketConfig},
+\code{anchorConfig}, \code{warpConfig}, \code{mldsaVerify} and
+\code{rewardManagerConfig}. \code{stakeWeightConfig} is implemented
+(\code{evm/precompile/contracts/stakeweight}) but does not appear in that file,
+so it is not active on mainnet today; \S\ref{sec:bond} depends on its
+activation.
+
+%=====================================================================
+\section{Objects}
+\label{sec:objects}
+
+We fix notation before stating any rule. $\Buyers$ is the set of buyer
+accounts, $\Ops$ the set of operator accounts. All amounts are integers in the
+smallest unit of AI ($10^{-18}$~AI); no rule in this document uses a
+non-integer.
+
+\begin{definition}[Model commitment]
+$\mu \in \{0,1\}^{256}$ is the identifier of a model version in the on-chain
+registry. \textbf{Observed:} \code{precompile/modelregistry} stores, per model
+name, a weight commitment and a version under admin control
+(\code{weightKey}, \code{verKey}, \code{IsAdmin}). $\mu$ names the pair; it
+does not prove that the named weights produced any particular output.
+\end{definition}
+
+\begin{definition}[Order]
+$\Ord = (\iota, b, \mu, \pi, \bar m, \delta, o)$, where $\iota$ is the order
+identifier, $b \in \Buyers$ the buyer, $\mu$ the model commitment, $\pi$ the
+price cap in the smallest unit, $\bar m$ the meter cap (the maximum quantity of
+work the buyer agrees to pay for, in the meter unit of \S\ref{sec:meter}),
+$\delta$ the deadline as a block height, and $o \in \Ops \cup \{\bot\}$ the
+assigned operator ($\bot$ = open to any bonded operator).
+\end{definition}
+
+\begin{definition}[Work proof]
+The byte layout the AI precompile already parses
+(\code{precompile/ai/ai\_mining.go}, \code{ParseWorkProof}):
+\begin{align*}
+&\text{deviceID}(32)\ \|\ \text{nonce}(32)\ \|\ \text{timestamp}(\text{u64})\\
+&\qquad \|\ \text{privacy}(\text{u16})\ \|\ \text{computeMinutes}(\text{u32})\ \|\ \text{teeQuote}(\ast)
+\end{align*}
+\end{definition}
+
+\begin{definition}[Attestation envelope]
+The envelope appended to a work proof
+(\code{precompile/ai/cross\_chain\_mining.go}, \code{verifyDeviceBinding}):
+\begin{align*}
+\text{envelope} &= \text{sigLen}(\text{u32})\ \|\ \text{teeSig}\ \|\ \text{receipt}\\
+\text{receipt} &= \underbrace{\text{deviceID}(32)\|\text{ts}(8)\|\text{nonce}(8)}_{\text{report, 48 B}}\ \|\ \text{certChainDER}
+\end{align*}
+\end{definition}
+
+\begin{definition}[Claim]
+$\Claim = (\iota, o, P, \sigma, \alpha, y, m, \lambda)$: the order identifier,
+the operator, the ML-DSA public key $P$, the ML-DSA signature $\sigma$ over the
+canonical claim bytes, the attestation envelope $\alpha$, the output commitment
+$y$, the meter reading $m$, and the privacy level $\lambda$.
+\end{definition}
+
+\begin{definition}[Privacy multiplier]
+$\phi: \lambda \mapsto \mathbb{N}$, in basis points. \textbf{Observed:}
+$\phi$ is \code{privacyMultipliers} in \code{precompile/ai/ai\_mining.go}, with
+$\phi(1) = 2500$ (public), $\phi(2) = 5000$ (private), $\phi(3) = 10000$
+(confidential) and $\phi(4) = 15000$ (sovereign); any other $\lambda$ is
+rejected with \code{ErrInvalidPrivacyLevel}. We reuse the function and its
+domain unchanged.
+\end{definition}
+
+\begin{definition}[Ledger accounts]
+Four maps, all held in chain state:
+$\mathrm{esc}: \Buyers \to \mathbb{N}$, escrowed credit;
+$\mathrm{lock}: \iota \to \mathbb{N}$, credit locked against an open order;
+$\mathrm{bond}: \Ops \to \mathbb{N}$, bonded stake;
+$\mathrm{earn}: \Ops \to \mathbb{N}$, claimable earnings.
+\end{definition}
+
+\begin{definition}[Epoch]
+$e$, a fixed count of blocks. $A(e)$ is the multiset of claims admitted in
+epoch $e$; $A_o(e)$ those attributed to operator $o$. $\Lambda(e)$ is the
+emission cap for the epoch, a governance parameter.
+\end{definition}
+
+%=====================================================================
+\section{The ledger}
+\label{sec:ledger}
+
+\subsection{Two flows, kept apart}
+
+Money reaches an operator by two routes with different sources, different
+bounds, and different failure modes.
+
+\begin{description}[leftmargin=1.6em,style=nextline]
+\item[Revenue.] A buyer's escrowed credit pays for work that buyer ordered. The
+source is the buyer's balance. It is a transfer: total supply is unchanged.
+Its bound is the order --- an operator cannot be paid more than the buyer
+committed.
+\item[Subsidy.] The protocol emits new AI to reward attested work in aggregate.
+The source is issuance. It is a mint: supply increases. Its bound must be
+external to any individual claim, because a claim's own fields are chosen by
+the party being paid.
+\end{description}
+
+The current implementation braids them: it computes a mint from fields of the
+claim (\S\ref{sec:admission}). A mint whose magnitude is read from a field of
+the claim is unbounded, because the claimant writes the field. Separating the
+two flows is the first change this document makes.
+
+\begin{invariant}[Conservation]
+\label{inv:conservation}
+For every epoch $e$,
+\[
+\sum_{o \in \Ops} \Delta\,\mathrm{earn}(o)
+\;=\;
+\underbrace{\sum_{b \in \Buyers} \Delta\,\mathrm{esc}(b)^{-}}_{\text{revenue, a transfer}}
+\;+\;
+\underbrace{M(e)}_{\text{subsidy, a mint}},
+\qquad
+0 \le M(e) \le \Lambda(e),
+\]
+where $\Delta\,\mathrm{esc}(b)^{-}$ is the total debited from buyer $b$. No
+other rule in this document increases $\mathrm{earn}$.
+\end{invariant}
+
+\begin{invariant}[Order bound]
+\label{inv:orderbound}
+The revenue paid against order $\Ord$ never exceeds $\pi_\Ord$, and the total
+revenue paid against $\Ord$ over its lifetime never exceeds $\mathrm{lock}(\iota)$.
+\end{invariant}
+
+\begin{invariant}[Bond solvency]
+\label{inv:bond}
+$\mathrm{bond}(o) \ge \beta_{\min}$ is a precondition of admitting any claim
+attributed to $o$. A reduction of $\mathrm{bond}(o)$ never makes it negative;
+a reduction is $\min(\mathrm{bond}(o), s)$ for the scheduled amount $s$.
+\end{invariant}
+
+\subsection{Credit in}
+
+\textbf{Proposed.} Credit enters by an escrow deposit and leaves by withdrawal
+or by payment. Three transitions:
+
+\begin{align*}
+\textsc{Deposit}(b, v)&: && \mathrm{esc}(b) \mathrel{+}= v, \text{ against a transfer of } v \text{ into the settlement contract} \\
+\textsc{Open}(\Ord)&: && \mathrm{esc}(b) \mathrel{-}= \pi_\Ord,\quad \mathrm{lock}(\iota) \mathrel{+}= \pi_\Ord \\
+\textsc{Withdraw}(b, v)&: && \mathrm{esc}(b) \mathrel{-}= v \text{ if } v \le \mathrm{esc}(b)
+\end{align*}
+
+Locked credit is not withdrawable. An order that expires unfilled at height
+$\delta$ releases its lock back to the buyer:
+$\mathrm{lock}(\iota) \to 0$, $\mathrm{esc}(b) \mathrel{+}= \mathrm{lock}(\iota)$.
+
+\textbf{Remark on denomination.} Credit is denominated in AI. Buyers who wish
+to hold a stable unit must do so outside the chain or through a separate
+instrument; introducing an oracle into the settlement path would add a trusted
+component to the one place where the chain's guarantee is supposed to be
+mechanical. This is a deliberate restriction, not an oversight, and it is a
+cost: it exposes buyers to AI price movement between deposit and use.
+
+\subsection{Rewards out}
+
+An operator's claimable balance is spent by \textsc{Claim}, which transfers
+$\mathrm{earn}(o)$ to $o$'s account. \textbf{Proposed:} a withdrawal that
+leaves the chain (a bridge, another chain) MUST NOT execute below the Horizon
+rung (\S\ref{sec:finality}).
+
+%=====================================================================
+\section{Admitting a served-compute claim}
+\label{sec:admission}
+
+\subsection{The predicate}
+
+\begin{definition}[Admission]
+$\Admit(\Claim, \Ord, h)$, evaluated at block height $h$ with block timestamp
+$t$, holds exactly when conditions A1--A7 all hold. Admission is the only
+event that moves money to an operator.
+\end{definition}
+
+\begin{description}[leftmargin=2.6em,style=sameline,labelwidth=2.2em]
+\item[A1] \emph{Form.} $\Claim$ parses; $|\text{workProof}| \ge 78$; the
+envelope's \code{sigLen} is nonzero and within bounds.
+\item[A2] \emph{Authorship.} $\textsc{VerifyMLDSA}(P, \text{claim bytes}, \sigma)$.
+The signature binds this exact claim to the key $P$.
+\item[A3] \emph{Device binding.} The receipt's certificate chain verifies to an
+embedded vendor root at the report's own timestamp; \code{teeSig} is the leaf's
+signature over the 48-byte report; and the attested device identity equals
+$\mathrm{BLAKE3}(P)$.
+\item[A4] \emph{Freshness and quote binding.} The report timestamp $t_r$
+satisfies $t - \Delta_{\text{fresh}} \le t_r \le t + \Delta_{\text{skew}}$, and
+the report nonce equals $\mathrm{BLAKE3}(\iota \,\|\, \text{chainID})$.
+\item[A5] \emph{Order binding.} $\Ord$ exists, is unfilled, $h \le \delta_\Ord$,
+$o = o_\Ord$ or $o_\Ord = \bot$, and the claim's model commitment equals
+$\mu_\Ord$.
+\item[A6] \emph{Uniqueness.} $\mathrm{workID} = \mathrm{BLAKE3}(\iota \,\|\,
+\mathrm{deviceID} \,\|\, \text{chainID})$ is unspent.
+\item[A7] \emph{Bond.} $\mathrm{bond}(o) \ge \beta_{\min}$ and $o$ is not jailed
+at $h$.
+\end{description}
+
+\subsection{Which of these exist}
+
+\textbf{Observed.} A2 and A3 are implemented, together, in
+\code{precompile/ai/cross\_chain\_mining.go}. \code{verifyAndMintWork} performs,
+in order: an ML-DSA verification over the work proof; \code{verifyDeviceBinding},
+which runs \code{verifyAttestation} against the embedded root pool and then
+checks $\text{attestedDevice} = \mathrm{BLAKE3}(P)$; and a third check that the
+work proof's own deviceID field equals $\mathrm{BLAKE3}(P)$. The verifier is
+deterministic by construction --- the chain is checked at the report's embedded
+timestamp rather than the wall clock, and the root pool is explicit rather than
+the host store (\code{precompile/ai/tee\_attest.go}, \code{tee\_roots.go}) ---
+and it fails closed: an empty or non-terminating chain cannot verify.
+
+A6 exists in a weaker form: \code{ComputeWorkId(deviceId, nonce, chainId)} keyed
+on the work proof's nonce field, with \code{IsSpent}/\code{MarkSpent} over a
+\code{BLAKE3("spnt" || workId)} slot.
+
+A1 is implemented. A4, A5 and A7 do not exist.
+
+\subsection{Why the gaps matter}
+
+\begin{observation}[The reward magnitude is written by the party being paid]
+\label{obs:magnitude}
+\textbf{Observed.} \code{CalculateReward} reads \code{privacy} and
+\code{computeMinutes} directly out of the work proof and returns
+\[
+\texttt{reward} = 10^{18} \cdot \texttt{computeMinutes} \cdot
+\frac{\texttt{multiplier}}{10000},
+\]
+with $\texttt{multiplier} \in \{2500, 5000, 10000, 15000\}$
+(\code{privacyMultipliers}). \code{mintWork} calls it after the spent check and
+returns the amount for the caller to mint. \textbf{Derived.} Neither field is
+covered by the TEE report --- \code{verifyDeviceBinding} constrains only the
+attested device identity and the signing key --- so both are chosen freely by
+whoever holds the ML-DSA key. \code{computeMinutes} is a \code{uint32}, so its
+maximum is $4{,}294{,}967{,}295$; at the \code{PrivacySovereign} multiplier the
+single-claim maximum is $6{,}442{,}450{,}942.5$~AI. That exceeds the total
+supply stated in HIP-0001 by more than six times.
+\end{observation}
+
+\begin{observation}[The replay key is also written by the claimant]
+\label{obs:replay}
+\textbf{Observed.} The spent-set key is
+$\mathrm{BLAKE3}(\text{deviceID} \| \text{nonce} \| \text{chainID})$, and
+\code{nonce} is \code{workProof[32:64]}, a field of the claim. The report's own
+nonce, \code{receipt[40:48]}, is never compared to it. \textbf{Derived.} One
+attested device can produce an unbounded family of distinct, individually valid
+claims by varying that field; the spent set bounds replay of an identical claim,
+not issuance of fresh ones. Combined with
+Observation~\ref{obs:magnitude}, a single genuine TEE device is sufficient to
+mint without bound.
+\end{observation}
+
+\begin{observation}[One quote serves forever]
+\label{obs:staleness}
+\textbf{Observed.} \code{verifyAttestation} checks the certificate chain's
+validity \emph{at the report's own timestamp}, which is what makes it
+deterministic, and nothing compares that timestamp to the block. \textbf{Derived.}
+A quote produced once remains admissible indefinitely, and remains admissible
+after the device has been decommissioned or its key exfiltrated. A4 is the fix:
+the block-relative window is the liveness check the deterministic verifier
+deliberately does not perform, and it belongs at the admission site, where a
+deterministic block timestamp is available --- the attestation precompile
+already threads exactly that value
+(\code{accessibleState.GetBlockContext().Timestamp()}) and states the rule
+``never \code{time.Now()}''.
+\end{observation}
+
+\begin{observation}[The compute market's verification is a tautology]
+\label{obs:tautology}
+\textbf{Observed.} \code{precompile/compute} at
+\code{0x0300\ldots0010} exposes \code{VerifyCompute(jobID, attestation)}, whose
+body recomputes $\mathrm{keccak256}(\text{jobID} \| \text{outputHash})$ from its
+own storage and compares it to the supplied \code{attestation}
+(\code{compute/contract.go}). \textbf{Derived.} The comparand is a function of
+values the caller already supplied through \code{ClaimReward}; any caller can
+compute it. The check establishes nothing about a TEE, a device, or an
+execution. \code{ClaimReward} itself requires only that the caller's provider
+nonce is nonzero --- that is, that the caller once called
+\code{RegisterProvider} --- and transfers no value. \textbf{Specification.} A
+claim MUST be admitted by $\Admit$; \code{compute}'s
+\code{VerifyCompute} MUST NOT be used as an admission decision. The two real
+verifiers in the block --- \code{ai.VerifyTEE} and the
+\code{attestation} adapter over it, which the latter's package documentation
+already names as ``exactly one way to verify a TEE quote across the block'' ---
+are the only ones a settlement decision may consult.
+\end{observation}
+
+\subsection{Settlement}
+
+\begin{algorithm}[H]
+\caption{Settle a claim. Executes only if $\Admit(\Claim,\Ord,h)$ holds.}
+\begin{algorithmic}[1]
+\State $u \gets \min(m_\Claim,\ \bar m_\Ord)$ \Comment{meter bounded by the order}
+\State $\rho \gets \min(\pi_\Ord,\ \mathrm{tariff}(\mu_\Ord)\cdot u)$ \Comment{revenue}
+\State $\mathrm{lock}(\iota) \mathrel{-}= \rho$; \quad $\mathrm{earn}(o) \mathrel{+}= \rho$
+\State $\mathrm{esc}(b) \mathrel{+}= \mathrm{lock}(\iota)$; \quad $\mathrm{lock}(\iota) \gets 0$ \Comment{refund the unspent cap}
+\State $W_o(e) \mathrel{+}= \phi(\lambda_\Claim)\cdot u$ \Comment{accrue the epoch weight, \S\ref{sec:reward}}
+\State $\textsc{MarkSpent}(\mathrm{workID})$
+\State mark $\Ord$ filled; record $(y_\Claim,\ o,\ h)$
+\end{algorithmic}
+\end{algorithm}
+
+Steps 1--4 are the whole of the revenue flow, and they touch no issuance. Step 5
+is the operator's only influence on the subsidy flow, and it is an addend to a
+share of a fixed pool, not an amount.
+
+\begin{proposition}[Revenue is bounded by the buyer's own commitment]
+Under A5 and A6, the total revenue an operator can obtain from order $\Ord$ is
+at most $\pi_\Ord$.
+\end{proposition}
+\begin{proof}
+A5 requires the order to be unfilled and step 7 marks it filled, so at most one
+claim settles per order. Step 2 caps $\rho$ at $\pi_\Ord$, and step 3 debits
+$\mathrm{lock}(\iota) = \pi_\Ord$, which \textsc{Open} funded from
+$\mathrm{esc}(b)$. A6 additionally prevents two claims from sharing a workID
+within one order, since $\iota$ is in the key.
+\end{proof}
+
+\begin{remark}[Why A6 changes the key]
+Deriving the workID from $\iota$ rather than a claim-chosen nonce converts the
+spent set from a duplicate filter into a one-claim-per-order rule. The change is
+one line at the call site of \code{ComputeWorkId}; the spent-set machinery,
+including its \code{BLAKE3} slot derivation and its atomic
+check-compute-mark ordering (which the current code correctly notes avoids a
+check-then-act race), is reused unchanged.
+\end{remark}
+
+\subsection{The meter}
+\label{sec:meter}
+
+\textbf{Proposed.} The meter unit is the same quantity the off-chain plane
+already records per request, so that the number the chain pays on and the number
+the invoice shows have one definition. \textbf{Observed:} the off-chain
+recorder's wire type is deliberately narrow --- subject, namespace, an exact
+decimal amount, currency, model and provider --- and carries no prompt content
+and no PII (HIP-1313). The chain reads $m$, the meter reading, from the claim
+and clamps it to $\bar m_\Ord$; the buyer set $\bar m_\Ord$ when opening the
+order.
+
+\textbf{Assumed.} The meter is not attested. A TEE quote of the form verified
+here binds a device identity and a key; it does not bind a token count or an
+elapsed time. Clamping to the buyer's cap is therefore the whole of the
+protection on the revenue side, and it is sufficient there precisely because
+the buyer chose the cap. It is \emph{not} sufficient on the subsidy side, which
+is why the subsidy is a pool share (\S\ref{sec:reward}) rather than a function
+of $m$ alone. Binding a meter to an execution requires either deterministic
+re-execution (\code{precompile/inference} makes this possible for the models it
+covers) or a proof system; both are out of scope here and named as open work in
+\S\ref{sec:open}.
+
+%=====================================================================
+\section{Operator bonds}
+\label{sec:bond}
+
+\subsection{Where the bond lives, and where it does not}
+
+\begin{observation}[The P-chain holds no slashable bond for a sovereign L1]
+\textbf{Observed.} \code{RegisterL1ValidatorTx} carries a \code{Balance} field
+documented as the validator's funding, and \code{IncreaseL1ValidatorBalanceTx}
+is documented as topping up ``an L1 validator's \emph{continuous-fee}
+balance''. On removal, the executor refunds the remainder to the registered
+\code{RemainingBalanceOwner} as a UTXO
+(\code{txs/executor/standard\_tx\_executor.go}). \textbf{Derived.} That balance
+pays for the validator's continued presence; it is refundable and is not a bond
+against misbehaviour. \textbf{Observed.} The consensus package that detects
+equivocation states the division explicitly: ``Actual stake deduction happens in
+the platformvm; this package provides detection and evidence only''
+(\code{consensus/core/slashing/slashing.go}). \textbf{Observed.} We found no
+stake-deduction path in \code{vms/platformvm/txs/executor}.
+\end{observation}
+
+\textbf{Specification.} The bond is held by the Hanzo staking contract --- the
+manager named in \code{ConvertNetworkTx} --- on the Hanzo EVM. The Lux P-chain
+holds a \emph{mirror} of the validator set's weights, not the value behind them.
+This is the direct consequence of choosing \code{Manager: Contract}, and it is
+the correct place for the bond: the faults that matter here are settlement
+faults, and settlement state is on the Hanzo EVM.
+
+\subsection{Weight is a projection of the bond}
+
+\textbf{Observed.} The manager changes a validator's weight by sending a Warp
+\code{L1ValidatorWeight} message --- $(\text{validationID}, \text{nonce},
+\text{weight})$, 49 bytes --- which the P-chain applies through
+\code{SetL1ValidatorWeightTx}. The executor verifies the message's nonce is at
+least the validator's \code{MinNonce}, and verifies via \code{verifyL1Conversion}
+that the message came from the L1's registered manager chain and manager
+address. Two behaviours are load-bearing:
+
+\begin{enumerate}[leftmargin=2.2em]
+\item \code{weight == 0} is \emph{removal}, not suspension: the executor
+refunds the remaining fee balance and deletes the validator, and refuses if this
+would remove the last validator (\code{errRemovingLastValidator}).
+\item \code{nonce == MaxUint64} is reserved for removal and is rejected with any
+nonzero weight (\code{L1ValidatorWeight.Verify}, \code{ErrNonceReservedForRemoval}).
+\end{enumerate}
+
+\textbf{Specification.} Weight is a monotone function of the bond,
+$w_o = \lfloor \mathrm{bond}(o) / \tau_{\min} \rfloor$, recomputed by the manager
+whenever the bond changes and pushed as a weight message. \textbf{Proposed:}
+jailing MUST be expressed as exclusion inside the manager and, on the P-chain,
+as a weight \emph{reduction} to a positive floor --- never as weight zero, which
+is irreversible and requires re-registration with a fresh
+\code{RegisterL1ValidatorTx} and proof of possession. A design that jails by
+sending weight zero silently converts a temporary penalty into permanent
+ejection.
+
+\subsection{Reading stake from inside the EVM}
+
+\textbf{Observed.} \code{evm/precompile/contracts/stakeweight} at
+\code{0x0200\ldots0006} lets a contract read a validator's P-chain weight and
+the set's total weight at a height, via a BLS-signed \code{Ballot} (168 bytes:
+nodeID, voter, authEpoch, P-chain height, weight, total weight, signature). The
+signed statement separates chain, node, voter and epoch, so one authorisation
+cannot be replayed onto another chain, node, address or revoked epoch; height
+and weight are deliberately \emph{not} signed and are checked against P-chain
+state instead, which is what lets one authorisation serve every later snapshot.
+The expensive work is paid in \code{PredicateGas} before execution; the
+in-execution read is 2{,}000 gas.
+
+\textbf{Specification.} The settlement contract reads participation weight
+through this precompile rather than trusting a self-reported figure. It
+therefore depends on \code{stakeWeightConfig} being activated, which it is not
+today (\S\ref{sec:chain}).
+
+\subsection{Faults and the schedule}
+
+\begin{description}[leftmargin=2.6em,style=sameline,labelwidth=2.2em]
+\item[F1] \emph{Non-delivery.} An order assigned to $o$ reaches its deadline
+$\delta$ with no admitted claim. Anyone may submit the evidence, which is the
+order identifier and the height; the chain verifies the absence itself from its
+own state. Reduction $s_1 = \min(\mathrm{bond}(o), \kappa_1 \pi_\Ord)$.
+\item[F2] \emph{Invalid attestation.} A claim attributed to $o$ satisfies A2 ---
+so authorship is attributable to a key bound to $o$ --- and fails A3 or A4. The
+evidence is the claim itself. Reduction
+$s_2 = \min(\mathrm{bond}(o), \kappa_2 \pi_\Ord)$, rate-limited to at most
+$n_2$ occurrences per epoch per operator.
+\item[F3] \emph{Output disagreement.} For an order whose model commitment names
+a deterministic profile, a challenger re-executes and submits an output
+commitment $y' \ne y$ together with the re-execution witness; the chain
+adjudicates by the deterministic path. Reduction
+$s_3 = \min(\mathrm{bond}(o), \kappa_3 \pi_\Ord)$ with $\kappa_3 > 1$.
+\item[F4] \emph{Consensus fault.} Double-vote, double-sign or downtime, as
+classified by \code{consensus/core/slashing} (\code{DoubleVote}, \code{DoubleSign},
+\code{Downtime}, with an \code{Evidence} record carrying the serialized
+conflicting votes and a \code{SlashRecord} carrying a jail expiry). Reduction
+$s_4$, a fixed fraction of the bond.
+\end{description}
+
+\begin{parameter}[Slash coefficients]
+$\kappa_1, \kappa_2, \kappa_3, n_2, s_4, \beta_{\min}, \tau_{\min},
+\Delta_{\text{fresh}}, \Delta_{\text{skew}}$ are governance parameters. This
+document fixes their \emph{constraints}, not their values.
+\end{parameter}
+
+\begin{invariant}[Deterrence]
+\label{inv:deterrence}
+$\kappa_1 \ge 1$: the penalty for accepting an order and not serving it must be
+at least the revenue foregone by serving it, or non-delivery is free whenever
+the operator finds a better use of the device. $\kappa_3 > 1$: the penalty for a
+wrong answer must exceed the payment for a right one, or fabricating output is
+profitable at any nonzero detection probability below one.
+\end{invariant}
+
+\begin{remark}[F2 is about attribution, not loss]
+An invalid attestation never settles --- $\Admit$ rejects it --- so the ledger
+loses nothing. F2 exists because submitting invalid attestations is a cheap way
+to consume verification gas and to probe the verifier, and because A2 makes the
+submission attributable to a bonded party. Its reduction should be small and
+rate-limited; treating it like F3 would punish a misconfigured operator as
+harshly as a lying one.
+\end{remark}
+
+\begin{remark}[What F1 can and cannot see]
+F1 is decidable from chain state alone: the order exists, the height has passed,
+no claim was admitted. It does not distinguish an operator who refused from one
+whose network failed. That is a deliberate limitation of a mechanism that must
+be adjudicated by a chain with no view of the operator's environment, and it
+argues for $\kappa_1$ near its lower bound rather than far above it.
+\end{remark}
+
+%=====================================================================
+\section{Distributing reward for served, attested compute}
+\label{sec:reward}
+
+\subsection{Pool share, not per-claim mint}
+
+\textbf{Proposed.} At the close of epoch $e$, each operator's subsidy is its
+share of a fixed pool:
+
+\[
+S_o(e) \;=\; \left\lfloor \Lambda(e) \cdot \frac{W_o(e)}{W(e)} \right\rfloor,
+\qquad
+W_o(e) = \sum_{\Claim \in A_o(e)} \phi(\lambda_\Claim)\, u_\Claim,
+\qquad
+W(e) = \sum_{o \in \Ops} W_o(e),
+\]
+
+with $u_\Claim$ the order-clamped meter of \S\ref{sec:meter} and $\phi$ the
+privacy multiplier of \S\ref{sec:objects}. If $W(e) = 0$ then $S_o(e) = 0$ for
+all $o$ and $M(e) = 0$: an epoch with no admitted work mints nothing. The
+remainder $\Lambda(e) - \sum_o S_o(e)$, at most $|\Ops| - 1$ units lost to the
+floors, is not minted.
+
+The multiplier values and the basis-point arithmetic are the deployed ones. What
+changes is the quantity they multiply --- the order-clamped meter rather than
+the claim's own \code{computeMinutes} --- and the fact that the product is a
+weight rather than an amount.
+
+\begin{proposition}[The mint is bounded regardless of claim contents]
+$M(e) = \sum_o S_o(e) \le \Lambda(e)$ for every epoch, for every set of
+admitted claims, whatever values the claims carry in their meter and privacy
+fields.
+\end{proposition}
+\begin{proof}
+Each $S_o(e)$ is a floor of $\Lambda(e) \cdot W_o(e)/W(e)$ with
+$W_o(e) \ge 0$ and $\sum_o W_o(e) = W(e)$; the unfloored terms sum to exactly
+$\Lambda(e)$ when $W(e) > 0$, and flooring only decreases them. The claim's
+fields influence the \emph{ratio} $W_o/W$ and therefore the split between
+operators, never the total.
+\end{proof}
+
+\begin{remark}[What a pool share does not fix]
+It bounds inflation; it does not make the split honest. An operator that
+inflates $u$ takes share from operators that do not, and the clamp
+$u \le \bar m_\Ord$ bounds that inflation only to what some buyer was willing to
+pay for. Under A5 an inflated $u$ therefore costs the inflater real escrowed
+credit, which is the mechanism that makes the share approximately truthful ---
+not the attestation. We state this plainly because it is the load-bearing
+economic assumption of the design and it is not proved here: it requires that
+a self-dealing buyer-operator pair cannot recycle credit at a profit, which
+holds only if the revenue leg is a genuine transfer with a nonzero cost
+(fees, or the opportunity cost of locked credit). See \S\ref{sec:open}.
+\end{remark}
+
+\subsection{Where the emission schedule comes from}
+\label{sec:disagreement}
+
+\textbf{Observed.} The published record disagrees. HIP-0001 states a total
+supply of $1{,}000{,}000{,}000$~AI with an emission of $100$M in year one
+halving every four years to a terminal $6.25$M. The \code{hanzo-ai-chain} paper
+in this repository states a hard maximum nominal supply of two trillion, split
+one trillion to the DAO and one trillion to proof-earned rewards on a
+Bitcoin-shaped geometric halving. HIP-0024 specifies a base staking reward of
+8\% APY with a 2--5\% AI-mining bonus, and names the consensus engine
+\code{nova}, which is a rung of the Lux finality ladder rather than an engine
+selector.
+
+\textbf{Specification.} This document does not resolve that disagreement. It
+requires only that $\Lambda: e \to \mathbb{N}$ is a total function fixed in
+chain state before epoch $e$ opens, that it is monotone non-increasing in $e$
+unless changed by governance, and that $\sum_e \Lambda(e)$ converges if a supply
+cap is claimed. The settlement rules of \S\ref{sec:ledger} and
+\S\ref{sec:reward} hold for any $\Lambda$ satisfying these conditions, so
+resolving the disagreement is a governance question and not a precondition for
+implementing them.
+
+%=====================================================================
+\section{The on-chain / off-chain split}
+\label{sec:split}
+
+\subsection{The rule}
+
+\begin{quote}
+The chain holds money and commitments. It never holds content. A number the
+chain pays on MUST be derivable from an on-chain order and a verified
+attestation; it MUST NOT come from an off-chain assertion alone.
+\end{quote}
+
+\subsection{The split}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lXl@{}}
+\toprule
+State & Where it lives & Why \\
+\midrule
+Escrow, lock, bond, earnings & Hanzo EVM, settlement contract & it is money \\
+Order (buyer, $\mu$, $\pi$, $\bar m$, $\delta$) & Hanzo EVM & the bound on payment \\
+Admission decision & Hanzo EVM, calling \code{0x0300\ldots} & it moves money \\
+Spent set & precompile state & replay is a consensus property \\
+Weight mirror & Lux P-chain, via Warp & the validator set is Lux's registry \\
+Model commitment & \code{modelregistry} & a 32-byte identifier \\
+Slash evidence and record & Hanzo EVM & adjudication must be public \\
+\midrule
+Request and response payloads & off chain, never committed & content, PII \\
+Model weights & off chain; only $\mu$ on chain & size \\
+Per-request meter detail & \code{hanzo.cloud\_usage} warehouse & volume \\
+Invoices, balances, tax & commerce ledger (HIP-1313) & not consensus \\
+Pay-per-request rail & x402 v2 (HIP-1163) & an HTTP rail, not a chain rail \\
+Matching and scheduling & clearing plane & an optimisation, not a ledger \\
+TEE quote generation & the operator's device & by construction \\
+Fleet inventory, kubeconfigs & KMS-sealed, per org (HIP-0121) & secrets \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{The one bridge between the halves}
+
+\textbf{Observed.} \code{precompile/anchor} at \code{0x0700\ldots0010} stores
+$(\text{appID}, \text{height}, \text{root})$ with per-appID height monotonicity
+and a 25{,}400-gas \code{submit}; \code{get}, \code{getLatest} and a
+range-capped \code{list} read it back.
+
+\textbf{Specification.} The off-chain usage ledger commits to the chain by
+anchoring the Merkle root of each epoch's records under a fixed appID. This gives
+a buyer a way to prove that a detail record was in the set the operator
+committed to, and gives a dispute a fixed reference. \textbf{It does not make the
+off-chain records authoritative for payment}: payment is decided by
+$\Admit$ against the order, and the anchor is evidence for reconciliation, not
+an input to settlement. An anchor whose root were an input to settlement would
+be a trusted oracle, since the party that computes the root is the party being
+paid; keeping it out of the payment path is what makes it a commitment instead.
+
+%=====================================================================
+\section{Binding money movements to finality}
+\label{sec:finality}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Movement & Required rung & Reason \\
+\midrule
+\textsc{Deposit}, \textsc{Open}, lock release & Nova & local, reversible with the block \\
+Admission and $\mathrm{earn}$ credit & Quasar & a counterparty will act on it \\
+Bond reduction (F1--F4) & Quasar & it is adverse to a third party \\
+Weight message to the P-chain & Quasar & it is an export \\
+Operator withdrawal off chain & Horizon & irreversible \\
+Cross-chain claim of earnings & Horizon & irreversible \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Derived.} The middle rows follow from the ladder's own statement that a
+block below Quasar can never be exported as deterministically final to a bridge,
+another chain, or an irreversible settlement, since Nova is reorgable by a lone
+equivocator holding a bare majority. The last two rows follow from
+\code{AuthorizesIrreversibleSettlement}, which requires the post-quantum seal.
+
+\begin{remark}
+Admission is placed at Quasar rather than Horizon deliberately. Admission
+credits an internal balance; it does not release value from the chain. Requiring
+the post-quantum seal for every claim would push settlement latency to the
+sealing cadence for no security gain, because the balance cannot leave without
+crossing the Horizon requirement anyway.
+\end{remark}
+
+%=====================================================================
+\section{Threat model}
+\label{sec:threat}
+
+\subsection{Assets}
+
+Escrowed buyer credit; operator bonds; the issuance right (the ability to
+increase supply); the integrity of the validator set; and buyer request content,
+which the chain never holds.
+
+\subsection{Adversaries}
+
+\begin{description}[leftmargin=1.6em,style=nextline]
+\item[A device holder.] Controls a genuine, vendor-certified TEE and its
+attestation key. Can produce arbitrarily many valid quotes for that device.
+\emph{This is the adversary the current implementation does not survive}
+(Observations~\ref{obs:magnitude}, \ref{obs:replay}).
+\item[A registered operator.] Holds a bond and serves orders. May under-serve,
+fabricate output, or inflate the meter.
+\item[A self-dealing pair.] A buyer and an operator under one principal,
+recycling credit to farm subsidy share.
+\item[A validator minority.] Below the Quasar floor. May equivocate; cannot
+export.
+\item[A network adversary.] Delays or reorders messages; cannot forge a
+certificate chain or an ML-DSA signature.
+\end{description}
+
+\subsection{Assumed}
+
+The embedded vendor roots are the correct trust anchors and their private keys
+are not compromised. ML-DSA at the deployed parameter set is unforgeable. A TEE
+that verifies has not had its attestation key extracted. Fewer than one third of
+stake is Byzantine. None of these is proved here; the first is the weakest,
+because a single vendor root compromise admits arbitrary claims, and it is why
+A7 (a bond) is a precondition of admission rather than an alternative to
+attestation.
+
+\subsection{Explicitly not covered}
+
+Confidentiality of the request payload against the operator; the operator sees
+it by construction unless the model runs inside the TEE, which the attestation
+verified here does not establish. Correctness of the model weights behind $\mu$.
+The economics of the clearing that assigns orders.
+
+%=====================================================================
+\section{Activation}
+\label{sec:activation}
+
+\textbf{Proposed.} The changes this document requires, in dependency order:
+
+\begin{enumerate}[leftmargin=2.2em]
+\item Activate \code{stakeWeightConfig} in the Hanzo chain's upgrade
+configuration; the module is registered
+(\code{evm/precompile/registry/registry.go}) and implemented but absent from the
+Lux mainnet \code{upgrade.json}.
+\item Add the four missing admission conditions. A4 needs the block timestamp
+already threaded into the attestation precompile and a nonce comparison; A5,
+A6 and A7 need the order and bond state that the settlement contract holds. A6
+is a change of argument to \code{ComputeWorkId}, not new machinery.
+\item Deploy the settlement contract and register it as the manager address in
+\code{ConvertNetworkTx}; until then the L1 cannot be sovereign with
+\code{Manager: Contract}.
+\item Change the subsidy path from a per-claim mint to an epoch pool share.
+\code{CalculateReward} remains useful as the weight function $\phi \cdot u$;
+its output stops being an amount and becomes an addend.
+\item Retire \code{compute.VerifyCompute} as an admission decision
+(Observation~\ref{obs:tautology}). The market records in \code{precompile/compute}
+may remain as an index; they must not gate money.
+\end{enumerate}
+
+Each of steps 2, 4 and 5 is a behaviour change to an activated mainnet
+precompile and therefore requires a new activation timestamp rather than an
+in-place edit.
+
+%=====================================================================
+\section{Limitations and open questions}
+\label{sec:open}
+
+\begin{enumerate}[leftmargin=2.2em]
+\item \emph{The meter is unattested.} Nothing in the verified quote binds a
+token count or an elapsed time. The revenue side is protected by the buyer's cap;
+the subsidy side is protected only by the cost of the revenue leg. Closing this
+properly requires deterministic re-execution --- \code{precompile/inference} is
+a byte-exact integer transformer built for exactly this, with the
+CPU/Metal/CUDA/HIP parity treated as a release conformance test --- or a
+succinct proof. Neither is specified here.
+\item \emph{Self-dealing is bounded but not eliminated.} We assert that a
+buyer-operator pair pays a real cost to recycle credit; we do not derive the
+condition under which subsidy share exceeds that cost. This needs the fee and
+$\Lambda$ parameters to be fixed and then measured, not argued.
+\item \emph{Only one vendor root is embedded.} \code{tee\_roots.go} contains the
+Intel SGX Provisioning Certification Root CA and states that chains presenting
+another vendor's leaf fail closed until that vendor's root is appended.
+HIP-0024's validator requirements name NVTrust GPU attestation. \textbf{Derived:}
+GPU quotes do not verify today. Adding a root is a consensus change and must go
+through activation.
+\item \emph{F3 needs an adjudication procedure.} We give the fault and the
+penalty constraint; the challenge protocol --- who may challenge, over what
+window, at what deposit, and how the re-execution is bounded in gas --- is not
+specified.
+\item \emph{Jail semantics on the P-chain.} We specify jail as a weight
+reduction to a positive floor because weight zero is removal. The interaction
+between a jailed operator's reduced weight and \code{errRemovingLastValidator}
+in a small validator set is not analysed.
+\item \emph{Credit is denominated in AI.} Buyers carry price exposure between
+deposit and use. A stable-denominated credit requires a price input in the
+settlement path, which we declined; whether that trade is right is an open
+question and depends on buyer behaviour we have not measured.
+\end{enumerate}
+
+%=====================================================================
+\section{Summary of evidence}
+
+File paths below are given by their leaf; the full paths are in the references.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}Xll@{}}
+\toprule
+Claim & Source & Status \\
+\midrule
+L1 promotion is \code{ConvertNetworkTx}, own set required & \code{convert\_network\_tx.go} & observed \\
+Security mode has two orthogonal axes & \code{security/mode.go} & observed \\
+Weight zero is removal, not suspension & \code{standard\_tx\_executor.go} & observed \\
+P-chain validator balance is a fee balance & \code{increase\_\ldots\_balance\_tx.go} & observed \\
+Consensus detects faults, does not deduct stake & \code{core/slashing} & observed \\
+Export needs Quasar; irreversibility needs Horizon & \code{finality.go} & observed \\
+TEE verification is real and fails closed & \code{ai/tee\_attest.go} & observed \\
+Device binding is $\mathrm{deviceID} = \mathrm{BLAKE3}(P)$ & \code{cross\_chain\_mining.go} & observed \\
+Only the Intel SGX root is embedded & \code{ai/tee\_roots.go} & observed \\
+Reward reads attacker-chosen \code{computeMinutes} & \code{ai/ai\_mining.go} & observed \\
+Single-claim maximum $6.44\times10^{9}$~AI & \code{uint32} $\times$ 1.5 & derived \\
+Spent-set key uses an attacker-chosen nonce & \code{ComputeWorkId} site & observed \\
+\code{compute.VerifyCompute} is caller-computable & \code{compute/contract.go} & observed \\
+\code{stakeWeightConfig} is not activated on mainnet & \code{upgrade.json} & observed \\
+Admission predicate A1--A7 & this document & proposed \\
+Two-flow ledger and pool-share subsidy & this document & proposed \\
+Fault classes F1--F4 and their constraints & this document & proposed \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+%=====================================================================
+\section*{References}
+\addcontentsline{toc}{section}{References}
+
+\begin{enumerate}[label={[\arabic*]},leftmargin=2.6em]
+\item Lux P-chain transaction set. \code{luxfi/node}, \code{vms/platformvm/txs}:
+\code{create\_network\_tx.go}, \code{create\_chain\_tx.go},
+\code{add\_chain\_validator\_tx.go} (deprecation notice),
+\code{convert\_network\_tx.go}, \code{register\_l1\_validator\_tx.go},
+\code{set\_l1\_validator\_weight\_tx.go},
+\code{increase\_l1\_validator\_balance\_tx.go}, \code{disable\_l1\_validator\_tx.go}.
+\item Lux network security model. \code{luxfi/node},
+\code{vms/platformvm/security/mode.go}; LP-018, network security modes.
+\item Lux Warp validator messages. \code{luxfi/node},
+\code{vms/platformvm/warp/message}: \code{chain\_to\_l1\_conversion.go},
+\code{l1\_validator\_registration.go}, \code{l1\_validator\_weight.go}.
+\item Lux finality ladder. \code{luxfi/consensus},
+\code{engine/chain/finality.go}, \code{engine/chain/cert.go},
+\code{config} stake floors, \code{conformance/corpus.json}.
+\item Equivocation detection. \code{luxfi/consensus}, \code{core/slashing}.
+\item AI mining precompile. \code{luxfi/precompile}, \code{ai}:
+\code{ai\_mining.go}, \code{tee\_attest.go}, \code{tee\_roots.go},
+\code{cross\_chain\_mining.go}.
+\item Attestation precompile. \code{luxfi/precompile}, \code{attestation}.
+\item Compute market precompile. \code{luxfi/precompile}, \code{compute}.
+\item Model registry and deterministic inference. \code{luxfi/precompile},
+\code{modelregistry}, \code{inference}.
+\item Anchor precompile. \code{luxfi/precompile}, \code{anchor}.
+\item Stake-weight precompile. \code{luxfi/evm},
+\code{precompile/contracts/stakeweight}.
+\item Post-quantum precompile block, slots \code{0x012201}--\code{0x012208}.
+\code{luxfi/precompile}: \code{mlkem}, \code{mldsa}, \code{slhdsa}, \code{pulsar},
+\code{p3q}, \code{corona}, \code{magnetar}, \code{hqc}; LP-4200.
+\item Mainnet precompile activation. \code{luxfi/genesis},
+\code{configs/mainnet/upgrade.json}.
+\item HIP-0001, AI --- Hanzo's native currency.
+\item HIP-0024, Hanzo Sovereign L1 Chain Architecture.
+\item HIP-0096, AI Compute Contribution Rewards.
+\item HIP-0121, BYO Compute Fleet \& Metered Billing.
+\item HIP-1020, Chain Registry.
+\item HIP-1163, x402 --- Pay Per Request.
+\item HIP-1313, Usage --- The Metered Record.
+\item \emph{Clearing Heterogeneous Compute}, Hanzo AI Research, this repository.
+\item \emph{Hanzo AI Chain (AIVM)}, Hanzo AI Research, this repository.
+\end{enumerate}
+
+\end{document}

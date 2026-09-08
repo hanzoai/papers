@@ -1,0 +1,58 @@
+\section{Execution at rest: an agent is a goroutine}
+\label{sec:execution}
+
+An agent that \emph{is} running --- waiting on a tool call, a model response, or
+another agent --- needs something to hold its place. In the shape this platform
+uses that something is a goroutine: a stack, a scheduler entry, and a channel it
+is parked on. Go allocates a goroutine an initial stack of 2\,KiB that grows and
+shrinks on demand~\cite{gostack}, so a fleet's memory is bounded by what the
+agents actually hold rather than by a per-agent reservation chosen in advance.
+
+We spawned \rFleetAgents{} goroutines, each parked as an agent loop would be,
+and measured heap after a forced garbage collection.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrl}
+\toprule
+\textbf{\rFleetAgents{} live execution contexts} & \textbf{median} & \textbf{range} \\
+\midrule
+Spawn, per agent          & \rGoSpawn{}\,ns  & \rGoSpawnLo{}--\rGoSpawnHi{}\,ns \meas{} \\
+Heap, per agent           & \textbf{\rGoPer{}\,bytes} & identical, 5 runs \meas{} \\
+Heap, total               & \rGoHeap{}\,MB   & identical, 5 runs \meas{} \\
+Wake all, per agent       & \rGoWake{}\,ns   & \rGoWakeLo{}--\rGoWakeHi{}\,ns \meas{} \\
+\bottomrule
+\end{tabular}
+\caption{Execution residency, five runs of a built binary. Memory was
+byte-identical on every run; latencies are medians with the observed range.}
+\label{tab:goroutine}
+\end{table}
+
+\paragraph{\rGoPer{} bytes, not 2 KiB.}
+The initial stack is 2\,KiB, but the measured cost is \rGoPer{}\,bytes, because
+a parked goroutine that has not descended into a deep call has not touched most
+of its stack and the runtime has not committed it. The figure was identical on
+all five runs, which is what one expects from a deterministic allocator under a
+forced GC and is a useful check that the measurement is measuring anything at
+all.
+
+Against the container floor this is the paper's widest ratio. A commodity
+serverless container reserves 128\,MiB at minimum~\cite{modal}; a parked agent
+loop costs \rGoPer{}\,bytes. That is a factor of roughly $223{,}000$. The two
+are not substitutes --- \S\ref{sec:isolation} is about exactly what the container
+buys --- but a great many agents in a real fleet are waiting on a network round
+trip and need none of it.
+
+\paragraph{Spawn and wake are effectively free.}
+At \rGoSpawn{}\,ns, creating an agent's execution context is cheaper than a
+single cache miss. At \rGoWake{}\,ns per agent, waking the entire million-agent
+fleet takes 114\,ms. Neither number constrains any design: an architecture that
+avoids spawning agent contexts to save time is optimizing something that costs
+nanoseconds.
+
+\paragraph{What this measures, and what it does not.}
+It measures an \emph{empty} loop --- an agent holding a place, not a
+conversation. A real agent holds context, and that context is the dominant term
+in its live memory. \rGoPer{}\,bytes is therefore a \emph{floor} on execution
+residency and not a prediction of it. \S\ref{sec:limits} takes this seriously,
+because it is the single easiest number in this paper to misuse.

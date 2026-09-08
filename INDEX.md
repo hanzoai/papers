@@ -6,10 +6,13 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 |-------|------|
 | `astle-reactive-sdk` | `astle-reactive-sdk/astle-reactive-sdk.tex` |
 | `attestation` | `attestation/attestation.tex` |
+| `clearing` | `clearing/clearing.tex` |
 | `cloud-unified-binary` | `cloud-unified-binary/main.tex` |
 | `code-trajectory` | `code-trajectory/code-trajectory.tex` |
+| `coinage` | `coinage/coinage.tex` |
 | `cover-hanzo` | `cover-hanzo.tex` |
 | `crowdstart-commerce` | `crowdstart-commerce/crowdstart-commerce.tex` |
+| `custody` | `custody/custody.tex` |
 | `hanzo-agentic-ai` | `defense/hanzo-agentic-ai.tex` |
 | `hanzo-agentic-prowess` | `defense/hanzo-agentic-prowess.tex` |
 | `hanzo-assured-networking` | `defense/hanzo-assured-networking.tex` |
@@ -30,6 +33,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-zap-protocol` | `defense/hanzo-zap-protocol.tex` |
 | `earle-genetic-marketing` | `earle-genetic-marketing/earle-genetic-marketing.tex` |
 | `enso` | `enso/main.tex` |
+| `equality` | `equality/equality.tex` |
 | `evolutionary-schedule-search` | `evolutionary-schedule-search.tex` |
 | `hanzo-4-0-launch` | `hanzo-4-0-launch/hanzo-4-0-launch.tex` |
 | `hanzo-aci` | `hanzo-aci/hanzo-aci.tex` |
@@ -68,6 +72,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-digital-securities-integration` | `hanzo-digital-securities-integration/hanzo-digital-securities-integration.tex` |
 | `hanzo-distributed-decode-latency` | `hanzo-distributed-decode-latency.tex` |
 | `hanzo-distributed-open-problems` | `hanzo-distributed-open-problems.tex` |
+| `hanzo-dormant-agents` | `hanzo-dormant-agents/hanzo-dormant-agents.tex` |
 | `hanzo-dso` | `hanzo-dso/hanzo-dso.tex` |
 | `hanzo-edge-inference` | `hanzo-edge-inference.tex` |
 | `hanzo-encryption-security` | `hanzo-encryption-security/hanzo-encryption-security.tex` |
@@ -105,6 +110,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-mcp-server` | `hanzo-mcp-server/hanzo-mcp-server.tex` |
 | `hanzo-mean-field-alignment` | `hanzo-mean-field-alignment.tex` |
 | `hanzo-ml-framework` | `hanzo-ml-framework/hanzo-ml-framework.tex` |
+| `hanzo-multi-hop-retrieval` | `hanzo-multi-hop-retrieval/hanzo-multi-hop-retrieval.tex` |
 | `hanzo-native-stack-thesis` | `hanzo-native-stack-thesis.tex` |
 | `hanzo-native-training` | `hanzo-native-training.tex` |
 | `hanzo-network-architecture` | `hanzo-network-architecture/hanzo-network-architecture.tex` |
@@ -132,11 +138,20 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-unified-tenant-cloud` | `hanzo-unified-tenant-cloud.tex` |
 | `hanzo-vector-search` | `hanzo-vector-search.tex` |
 | `hanzo-webhooks` | `hanzo-webhooks/hanzo-webhooks.tex` |
+| `hanzod-attested-compute` | `hanzod-attested-compute.tex` |
 | `hip-0302-replicate` | `hip-0302-replicate/hip-0302-replicate.tex` |
 | `lightspeed-dex` | `lightspeed-dex/lightspeed-dex.tex` |
+| `mechanism` | `mechanism/mechanism.tex` |
 | `native-object-store-vfs` | `native-object-store-vfs.tex` |
 | `ntt-transform` | `ntt-transform/ntt-transform.tex` |
 | `refutation-driven-perf` | `refutation-driven-perf.tex` |
+| `residency` | `residency/residency.tex` |
+| `retrofit` | `retrofit/retrofit.tex` |
+| `search` | `search/search.tex` |
+| `settlement` | `settlement/settlement.tex` |
+| `soundness` | `soundness/soundness.tex` |
+| `surplus` | `surplus/surplus.tex` |
+| `training` | `training/training.tex` |
 | `verus-analytics` | `verus-analytics/verus-analytics.tex` |
 | `training-without-retention` | `zen/training-without-retention.tex` |
 | `zen_family_overview` | `zen/zen_family_overview.tex` |
@@ -225,25 +240,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `zen4-thinking_whitepaper` | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | `zen/zen4-ultra_whitepaper.tex` |
 
-## Compute-market series
-
-Substrate, verification and economics for a decentralized market in heterogeneous
-compute. Start with `mechanism` (the Hamiltonian market maker we run) and `surplus` (the
-joint arithmetic); `clearing` gives the exchange mechanics and the rest supply the
-primitives each depends on.
-
-| Paper | TeX |
-|-------|-----|
-| `clearing` | `clearing/clearing.tex` |
-| `coinage` | `coinage/coinage.tex` |
-| `custody` | `custody/custody.tex` |
-| `mechanism` | `mechanism/mechanism.tex` |
-| `equality` | `equality/equality.tex` |
-| `residency` | `residency/residency.tex` |
-| `retrofit` | `retrofit/retrofit.tex` |
-| `search` | `search/search.tex` |
-| `soundness` | `soundness/soundness.tex` |
-| `surplus` | `surplus/surplus.tex` |
-| `training` | `training/training.tex` |
-
-**Total**: 230 papers
+**Total**: 235 papers

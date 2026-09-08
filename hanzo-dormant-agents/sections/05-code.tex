@@ -1,0 +1,62 @@
+\section{Code: three language runtimes, none of them a container}
+\label{sec:code}
+
+An agent that only waits is not interesting. At some point it runs code --- a
+tool implementation, a transformation, a policy the tenant wrote. The reflex is
+that running tenant code requires a container, and \S\ref{sec:isolation} is
+about when that reflex is right. But there is a tier between ``call a Go
+function'' and ``start Linux'', and it is not exotic: an interpreter, in the
+host process, with the host deciding what it can reach.
+
+We measured three, all pure Go, all linked into the same binary that holds the
+agent loops.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrl}
+\toprule
+\textbf{Runtime} & \textbf{Runs} & \textbf{Instantiate} & \textbf{Range} \\
+\midrule
+wazero~\cite{wazero}  & WebAssembly & \rWazero{}\,\textmu s & \rWazero{}--\rWazeroHi{}\,\textmu s \meas{} \\
+goja~\cite{goja}      & JavaScript (ES5.1+) & \rGoja{}\,\textmu s & \rGojaLo{}--\rGojaHi{}\,\textmu s \meas{} \\
+gpython~\cite{gpython}& Python & \rGpython{}\,\textmu s & \rGpythonLo{}--\rGpythonHi{}\,\textmu s \meas{} \\
+\bottomrule
+\end{tabular}
+\caption{Cost of a fresh execution context for tenant code, in-process. Calling
+into an instantiated wazero module costs \rWazeroCall{}\,ns; re-evaluating in an
+already-warm goja VM costs \rGojaWarm{}\,ns
+(\rGojaWarmLo{}--\rGojaWarmHi{}\,ns).}
+\label{tab:runtimes}
+\end{table}
+
+All three are microseconds. The slowest, Python, is \rGpython{}\,\textmu s ---
+still four orders of magnitude below a container cold start, and roughly the
+cost of a single disk seek on hardware that has not had one in a decade.
+
+\paragraph{WebAssembly is not one language.}
+The wazero row deserves emphasis because it is easy to file under ``Rust and
+Go''. WebAssembly is a compilation target, and CPython, TypeScript via QuickJS,
+Rust, Go, C and C++ all reach it. A \rWazero{}\,\textmu s instantiation is
+therefore not a JavaScript-shaped capability; it is a general one, with a
+capability model that is deny-by-default --- a module reaches exactly the host
+functions it was linked against and nothing else~\cite{wasm}. That is a stronger
+default than a container, which starts with a filesystem and a network stack and
+must have them taken away.
+
+\paragraph{Warm is a different number, and usually the relevant one.}
+\rGojaWarm{}\,ns to evaluate in an existing VM against \rGoja{}\,\textmu s to
+make a new one is a factor of about three thousand. A fleet that creates one
+context per call is paying the left column; a fleet that keeps a context per
+active agent pays the right. Since \S\ref{sec:state} showed that agent state is
+a row that can be rehydrated in \rFleetResume{}\,ms, the natural arrangement is
+to key a pooled context by agent and let it fall away when the agent goes
+dormant --- which converts the instantiation cost from per-call to per-wake.
+
+\paragraph{The honest limit.}
+None of these is a security boundary against an actively hostile tenant in the
+way a virtual machine is. goja and gpython are interpreters in the host address
+space: a bug in one of them is a bug in the host process. wazero is stronger ---
+the sandbox is the WebAssembly semantics themselves, and the module cannot name
+what it was not given --- but it is still one process. Where the threat model
+includes an adversary who will try to escape, the answer is the next section,
+and it costs a thousand times more for exactly that reason.

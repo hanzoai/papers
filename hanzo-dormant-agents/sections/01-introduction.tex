@@ -1,0 +1,74 @@
+\section{Introduction}
+\label{sec:intro}
+
+Ask what it costs to run a million agents and the answer usually arrives as one
+number. That number is almost always the memory floor of a container, because
+the deployment shape that has become idiomatic for agent platforms is one
+container per agent, and a container on the commodity serverless platforms
+reserves 128\,MB at the low end and 512\,MB at the
+high~\cite{modal,e2b,cfworkers}. A million of those is between 128 and 512
+terabytes of resident memory, which is a datacenter, and a platform that
+believes this about itself will build a scheduler, a billing model and a
+market position around a scarcity its own hardware does not impose.
+
+The estimate is wrong because the unit is wrong. ``An agent'' is not one thing
+with one cost. It is three things that happen to be discussed together:
+
+\begin{description}[leftmargin=1.4cm,style=nextline]
+\item[State] what the agent will resume from --- its identity, its position in
+  a workflow, its handle on a conversation. This exists whether or not the
+  agent is running, and it is data.
+\item[Execution] the context that holds the agent's loop while it waits: a
+  stack, a scheduler entry, a place for a continuation to live. This exists
+  only while the agent is resident.
+\item[Isolation] the boundary the agent's code runs behind, which is what stops
+  agent $a$ reading agent $b$'s filesystem or exhausting the host. This exists
+  only while the agent's code is actually executing.
+\end{description}
+
+Nothing requires these to be the same object, and when they are separated they
+turn out to differ by five orders of magnitude. This paper measures each one on
+the same laptop, at a fleet of a million, and reports what it found --- including
+where the expensive primitive is worth its price.
+
+The finding that motivates the rest: \textbf{an agent that is doing nothing does
+not need an execution context or an isolation boundary at all.} It needs a row.
+A row costs \rFleetPer{}\,bytes \meas{} and can be brought back into a running
+loop in \rFleetResume{}\,ms \meas{}, which is fast enough that keeping the loop
+alive to avoid the resume is a false economy for any agent idle longer than a
+few milliseconds. The dormant majority of a fleet --- which is most of any real
+fleet, most of the time --- therefore costs storage rather than memory, and
+storage is four orders of magnitude cheaper.
+
+This is the same argument, one level down, that the companion tenant-residency
+paper makes about databases~\cite{unifiedtenant}: there the unit was a whole
+per-tenant SQLite file at ${\approx}0.25$\,MB of resident memory, and the result
+was that memory scales with concurrency rather than registrations. Here the unit
+is a single agent inside such a file, and the result has the same shape: cost
+tracks \emph{activity}, not \emph{population}. That the two hold at different
+granularities is the point --- it is a property of the decomposition, not of a
+particular size.
+
+\subsection*{Contributions}
+
+\begin{enumerate}[leftmargin=*]
+\item A separation of the per-agent cost into state, execution and isolation,
+  with each measured independently rather than inferred from a deployment shape
+  (\S\ref{sec:state}--\S\ref{sec:isolation}).
+\item Measured residency for a fleet of \rFleetAgents{} dormant agents:
+  \rFleetPer{}\,bytes each on disk, written at \rFleetRate{}/s, resumed in
+  \rFleetResume{}\,ms in-process (\S\ref{sec:state}).
+\item Measured residency for \rFleetAgents{} \emph{live} execution contexts:
+  \rGoPer{}\,bytes of heap per goroutine, reproducible to the byte across five
+  runs, with spawn and wake latencies in the hundreds of nanoseconds
+  (\S\ref{sec:execution}).
+\item Instantiation cost for three in-process language runtimes --- WebAssembly,
+  JavaScript and Python --- all in the single-digit to tens of microseconds, and
+  all without a container (\S\ref{sec:code}).
+\item A like-for-like cold-start comparison of the two isolation primitives that
+  are usually conflated, with an argument for why the \rOciRatio{}$\times$ ratio
+  between them is not a defect (\S\ref{sec:isolation}).
+\item A capacity and cost model built only from the measured constants, and a
+  statement of the conditions under which it stops holding
+  (\S\ref{sec:capacity}--\S\ref{sec:limits}).
+\end{enumerate}

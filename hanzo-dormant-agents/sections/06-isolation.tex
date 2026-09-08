@@ -1,0 +1,64 @@
+\section{Isolation: what a boundary costs, and what it buys}
+\label{sec:isolation}
+
+Sandbox comparisons are usually published as one column of milliseconds, and
+that column conflates two primitives that are not alternatives. We measured both
+on the same host, 20 runs each.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Primitive} & \textbf{median} & \textbf{p95} & \textbf{What it can run} \\
+\midrule
+V8 context, in-process   & \rVeight{}\,ms  & \rVeightP{}\,ms  & JavaScript. No shell, no pip, no pytest. \\
+OCI container, cold      & \rOci{}\,ms     & \rOciP{}\,ms     & Any language, any binary, a real filesystem. \\
+OCI container, pooled    & \rPooled{}\,ms  & \rPooledP{}\,ms  & As above, on a container already started. \\
+\bottomrule
+\end{tabular}
+\caption{Cold start by isolation primitive, 20 runs each. The measured ratio
+between a cold container and an in-process V8 context is
+\rOciRatio{}$\times$.}
+\label{tab:sandbox}
+\end{table}
+
+\paragraph{The ratio is real and it is not a defect.}
+\rOciRatio{}$\times$ is what a kernel-enforced boundary costs: namespaces, a
+mount table, a network interface, a cgroup, and an image to unpack. A V8 context
+is a data structure in a process that is already running, so it starts in
+\rVeight{}\,ms and offers a boundary that is exactly as strong as the embedding
+process's correctness. These buy different things and the choice is per workload,
+not per millisecond.
+
+The workload decides it, and for agents the workload is frequently unambiguous.
+An agent asked to run a project's test suite needs a package manager, a
+filesystem and a shell. No JavaScript isolate provides those at any latency. The
+right comparison for that workload is the second row against other people's
+second rows --- and \rOci{}\,ms compares favourably to the published cold-start
+figures for hosted sandbox platforms, which range from under 200\,ms to several
+seconds~\cite{e2b,modal,cfworkers}.
+
+\paragraph{Pooling collapses most of the gap, and is the only tier that matters
+at fleet scale.}
+\rPooled{}\,ms is a command dispatched into a container that is already up. It is
+$4\times$ better than a cold start and it is what a fleet actually experiences,
+because a fleet reuses sandboxes rather than creating one per call. The cold
+number is the right one to quote for a first call after a scale-up; the pooled
+number is the right one for steady state, and quoting the cold number as the
+platform's latency is as misleading as quoting the pooled one as its worst case.
+
+\paragraph{Three tiers, chosen by threat model.}
+Taken with \S\ref{sec:code}, the measurements describe a ladder, and the sensible
+policy is to take the cheapest rung the threat model permits:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{In-process call} --- our own code, no boundary, nanoseconds.
+\item \textbf{In-process runtime} --- tenant code that is not adversarial, a
+  capability boundary, \rWazero{}--\rGpython{}\,\textmu s (\S\ref{sec:code}).
+\item \textbf{Container} --- arbitrary binaries, an adversarial tenant, or a real
+  filesystem: \rPooled{}\,ms pooled, \rOci{}\,ms cold.
+\end{enumerate}
+
+A platform that offers only the third rung charges every workload the price of
+the most demanding one. That is the cost this paper is trying to make visible ---
+not the container itself, which is worth its price when it is needed.

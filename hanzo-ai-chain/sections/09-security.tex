@@ -1,128 +1,115 @@
 \section{Security}
 \label{sec:security}
 
-\subsection{Three-Lane Post-Quantum Safety, Inherited}
+\subsection{Three complementary protocol layers}
 
-The AI Chain inherits the full Quasar 3.0 security envelope from the Lux
-consensus substrate (LP-105). Every block is finalized by a QuasarCert
-that simultaneously requires:
+A-Chain PoAI consensus decides whether an admitted useful-work claim is valid,
+final, unique, and reward-bearing. Z-Chain P3Q compresses and settles finalized
+A-Chain receipt transitions without becoming a mining authority. Lux Quasar
+supplies validator ordering, fork choice, and finality for both states. The
+activated post-quantum validator authentication policy secures exported A/Z
+settlement roots. These are complementary layers: PoAI is not an alternate
+block-leader race, P3Q is not raw-work admission, and Quasar finality alone does
+not prove that an AI workload ran.
 
-\begin{enumerate}[leftmargin=1.4em]
-  \item A BLS12-381 aggregate signature over the certificate subject;
-  \item A Corona two-round Ring-LWE threshold signature anchored to
-        a Q-Chain ceremony root;
-  \item A Z-Chain Groth16 SNARK rolling up $N$ ML-DSA-65 validator
-        signatures into a single 192-byte proof plus 32-byte public-input
-        hash.
-\end{enumerate}
+Security claims must be made against the protocol actually activated. ML-DSA is
+a standardized signature, not evidence of computation and not a threshold
+protocol by itself. P3Q is the intended Plonky3-derived, pairing-free Z-Chain
+settlement substrate, but a PoAI AIR, recursive policy, A-to-Z state binding,
+and verifier are not authoritative until implementation, audit, parameter
+review, node wiring, and activation are complete. Pulsar and
+Corona likewise require their selected threshold protocol and networking, not
+only compatible signature bytes.
 
-The certificate subject binds chain id, epoch, round, mode, and the
-seven chain-specific roots ($P_\text{val}\,\|\,Q_\text{cer}\,\|\,
-Z_\text{vk}\,\|\,A_\text{att}\,\|\,B_\text{br}\,\|\,M_\text{mpc}\,\|\,
-F_\text{fhe}$) plus the parent block hash and execution roots, making
-cross-epoch and cross-chain replay structurally impossible. See LP-105
-§4 and §6 for the formal QuasarCert definition.
+\subsection{Execution soundness}
 
-\subsection{What an AI Chain Adversary Must Break}
+For a committed integer matrix product $C=AB$ over
+$\mathbb{F}_{p}$, $p=2^{61}-1$, a post-commitment Freivalds challenge accepts an
+invalid product with probability at most $1/p$ per independent vector. Honest
+integer work has zero false rejection when serialization, overflow, reduction,
+and challenge derivation are identical.
 
-To forge a block on the AI Chain, an adversary must \emph{simultaneously}:
+This local bound does not automatically cover a full graph. If $s$ operations
+are sampled uniformly from a graph of $L$ operations with $b$ invalid nodes, a
+simple upper bound on acceptance is
 
-\begin{itemize}[leftmargin=1.2em]
-  \item Solve the discrete logarithm on BLS12-381 (P-lane);
-  \item Solve Module-LWE for the Corona parameters (Q-lane);
-  \item Solve Module-LWE / MSIS for ML-DSA-65 (Z-lane).
-\end{itemize}
+\begin{equation}
+  \Pr[\mathrm{accept\ invalid\ trace}] \leq (1-b/L)^s+s/p^k,
+\end{equation}
 
-Breaking any single lane, or any two of the three, leaves the third
-intact and the certificate unforgeable. A future cryptographically
-relevant quantum computer that breaks BLS does not break the AI Chain;
-the Q and Z lanes still hold.
+where $k$ is the number of independent challenge vectors per opening. Sparse
+fraud is dominated by the coverage term. A production optimistic policy
+therefore needs complete transcript availability and independent watchers that
+may challenge any invalid operation, or a coverage parameter justified against
+the reward at risk.
 
-\subsection{Operator Honesty}
+\subsection{CPU validation claim}
 
-Block-level safety guarantees that what the chain accepted, the
-quorum signed. It does not guarantee that an operator ran the right
-model on the right input. That second-tier honesty is enforced by TEE
-attestation:
+For supported operations, CPU validation is practical because an opened matrix
+product is checked in quadratic work instead of rerunning the provider's cubic
+product. Merkle inclusion and graph binding ensure the opened matrices are part
+of the committed job. Small jobs may be replayed exactly. This does not imply
+that every arbitrary floating-point training system is CPU-verifiable; only
+activated deterministic operations with bounded payloads fall under the claim.
 
-\begin{itemize}[leftmargin=1.2em]
-  \item Every receipt is accompanied by a vendor-rooted TEE quote
-        (LP-134, A-Chain attestation primitive). The quote covers the
-        loaded model commitment, the runtime image, and the input/output
-        commitments.
-  \item Verifiers re-validate the quote against the vendor root CA on
-        chain. A malformed or unsigned quote rejects the receipt and
-        slashes the operator (Algorithm in \S\ref{sec:markets}).
-  \item Periodic spot-check verifiers, drawn by VRF, replay a sampled
-        fraction of jobs in their own TEEs. Discrepancies escalate to
-        full slashing.
-\end{itemize}
+\subsection{Availability and metering}
 
-\begin{theorem}[Operator-fraud detection]
-\label{thm:fraud}
-Let $\alpha$ be the verifier sampling rate per epoch and $\rho$ the
-fraction of jobs an attacker chooses to falsify. The probability that a
-false job goes undetected for $k$ epochs is
-$(1 - \alpha\rho)^k$. For $\alpha = 0.003$ and $\rho = 0.05$, the
-probability of evading detection across 1{,}000 jobs is below
-$10^{-3}$, while the verifier overhead remains below 0.3\% of total
-compute.
-\end{theorem}
+An optimistic proof is ineffective when the provider withholds the transcript.
+The complete transcript, or erasure-coded data sufficient for every challenge,
+must remain available through the finality window. Issuance remains reversible
+or disabled until that window closes.
 
-\begin{proof}[Sketch]
-Verifier sampling is independent across jobs. The probability of
-sampling a specific job is $\alpha$; the probability of detecting a
-falsified job conditional on sampling is 1 (the TEE quote replay
-exposes the divergence by construction). Over $k$ jobs, the unsampled
-probability is $(1-\alpha)^{\rho k}$. Substituting: at $\alpha=0.003$,
-$\rho=0.05$, $k=1000$ gives detection probability $> 0.999$.
-\end{proof}
+Correct output does not prove the claimed work quantity. Reward calculation must
+bind a metering commitment that is derived from the admitted graph and execution
+policy. Wall-clock time, GPU SKU, token count, and FLOP claims cannot be accepted
+solely from the provider.
 
-\subsection{Sybil Resistance}
+\subsection{Usefulness and anti-self-dealing}
 
-Sybil attacks against the operator side are bounded by stake. A
-fictitious operator must post $\geq$10{,}000 AI of stake; a Sybil farm of
-$N$ identities must post $10{,}000\,N$ AI. Block reward and inference
-fees are split per attested job, not per operator identity, so creating
-identities does not increase share. False quotes from any one identity
-slash 100\% of that identity's stake.
+Cryptography proves execution of the specified job; protocol admission proves
+that the work had an identified consumer or governed network purpose before the
+result existed. Neither proves universal truth or social value. A miner-created
+circular job, recycled demand fee, copied output, or colluding requester must not
+turn the mining pool into an unbounded faucet. Admission caps, declared related
+parties, non-recyclable budgets, work-class normalization, and per-era reward
+limits are consensus-critical economics.
 
-\subsection{Liveness}
+\subsection{TEE scope}
 
-Liveness on the AI Chain requires that the Quasar 3.0 quorum remains
-intact. LP-105 guarantees safety with $f < n/3$ Byzantine validators;
-liveness is preserved with $f < n/3$ failed validators provided the
-remaining $2n/3 + 1$ produce the three lanes. No additional liveness
-assumption is added on top.
+TEE evidence is optional and explicitly vendor-dependent. A confidential profile
+must validate the complete certificate chain, TCB collateral, measurement,
+freshness, revocation, model, input, output, runtime, job, and provider binding.
+A quote proves provenance under that vendor trust model; it does not prove
+semantic correctness and does not replace proof-policy finality.
 
-For the markets, liveness requires that operators participate. Idle
-operators do not earn block reward share, which produces a baseline
-incentive to attest and serve.
+\subsection{Replay and omnichain safety}
 
-\subsection{Replay and Cross-Chain Attacks}
+The global work nullifier includes the A-Chain network, policy epoch, job, and
+execution commitment. A-Chain consumes it atomically with receipt finalization.
+The receipt binds one destination chain and recipient. Each destination records
+consumption of that exact receipt, but its local consumed set does not decide
+whether work was valid.
 
-Every QuasarCert binds the certificate subject to the chain id, the
-epoch, and the seven chain-root tuple. The same finalized block on
-AI Chain cannot be replayed on C-Chain or any other chain in the
-pipeline because the chain id and the Z-Chain Groth16 verification key
-differ. Cross-chain bridge messages on B-Chain include a B-Chain block
-height and a destination chain id; replay across chains is similarly
-impossible.
+An accepted destination payout must require a monotonically advancing,
+PQ-authenticated, Quasar-finalized Z-Chain settlement commitment to the A-Chain
+receipt root (or an explicitly activated native A/Z direct-finality proof) and
+Merkle inclusion of the full receipt. Accepting a raw proof, TEE quote, miner
+signature, or local subsidy calculation would create a second mining authority
+and violate the supply cap.
 
-\subsection{Audit Surface}
+\subsection{Launch security gates}
 
-The AI Chain exposes the following for external audit:
+Mining remains disabled until the production system demonstrates:
 
 \begin{itemize}[leftmargin=1.2em]
-  \item All HMM registry records and their training history DAG;
-  \item All operator listings, jobs, receipts, and TEE quotes;
-  \item All agent registry records and capability declarations;
-  \item All QuasarCert lane components per block (P, Q, Z);
-  \item All slashing events, with the underlying evidence
-        (malformed quote, divergent replay, lane-incomplete cert).
+  \item byte-identical CPU/GPU commitments for a real model path;
+  \item objective detection of a fabricated intermediate operation;
+  \item transcript recovery and challenges under node loss;
+  \item no irreversible issuance while proof status is pending;
+  \item verifiable metering and anti-self-dealing admission;
+  \item atomic global-nullifier consumption and reward finalization;
+  \item Z-settled, PQ-authenticated receipt export and exactly-once consumption in at
+        least two destination environments;
+  \item enforcement of the two-trillion total cap and one-trillion mining pool
+        under replay, reorganization, and bridge failure.
 \end{itemize}
-
-This is, by design, more transparent than any centralized AI service.
-The premise of the AI Chain is that the cost of that transparency is
-paid down by the ability to verify any output without asking the
-provider.

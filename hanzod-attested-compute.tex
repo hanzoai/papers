@@ -1,0 +1,534 @@
+\documentclass[11pt]{article}
+\input{shared/kernel-preamble.tex}
+
+\usepackage{amsthm}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{\textbf{Attested Compute in \code{hanzod}:\\
+Host-Asserted Evidence over a Monitor's Measurement,\\ and the Gap to Hardware
+Attestation}}
+\author{
+    Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai} \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    Los Angeles, California \\
+    \texttt{https://hanzo.ai}
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\code{hanzod} runs work for other parties on hardware those parties cannot
+inspect. If that work is to be paid for on a settlement chain, the chain needs
+some statement about what ran, and needs to know what the statement is worth.
+This paper specifies the statement \code{hanzod} makes today and states its
+limits. The measurement itself is not \code{hanzod}'s: the \code{hanzo-vm}
+monitor folds the kernel, the kernel command line it builds, the root image and
+the machine shape into an extend-only SHA-384 register, under the same extend
+rule Intel TDX applies to a runtime measurement register, and emits a document
+whose \code{bind} field is the 64 bytes an SEV-SNP report or a TDX quote carries
+as caller data. \code{hanzod} takes that document, signs the \code{bind} with
+the node's ed25519 identity key, and publishes a record. We define
+\emph{evidence} as a signed statement about a bind and distinguish two roots for
+it: \emph{host-asserted} evidence, signed by the node's own key, which is
+implemented; and \emph{hardware attestation}, rooted in a vendor certificate
+chain, which is not, and which cannot be produced by \code{hanzod} at all
+because the report is requested from inside a guest and \code{hanzod} runs on
+the host. Host-asserted evidence establishes that a particular node made a
+particular claim and that the claim has not been altered since; it does not
+establish that the node fed those images to the monitor. We report an
+implementation of 892 lines of Rust with 46 tests, wired into \code{hanzod} as
+\code{hanzod machine}, and an end-to-end run on Apple M1 Max that measures a
+real microVM through \code{hanzo-vm}, signs the measurement with the node's
+identity key, boots the machine, publishes the record, and reports how the
+machine ended. We verify one such record with OpenSSL and a re-fold of the
+register, using no Hanzo code. We then state what
+remains: a guest-side attester that binds the same 64 bytes into a hardware
+report, a workload register that covers the guest command, and a registry that
+outlives the process.
+\end{abstract}
+
+\section{Problem}
+
+A node sells compute. A buyer pays for it. Between the two sits a question the
+buyer cannot answer by looking: \emph{what actually ran?} The buyer sees a
+result, or an endpoint, and has no view of the machine that produced it.
+
+Three claims are commonly conflated, and it is worth separating them before
+anything else:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Integrity of the inputs.} The images fed to the hypervisor were
+    the images they were said to be.
+  \item \textbf{Fidelity of execution.} Those images, and only those, determined
+    what ran.
+  \item \textbf{Quality of the result.} What ran produced a correct answer.
+\end{itemize}
+
+They are different properties with different mechanisms. A digest over images
+addresses the first. A hardware root of trust addresses the second. Neither
+addresses the third; that is the domain of verification schemes over the
+computation itself, and is out of scope here. This paper is about the first, and
+about being exact regarding how far short of the second it falls.
+
+\section{Current behavior}
+
+This section reports what exists, with locations, so that later claims can be
+checked against code rather than against prose.
+
+\subsection{The monitor, and where the measurement lives}
+\label{sec:monitor}
+
+\code{hanzo-vm} (repository \code{hanzoai/vm}, crate \code{hanzo-vm} 2.0.1) is
+the virtual machine monitor. It uses Virtualization.framework on macOS and KVM
+or cloud-hypervisor on Linux. Its operating-system assets live in
+\code{\$HANZO\_VM\_HOME}, defaulting to \code{\~{}/.hanzo/vm}: a kernel image
+(\code{Image}), a base root filesystem (\code{rootfs.ext4}), an optional
+initramfs, a \code{VERSION} file, and a \code{checkpoints/} directory holding
+saved disk states.
+
+The measurement is the monitor's, in crate \code{vm-measure}. It is an ordered
+log of events folded into a single register:
+\[
+  e_i = \mathrm{SHA\text{-}384}\bigl(\mathrm{name}_i \,\|\, \texttt{0x00} \,\|\,
+        \mathrm{SHA\text{-}384}(\mathrm{content}_i)\bigr), \quad
+  R_0 = 0^{384}, \quad
+  R_{i+1} = \mathrm{SHA\text{-}384}(R_i \,\|\, e_i).
+\]
+This is the extend rule Intel TDX applies to a runtime measurement register, so
+a register built this way reproduces an RTMR that started at zero and was
+extended with the same events in the same order. SHA-384 is the digest both TDX
+registers and the AMD SEV-SNP launch measurement use.
+
+Two logs are kept separately. \emph{Launch} is what the hypervisor was handed:
+the kernel image, the command line the monitor builds, the initramfs when there
+is one, the source root image, and the machine shape as the text
+\code{cpus=$c$ memory=$m$MB disk=$s$MB}. \emph{Workload} is what the started
+system was told to run, and is extended by whoever deploys into the machine.
+The two are separate because on TDX they map onto separate registers, and
+folding them would lose which half a verifier is entitled to predict.
+
+\begin{definition}[Bind]
+\label{def:bind}
+The \emph{bind} of a measurement is
+$\mathrm{SHA\text{-}512}(R_{\mathrm{launch}} \,\|\, R_{\mathrm{workload}})$, 64
+bytes. SHA-512 because the caller field of an SEV-SNP report and of a TDX quote
+is 64 bytes wide, and a report that pads is a report where the padding is
+unaccounted for.
+\end{definition}
+
+Two properties of the fold matter downstream. An event's name is inside its own
+digest, so an event cannot be replayed under another name, and the chain commits
+to order. Only content is hashed: the path a file was read from is recorded for
+the reader and never enters a digest, so the same kernel and the same root image
+measure identically on every machine that has them.
+
+Published boot medians for this monitor, measured across three hosts, are
+0.30\,s (Apple M4 Max, Virtualization.framework), 0.27\,s (Ryzen AI Max+ 395,
+cloud-hypervisor) and 0.30\,s (GB10, KVM). Those are boot alone. The wall times
+in §7 are whole invocations --- disk clone, boot, the guest's command, and
+teardown --- and are the larger number for that reason.
+
+\subsection{The Kubernetes path}
+
+\code{hanzo up} (repository \code{hanzoai/cli}) boots \code{k3s} inside one such
+microVM and writes a kubeconfig. It supervises \code{hanzo-vm run --stdio} as a
+child and speaks JSON-RPC 2.0 over that child's stdio. First boot creates a disk
+checkpoint named \code{k3s}; every later boot starts from it. This is the path by
+which an OCI image --- for the cloud control plane, \code{ghcr.io/hanzoai/cloud}
+--- reaches a microVM. It is also the existing consumer of the monitor's
+measurement: it receives the launch log over stdio and extends the workload
+register with the manifest it deploys.
+
+\subsection{Where machines are recorded today}
+
+Two durable surfaces exist, and neither holds a measurement.
+
+\code{/v1/machines}, served by \code{hanzoai/visor}, is the org's machine
+inventory: owner, name, provider, region, image, status, addresses, tags. It
+records \emph{that} a machine exists and who owns it.
+
+\code{/v1/node}, specified in HIP-1325 and implemented in \code{hanzoai/cloud},
+is an org's own machines connected by an agent that dials in and holds a socket.
+The specification is explicit that it keeps no durable store: it is a presence
+map. It records \emph{that} a machine is currently reachable.
+
+Neither surface has a field for what a machine booted from, and neither carries a
+signature. That absence is the gap this work begins to close.
+
+\subsection{Prior code in the node repository}
+
+\code{hanzoai/node} already contains a security module
+(\code{hanzo-bin/hanzo-node/src/security/}, six files) implementing a TEE
+attestation framework with SEV-SNP, TDX, SGX and NVIDIA confidential-computing
+detection, keyed to a \code{PrivacyTier} type from a \code{hanzo-kbs} crate. It
+is not compiled: the crate it depends on is excluded from the workspace as
+incomplete, and the module is not declared in either \code{main.rs} or
+\code{lib.rs}. A \code{compute\_dex} module in the same tree binds Solidity
+contracts that already carry a \code{bytes32 attestation} field on orders; it is
+likewise undeclared and depends on a crate not listed in the manifest.
+
+We report this rather than extend it. The present work does not replace that
+framework's ambition; it establishes the layer beneath it --- a statement that is
+defined, produced and tested --- so that a hardware attester, when written, has
+something specific to bind to.
+
+\section{What \code{hanzod} adds, and what it deliberately does not}
+
+The monitor answers \emph{what was launched}. It does not answer \emph{on whose
+word}, \emph{for whom}, or \emph{where the answer is recorded}. Those are
+\code{hanzod}'s, and they are the whole of what this work adds.
+
+\code{hanzod} therefore holds no measurement code. It builds one description of
+a machine and derives both monitor invocations from it, so what is measured and
+what boots cannot drift:
+
+\begin{lstlisting}[language=bash]
+hanzo-vm measure --cpus 2 --memory 2048 --disk-size 8192 --from k3s
+hanzo-vm run     --cpus 2 --memory 2048 --disk-size 8192 --from k3s \
+                 --allow-net -p 6443:6443 -- k3s server
+\end{lstlisting}
+
+The flags \code{run} carries and \code{measure} does not --- port forwards and
+network egress --- are exactly the ones that do not enter the launch register.
+They change what the machine can reach, not what was launched. A record says so
+rather than implying they were measured (§\ref{sec:limits}).
+
+The argument for not computing a second measurement in \code{hanzod} is not
+economy of code. A second fold would be a second answer to a question that has
+one, and the two would diverge the first time the monitor changed what it hands
+the hypervisor --- silently, because a measurement that is merely wrong still
+verifies. It would also be the wrong number: the monitor's register is
+SHA-384 under the TDX extend rule and its bind is 64 bytes wide, so it can be
+placed in a hardware report's caller field unchanged, and a register computed
+here under any other rule could not.
+
+\section{Evidence and its trust base}
+
+A bind is a number anyone holding the same images can compute. It becomes useful
+only when some party stands behind it.
+
+\begin{definition}[Evidence]
+\emph{Evidence} is a tuple $(B, \kappa, p, \sigma, t)$: a bind, a kind $\kappa$,
+a public key $p$, a signature $\sigma$, and a timestamp $t$.
+\end{definition}
+
+The signed preimage is
+\[
+  \code{hanzo.evidence.v1} \;\|\; \kappa \;\|\; B \;\|\; t
+\]
+with $\kappa$ a single byte and $t$ a big-endian 64-bit Unix second. Including
+$\kappa$ means a signature made as one kind cannot be presented as another.
+Including $t$ means a statement cannot be replayed later under a fresher date:
+re-dating it invalidates $\sigma$. Evidence is therefore dated to the second it
+publishes, and not more finely --- anything below the resolution of $t$ would sit
+outside $\sigma$ and could be altered without breaking it.
+
+\subsection{Two kinds, and the difference between them}
+
+\begin{description}[leftmargin=1.4em]
+  \item[\code{host}] The node signs $B$ with its own ed25519 identity key ---
+    the same key it is known by on the network, read from the same
+    \code{.secret} file the daemon uses. \emph{Implemented.}
+  \item[\code{snp}, \code{tdx}] A report produced by AMD SEV-SNP or Intel TDX
+    over the same 64 bytes, rooted in a vendor certificate chain rather than in
+    the node. \emph{Not produced by \code{hanzod}}, and not for want of
+    finishing: those reports are requested over \code{/dev/sev-guest} and
+    \code{/dev/tdx\_guest}, which are guest devices, and \code{hanzod} runs on
+    the host. The monitor already implements the two request ABIs and reports
+    which platform it found; on every machine this has run on, the answer is
+    \code{none}. \code{hanzod} carries that answer and does not claim it.
+\end{description}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{0.40\textwidth}cc@{}}
+\toprule
+ & \code{host} & \code{snp}/\code{tdx} \\
+\midrule
+Statement is attributable to a named key & yes & yes \\
+Statement cannot be altered in transit & yes & yes \\
+Statement cannot be replayed under a new date & yes & yes \\
+Images were the ones named & \emph{if the node is honest} & yes \\
+Node cannot forge the statement & no & yes \\
+Available in this implementation & yes & no \\
+\bottomrule
+\end{tabular}
+\caption{What each kind of evidence establishes. The fourth and fifth rows are
+the entire difference, and they are the rows a settlement chain cares about.}
+\end{table}
+
+\subsection{Adversaries}
+
+\begin{description}[leftmargin=1.4em]
+  \item[A network adversary] between the node and whoever reads its records can
+    modify what is in flight. Host-asserted evidence defeats this: the record is
+    self-contained and signed, so a reader re-folds the monitor's log, compares
+    the result to the bind inside the signature, and checks the signature ---
+    without trusting the transport.
+  \item[A confused or buggy node] that boots something other than what it
+    intended. The measurement catches this to the extent that the divergence is
+    in the launch inputs: a different checkpoint, a different kernel, a different
+    shape all change the register.
+  \item[A dishonest node operator] who wants payment for compute not delivered,
+    or delivered on a cheaper image. Host-asserted evidence does \emph{not}
+    defeat this. The operator measures the images they wish to claim, signs the
+    bind with their own key, and boots whatever they like. The signature
+    verifies. This is not a defect in the implementation; it is the definition of
+    a host-asserted root, and it is why hardware attestation is the next piece of
+    work and not an optional refinement.
+\end{description}
+
+Pre-boot measurement on the host is therefore a statement about intent, made by
+the party whose intent is in question. It is worth exactly the reputation of the
+signer, and a settlement chain reading these records today should price them
+accordingly.
+
+\section{Registration}
+
+\begin{definition}[Record]
+A \emph{record} is $(\code{node}, \code{vm}, M, E, t)$: the node's identity, the
+machine's identifier, the monitor's measurement document, the evidence, and the
+time of publication.
+\end{definition}
+
+The record carries the monitor's whole document rather than only the bind, so a
+reader who never met the node can re-fold the log, recompute the bind, and
+compare it to the number inside $E$. We call a record satisfying
+$B_M = B_E$ \emph{coherent}. Coherence is cheap, local, and independent of the
+signature: a record can be internally inconsistent while carrying a perfectly
+valid signature over some other bind, and the check that catches that is
+comparison, not cryptography.
+
+Verifying a signature and deciding whether its signer deserves belief are
+separate questions, and the implementation separates them. The \code{Verify}
+trait answers the first. The second belongs to whoever reads the registry --- a
+scheduler, an operator, a chain --- and is not represented in this crate at all.
+
+The implemented registry is the node's own view: records are added when a machine
+starts, removed when it stops, and gone when the process is. This matches the
+durability of \code{/v1/node} (§2.3), which by specification holds no durable
+store. A registry that outlives the process is a second implementation of the
+same four-method trait and requires no change to anything above it.
+
+\section{Implementation}
+
+The crate is \code{hanzo-attest}, at \code{hanzo-libs/hanzo-attest} in
+\code{hanzoai/node}, 892 lines of Rust across seven modules.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+Module & Holds & Lines \\
+\midrule
+\code{monitor} & the two argv, holding the child, waiting on it & 280 \\
+\code{evidence} & kinds, signing preimage, attester, verifier & 196 \\
+\code{measure} & the monitor's document, as \code{hanzod} holds it & 116 \\
+\code{registry} & records, coherence, the node's own view & 93 \\
+\code{node} & the composition & 91 \\
+\code{lib} & the crate root and hex encoding & 81 \\
+\code{error} & every way the crate fails & 35 \\
+\bottomrule
+\end{tabular}
+\caption{Modules. Line counts are of implementation only: everything above each
+file's test module, comments and blank lines included.}
+\end{table}
+
+Three traits keep the parts separable: \code{Monitor} (measure, start, wait,
+stop, running), \code{Attest}/\code{Verify}, and \code{Registry} (put, get,
+remove, list). The monitor knows nothing about signing, the key knows nothing about
+machines, and the registry knows nothing about either. \code{Node} is the single
+place they meet, which is what makes the ordering a property of the type rather
+than a convention: a machine is never registered before it is measured, and never
+left running unregistered.
+
+\code{Monitor::stop} is idempotent. A machine that has already exited is the
+state being asked for, not a failure, so a reconciler never has to distinguish
+the two cases.
+
+\code{Monitor::wait} exists because starting a machine is spawning the monitor,
+and a monitor that refuses the configuration refuses it \emph{after} the spawn
+has already succeeded. Without waiting, \code{hanzod} would print a record for a
+machine that never came up and exit successfully. \code{Node::serve} waits,
+withdraws the record whichever way the machine goes, and returns how it ended;
+\code{hanzod} exits with that code, so a machine that failed is a command that
+failed.
+
+\subsection{The contract with the monitor}
+
+Nothing here reimplements what \code{hanzo-vm} already does. The crate builds the
+two argv above, runs \code{measure} to completion, parses the document, and
+spawns \code{run}, holding the child. The guest's console is inherited, so what
+the machine prints lands in \code{hanzod}'s log. The JSON-RPC supervision path
+(\code{--stdio}) belongs to \code{hanzo up} and is not duplicated.
+
+The parse is deliberately narrow: three fields --- the algorithm, the bind, and
+what the monitor said about the platform --- and the rest of the document carried
+without rewriting. A document naming any algorithm but \code{sha384}, or a bind
+that is not 64 bytes, is refused. A monitor too old to have a \code{measure}
+subcommand fails the same way, and the failure is a refusal to publish rather
+than a fallback to some number \code{hanzod} computed itself.
+
+\subsection{The command}
+
+\code{hanzod} gains one subcommand, on the same identity the daemon uses:
+
+\begin{lstlisting}[language=bash]
+hanzod machine measure [shape] [-- argv]   # what would boot, and the evidence
+hanzod machine run     [shape] [-- argv]   # boot it, publish, hold it
+\end{lstlisting}
+
+The two differ in exactly one thing: whether a machine actually starts. Both ask
+the monitor the same question about the same machine and sign the same answer
+with the same key, so \code{measure} is how an operator inspects what a
+\code{run} will publish before publishing it. Bare \code{hanzod} is unchanged.
+
+Identity resolution was, before this change, inline in the daemon's startup path.
+It is now one function, \code{runner::identity}, called by both, so the daemon
+and the subcommand cannot disagree about who the node is.
+
+\section{Evaluation}
+
+\paragraph{Tests.} 46 tests pass: 41 in \code{hanzo-attest}, one documentation
+test, and four over the command's argument parsing in \code{hanzod}. The measure
+tests assert that a document yields the bytes a report would carry, that the
+monitor's JSON is carried unrewritten, that an unknown fold and a bind of the
+wrong width are refused, and that a hardware report is noticed without being
+claimed. The evidence tests assert that a signature fails after the bind, the
+date, the signer or the kind is altered. The monitor tests assert both argv, that
+the flags \code{measure} omits are the ones that are not measured, that a monitor
+which will not measure does not boot, that a machine which never came up is not a
+success, that a machine killed outright reports 128 plus its signal, and the
+child bookkeeping --- using a shell script that prints a document and does as it
+is told, in place of a hypervisor.
+
+\paragraph{End-to-end.} On Apple M1 Max, macOS 26.6.2, with \code{hanzo-vm}
+2.0.1 and its 2.0.0 OS assets:
+
+\begin{lstlisting}[language=bash]
+$ hanzod machine run --cpus 2 --memory 2048 --disk-size 8192 \
+    -- /bin/sh -c "uname -srm; nproc; free -m"
+\end{lstlisting}
+
+writes one record to standard output and the guest's console to standard error,
+where the guest reports \code{Linux 6.12.17 aarch64}, two processors and
+1998\,MB of memory --- the shape that was asked for and measured. The launch log
+carries five events (\code{kernel}, \code{cmdline}, \code{initrd}, \code{root},
+\code{shape}); the workload register is zero (§\ref{sec:limits}); \code{platform}
+is \code{none}; the evidence kind is \code{host}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & \code{hanzo-vm} alone & under \code{hanzod} \\
+\midrule
+measure, images already digested & 0.05--0.06\,s & 0.05--0.13\,s \\
+measure, first time (4\,GiB root image) & 44.2\,s & --- \\
+run a trivial guest command & 1.10--2.31\,s & 1.07--1.09\,s \\
+\bottomrule
+\end{tabular}
+\caption{Three runs each, same host. \code{hanzod} adds a process invocation, a
+JSON parse and one ed25519 signature to a boot, and the columns are within each
+other's spread. The cold measurement is the monitor reading the root image; its
+digest cache is keyed to the file's identity and is host-local, so it saves the
+44 seconds and establishes nothing.}
+\end{table}
+
+\paragraph{The record checks out under someone else's tools.} Taking that record
+and using no Hanzo code: re-folding the launch and workload logs with SHA-384
+reproduces both register values; \(\mathrm{SHA\text{-}512}\) over the two
+registers reproduces the \code{bind}; the bind equals the one inside the
+evidence; and OpenSSL verifies the ed25519 seal over
+\code{hanzo.evidence.v1}\,\(\|\)\,\code{0x01}\,\(\|\)\,bind\,\(\|\)\,\(t\)
+(90 bytes) under the signer named in the record. This is the property the record
+is for: a reader who never met the node establishes what the node said without
+running anything the node wrote.
+
+\paragraph{What the failure paths do.} A monitor too old to have a \code{measure}
+subcommand --- the released \code{hanzo-vm} 2.0.0 --- is refused: \code{hanzod}
+prints the monitor's own complaint, publishes nothing and exits 1. A monitor that
+measures but cannot boot --- on macOS, one lacking the
+\code{com.apple.security.virtualization} entitlement --- exposes the failure the
+spawn cannot see: the record is published, the machine never comes up, and
+\code{Node::serve} withdraws the record and exits 1. Changing the shape changes
+the bind. A guest command exiting 42 makes \code{hanzod} exit 42.
+
+\section{Limitations}
+\label{sec:limits}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item The measurement is taken before the boot, on the host, over images on the
+    host. It binds the inputs. It does not witness the execution, and a
+    dishonest host produces evidence that verifies (§4.2).
+  \item \code{hanzod} cannot produce \code{snp} or \code{tdx} evidence at all: a
+    report is requested from inside the guest and \code{hanzod} runs on the host.
+    The monitor's document carries which platform was found; on every machine
+    this has run on it is \code{none}.
+  \item The workload register is empty for machines \code{hanzod} starts.
+    \code{hanzo-vm measure} takes no trailing command, so the argv the guest runs
+    is not folded into any register. It is recorded in the run invocation and in
+    \code{hanzod}'s own log, and it is \code{hanzod}'s claim, not a measured
+    input. Closing this is a change to the monitor, not to \code{hanzod}
+    (§\ref{sec:next}).
+  \item Port forwards and network egress do not enter the launch register. Two
+    machines that differ only in what they can reach measure identically. This is
+    a property of the monitor's launch log, reported here rather than worked
+    around.
+  \item Measuring and booting are two invocations of the monitor, so a host that
+    changed an image between them would measure one thing and boot another. Under
+    a host-asserted root this costs nothing --- a host that would do it can
+    already sign for images it never booted --- but it is a real window, and it
+    is the monitor's to close by emitting the document for the launch it performs.
+  \item The root image measured is the source the monitor clones. The guest
+    writes to the copy; nothing here measures the machine's state after it starts,
+    and a long-running machine's disk diverges from its measurement immediately
+    and by design.
+  \item The registry does not outlive the process. A record is the node's current
+    claim, not a history.
+  \item Machine shape is what \code{hanzod} asked the monitor for. It is honest
+    about intent, but it is not a measurement of delivered performance: two hosts
+    granting the same shape need not deliver the same throughput.
+  \item A hard kill of \code{hanzod} leaves a running machine to the monitor.
+    \code{machine run} withdraws its own record on exit; it cannot withdraw one
+    after \code{SIGKILL}.
+\end{enumerate}
+
+\section{Next step}
+\label{sec:next}
+
+The following are proposals, not implemented behavior.
+
+\paragraph{A guest-side attester.} On a host with SEV-SNP or TDX, an agent inside
+the guest asks its firmware for a report over the bind and returns it. The
+evidence structure needs no change and neither does the number: the bind is
+already 64 bytes and already the value the caller field takes. The kind becomes
+\code{snp} or \code{tdx}, the signer becomes the vendor chain, and the verifier
+gains a certificate path. This is the change that moves rows four and five of
+Table 1. A verifier then owes one further check the log alone cannot supply: the
+platform's own launch measurement, carried in the same report, against an
+expected value.
+
+\paragraph{A workload register that covers the command.} \code{hanzo-vm measure}
+accepting the trailing command that \code{hanzo-vm run} already takes, and
+extending the workload log with it, would put the guest's argv inside the number
+\code{hanzod} signs. It is a change in the monitor because the fold is the
+monitor's; making it in \code{hanzod} would reintroduce exactly the second answer
+§3 argues against.
+
+\paragraph{A durable registry.} A second \code{Registry} implementation writing to
+\code{/v1/node}, or to a chain. The record is already self-contained and signed,
+so the transport need not be trusted; what a durable registry adds is history, and
+history is what a settlement window is computed over.
+
+\paragraph{The settlement read.} A chain that prices these records must decide
+what a record is worth, which is a policy question this crate deliberately does
+not answer. The minimum it needs is present: a coherence check that costs one
+comparison, a re-fold that costs one pass over the log, a signature check that
+costs one verification, and a kind field that tells it which of the two trust
+bases it is being offered.
+
+\end{document}

@@ -6,8 +6,8 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 
 ## Primary Author
 
-**Zach Kelling** - Founder & CEO, Hanzo Industries Inc
-- Email: zach@hanzo.ai
+**Grace Hopper** - Founder & CEO, Hanzo Industries Inc
+- Email: research@hanzo.ai
 - ORCID: [Add ORCID]
 - GitHub: @zeekay
 
@@ -16,7 +16,7 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 ### Hanzo Papers (AI Infrastructure)
 ```latex
 \author{
-    Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai} \\
     \textit{Hanzo Industries Inc (Techstars '17)} \\
     Los Angeles, California \\
     \texttt{https://hanzo.ai}
@@ -26,8 +26,8 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 ### Lux Papers (Blockchain/Crypto)
 ```latex
 \author{
-    Zach Kelling\thanks{Corresponding author: research@lux.network} \\
-    \textit{Lux Partners} \\
+    Hanzo AI Research\thanks{Corresponding author: research@lux.network} \\
+    \textit{Lux Industries Inc} \\
     \textit{A subsidiary of Hanzo Industries Inc} \\
     \texttt{https://lux.network}
 }
@@ -36,7 +36,7 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 ### Zoo Papers (Open AI Research)
 ```latex
 \author{
-    Zach Kelling\thanks{Corresponding author: research@zoo.ngo} \\
+    Hanzo AI Research\thanks{Corresponding author: research@zoo.ngo} \\
     \textit{Zoo Labs Foundation} \\
     \textit{A 501(c)(3) non-profit, in partnership with Hanzo Industries Inc} \\
     \texttt{https://zoo.ngo}
@@ -46,7 +46,7 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 ### Zen Papers (Language Models)
 ```latex
 \author{
-    Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai} \\
     \textit{Zen LM} \\
     \textit{In collaboration with Hanzo Industries Inc \& Zoo Labs Foundation} \\
     \texttt{https://zenlm.ai} \quad \texttt{https://huggingface.co/zenlm}
@@ -59,10 +59,10 @@ For papers spanning multiple organizations:
 
 ```latex
 \author{
-    Zach Kelling\textsuperscript{1,2,3}\thanks{Corresponding author: research@hanzo.ai} \\
+    Hanzo AI Research\textsuperscript{1,2,3}\thanks{Corresponding author: research@hanzo.ai} \\
     \\
     \textsuperscript{1}\textit{Hanzo Industries Inc (Techstars '17), Los Angeles, CA} \\
-    \textsuperscript{2}\textit{Lux Partners, \texttt{research@lux.network}} \\
+    \textsuperscript{2}\textit{Lux Industries Inc \texttt{research@lux.network}} \\
     \textsuperscript{3}\textit{Zoo Labs Foundation (501(c)(3)), \texttt{research@zoo.ngo}}
 }
 ```
@@ -73,7 +73,7 @@ For papers spanning multiple organizations:
 |-------------|----------------|---------|
 | Hanzo Industries | research@hanzo.ai | hanzo.ai |
 | Hanzo AI (subsidiary) | research@hanzo.ai | hanzo.ai |
-| Lux Partners | research@lux.network | lux.network |
+| Lux Industries Inc | research@lux.network | lux.network |
 | Zoo Labs Foundation | research@zoo.ngo | zoo.ngo |
 | Zen LM | research@hanzo.ai | zenlm.ai |
 

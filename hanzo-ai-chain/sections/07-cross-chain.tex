@@ -1,116 +1,135 @@
-\section{Cross-Chain Integration}
+\section{Post-Quantum Omnichain Settlement}
 \label{sec:xchain}
 
-The AI Chain is one chain in the Lux multi-chain layout (LP-134, the
-P/Q/Z/A/B/M/F pipeline). Each peer chain has a single, well-defined
-purpose; AI Chain composes with them through small, typed precompiles
-rather than redefining their work.
+Hanzo's omnichain claim is deliberately asymmetric. Proof-of-AI consensus exists
+only on Lux A-Chain. Any supported chain may receive a payout, but no destination
+may accept raw work, run a local mining verifier, maintain a competing work-spent
+set, or instantiate another AI emission schedule. Z-Chain is the P3Q settlement
+rollup for finalized A-Chain transitions, not another PoAI authority.
 
-\subsection{C-Chain (EVM)}
+\subsection{A-Chain work truth, Z-Chain settlement, and Lux finality}
 
-The Lux C-Chain runs the general-purpose EVM. The AI Chain runs the
-AIVM, which is a strict superset of the EVM (\S\ref{sec:arch}). Any
-solidity contract that runs on C-Chain runs on AI Chain unmodified;
-contracts on AI Chain may additionally call the AIVM precompiles.
-
-The two chains exchange value and messages through B-Chain bridges.
-A C-Chain ERC-20 contract holding USDC can settle the receivable side
-of a Hanzo inference contract that lives on AI Chain; the bridge
-message is what makes the cross-chain transfer atomic with respect to
-the AI receipt.
-
-\subsection{F-Chain (FHE Confidential Inference)}
-
-F-Chain is the Lux fully homomorphic encryption chain (LP-013) and the
-home of confidential ERC-20 patterns (LP-067). For inference workloads
-where the input data must remain encrypted end-to-end, the AI Chain
-delegates execution to F-Chain through the \texttt{F\_CALL} precompile.
-
-The flow:
+The settlement path is:
 
 \begin{enumerate}[leftmargin=1.4em]
-  \item Caller encrypts input under CKKS to the operator's public key
-        on F-Chain.
-  \item Caller invokes \texttt{F\_CALL}(model\_root, fhe\_input,
-        max\_payment) on AI Chain.
-  \item AI Chain emits a B-Chain bridge message routing the FHE
-        ciphertext and the model commitment to F-Chain.
-  \item F-Chain operator runs the homomorphic forward pass under TEE,
-        emits an encrypted output and a TEE quote.
-  \item Bridge returns (encrypted\_output, tee\_quote) to AI Chain;
-        the receipt is recorded.
-  \item Caller decrypts the output under their secret key.
+  \item A-Chain admits a useful job and fixes the execution policy, proof policy,
+        reward, destination chain, and destination recipient.
+  \item A provider commits its output, transcript, and metering after executing
+        the job on CPU or GPU.
+  \item PoAI consensus resolves the configured proof policy, validates that the
+        bound work was actually performed, and consumes the global nullifier.
+  \item The final mining receipt is committed under the A-Chain receipt root.
+  \item Z-Chain batches the finalized receipt transition and verifies its
+        activated Plonky3-derived P3Q STARK/FRI settlement proof. It does not
+        reconsider usefulness or accept an unrelated raw-work claim.
+  \item Lux Quasar finalizes the corresponding A-Chain and Z-Chain blocks; the
+        activated post-quantum validator policy authenticates their roots,
+        heights, and validator context.
+  \item Warp/Teleport, a native atomic boundary, or an authenticated relay carries
+        the Z-settled receipt and inclusion proof to the named destination.
+  \item The destination verifies finality, Z settlement, inclusion, chain binding, recipient,
+        amount, and local non-consumption, then releases the representation once.
 \end{enumerate}
 
-The provider sees only ciphertext throughout. The receipt on AI Chain
-proves which model produced the result without revealing inputs or
-outputs. This is the same primitive Hanzo AI Cloud describes for
-confidential inference (\texttt{\textasciitilde/work/hanzo/papers/hanzo-ai-cloud}),
-now anchored on chain.
+Thus ``mine into chain $D$'' means that the A-Chain job names $D$ before work is
+committed. It never means that $D$ can decide whether the work occurred.
 
-\subsection{M-Chain (Threshold Custody)}
+\subsection{Receipt object}
 
-M-Chain is the Lux MPC chain. Model owners with high-value or
-regulated weights may custody their model decryption keys on M-Chain
-under threshold MPC: a quorum of custodians must sign to release a
-decryption shard. The AI Chain references the custody record through
-the \texttt{M\_CUSTODY} precompile; an operator that wants to load
-encrypted weights must request and receive the threshold-signed
-release.
+A mining receipt binds at least
 
-This composes with HMMs in two useful ways. First, a model owner can
-publish weights publicly under a permissive license while reserving a
-specialized fine-tune under threshold custody. Second, regulated
-domains (medical, financial) can satisfy data-residency requirements
-by anchoring decryption authority to a custody quorum that includes
-in-jurisdiction parties.
+\begin{equation}
+\begin{split}
+R=(&\text{job id},\text{work nullifier},\text{miner},\text{model},
+\text{input},\text{output},\\
+&\text{execution policy},\text{proof policy},\text{proof finality},
+\text{measured work},\\
+&\text{authorized reward},\text{destination chain},
+\text{destination recipient},\text{A-Chain height}).
+\end{split}
+\end{equation}
 
-\subsection{B-Chain (Bridges)}
+The destination acts only on a completed, nonzero, finalized receipt under an
+authenticated monotonically advancing Z-settlement root that binds the A-Chain
+receipt. A raw miner signature, Freivalds
+opening, TEE quote, or output quorum is not an omnichain authorization.
 
-B-Chain (LP-134 §5) is the chain of bridges. All cross-chain messages
-in the AI Chain workflows above flow over B-Chain. The bridge is itself
-QuasarCert-secured: a B-Chain message attesting that ``AI Chain block
-$h$ recorded receipt $r$'' is signed by the same three-lane consensus
-that finalized the underlying block. There is no weaker bridge security
-tier.
+\subsection{Z-Chain P3Q settlement rollup}
 
-\subsection{P-Chain, Q-Chain, Z-Chain (Consensus Substrate)}
+P3Q is the intended Plonky3-derived, pairing-free STARK/FRI substrate for
+compressing finalized A-Chain receipt transitions on Z-Chain. The statement
+proved must include the prior A-Chain receipt root, finalized transition batch,
+global-nullifier effects, reward authorizations, and resulting root. Before the
+exact PoAI AIR, recursive batching policy, A-to-Z binding, verifier, and node
+integration are audited and activated, Z-Chain may record only an independently
+authenticated final A-Chain root and must not claim succinct proof authority.
 
-P/Q/Z are the consensus chains that produce the lanes of every
-QuasarCert (LP-105). The AI Chain is a consumer of those certificates,
-not a producer of them, in the same way every other Lux chain is.
-This is why AI Chain inherits Quasar 3.0 security without modification:
-the lanes are produced once, on the consensus substrate, and reused by
-every chain that asks for finality.
+\subsection{Supply conservation}
 
-\subsection{Topology Summary}
+There is one canonical AI ledger and one proof-earned allowance. A destination
+either releases escrowed canonical AI or mints a representation backed by the
+canonical settlement rail. It does not reproduce the two-trillion cap, DAO
+allocation, halving calculation, or global nullifier. The sum of canonical AI
+and unbacked representations must never exceed the canonical supply.
+
+\subsection{C-Chain and external EVMs}
+
+An EVM receipt adapter verifies the Z-settled, PQ-authenticated A-Chain receipt,
+Merkle inclusion, destination binding, and exactly-once consumption. Application
+contracts may use the receipt to pay a provider, release a model, advance a
+workflow, or record provenance. They cannot reinterpret the evidence or award a
+different mining amount.
+
+\subsection{F-Chain confidentiality}
+
+F-Chain may supply encrypted execution or confidentiality services to an
+A-Chain job. Its ciphertext commitments and output root are bound into the same
+PoAI receipt. F-Chain does not become a mining authority, and a confidential
+execution profile still requires an explicit proof or attestation policy.
+
+\subsection{M-Chain threshold custody}
+
+M-Chain may custody model keys or authorize confidential-weight release under a
+threshold policy. That authorization is an input to the A-Chain job, not proof
+that the job ran. Pulsar or Corona may authenticate consensus and custody flows
+after their selected protocol and deployment pass review; choosing ML-DSA alone
+does not create threshold security.
+
+\subsection{B-Chain and Warp/Teleport transport}
+
+B-Chain, Warp/Teleport, and native atomic interfaces are transport and
+settlement mechanisms. Their security obligation is to carry the exact
+Quasar-finalized A/Z settlement root and receipt proof without changing the
+destination or amount. The same receipt may be relayed by anyone but consumed
+only once at its bound destination.
+
+\subsection{Topology summary}
 
 \begin{figure}[h]
 \centering
+\resizebox{\linewidth}{!}{%
 \begin{tikzpicture}[
-    node distance=0.55cm and 1.0cm,
-    box/.style={rectangle, draw, minimum width=1.7cm, minimum height=0.55cm,
+    node distance=0.8cm and 1.2cm,
+    box/.style={rectangle, draw, minimum width=2.2cm, minimum height=0.65cm,
                 font=\footnotesize, rounded corners=1pt},
-    arrow/.style={<->, thick}
+    arrow/.style={->, thick}
 ]
-\node[box] (a) {A (= AI)};
-\node[box, above=of a]      (c) {C (EVM)};
-\node[box, below=of a]      (b) {B (Bridges)};
-\node[box, left=of a]       (f) {F (FHE)};
-\node[box, right=of a]      (m) {M (MPC)};
-\node[box, below left=of b] (p) {P (val)};
-\node[box, below=of b]      (q) {Q (cer)};
-\node[box, below right=of b](z) {Z (snark)};
-\draw[arrow] (c) -- (a);
-\draw[arrow] (a) -- (b);
-\draw[arrow] (a) -- (f);
-\draw[arrow] (a) -- (m);
-\draw[arrow] (b) -- (p);
-\draw[arrow] (b) -- (q);
-\draw[arrow] (b) -- (z);
+\node[box] (job) {Useful AI job};
+\node[box, right=of job] (a) {A-Chain PoAI};
+\node[box, right=of a] (z) {Z-Chain P3Q};
+\node[box, right=of z] (lux) {Lux PQ finality};
+\node[box, above right=of lux] (hanzo) {Hanzo};
+\node[box, right=of lux] (other) {Any destination};
+\node[box, below right=of lux] (zoo) {Zoo / Lux / EVM};
+\draw[arrow] (job) -- (a);
+\draw[arrow] (a) -- node[above,font=\scriptsize]{one receipt} (z);
+\draw[arrow] (z) -- node[above,font=\scriptsize]{settled proof} (lux);
+\draw[arrow] (lux) -- (hanzo);
+\draw[arrow] (lux) -- (other);
+\draw[arrow] (lux) -- (zoo);
 \end{tikzpicture}
-\caption{The AI Chain (A) sits at the center: it composes with the EVM
-(C) above, with bridges (B) below, with FHE (F) on the left, and with
-MPC (M) on the right. P/Q/Z produce the lanes that finalize every
-chain.}
+}
+\caption{One A-Chain PoAI decision is proved and settled through P3Q on Z-Chain,
+then becomes a PQ-authenticated omnichain receipt. Destinations consume it; they
+do not validate mining work.}
 \end{figure}

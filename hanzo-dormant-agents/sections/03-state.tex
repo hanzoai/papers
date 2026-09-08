@@ -1,0 +1,63 @@
+\section{State at rest: an agent is a row}
+\label{sec:state}
+
+A dormant agent's state is whatever it must be handed to carry on: an
+identifier, the tenant it belongs to, its position in a workflow, a pointer to
+its conversation, and whatever the agent itself has stashed. Serialized through
+the production schema this is \rFleetRecord{}\,bytes of JSON for a representative
+agent \meas{}.
+
+We wrote \rFleetAgents{} of them --- 100{,}000 tenants with 10 agents each ---
+into SQLite and measured the file.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Fleet of \rFleetAgents{} dormant agents} & \\
+\midrule
+Agent record, serialized       & \rFleetRecord{}\,bytes \meas{} \\
+On disk, per agent             & \textbf{\rFleetPer{}\,bytes} \meas{} \\
+On disk, total                 & \rFleetDisk{}\,MiB \meas{} \\
+Write time                     & \rFleetWriteS{}\,s \meas{} \\
+Write rate                     & \rFleetRate{}\,agents/s \meas{} \\
+Resume, in-process             & \textbf{\rFleetResume{}\,ms} \meas{} \\
+Resume, via process spawn      & \rFleetResumeCold{}\,ms \meas{} \\
+\bottomrule
+\end{tabular}
+\caption{State residency. The gap between the serialized record and the on-disk
+figure is SQLite's per-row and index overhead: \rFleetPer{} against
+\rFleetRecord{} is 110\,bytes of structure per agent, which buys the index that
+makes the resume in the last row possible.}
+\label{tab:fleet}
+\end{table}
+
+Three things in that table matter more than the headline.
+
+\paragraph{The whole fleet fits in a file you can copy.}
+\rFleetDisk{}\,MiB is smaller than a single container image. It fits in page
+cache on the laptop it was measured on. There is no storage tier involved and no
+distributed system: it is one file, and the standard tools work on it. This is
+what makes the dormant majority cheap --- not a compression scheme or a tiering
+policy, but the absence of anything that would make it expensive.
+
+\paragraph{Writing is not the bottleneck anyone expects.}
+\rFleetRate{}\,agents/s means the entire million-agent fleet is created in
+\rFleetWriteS{}\,seconds on one core of a laptop. A platform provisioning agents
+at even a thousand a second --- which would be a very busy platform --- is using
+0.3\% of the write path measured here.
+
+\paragraph{Resume is cheap enough to prefer over residency.}
+\rFleetResume{}\,ms in-process is the number that settles the design question.
+If bringing an agent back from a row costs 34 microseconds, then holding its
+execution context alive to avoid that cost is only worth it for an agent that
+will be woken again within microseconds. For anything idle longer --- which is
+what dormant means --- the row is strictly better: it costs \rFleetPer{}\,bytes
+of disk instead of \rGoPer{}\,bytes of RAM, and it survives a restart.
+
+The contrast in the last row is worth stating plainly. Resuming through a cold
+process spawn costs \rFleetResumeCold{}\,ms, which is 100$\times$ the in-process
+figure. That entire 100$\times$ is process creation, not agent work. It is the
+first appearance in this paper of the pattern that dominates the rest of it:
+\emph{the cost is almost never the agent, it is the container the agent was put
+in.}

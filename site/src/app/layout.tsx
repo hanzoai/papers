@@ -1,4 +1,6 @@
 import type { Metadata } from 'next'
+import { Zen } from '@hanzo/font/sans'
+import { ZenMono } from '@hanzo/font/mono'
 import { ThemeProvider } from 'next-themes'
 import { siteConfig } from '@/config/papers'
 import './global.css'
@@ -25,10 +27,12 @@ export default function RootLayout({
 }: {
   children: React.ReactNode
 }) {
-  // No font loader. Zen ships inside @hanzo/design and global.css declares the
-  // faces, so there is no generated family name to bind here.
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      className={`${Zen.variable} ${ZenMono.variable}`}
+      suppressHydrationWarning
+    >
       <head>
         <script
           dangerouslySetInnerHTML={{

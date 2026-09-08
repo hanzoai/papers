@@ -1,170 +1,38 @@
 \documentclass[11pt]{article}
-\usepackage[margin=1in]{geometry}
-\usepackage{booktabs}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{graphicx}
-\usepackage{xcolor}
-\usepackage{hyperref}
-\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
-\usepackage{enumitem}
-\usepackage{listings}
-\usepackage{array}
+\input{shared/kernel-preamble.tex}
 
-\definecolor{kw}{rgb}{0.13,0.29,0.53}
-\definecolor{cmt}{rgb}{0.40,0.40,0.40}
-\definecolor{str}{rgb}{0.16,0.50,0.16}
-\lstset{
-  basicstyle=\ttfamily\footnotesize,
-  keywordstyle=\color{kw}\bfseries,
-  commentstyle=\color{cmt}\itshape,
-  stringstyle=\color{str},
-  showstringspaces=false,
-  breaklines=true,
-  columns=fullflexible,
-  frame=single,
-  framesep=4pt,
-}
-\lstdefinelanguage{Rust}{
-  morekeywords={fn,let,mut,pub,struct,impl,trait,enum,match,if,else,for,while,loop,return,use,mod,crate,self,super,async,await,where,type,const,static,unsafe,ref,move,dyn,as,true,false},
-  morecomment=[l]{//}, morecomment=[s]{/*}{*/}, morestring=[b]", sensitive=true,
-}
-
-\newcommand{\x}{\ensuremath{\times}}
-\newcommand{\dpa}{\texttt{dp4a}}
-\newcommand{\hk}{\texttt{hanzo-kernel}}
-\newcommand{\code}[1]{\texttt{#1}}
-
-% Absorb minor prose overfulls without rivers; keep line-breaking sane.
-\tolerance=800
-\emergencystretch=3em
-
-\title{\textbf{Fusion Is Composition:\\
-A Category-Theoretic Kernel DSL that Collapses the\\
-Backends\,\x\,Ops\,\x\,Types Product}}
+\title{\textbf{One Source, Every Backend:\\ The \hk{} DSL --- Thesis and Guided Tour}}
 \author{Hanzo AI --- ML Systems}
-\date{Paper 07 --- companion to Paper 06 (\emph{When Does a Kernel Win Surface?})}
+\date{Paper 07 (umbrella) --- companion to Paper 06 (\emph{When Does a Kernel Win Surface?})}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-A multi-backend inference engine hand-writes the same $\sim$20 operations, specialized over $\sim$22
-GGUF quantization formats, once per GPU backend --- a Cartesian product of five kernel trees and
-$\sim$52{,}000 lines that is not merely a maintenance cost but the breeding ground for
-divergence bugs, because one operation with five implementations has five numeric behaviors. We
-present \hk{}, a first-party Rust GPU-kernel DSL that collapses this product to a sum, built on one
-organizing idea: \textbf{fusion is composition} --- the functor law $\mathrm{map}(g)\circ\mathrm{map}(f)
-= \mathrm{map}(g\circ f)$ made mechanical, with Reduce/Scan as algebraic fences, so ``can these two
-ops fuse?'' is a total function of the op's \emph{class}, not a pattern matcher or a cost model.
-On this base sit three mechanisms that each attack one axis of the product: \emph{comptime-specialized
-autotune} (one kernel source, its schedule exposed as compile-time knobs the tuner picks per device,
-every variant byte-identical); \emph{intrinsic islands} (scoped target-gated blocks inside one kernel
-whose \code{default} arm is the normative oracle); and \emph{a CPU runtime as the bit-exact oracle}
-for every backend. We report the evidence: 10/10 op families bit-exact against the CPU oracle;
-DSL$\to$Vulkan and DSL$\to$ROCm dispatch bit-exact on real hardware (rms\_norm on gfx1151,
-$\text{max\_rel}=2.43\times10^{-7}$); a single-source \dpa{} matvec at \textbf{118\% of the hand-tuned
-kernel} it replaces (196~GB/s, gfx1151); a shipped Vulkan migration where the DSL twin was
-\textbf{7.1\x{} faster} than the hand-written shader \emph{and} bit-exact; and a nightly three-backend
-GPU CI (self-hosted CUDA/ROCm/Metal) that enforces the bit-exactness law. We also report a
-scientifically load-bearing \emph{negative} result: int8 tensor-core MMQ via the high-level WMMA API is
-structurally sync-bound (the opaque accumulator fragment forces a store$\to$sync$\to$reload$\to$scale per
-32-element block; a better-tiled version is \emph{slower}), so block-quantized GEMM stays hand-written
-behind benchmark gates --- which is exactly what islands are designed to hold. None of Triton, XLA,
-torch.compile, TVM, Halide, Burn, or Mojo models fusion as morphism composition; we state precisely
-what is and is not novel.
+The kernel layer of a multi-backend LLM engine is a Cartesian product: the same $\sim$20 operations,
+specialized over $\sim$22 quantization formats, hand-written once per GPU backend --- five kernel trees
+and $\sim$52{,}000 lines, and the breeding ground for the divergence bugs that cost the most to chase,
+because one operation with five implementations has five numeric behaviors. This umbrella paper states the
+thesis that collapses the product to a sum and gives a guided tour of the six companion papers that make
+it concrete. The thesis rests on one idea --- \textbf{fusion is composition}, the functor law made
+mechanical --- extended by three mechanisms that each attack one axis of the product: comptime-specialized
+autotune (the schedule as a value, not a fork), intrinsic islands (a per-backend idiom held behind a
+normative oracle arm), and a CPU runtime that is the bit-exact reference for every backend. We describe the
+facade that ties them together (a first-party namespace over the CubeCL lowering engine, plugged in as a
+code generator rather than a second runtime), summarize the evidence --- portability that costs nothing, a
+shipped migration that improved performance, an honest structural negative result --- and place the work
+against Triton, XLA, torch.compile, TVM, Halide, Burn, and Mojo. Each fact in this series lives in exactly
+one paper; here we connect them.
 \end{abstract}
 
-\section{Introduction}
+\section{The thesis: a product that should be a sum}
+\label{sec:thesis}
 
-The kernel layer of a multi-backend LLM engine is a product. Table~\ref{tab:dup} is the current
-inventory in the Hanzo ML and engine repositories: five hand-written kernel trees --- CUDA C++, HIP
-C++, Metal Shading Language, GLSL$\to$SPIR-V, and the engine's own CUDA --- carrying on the order of
-$52{,}000$ lines of hand-written kernel arithmetic. The same $\sim$20 operations (matvec, matmul,
-flash attention, RMSNorm, RoPE, softmax, the Gated-DeltaNet linear-attention ops) are re-implemented in
-each, and within each they are specialized over $\sim$22 GGUF quantization formats. Three axes ---
-\emph{backends}, \emph{ops}, \emph{types} --- are multiplied by hand.
-
-That product is where the correctness bugs breed, and Paper~06 catalogs the class concretely: a
-Qwen3-8B model that generates coherently on Metal collapses into token repetition under CUDA
-flash-attention, byte-identical weights and sampler, because \emph{the same operation has a different
-kernel per backend and therefore a different numeric behavior}. Uniform numeric behavior across
-backends is not something four or five copies can be tested \emph{into}; it is a structural property of
-having exactly one implementation. The engineering goal, then, is not ``write the kernels more
-carefully'' but ``write each operation once and lower it everywhere,'' turning the product into a sum:
-\[
-\underbrace{\text{backends} \x \text{types} \x \text{ops}}_{\text{hand-written today}}
-\;\longrightarrow\;
-\underbrace{\text{backends} + \text{types} + \text{ops}}_{\text{one source, lowered}}.
-\]
-
-\begin{table}[h]
-\centering
-\begin{tabular}{llrr}
-\toprule
-\textbf{Tree} & \textbf{Language} & \textbf{Files} & \textbf{Lines} \\
-\midrule
-CUDA (ML)      & CUDA C++                 & --  & 13{,}123 \\
-ROCm           & HIP C++                  & 19  & 6{,}725  \\
-Metal          & Metal Shading Language   & --  & 3{,}530  \\
-Vulkan         & GLSL $\rightarrow$ SPIR-V & 121 & 7{,}105  \\
-CUDA (engine)  & CUDA C++                 & --  & 21{,}862 \\
-\midrule
-\textbf{Total} & 5 trees & & \textbf{52{,}345} \\
-\bottomrule
-\end{tabular}
-\caption{The collapse ledger: hand-written kernel arithmetic across the five backend trees.\protect\footnotemark{}
-The DSL's job is to drain this to op-specs $+$ type-specs $+$ backend lowerings.}
-\label{tab:dup}
-\end{table}
-\footnotetext{These are hand-written, non-generated, non-vendored kernel lines --- the \emph{deletable}
-duplication. A na\"ive \code{wc -l} over all \code{*.cu/*.cuh/*.hip/*.hpp/*.metal/*.comp} is roughly
-$2\x$ larger ($\sim$112k) because it also counts C++ headers, a \code{target/package/} build-artifact
-copy, machine-generated codebook tables (e.g. the i-quant grids), and vendored upstream kernels
-(FlashInfer, Marlin, GPTQ) that are neither hand-written duplication nor a DSL collapse target.}
-
-\paragraph{Thesis and contributions.}
-This paper argues that the collapse is not an engineering slog of retyping kernels into a portable
-syntax but follows from one algebraic idea, applied three ways. The idea is that \textbf{kernel fusion
-is morphism composition}: an elementwise kernel is the lift of a scalar function to every array index,
-and the functor law $\mathrm{map}(g)\circ\mathrm{map}(f)=\mathrm{map}(g\circ f)$ read right-to-left
-\emph{is} fusion --- one kernel computing the composite, no intermediate array. Reduce/Scan are the
-\emph{fences} where the pattern changes, decidable from the op's class, not from a pattern matcher.
-Concretely, we contribute:
-\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
-\item \textbf{Fusion as composition} (\S\ref{sec:fuse}): an op algebra in which legal fusion is a total
-function of op \emph{class}, one fused-interpreter kernel that lowers any composed chain to a single
-launch with zero intermediates, and its generalization from a line to an arbitrary DAG --- all
-bit-exact-gated on the CPU (fused one-kernel $=$ na\"ive $N$-kernel $=$ plain-Rust reference).
-\item \textbf{Comptime-specialized autotune} (\S\ref{sec:tune}): the schedule of a single-source kernel
-exposed as \code{\#[comptime]} knobs the engine monomorphizes over; a small variant set timed once per
-$(\text{device},\text{op},\text{shape})$ and cached to XDG; every variant byte-identical, so the tuner
-picks speed without touching numerics --- the ``one op, $N$ device forks'' bug class killed.
-\item \textbf{Intrinsic islands} (\S\ref{sec:island}): a target-gated block \emph{inside} one kernel
-whose \code{default} arm is normative and whose accelerated arms are proven byte-for-byte equal to it
-on the CPU oracle --- the disciplined seam for the rare instruction that truly needs a per-backend idiom.
-\item \textbf{The CPU oracle law and its CI} (\S\ref{sec:oracle}): the CPU runtime is the single
-bit-exact reference for every backend, enforced nightly on self-hosted CUDA/ROCm/Metal runners.
-\item \textbf{Evidence, positive and negative} (\S\ref{sec:eval}--\ref{sec:negative}): cross-backend
-bit-exactness, a portable kernel that \emph{beats} the hand-tuned one, a shipped migration that improved
-performance, and an honest structural negative result on int8 tensor-core MMQ.
-\end{enumerate}
-
-We adopt CubeCL as the lowering engine and wrap it in a first-party facade so that kernel source names
-only \code{hanzo\_kernel::*}; the string \code{cubecl} appears in exactly one line of one
-\code{Cargo.toml}. That is ``values, not places'': CubeCL is the implementation \emph{value};
-\hk{} is the stable \emph{namespace} we build against, upgradable or forkable without editing a kernel.
-
-\section{Design: the facade and the three axes}
-\label{sec:design}
-
-\subsection{Three orthogonal axes, one source}
-The kernel code braids three independent concerns. Pulled apart, each is written once and they compose
-(Table~\ref{tab:axes}). The transformation is not new in spirit --- ROCm already decomplected two of
-the three axes, writing its kernels as \code{qmatvec\_core<WTYPE>}: one contraction, the quantization
-type injected as a compile-time template parameter. The DSL is exactly that pattern with the
-\emph{backend} as the other compile-time axis. We are generalizing a decomplect already trusted in
-production, not inventing an untested one.
+Table~\ref{tab:axes} is the disease. A multi-backend engine braids three independent concerns into one
+hand-multiplied product: the operations (the math), the quantization types (the bit layout), and the
+backends (the lowering). Written by hand, that is $\sim$20 $\times$ 22 $\times$ 5 kernels; in the Hanzo
+repositories it is $52{,}345$ lines across five trees and five shading languages (the ledger and its
+audit live in the collapse-method paper, \cite{method}).
 
 \begin{table}[h]
 \centering
@@ -177,29 +45,39 @@ Quant types & $\sim$22 & the bit layout: Q4\_K, Q6\_K, Q8\_0, the IQ codebooks \
 Backends   & 5        & the lowering: threads, memory, tensor cores, per shading language \\
 \bottomrule
 \end{tabular}
-\caption{The three axes the hand-written product multiplies. The DSL makes each a summand.}
+\caption{Three orthogonal axes, multiplied by hand today. The DSL's job is to make each a summand.}
 \label{tab:axes}
 \end{table}
 
-\subsection{A code generator, not a second runtime}
-\hk{} lowers a \code{\#[kernel]} to SPIR-V for Vulkan, to CUDA/PTX for CUDA, to MSL for Metal, and
-through cubecl-hip for ROCm. Crucially it is a \emph{code generator}, not a competing GPU runtime: the
-engine's Vulkan path is already \code{include\_bytes!(<name>.spv)} $\to$ \code{create\_shader\_module}
-$\to$ dispatch, and CubeCL emits exactly those bytes. A DSL RMSNorm dumped and inspected is a
-\code{GLCompute} entry point with buffers on descriptor bindings $0,1,2$ --- byte-for-byte the shape
-the engine's hand-written \code{.comp}$\to$\code{.spv} shaders already take. So the DSL plugs into each
-backend's \emph{existing} dispatch machinery; there is no dual runtime and no cross-runtime copy. The
-one bounded integration step is a three-line SPIR-V post-pass (rename the entry point to \code{main};
-strip CubeCL's unused info-uniform at binding~3 via \code{spirv-opt --remove-unused-interface-variables};
-dispatch), automated by a reusable emitter.
+That product is not merely a maintenance cost. It is where correctness bugs breed: a single quantized
+model that generates coherent text on one backend and collapses into token repetition on another, from
+byte-identical weights, because the same operation has a different kernel --- and therefore a different
+numeric behavior --- per backend (the bug and its cure are the subject of the oracle paper,
+\cite{oracle}). Uniform numeric behavior across backends cannot be tested \emph{into} five copies; it is a
+structural property of having one implementation. So the goal is to turn the product into a sum:
+\[
+\underbrace{\text{backends} \x \text{types} \x \text{ops}}_{\text{hand-written today}}
+\;\longrightarrow\;
+\underbrace{\text{backends} + \text{types} + \text{ops}}_{\text{one source, lowered}}.
+\]
+This is a decomplect we already trust in miniature: the ROCm tree writes \code{qmatvec\_core<WTYPE>} --- one
+contraction, the quant type injected as a compile-time parameter. The DSL generalizes exactly that pattern
+with the \emph{backend} as the other compile-time axis.
 
-\subsection{The kernel-authoring surface}
-Listing~\ref{lst:names} shows the facade's first-principles vocabulary: \code{\#[kernel]} says what it
-is (a GPU kernel), not \code{cube} (a brand); \code{Grid} and \code{Block} name the launch shape
-directly. A kernel's only import is \code{use hanzo\_kernel::prelude::*;}.
+\section{The facade: a namespace, and a code generator}
+\label{sec:facade}
 
-\begin{lstlisting}[language=Rust,caption={The Q8\_0 matvec: one source, no backend in it. The decode
-(\code{wd*wq}) and the contraction are the arithmetic each backend hand-writes today.},label={lst:names}]
+\hk{} is a first-party Rust DSL: a kernel is written once, in Rust, and lowered to CUDA, ROCm, Vulkan, and
+Metal. It is a \emph{facade} over the CubeCL lowering engine --- kernel source names only
+\code{hanzo\_kernel::*}, and the string \code{cubecl} appears in exactly one line of one \code{Cargo.toml}.
+That is ``values, not places'': CubeCL is the implementation \emph{value}; \hk{} is the stable
+\emph{namespace} we build against, upgradable or forkable without editing a kernel. The authoring surface
+uses first-principles names --- \code{\#[kernel]} says what a thing is (a GPU kernel), not \code{cube} (a
+brand); \code{Grid} and \code{Block} name the launch shape directly (Listing~\ref{lst:matvec}).
+
+\begin{lstlisting}[language=Rust,caption={A quantized matvec: one source, no backend in it. The decode
+(\code{wd*wq}) and the contraction are the arithmetic each backend hand-writes today. This one function
+lowers to CUDA, ROCm, Vulkan, Metal, and CPU.},label={lst:matvec}]
 use hanzo_kernel::prelude::*;
 
 #[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
@@ -215,446 +93,122 @@ pub fn matvec_q8<F: Float>(wd: &Array<F>, wq: &Array<i32>, x: &Array<F>,
 }
 \end{lstlisting}
 
-The perf primitives the hand-tuned kernels rely on are all reachable and each lowers to the native
-instruction: \code{dot} on a vectorized \code{Line<i8>} $\to$ \dpa{}\,/\,\code{OpSDotAccSat};
-\code{cmma} $\to$ WMMA\,/\,cooperative-matrix\,/\,simdgroup; \code{SharedMemory}, the \code{plane\_*}
-subgroup reductions, \code{Atomic}, and barriers. The DSL is a superset of what we express by hand, so
-nothing about portability forces a performance downgrade --- a claim we make good on in \S\ref{sec:eval}
-and qualify honestly in \S\ref{sec:negative}.
+Crucially the DSL is a \emph{code generator}, not a competing GPU runtime. The engine's Vulkan path is
+already ``load SPIR-V bytes, create a shader module, dispatch,'' and the DSL \emph{emits} exactly those
+bytes: a compiled kernel is a \code{GLCompute} entry point with buffers on descriptor bindings $0,1,2$ ---
+byte-for-byte the shape the hand-written \code{.comp}$\to$\code{.spv} shaders already take. So the DSL plugs
+into each backend's \emph{existing} dispatch machinery; there is no dual runtime and no cross-runtime copy.
+The one bounded integration step is a three-line SPIR-V post-pass (rename the entry point to \code{main};
+strip the engine's unused info-uniform; dispatch). The perf primitives the hand-tuned kernels rely on are
+all reachable and each lowers to the native instruction --- \code{dot} on a vectorized \code{Line<i8>}
+$\to$ \dpa{}, \code{cmma} $\to$ tensor cores, \code{SharedMemory} and the \code{plane\_*} subgroup
+reductions --- so portability does not, by construction, force a performance downgrade.
 
-\section{Mechanism I: fusion is composition}
-\label{sec:fuse}
+\section{A guided tour of the mechanisms}
+\label{sec:tour}
 
-\subsection{The functor law, read right-to-left}
-An elementwise (pointwise) kernel is the lift of a scalar morphism $f:F\to F$ applied at every index.
-Pointwise lifts obey the functor law
-\[
-\mathrm{map}(g)\circ\mathrm{map}(f) \;=\; \mathrm{map}(g\circ f).
-\]
-Read left-to-right this is two kernels with a materialized intermediate array between them; read
-right-to-left it is \emph{one} kernel computing the composed scalar function with \emph{no}
-intermediate. Kernel fusion is nothing but that law read right-to-left. It is exactly the transducer
-story: \code{map(f)} and \code{map(g)} are transformations independent of the collection, so you compose
-the \emph{transformations} and apply the composite to the collection once. Here the collection is a GPU
-array and ``once'' is one launch. Categorically the Maps are morphisms $\mathrm{Array}\to\mathrm{Array}$
-and composition of morphisms \emph{is} fusion --- there is no separate ``fusion pass'' concept, only the
-associativity of $\circ$.
+The collapse is not a syntactic retyping of kernels; it follows from one algebraic idea applied three
+ways. Each is developed in full in its own companion paper; here is the map.
 
-\subsection{The class decides fusibility}
-The whole surface is a tiny op algebra, and legal fusion falls out of the op's \emph{class}, not from a
-pattern matcher over concrete ops:
-\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
-\item \textbf{Map} (pointwise morphism): output element $i$ depends only on input(s) at index $i$.
-Shape-preserving, index-local. Maps compose freely: any run of Maps is one Map (the functor law). This
-is the fusible family --- \code{Add Sub Mul Div Neg Recip Abs Exp Rsqrt Sigmoid Tanh Silu Gelu}.
-\item \textbf{Reduce\,/\,Scan} (contraction): output $i$ depends on a whole row/axis
-(\code{sum}, \code{max}, \code{mean} $\to$ RMSNorm, softmax, matmul). Not index-local, so it cannot be
-absorbed into an adjacent Map by the same lift; it needs cross-lane communication. A Reduce is therefore
-a \emph{fence}: a preceding Map run fuses into its input \emph{read} (prologue) and a following Map run
-fuses into its output \emph{write} (epilogue), but the reduction is the seam where the kernel pattern
-changes.
-\end{itemize}
-The decision ``can these two adjacent ops fuse?'' reduces to
-$\mathrm{fusible}(a,b) := \mathrm{is\_map}(a)\wedge\mathrm{is\_map}(b)$, plus prologue/epilogue
-attachment at a Reduce's ports. Nothing else. The fusion pass is one fold: walk the chain, compose
-adjacent Maps by substituting the previous expression for the current-value leaf (\code{compose\_cur},
-which \emph{is} $g[\,\code{Cur}:=f\,]$), and cut a new region at every Reduce.
+\paragraph{Fusion is composition (\cite{fuse}).} An elementwise kernel is the lift of a scalar function to
+every index, and such lifts obey the functor law $\mathrm{map}(g)\circ\mathrm{map}(f)=\mathrm{map}(g\circ
+f)$. Read right-to-left, that law \emph{is} fusion: one kernel computing the composite, no intermediate
+array. Reduce and Scan are algebraic \emph{fences} where the pattern changes, decidable from the op's
+class rather than a pattern matcher. This is the theory core: the fusibility of two ops is a total function
+of their type, one fused-interpreter kernel lowers any composed chain to a single launch, and the same
+algebra lifts from a line to an arbitrary DAG --- draining, for instance, a per-layer Gated-DeltaNet chain
+from 9 kernel launches to 5, bit-exact.
 
-\subsection{One kernel interprets the whole chain}
-The fused Map region is lowered to a small linear ``op program'' carried as a \code{\#[comptime]} value
-and walked in a comptime-\emph{unrolled} loop, so each op becomes straight-line arithmetic in one kernel
-body --- no runtime interpreter, no intermediate arrays, no extra launches
-(Listing~\ref{lst:fused}). It is not a hand-written fixed kernel: any linear elementwise chain the
-builder produces runs through this one \code{fused\_interp}, whatever its length.
+\paragraph{The schedule is a value (\cite{tune}).} The last place a backend forks a kernel is the schedule
+--- tile size, vector width, unroll, block dimension. A fork is exactly what reintroduces the divergence
+bug. Autotune folds the fork into the one source by exposing the schedule as compile-time knobs the engine
+monomorphizes; a small variant set is timed per device and the winner cached to disk. Because the knobs
+never touch the arithmetic, every variant is byte-identical --- the tuner buys speed and can never spend
+correctness.
 
-\begin{lstlisting}[language=Rust,caption={The one fused kernel. It reads the primary input once,
-threads it through the comptime program (unrolled to straight-line code), writes once. Every
-\code{Instr} is inlined; one launch, zero intermediates.},label={lst:fused}]
-#[kernel(targets(cuda, metal, vulkan, webgpu, cpu), unchecked)]
-pub fn fused_interp<F: Float>(x: &Array<F>, sides: &Sequence<Array<F>>,
-                              out: &mut Array<F>, #[comptime] prog: Program) {
-    let i = ABSOLUTE_POS;
-    if i < out.len() {
-        let mut acc = x[i];
-        #[unroll]
-        for step in 0..prog.instrs.len() {
-            match comptime!(prog.instrs[step]) {
-                Instr::Un(op)          => acc = apply_un_dev::<F>(op, acc),
-                Instr::BinIn(op, slot) => acc = apply_bin_dev::<F>(op, acc, sides.index(slot)[i]),
-                Instr::BinConst(op, b) => { let c = comptime!(f32::from_bits(b));
-                                            acc = apply_bin_dev::<F>(op, acc, F::new(c)) }
-            }
-        }
-        out[i] = acc;
-    }
-}
-\end{lstlisting}
+\paragraph{Intrinsic islands (\cite{island}).} When one inner line wants a target-specific instruction, you
+do not fork the kernel; you write a scoped, target-gated block \emph{inside} it. Selection is a
+compile-time \code{match} on a tag the launch layer fills in, so exactly one arm is lowered per backend.
+The \code{default} arm is \emph{normative} --- the CPU always takes it, and every accelerated arm is proven
+byte-for-byte equal to it on the CPU oracle before it ships. An escape hatch that cannot escape correctness.
 
-The ergonomic surface is a builder that reads like the composition it denotes:
-\code{Fuse::new(a).\allowbreak{}mul(w).\allowbreak{}add(b).\allowbreak{}silu().\allowbreak{}run(c)} appends one \code{Instr} per call, compiles
-them to one \code{Program}, and dispatches exactly one \code{fused\_interp}. Because the \code{Program}
-rides as a comptime value, the constant leaf is stored as \code{f32::to\_bits} so the program stays
-\code{Eq + Hash} --- the lowering engine keys the compiled kernel on it, one compiled kernel per distinct
-fused chain.
+\paragraph{One oracle, every backend (\cite{oracle}).} The foundation under all three: the CPU runtime is
+the single bit-exact reference for every backend. Every op's device code mirrors a plain-Rust reference
+line-for-line; because the CPU runs pointwise ops in program order, its result is the definition, and a GPU
+differs only by bounded reduction-order rounding. The law is enforced nightly by a three-backend GPU CI on
+self-hosted NVIDIA, AMD, and Apple machines --- so ``the same op has the same numbers everywhere'' is a
+checked invariant, and the repetition collapse becomes an unreachable state rather than a bug to fix.
 
-\subsection{From a line to a DAG}
-A real forward pass is not a line: a value fans out (used by several ops) and a binary fans in (reads two
-independently computed values). \code{silu(a)*b + a} reuses $a$ twice and a linear chain cannot express
-it in one region; a DAG can, and it still fuses to one kernel. The same algebra lifts from a path to a
-graph: a \code{NodeId}-taping newtype records an arbitrary pointwise DAG as a \code{Vec<Node>} (operator
-overloads push nodes instead of computing); a flood-fill partitions maximal Map-only connected regions,
-cutting every edge into a fence --- the identical \code{Class} predicate applied to graph edges instead
-of list-adjacency; and one generic \code{dag\_interp} kernel interprets a per-region DAG program over a
-per-element slot array (fan-out $=$ a slot read by several later instructions; fan-in $=$ a binary
-reading two slots), generalizing \code{fused\_interp}'s single accumulator to $n$ accumulators. The
-concrete payoff is measured on the real engine pattern: the per-GDN-layer chain
-\code{rms\_norm(x)*w*silu(g)} fuses from \textbf{9 launches to 5}, bit-exact
-($\text{max}=2.98\times10^{-8}$) against the na\"ive per-op path --- directly draining the prefill
-launch storm these hybrid models suffer.
+\paragraph{Where the product won't collapse (\cite{mmq}).} Honesty is part of the thesis. Block-quantized
+tensor-core MMQ --- the kernel that governs prefill --- does \emph{not} collapse through the portable API:
+its accumulator fragment is opaque, forcing a per-block scale round-trip that caps it near one-tenth of
+hand-tuned (proven sync-bound because better tiling is \emph{slower}). The viable route is per-backend
+anyway. So MMQ stays hand-written behind exactly the island seam built for it --- a named boundary, not a
+quiet exclusion.
 
-\subsection{The bit-exact gate}
-Every fused chain is checked three ways on the CPU runtime: (i) the fused one kernel, (ii) the na\"ive
-$N$-kernel pipeline that materializes $N{-}1$ device intermediates, and (iii) a plain-Rust reference ---
-all byte-for-byte identical. The tests exercise the two patterns the llama.cpp fusion audit named plus a
-stress case: the SwiGLU tail \code{silu(a)*b} (2 kernels $\to$ 1) and \code{silu(a*w+b)} (3 $\to$ 1) are
-\emph{byte-identical} fused-versus-na\"ive with reference error $\le 4.8\times10^{-7}$, and a 7-op mixed
-chain (\code{gelu((|2a{-}1|+b)/sigmoid(w)).tanh()}) runs in one launch, matching its host oracle. The
-device morphism table \code{apply\_un\_dev} is a line-for-line mirror of the host \code{apply\_un} ---
-which is \emph{why} fused equals oracle bit-exactly, not merely within tolerance.
+\paragraph{Verify, then delete (\cite{method}).} The migration method ties it together: a hand-written
+kernel is retired only when its single-source twin is both bit-exact against the oracle and at least as
+fast on a kernel-only benchmark, cell by cell through a per-\code{(op,type,backend)} registry, so the
+engine is faster-or-equal at every step. Cells have already flipped on \code{main} --- including a Vulkan
+\code{add\_rmsnorm} twin that was \emph{7.1$\times$ faster} than the shader it replaced and bit-exact.
 
-\paragraph{Why this is the right base.} Fusibility is a property of the op's \emph{type}, computed once,
-not rediscovered by a matcher for each new op combination. Adding an op adds one algebra variant and its
-device mirror; it does not add fusion rules. The reduction and matmul kernels stay hand-tuned and the
-Map regions attach to them as prologue/epilogue --- the fusion composes \emph{with} the peak kernels
-rather than competing with them.
+\section{Evidence, in one breath}
+\label{sec:evidence}
 
-\section{Mechanism II: comptime-specialized autotune}
-\label{sec:tune}
-
-\subsection{The collapse, closed on the schedule}
-The DSL already gives one source lowered to every backend. Autotune closes the loop on the last place a
-backend used to fork a kernel: the \emph{schedule}. Hand-tuning a schedule per device --- tile size,
-vector width, unroll factor, cube dimension --- is the ``same op, $N$ forks, $N$ drifting numeric
-behaviors'' bug class in a subtler dress. The fix is to expose the schedule as \code{\#[comptime]} knobs
-on the \emph{one} source. Each knob value is a distinct compiled kernel (CubeCL monomorphizes on comptime
-state), so a small variant set is enumerated, timed once per $(\text{device},\text{op},\text{shape})$,
-and the winner cached. There are no forks: the source is one; only the chosen comptime tuple differs per
-device. Crucially the knobs never change the numerics --- the per-row reduction is the same fold in the
-same order for every schedule --- so \emph{every variant is byte-identical}, and the tuner buys speed
-without ever risking a numeric change.
-
-\subsection{The algebra: Variant, Tuned, Tuner}
-Three orthogonal values (Listing~\ref{lst:tune}): a \code{Variant} is a named schedule --- a closure
-\code{f(iters) -> (output, ms)} that both benchmarks (many iters) and executes (one iter); \code{Tuned}
-is the fluent builder collecting variants for one $(\text{op},\text{shape-key})$; \code{Tuner} is the
-cache, an in-memory $(\text{device},\text{op},\text{key})\to\text{winner}$ map backed by a per-device
-on-disk file. The \code{Tuner} is a plain value over an explicit cache root, so it is fully unit-testable
-offline --- no GPU, no env, no globals; the process-wide default roots at the XDG cache dir and the disk
-format is one TSV line per key (no serde, no new dependency).
-
-\begin{lstlisting}[language=Rust,caption={The production surface. One source per op, autotuned per
-device, no forks. On a cache hit only the winner launches (once, to produce its output); the losers are
-never run.},label={lst:tune}]
-let y = Tuned::new("rms_norm", format!("rows={rows},n={n}"))
-    .variant("b64_r1",  |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1,  64, it))
-    .variant("b128_r1", |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1, 128, it))
-    .variant("b256_r1", |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 1, 256, it))
-    .variant("b64_r2",  |it| rms_norm_tuned_bench(&c, x, w, rows, n, eps, 2,  64, it))
-    .run(&c);  // times each once per (device,op,shape), caches the winner, thereafter runs it
-\end{lstlisting}
-
-\subsection{The variant tables and their proof}
-Two ops ship autotuned (Table~\ref{tab:variants}). Both variant sets are proven on the CPU runtime:
-every schedule is bit-identical to the oracle (rms\_norm: byte-for-byte equal, the fold order is
-invariant; \dpa{}: byte-identical across variants, within $2\times10^{-3}$ f32-reorder of the
-per-element oracle), and the cache mechanism is exercised directly --- a miss benchmarks all four and
-records the winner, a second call is a hit that benchmarks zero, a fresh \code{Tuner} over the same
-directory reloads the winner from disk and skips timing, and a changed variant set is treated as a miss
-and re-tuned rather than trusting a stale name. Timing on the CPU proves the select/cache machinery; a
-GPU run additionally makes the \emph{winner} meaningful.
-
-\begin{table}[h]
-\centering\small
-\setlength{\tabcolsep}{5pt}
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{Op} & \textbf{Knobs} & \textbf{Variants (all byte-identical)} \\
-\midrule
-\code{rms\_norm}      & cube dim $\{64,128,256\}\times$ unroll $\{1,2\}$        & \code{b64\_r1 b128\_r1 b256\_r1 b64\_r2} \\
-\code{matvec\_q8\_dp4a} & cube dim $\{64,128,256\}\times$ vec.\ width $\{1,2,4,8\}$ & \code{b64\_v1 b64\_v4 b128\_v2 b256\_v8} \\
-\bottomrule
-\end{tabular}
-\caption{The autotune variant sets (\hk{} 0.2.17). A knob value is a distinct compiled kernel;
-the tuner caches the winner per $(\text{device},\text{op},\text{shape})$ to
-\code{\$XDG\_CACHE\_HOME/hanzo-kernel/autotune/<device>.tsv}.}
-\label{tab:variants}
-\end{table}
-
-\subsection{Why first-party}
-CubeCL ships an autotuner; it was studied and declined for three concrete reasons, not NIH. It is
-re-exported only from \code{cubecl\_runtime}, so adopting it would force a \emph{second} engine crate
-into a facade architected so only \code{Cargo.toml} names the engine; its persistent cache lives under
-\code{target/} rather than the XDG path this layer requires; and its generic-associated-type input
-machinery is a large surface for ``pick the fastest of $N$ named closures.'' The concepts above are
-deliberately the same as CubeCL's, sized to this crate and pointed at XDG --- a thin analog, not a new
-philosophy.
-
-\section{Mechanism III: intrinsic islands}
-\label{sec:island}
-
-\subsection{Killing the whole-kernel escape hatch}
-Sometimes one inner loop needs a target-specific instruction or idiom. The wrong response is to fork a
-parallel per-backend kernel --- that is the product, back again. The right response is a scoped,
-target-gated \code{island!} block \emph{inside} the one DSL kernel (Listing~\ref{lst:island}). The kernel
-keeps one signature, one launch contract, one CPU oracle, one test. The \code{default} arm is the
-normative semantics; accelerated arms are optimizations that must equal it.
-
-\begin{lstlisting}[language=Rust,caption={An island in a \dpa{} matvec. The accelerated arm issues the
-hardware 4-wide int8 dot; \code{default} --- the normative oracle, taken by CPU and any unlisted target
---- computes the identical contraction with portable scalar lane MACs.},label={lst:island}]
-let dp = island! {
-    cuda | rocm | metal | vulkan => { w.dot(x) }                       // hardware dp4a / OpSDot
-    default => { w[0]*x[0] + w[1]*x[1] + w[2]*x[2] + w[3]*x[3] }        // NORMATIVE oracle
-};
-\end{lstlisting}
-
-\subsection{The mechanism: target selection at comptime}
-CubeCL compiles the same target-agnostic IR for every backend; at \code{\#[cube]} expand time there is no
-``which backend am I'' string, only a capability set. But the backend brand \emph{is} known on the host,
-via the runtime name. So an island is selected by a \code{\#[comptime] target: Target} tag the launch
-layer derives from the runtime (\code{Target::of::<R>}) and threads in; the \code{\#[kernel]} macro
-rewrites \code{island!\{...\}} into a comptime \code{match target}. A comptime match over a const
-scrutinee lowers \emph{only} the selected arm --- every backend compiles exactly its own arm, nothing
-else. The tag is out of the authoring surface twice over: the branch site names backends, not a target,
-and the launch wrapper fills the tag, so callers pass only data.
-
-\subsection{The oracle contract, tested}
-The CPU runtime is always tagged \code{Target::Cpu} --- a variant no accelerated arm claims --- so on CPU
-every island resolves to \code{default}. This makes the CPU runtime the single bit-exact oracle for every
-island, and the test proves it directly: run the kernel on CPU with each accelerated tag \emph{forced},
-and it must equal the \code{default} result byte-for-byte. The shipped test drives all five accelerated
-tags (\code{Cuda, Rocm, Metal, Vulkan, WebGpu}) through the CPU runtime and asserts each is byte-identical
-to \code{default} and to the plain-Rust reference, and separately asserts the production launch (which
-derives the tag from the runtime) resolves to the oracle on CPU without the caller naming a target. An
-accelerated arm is thus never trusted; it is proven equivalent to the normative arm before it can ship.
-This is the designed seam for the one case the rest of the paper cannot make portable ---
-block-quantized tensor-core GEMM (\S\ref{sec:negative}).
-
-\section{The CPU runtime as bit-exact oracle, and its CI}
-\label{sec:oracle}
-
-The three mechanisms share one foundation: \textbf{the CPU runtime is the single bit-exact reference for
-every backend.} It is not an accelerator target --- it is the oracle. Every op ships with a plain-Rust
-reference whose scalar semantics the device code mirrors line-for-line; the fusion engine's device
-morphism table mirrors its host table; every island's \code{default} arm \emph{is} the CPU semantics; and
-every autotune variant is checked against the oracle. Because a Map's arithmetic is index-local and the
-CPU runs it in program order, the CPU result is the definition, and a GPU backend differs only by f32
-re-association where a reduction reorders a sum --- a difference bounded and explained, not a bug to
-hunt. The op library --- \code{rms\_norm}, \code{layer\_norm}, \code{rope} (both NeoX and GPT-J
-conventions), \code{sdpa} (online/flash softmax), the GDN \code{conv1d}/\code{gating}/\code{scan}, the
-quant matvecs, and the fusion chains --- is gated this way across 36 CPU tests.
-
-This law is enforced continuously. A nightly GitHub Actions workflow
-(\code{.github/\allowbreak{}workflows/\allowbreak{}gpu-tests.yml}) runs a three-backend matrix on self-hosted boxes --- one runner
-label per backend: \code{cuda} $\to$ spark (NVIDIA GB10, sm\_121), \code{rocm} $\to$ evo (AMD Strix Halo
-gfx1151, ROCm~7.x), \code{metal} $\to$ dbc (Apple M4~Max) --- each running
-\code{cargo test -p hanzo-ml} \code{-{}-features <backend>} \code{-{}-test-threads 1} behind a
-GPU-guard step. Serial
-execution and the guard keep a single GPU consumer at a time per backend, which is not fastidiousness but
-necessity: concurrent ROCm inits race in the kernel-fusion driver and wedge it until reboot. The
-practical result is that ``the same op has the same numbers on every backend'' is a checked invariant,
-not an aspiration.
-
-\section{Evaluation}
-\label{sec:eval}
-
-We separate what is a committed, reproducible test (bit-exactness) from what is a measured benchmark on
-named hardware.\footnote{Bit-exactness figures are enforced by the committed CPU/GPU tests cited.
-Throughput and latency figures are session benchmarks on the named machines: evo (AMD Strix Halo,
-gfx1151, RADV/Vulkan and ROCm~7.13), spark (NVIDIA GB10, sm\_121), dbc (Apple M4~Max, Metal).
-Benchmarks are kernel-only (buffers created once, $N$ dispatches enqueued back-to-back, one final
-sync).}
-
-\subsection{Cross-backend bit-exactness}
-The op library is bit-exact against the CPU oracle for every family it targets, and --- the part that
-matters --- the DSL \emph{dispatches} bit-exact through real backend runtimes, not merely compiles
-(Table~\ref{tab:bitexact}). The ROCm figure is the falsifiable end-to-end proof that the
-cubecl-hip$\to$ROCm~7.13 seam works: the same \code{rms\_norm} source lowered through cubecl-hip and
-dispatched on gfx1151 (device query via the R0600 bindings $+$ HIP-RTC module compile $+$ launch $+$
-readback) matches the CPU oracle to $\text{max\_rel}=2.43\times10^{-7}$, well under the $2\times10^{-3}$
-gate --- pure f32-reorder noise, not a decode defect.
-
-\begin{table}[h]
-\centering\small
-\setlength{\tabcolsep}{5pt}
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{Path} & \textbf{Op(s)} & \textbf{Result} \\
-\midrule
-CPU oracle          & rms/layer\_norm, rope$\times$2, sdpa, gdn, quant, fuse & 10/10 bit-exact (36 tests) \\
-DSL $\to$ Vulkan (gfx1151) & rms\_norm, softmax, matvec, sdpa & bit-exact, real dispatch \\
-DSL $\to$ Metal (M4 Max)   & rms\_norm, layer\_norm, rope, sdpa & bit-exact ($2.35\mathrm{e}{-}7$) \\
-DSL $\to$ ROCm (gfx1151)   & rms\_norm & $\text{max\_rel}=2.43\mathrm{e}{-}7$ \\
-\bottomrule
-\end{tabular}
-\caption{The same source, dispatched through each backend's real runtime, matches the CPU oracle. The
-\code{sdpa} online-softmax being a \emph{single} implementation is the structural cure for the 8B
-repetition-collapse: with one attention kernel there is no flash-vs-eager-vs-Metal fork to diverge.}
-\label{tab:bitexact}
-\end{table}
-
-\subsection{Portability costs nothing: the DSL matches and beats hand-tuned}
-The central risk of any portable DSL is a performance downgrade. It does not materialize on the
-bandwidth-bound kernels that dominate decode. A tuned single-source \dpa{} Q8 matvec ---
-\code{Vector<i8,4>}$\to$\code{OpSDot}, one thread block per output row with its threads striding the
-$k/4$ groups so adjacent threads read adjacent 4-byte packed weights (coalesced 256-byte transactions),
-partials tree-reduced in shared memory --- measures \textbf{196~GB/s} on evo (gfx1151, Vulkan, $8192^2$,
-cache-busting), which is \textbf{118\% of the $\sim$166~GB/s hand-tuned \dpa{} kernel} it would replace
-and $\sim$77\% of the $\sim$256~GB/s DRAM roofline, bit-exact against the CPU oracle. The na\"ive
-one-thread-per-row kernel that started at $\sim$17~GB/s was memory-\emph{uncoalesced}, not DSL-limited;
-the fix was two standard decomplected steps --- coalescing and reduction --- both expressed in the DSL.
-The DSL reaches the same hardware integer-dot instruction and, with standard coalescing, \emph{beats} the
-hand-written code.
-
-\subsection{A migration that improved performance}
-Retirement is real, not hypothetical, and it can be a strict win. Two hand-written Vulkan kernels were
-drained on \code{main}: the DSL block-per-row \code{rms\_norm} (270~GB/s) and \code{softmax} (268~GB/s)
-replaced na\"ive hand-written \code{.comp} shaders, each now the production kernel with its \code{.comp}
-deleted, dispatching bit-exact through the engine's real Vulkan pipeline. The sharpest example is the
-fused residual-add\,+\,RMSNorm: the DSL \code{add\_rmsnorm} twin ran \textbf{7.1\x{} faster} than the
-incumbent hand-written shader ($166.5\to23.4$~ms at $4096^2$ on RADV) \emph{and} was bit-exact ---
-$s=x{+}\text{res}$ byte-identical, $y$ within $4.8\times10^{-7}$. A ``uniformity'' change turned out to
-also be a large speedup, because the incumbent was na\"ive and the DSL block kernel is coalesced. The
-migration is faster-or-equal at every step by construction: a kernel is retired only when its DSL twin is
-bit-exact \emph{and} at least as fast.
-
-\subsection{The discipline cuts both ways}
-The gate also \emph{declines} migrations. Where a hand-tuned kernel is already optimal --- the Vulkan
-quant matvec, Metal's \code{simd\_sum} reductions, the fused \code{rope\_norm} epilogue --- agents built
-bit-exact DSL twins, measured, and correctly did \emph{not} swap: a uniformity-only change with zero
-speedup and real regression risk is churn, not migration. ``One source'' is the goal; a bit-exact,
-no-faster twin is kept as the portable fallback for backends that lack the tuned version, and the tuned
-peak stays the specialized fast path. We only ever add coverage and correctness.
-
-\subsection{The ROCm-7 seam, as an engineering note}
-Shipping the DSL on AMD required fixing two independent upstream defects without bumping CubeCL (0.10 is
-the newest published; no version escapes either). First, cubecl-hip-sys selects its FFI bindings from
-\code{hipconfig --version}; ROCm~7.13 reports patch 99004, past the newest shipped binding, so upstream
-emitted a feature with no bindings module and every symbol went undefined. The fix is a vendored
-\code{[patch.crates-io]} fork whose \code{build.rs} clamps an unknown-newer patch to the latest shipped
-binding --- ABI-safe because AMD versions every changed symbol (R0600) and 7.13 still maps
-\code{hipGetDeviceProperties} to that revision. Second, cubecl-hip's server uses a \code{MultiStream}
-gated behind a \code{std}-only cfg the \code{hip}/\code{rocm} features do not pull, so the ROCm feature is
-declared \code{rocm = ["cubecl/hip", "cubecl/rocm", "cubecl/std"]}. Both are recorded because a portable
-DSL lives or dies on the least-loved backend building cleanly.
-
-\section{A negative result: int8 tensor-core MMQ}
-\label{sec:negative}
-
-Not everything collapses. The universal prefill gap Paper~06 documents (dense $0.6$--$0.9\x$ of
-llama.cpp on every backend) is a tensor-core-MMQ gap: llama quantizes the activation to q8\_1 (int8) and
-contracts block-quantized weights against it on the matrix cores. We asked whether that kernel, too, can
-be written once in \hk{} and lowered to the hardware int8 matrix cores instead of hand-written four times
-(CUDA \code{fast\_mmq}, Vulkan \code{mul\_mm\_q8\_mmq}, ROCm \code{qmmq}, Metal simdgroup). The answer,
-honestly, is \emph{not through the portable API}, and the reason is structural rather than a missing
-optimization.
-
-\subsection{The structural cap}
-CubeCL exposes two routes to the int8 matrix cores. The high-level WMMA API (\code{cmma::Matrix},
-$16{\times}16{\times}16$, i8$\to$i32) loads and stores accumulator fragments automatically, one tile at a
-time --- but \emph{the fragment layout is opaque}. Block-quantized GEMM needs a per-32-block f32 scale
-applied to the integer accumulator, and int8 accumulation is only valid \emph{within} one constant-scale
-32-block (this is inherent to the format, not a kernel choice). With an opaque fragment the only place to
-apply the scale is a store$\to$sync$\to$reload round-trip through shared memory, \emph{once per block}.
-That serialization is the wall. Measured on GB10/Blackwell, the high-level WMMA MMQ reaches only
-$\sim$7.6~TFLOP/s, roughly one-tenth of the hand-tuned kernel, and --- the diagnostic that proves it is
-sync-bound, not occupancy-bound --- a \emph{better-tiled} version (a $32{\times}64$ output tile, 8 warps,
-operands staged to shared memory once per block and reused across the tile, which fixes occupancy and
-operand reuse) is \emph{slower}, because the only remaining tax is exactly the per-block scale round-trip
-through the opaque fragment, and better tiling adds more of them.\footnote{The structural argument (opaque
-fragment $\Rightarrow$ per-block shared-memory scale round-trip; manual MMA with exposed lane map as the
-higher-ceiling path) is documented in the committed \code{mmq.rs} probe. The TFLOP/s figures and the
-tiled-is-slower comparison are session measurements on spark (GB10); the probe commit records CUDA
-verify/bench as pending, so we report them as measured, not as a committed test.}
-
-\subsection{The viable route is per-backend anyway}
-The higher-ceiling path is manual MMA (\code{cmma::MmaDefinition}, \code{mma.sync} at
-$16{\times}8{\times}32$), where the fragment element-to-lane map \emph{is} exposed, so the block scale can
-be applied in register with no shared-memory round-trip. But that path is per-backend by nature ---
-CubeCL 0.10's int8 MMA is CUDA-only (the probe kernels are literally \code{\#[kernel(targets(cuda))]}) ---
-so writing it does not collapse the product; it writes one more backend-specific kernel, just in Rust.
-The honest conclusion is therefore: \textbf{block-quantized MMQ stays hand-written behind benchmark
-gates.} This is not a defeat of the thesis but a boundary the thesis anticipates. The decode matvecs,
-norms, RoPE, attention, GDN, and the entire elementwise fabric --- the bulk of the ledger and the whole
-of the divergence-bug surface --- collapse. The one op that resists is exactly the one for which
-\S\ref{sec:island} built the seam: an island holds the hand-written tensor-core arm behind a normative,
-CPU-checkable \code{default}, so even the un-collapsed kernel keeps one signature, one oracle, one test.
-The negative result names the boundary and the mechanism that contains it.
-
-\section{The collapse ledger}
-\label{sec:ledger}
-
-Table~\ref{tab:dup} is the denominator; this section is the protocol that drains it. Roughly 85\% of the
-$52{,}345$ lines are a deletable target --- the hand-written arithmetic duplicated across backends, as
-opposed to the genuinely peak, genuinely per-backend kernels (the MMQ GEMMs of \S\ref{sec:negative}) that
-stay behind islands. Draining is never all-or-nothing and never a downgrade, because it is governed by a
-\textbf{verify-then-delete protocol}:
-\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
-\item \textbf{Coverage first.} The DSL fills the entire $22\,\text{types}\x5\,\text{backends}$ matrix from
-one source. Cells that were missing or buggy become uniform immediately.
-\item \textbf{The gate.} A hand-tuned kernel is retired for its DSL twin \emph{only} when the twin is
-(a)~bit-exact against the shared CPU oracle and (b)~within performance noise on a kernel-only benchmark
---- in practice $\ge 97\%$ of the incumbent's throughput. The number decides, per type, per backend.
-\item \textbf{Delete on parity.} As each twin passes, its hand-written copies are deleted and a
-per-$(\text{op},\text{type},\text{backend})$ registry flips that cell to the DSL, keyed by the gate
-result. The product drains to a sum one measured cell at a time, with a working, faster-or-equal engine
-at every intermediate state.
-\end{enumerate}
-Executed instances already on \code{main}: the Vulkan \code{rms\_norm}, \code{softmax}, and
-\code{add\_rmsnorm} shaders deleted in favor of bit-exact DSL twins (\S\ref{sec:eval}, the last a 7.1\x{}
-win); the ROCm-7 seam opened so gfx1151 dispatches from the same source; and the DAG fusion cutting the
-GDN launch storm 9$\to$5. Instances correctly \emph{not} executed: the Vulkan quant matvec and Metal
-\code{simd\_sum}, where the DSL twin was bit-exact but not faster. The ledger is a scoreboard with a
-gate, not a rewrite.
+The claims the tour makes are backed by measurement, detailed in the companion papers: the op library is
+bit-exact against the CPU oracle and dispatches bit-exact through real Vulkan, Metal, and ROCm runtimes
+(rms\_norm on gfx1151 to $2.43\times10^{-7}$; \cite{oracle}); a single-source \dpa{} matvec runs at 118\%
+of the hand-tuned kernel it replaces (196~GB/s on gfx1151; \cite{method}); a shipped migration was
+7.1$\times$ faster \emph{and} bit-exact (\cite{method}); the autotune variants are byte-identical with a
+per-device cached winner (\cite{tune}); and the one op that resists is reported in full as a structural
+negative result (\cite{mmq}). Portability costs nothing where it counts, the collapse is real and
+reversible, and the boundary is drawn honestly.
 
 \section{Related work}
 \label{sec:related}
 
-Portable kernel authoring and kernel fusion are both well-trodden; the specific claim we make is narrow
-and we state it precisely. \textbf{Triton} gives a tile-level Python DSL that lowers to GPU code, but
-fusion is the programmer's job (you write a fused kernel) or the compiler's inside a larger stack; it has
-no notion of fusion as an algebraic law over an op class. \textbf{XLA} fuses HLO graphs via
-producer-consumer heuristics and a cost model; \textbf{torch.compile}/TorchInductor captures an FX graph
-and fuses by a scheduler's heuristics. Both fuse by \emph{analysis over a graph}, not by a fusibility
+Portable kernel authoring and kernel fusion are both well-trodden; our specific claim is narrow, and we
+state it precisely. \textbf{Triton} gives a tile-level Python DSL, but fusion is the programmer's job or a
+larger stack's; it has no notion of fusion as an algebraic law over an op class. \textbf{XLA} fuses HLO
+graphs by producer-consumer heuristics and a cost model; \textbf{torch.compile}/TorchInductor captures a
+graph and fuses by a scheduler's heuristics --- both fuse by \emph{analysis over a graph}, not by a
 predicate that is a function of the op's type. \textbf{Halide} and \textbf{TVM} pioneered separating the
-\emph{compute} from the \emph{schedule} and autotuning the latter --- this is the nearest neighbor of our
-autotune mechanism (\S\ref{sec:tune}), and we claim no novelty for schedule/compute separation itself;
-what differs is that our schedule knobs are \code{\#[comptime]} monomorphizations of one kernel proven
-byte-identical, so autotuning is guaranteed not to perturb numerics. \textbf{Burn}'s \code{burn-fusion}
-is the closest relative to our fusion engine: it records an op stream and JITs fused elementwise kernels
-over the \emph{same} CubeCL substrate. The difference is where fusibility comes from --- \code{burn-fusion}
-traces Burn tensor ops and applies its own cut/epilogue policy, coupling to Burn's tensor abstraction;
-ours is the functor law over an op \emph{class}, one predicate, on our own tensor type, composing with our
-hand-tuned peak kernels. \textbf{Mojo} is a language for kernels, not a fusion-as-composition model.
-Across all of these, we are unaware of a system that presents kernel fusion \emph{as} morphism composition
---- the functor law $\mathrm{map}(g)\circ\mathrm{map}(f)=\mathrm{map}(g\circ f)$ as the mechanical rule
-and Reduce/Scan as the algebraic fences --- with a bit-exact CPU oracle as the definitional semantics.
-That framing, and the three mechanisms it organizes, is the contribution; the substrate (CubeCL) and the
-individual ideas (portable IR, autotuning, oracle testing) are prior art we build on and cite.
+\emph{compute} from the \emph{schedule} and autotuning the latter; this is the nearest neighbor of our
+autotune mechanism (\cite{tune}), and we claim no novelty for schedule/compute separation itself --- what
+differs is that our schedule knobs are compile-time monomorphizations of one kernel proven byte-identical,
+so autotuning cannot perturb numerics. \textbf{Burn}'s \code{burn-fusion} is the closest relative to our
+fusion engine: it records an op stream and JITs fused elementwise kernels over the \emph{same} CubeCL
+substrate, but it traces Burn tensor ops with its own cut/epilogue policy, coupling to Burn's tensor
+abstraction; ours is the functor law over an op \emph{class}, one predicate, on our own tensor type,
+composing with our hand-tuned peak kernels. \textbf{Mojo} is a language for kernels, not a
+fusion-as-composition model. Across all of these we are unaware of a system that presents kernel fusion
+\emph{as} morphism composition --- the functor law as the mechanical rule, Reduce/Scan as the algebraic
+fences --- anchored by a bit-exact CPU oracle as the definitional semantics. That framing, and the three
+mechanisms it organizes, is the contribution; the substrate (CubeCL) and the individual ideas (portable
+IR, autotuning, oracle testing) are prior art we build on and cite.
 
 \section{Conclusion}
 
 The kernel layer is a Cartesian product of backends, quantization types, and operations, hand-written in
-five shading languages, and it is the breeding ground for the divergence bugs that cost the most to
-chase. \hk{} collapses that product to a sum on one idea --- fusion is composition --- extended by three
-mechanisms that each attack an axis: autotune folds the schedule fork into comptime knobs proven
-byte-identical; islands hold the rare per-backend idiom behind a normative, CPU-checkable arm; and the CPU
-runtime is the single bit-exact oracle every backend is measured against, nightly. The evidence is that
-portability costs nothing where it counts (a single-source \dpa{} matvec at 118\% of hand-tuned, a shipped
-migration 7.1\x{} faster and bit-exact), that the collapse is real and reversible (a verify-then-delete
-ledger with kernels already deleted on \code{main}), and --- stated as plainly as the wins --- that one
-op resists: block-quantized tensor-core MMQ is structurally sync-bound through the portable WMMA API and
-stays hand-written behind exactly the island seam we built for it. What remains is a disciplined,
-measured migration whose engine is faster-or-equal at every step.
+five shading languages, and it is the breeding ground for the divergence bugs that cost the most to chase.
+\hk{} collapses that product to a sum on one idea --- fusion is composition (\cite{fuse}) --- extended by
+three mechanisms that each attack an axis: autotune folds the schedule fork into byte-identical comptime
+knobs (\cite{tune}); islands hold the rare per-backend idiom behind a normative, CPU-checkable arm
+(\cite{island}); and the CPU runtime is the single bit-exact oracle every backend is measured against,
+nightly (\cite{oracle}). Portability costs nothing where it counts, the collapse is real and reversible via
+a verify-then-delete method (\cite{method}), and --- stated as plainly as the wins --- one op resists and
+stays hand-written behind an island (\cite{mmq}). Read the six companion papers for the depth; this one is
+the map.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{umbrella} Hanzo AI. \emph{One Source, Every Backend: The hanzo-kernel DSL.} Paper 07 (this umbrella).
+\bibitem{fuse} Hanzo AI. \emph{Fusion Is Composition: Kernel Fusion as the Functor Law.} Paper 07.1.
+\bibitem{tune} Hanzo AI. \emph{The Schedule Is a Value: Comptime-Specialized Autotuning.} Paper 07.2.
+\bibitem{island} Hanzo AI. \emph{Intrinsic Islands: An Oracle-Anchored Escape Hatch.} Paper 07.3.
+\bibitem{oracle} Hanzo AI. \emph{One Oracle, Every Backend: The CPU Bit-Exactness Law.} Paper 07.4.
+\bibitem{mmq} Hanzo AI. \emph{When the Product Won't Collapse: An int8 Tensor-Core MMQ Negative Result.} Paper 07.5.
+\bibitem{method} Hanzo AI. \emph{Verify, Then Delete: Collapsing a Kernel Cartesian Product.} Paper 07.6.
+\end{thebibliography}
 
 \end{document}

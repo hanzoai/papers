@@ -489,14 +489,35 @@ the test number read once after the freeze. The full grid is in
 \section{LoCoMo: Answers}
 \label{sec:answers}
 
+A reader is handed the retrieved turns and scored on what it says
+(Table~\ref{tab:answers}). Every row of a reader shares the prompt
+(\texttt{prompts/reader-locomo.txt}), temperature 0 and a 64-token cap; rows
+differ only in what was retrieved. The open reader is gemma-4-31B-it, run
+locally, the reader LoCoMo-Conv fixes; qwen3.6-35B-A3B follows on all four
+categories. The oracle row hands the reader exactly the annotated turns.
+
+The multi-hop questions with Gemma say where the remaining error is. Cosine
+context yields F1 37.6; the first cut 40.7; the engine 40.5; the annotated
+turns themselves 53.0. Retrieval moved the share of questions whose context
+holds a gold turn from 79.8\% to 87.9\%, and the reader turned that into
+three points of F1 out of a fifteen-point gap to the oracle. The rest of the
+gap is the reader's: a 31B open model at temperature 0, asked for the
+shortest answer, scores 53.0 even when handed nothing but the evidence.
+That is the ceiling any retrieval improvement is measured against on this
+reader, and it is the reason the retrieval tables are reported on their own:
+a reader can hide a retrieval gain, and a stronger reader raises every row.
+
 \begin{table*}[t]
 \centering
 \footnotesize
-\input{tables/locomo-answers}
-\caption{Answer accuracy on the LoCoMo test split with the same reader,
-prompt and $k$ across rows. The oracle row hands the reader exactly the
-annotated turns and bounds what retrieval can still buy. Tokens per question
-are the retrieved context delivered to the reader.}
+\resizebox{\textwidth}{!}{\input{tables/locomo-answers}}
+\caption{Answer accuracy on LoCoMo with the same reader, prompt and $k$
+across rows, all ten conversations. EXACT is the share of questions whose
+context held an annotated turn; ANSWERED is F1 $\geq 0.5$ or an exact match.
+The oracle row hands the reader exactly the annotated turns and bounds what
+retrieval can still buy. Tokens per question are the retrieved context
+delivered to the reader; the reader's own p50 latency is the local Ollama
+service under shared load and is reported, not claimed.}
 \label{tab:answers}
 \end{table*}
 
@@ -508,13 +529,41 @@ questions each, facts numbered in order of arrival, later serials
 superseding earlier ones. The deterministic resolver of
 Section~\ref{sec:read} is scoped to exactly this question type.
 
+The write side parses every fact line into (serial, subject, relation,
+object) — 45 templates, no line left unparsed at any size, and the gold
+answer is the object of some fact for every question. The read side compiles
+the question into a base entity and a chain of relations, follows the chain
+hop by hop, and at each hop takes the latest serial for (entity, relation)
+deterministically; the reader, where one is used, sees only the resolved
+facts. The \emph{noreader} row emits the resolved object string itself, so
+it is the resolver's accuracy with no model in the loop at all.
+
+The first run compiled plans with a hand-written lexicon. It scored 98.0 /
+77.5 (SH / MH) on the 6K dev haystacks, held single-hop at 92.9--98.0 on
+test, and fell to 32.0 / 31.3 / 25.5 on multi-hop at 32K / 64K / 262K. The
+traces say why: 126 of the 209 multi-hop misses were complete chains with
+the wrong answer, and 83 asked for a relation the entity never had. Both are
+the plan: the lexicon emitted relations in the question's surface order
+(``capital of the country that X originates from'' became
+\texttt{[capital, country\_origin]} rather than the reverse) and added a hop
+for every relation word it saw, and it had been written against the 6K
+phrasings. Parse coverage, entity lookup and version selection were not the
+problem. The second run keeps the exact single-hop templates as rules, has a
+model compile every other question into the same plan shape, validated
+against the relation set, and uses the lexicon only where the model's plan
+fails validation; both runs stand in Table~\ref{tab:mab}. The comparison
+with CAR is on the same metric and haystacks; CAR's reader is gpt-4o-mini or
+gpt-4o, and ours is either none or an open model, which is stated on every
+row.
+
 \begin{table*}[t]
 \centering
 \footnotesize
 \input{tables/mab-fc}
-\caption{Substring exact match on FactConsolidation, one reader across all
-rows. The 6K columns are the dev split and are marked as such; 32K--262K
-were run once after the freeze.}
+\caption{Substring exact match on FactConsolidation. Rows name their
+reader; \emph{none} is the resolver's own output. The 6K columns are the dev
+split; 32K--262K were run once per configuration. Pooled is the mean of the
+four sizes, as CAR reports its headline.}
 \label{tab:mab}
 \end{table*}
 

@@ -64,7 +64,28 @@ all: $(ALL_PDFS)
 #                   finds hanzo-defense.sty, the root finds shared/
 #   -outdir         absolute, because -cd moved us: PDF and aux land together
 #                   under pdfs/, never at the repo root
-pdfs/%.pdf: %.tex
+#
+# A paper is more than its .tex. A figure, a section fragment, a .bib, a local
+# .sty or the shared preamble all change the PDF, so all of them have to change
+# the build. Without them `make` answers "up to date" over a stale PDF after a
+# figure edit, which is the same silent success the old `|| true` produced.
+# Secondary expansion is what makes $* usable in a pattern rule's prerequisites.
+# The sibling-.tex line is skipped for a paper that lives at the repository
+# root, where it would make all 150 of them depend on each other.
+#
+# latexmk keeps its own dependency record and skips a paper whose inputs have
+# not changed in content, leaving the PDF's timestamp behind a prerequisite
+# whose mtime moved but whose bytes did not. The touch after a successful run
+# records what latexmk just established, so make and latexmk agree on what is
+# current instead of one of them re-asking forever.
+.SECONDEXPANSION:
+pdfs/%.pdf: %.tex \
+            $$(wildcard $$(dir $$*)figures/*.tex) \
+            $$(wildcard $$(dir $$*)sections/*.tex) \
+            $$(if $$(filter ./,$$(dir $$*)),,$$(wildcard $$(dir $$*)*.tex)) \
+            $$(wildcard $$(dir $$*)*.bib) \
+            $$(wildcard $$(dir $$*)*.sty) \
+            $$(wildcard shared/*)
 	@mkdir -p $(dir $@)
 	@echo "Compiling $< ..."
 	@latexmk -pdf -halt-on-error -bibtex -Werror -interaction=nonstopmode -quiet \
@@ -73,6 +94,7 @@ pdfs/%.pdf: %.tex
 		     grep -A5 '^!' $(dir $@)$(*F).log; \
 		     sed -n '/^Latexmk: Summary/,/^----/p' $(dir $@)$(*F).latexmk; \
 		     false; }
+	@touch $@
 	@echo "  OK   $@"
 
 # Clean auxiliary files (keep PDFs). The second sweep clears what the previous

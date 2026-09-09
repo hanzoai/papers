@@ -1,0 +1,305 @@
+\documentclass[11pt]{article}
+\usepackage{shared/hanzocover}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\emergencystretch=1.5em
+
+\title{Context Engine:\\ Typed Retrieval Across Memory and Code}
+\author{Zach Kelling\thanks{Corresponding author: research@hanzo.ai} \\
+    \textit{Hanzo Industries Inc (Techstars '17)} \\
+    Los Angeles, California \\
+    \texttt{https://hanzo.ai}}
+\date{Draft, revision~0}
+
+\begin{document}
+
+\hanzocoverpage
+
+\twocolumn[
+  \begin{@twocolumnfalse}
+  \maketitle
+  \begin{abstract}
+  \noindent
+  The companion paper showed that long-term conversational memory is a
+  linkage problem: a question reaches its evidence through a fact, an
+  entity or a date more often than through wording, and a second index of
+  typed links lifts complete-evidence recall on multi-hop questions from
+  22.7\% to 36.2\% with nothing learned. This paper asks whether the same
+  engine, unchanged in shape, is the right retriever for a software
+  repository. A repository is connected information with an unusually
+  honest ground truth: the compiler and the language server know which
+  symbol a reference resolves to, which function calls which, which test
+  covers which file, which commit last touched a line. We describe the
+  Context Engine as one abstraction---raw artefact, typed facts, canonical
+  entities, time, provenance, and a read path that plans, seeds, expands
+  along typed edges within a budget, scores once and rewrites the query
+  after each resolved hop---and its two instantiations: conversation, where
+  the edges are people, events, sessions and dates; and code, where they are
+  symbols, definitions, references, implementations, callers, callees,
+  types, files, commits, issues, tests and runtime logs. We set out a
+  deterministic benchmark whose gold links are emitted by the language
+  server rather than annotated by hand, and an evaluation plan on RepoBench,
+  CrossCodeEval and RepoProbe with retrieval measured separately from
+  generation. Results are pending and the sections that will carry them are
+  marked. The claim this draft is written to test is narrow: that semantic
+  similarity is one candidate generator inside a typed retrieval system,
+  and that the system beats similarity alone on both kinds of corpus.
+  \end{abstract}
+  \vspace{1em}
+  \end{@twocolumnfalse}
+]
+
+\section{One Abstraction}
+
+Retrieval systems for memory and retrieval systems for code are usually
+built by different teams from different papers. Both start from the same
+mistake: embed the unit of text, embed the request, return the nearest
+neighbours, and hope the answer resembles the question. In a conversation
+the turn that answers ``where did she work after leaving Acme'' contains
+neither ``work'' nor ``Acme''. In a repository the file that explains why a
+request handler retries contains neither ``retry'' nor the handler's name;
+it is the interface the handler implements, two directories away, reached
+by a typed edge the compiler already knows.
+
+The Context Engine is the abstraction the companion paper
+\cite{contextmemory} arrived at for memory, restated so that nothing in it
+names a conversation:
+
+\begin{itemize}
+  \item \textbf{raw} --- the artefact as received, immutable, with source and
+        observation time.
+  \item \textbf{facts[]} --- atomic typed statements about the artefact, each
+        with a canonical subject, a relation, a canonical object or a literal,
+        a time interval where one applies, a confidence, an embedding and a
+        pointer to the exact span it came from.
+  \item \textbf{entities[]} --- canonical identifiers resolved by type.
+  \item \textbf{events[]} --- groups of facts that belong together.
+  \item \textbf{supersedes[]} --- what this artefact replaces.
+  \item \textbf{abstraction} and \textbf{anchors[]} --- one short phrase for what
+        the artefact is about and several alternative entry points.
+\end{itemize}
+
+And the read path: understand the request into operators; seed from dense,
+lexical, fact, entity and time generators with small pools; expand along
+typed edges within a bounded budget; score every candidate once with
+recorded contributions; return the least raw context that proves the
+answer; and if a hop resolved something, rebuild the query from the resolved
+state before the next hop.
+
+\section{Two Instantiations}
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\begin{tabular}{p{24mm}p{58mm}p{74mm}}
+\toprule
+Record field & Conversation & Code \\
+\midrule
+raw & a turn & a file, a hunk, a log line \\
+entity & person, place, org, work, date & symbol, type, module, file, commit, issue, test \\
+relation & said, did, plans, moved, met & defines, references, implements, calls, imports, extends, covers, touched \\
+event & the trip, the interview & the change set, the incident, the release \\
+time & session date, event time & commit time, blame, run time \\
+supersedes & a later fact about the same relation & a later commit on the same lines \\
+abstraction & ``Caroline moved from Sweden'' & ``retry policy for outbound HTTP'' \\
+anchors & names, places, dates & identifiers, error strings, config keys \\
+provenance & conversation, session, turn & repo, path, line range, commit \\
+\bottomrule
+\end{tabular}
+\caption{The same record, two corpora. Every edge in the code column is
+emitted by tools that already exist: the language server, the compiler,
+the version control system, the test runner.}
+\label{tab:two}
+\end{table*}
+
+\subsection{Conversation}
+
+The memory instantiation is described and measured in the companion paper.
+Its edges are extracted by a model and are probabilistic; its gold evidence
+is human-annotated and, as LoCoMo-Conv showed \cite{locomoconv},
+incomplete. This is the harder of the two settings to evaluate honestly,
+which is why the companion paper spends a section on what is being measured.
+
+\subsection{Code}
+
+The code instantiation is the easier of the two to evaluate and the harder
+to build, because the typed edges are many and exact. Candidate generators:
+
+\begin{itemize}
+  \item dense search over facts about symbols (a symbol's abstraction: its
+        signature, docstring and the one-line purpose an extractor assigns);
+  \item lexical search over identifiers and literal strings, which in code
+        carries more of the signal than in prose;
+  \item the symbol index: exact matches on canonical symbol identifiers, with
+        aliases and re-exports resolved;
+  \item typed edges from the language server: definition, references,
+        implementations, type hierarchy, callers and callees;
+  \item file and module structure: siblings, parents, the AST path;
+  \item history: the commits that touched a span, their messages, the issues
+        they close, blame;
+  \item tests: the test cases whose coverage includes a span, and the runtime
+        logs a failing test emitted.
+\end{itemize}
+
+Expansion is bounded exactly as in memory---at most $n$ hops along at most
+$m$ edges of each type---and every candidate carries the edge it entered by.
+A stateful hop is natural here: resolving ``the retry logic'' to a symbol on
+hop one turns hop two into \emph{implementations of that symbol's
+interface, in files touched by the commit that introduced it}, a query that
+no embedding of the original sentence would find.
+
+\section{A Deterministic Gold Benchmark}
+\label{sec:lsp}
+
+Hand-annotated retrieval gold is expensive and incomplete. For code it is
+also unnecessary. We build the Hanzo LSP benchmark as follows. For each of
+a set of repositories, run the language server and the test runner and
+record every definition, reference, implementation, call, import and
+coverage edge. Generate questions mechanically from the graph---``what
+implements X'', ``who calls Y'', ``which test covers Z'', ``what changed in
+this function in the last release''---and their answers as the exact set of
+spans the graph names. Phrase each question three ways, one of them without
+the symbol's name, so that lexical matching alone cannot answer it. Score
+retrieval as ALL and ANY over the gold spans at $k$, as in the companion
+paper, and report MRR, tokens delivered and latency.
+
+The gold is complete by construction, so the SUPPORTED grade of the memory
+paper is not needed here; EXACT is the whole story. This is the benchmark on
+which a difference between similarity and linkage will be least arguable.
+
+\section{External Lanes}
+
+\paragraph{RepoBench.} \cite{repobench} separates retrieval (RepoBench-R),
+completion (RepoBench-C) and the pipeline (RepoBench-P) for Python and Java.
+We report RepoBench-R as a retrieval number and RepoBench-P with a fixed
+generator across rows, so a gain is attributable to retrieval.
+
+\paragraph{CrossCodeEval.} \cite{crosscodeeval} requires cross-file context
+to complete code in Python, Java, TypeScript and C\#. We report exact match
+and edit similarity with the same generator across rows and the retrieval
+budget held constant.
+
+\paragraph{RepoProbe.} \cite{repoprobe} asks open-ended architectural
+questions drawn from GitHub Discussions across real repositories and scores
+answers against checklists of atomic verifiable facts. We report the
+checklist score and, separately, the fraction of checklist facts whose
+supporting span was retrieved, which is the retrieval question this paper
+is about.
+
+\paragraph{ContextBench.} \cite{contextbench} measures context retrieval in
+coding agents directly and shares a name with the Hanzo benchmark described
+in the companion paper; the two are distinct, and we run this one as an
+external lane where its harness permits.
+
+\section{Evaluation Plan}
+
+Every table carries the rows of the companion paper's protocol: semantic
+only; plus lexical; plus facts; plus entities; plus timeline; plus adjacency
+(here: siblings in the file and the AST); plus typed graph; plus iterative
+hops; full; and the failed variants---pseudo-relevance feedback, generic
+multi-query, chain search, surface-identifier expansion, global fusion.
+Retrieval is measured separately from generation. A declared dev set of
+repositories is used for every parameter choice; the commit is frozen; the
+test repositories are run once.
+
+\section{Results}
+\label{sec:results}
+
+Pending. The tables below will be filled from \texttt{runs/} of the benchmark
+repository with the run identifier printed beside each.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Hanzo LSP benchmark & ALL@10 & ANY@10 & MRR & tokens/q \\
+\midrule
+semantic only & \ldots & \ldots & \ldots & \ldots \\ % TODO run code-lsp-test-semantic
++ lexical & \ldots & \ldots & \ldots & \ldots \\
++ symbol index & \ldots & \ldots & \ldots & \ldots \\
++ typed edges & \ldots & \ldots & \ldots & \ldots \\
++ history and tests & \ldots & \ldots & \ldots & \ldots \\
++ iterative hops & \ldots & \ldots & \ldots & \ldots \\
+full & \ldots & \ldots & \ldots & \ldots \\
+\bottomrule
+\end{tabular}
+\caption{Pending: retrieval on the deterministic benchmark of
+Section~\ref{sec:lsp}.}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+External lane & retrieval & end-to-end & tokens/q \\
+\midrule
+RepoBench-R / P & \ldots & \ldots & \ldots \\ % TODO run code-repobench-test-full
+CrossCodeEval & \ldots & \ldots & \ldots \\ % TODO run code-cceval-test-full
+RepoProbe & \ldots & \ldots & \ldots \\ % TODO run code-repoprobe-test-full
+\bottomrule
+\end{tabular}
+\caption{Pending: external lanes, full configuration, one generator across rows.}
+\end{table*}
+
+\section{Related Work}
+
+Repository-level retrieval for completion is the subject of RepoBench
+\cite{repobench} and CrossCodeEval \cite{crosscodeeval}; architectural
+comprehension of RepoProbe \cite{repoprobe}; context retrieval for coding
+agents of ContextBench \cite{contextbench}. On the memory side the closest
+designs are AnchorMem \cite{anchormem}, which anchors retrieval on atomic
+facts and returns raw context, Memora \cite{memora}, which indexes an
+abstraction and cue anchors and keeps the value unindexed, and APEX-MEM
+\cite{apexmem}, an entity-centric temporal property graph with append-only
+history. HippoRAG \cite{hipporag} is the nearest graph-retrieval ancestor.
+None of these is applied to code, and none of the code benchmarks is
+approached with a memory system; the point of this draft is that the gap is
+an accident of who built what.
+
+\section{What Would Falsify It}
+
+If the full configuration does not beat semantic-only retrieval on the
+deterministic benchmark by a margin outside the bootstrap interval, the
+abstraction is wrong for code and the paper says so. If it wins there but
+not on RepoBench-P with a fixed generator, the gain is not reaching the
+task. If it wins on code but the memory numbers of the companion paper do
+not hold on their test split, the engine is two engines with one name.
+Each of these is a reportable outcome.
+
+\begin{thebibliography}{99}
+\bibitem{contextmemory} Z. Kelling. Linkage, Not Similarity: Context-Sensitive Retrieval
+  for Long-Term Agent Memory. Hanzo Research, 2026.
+\bibitem{locomoconv} W.-Y. Chang, Y.-N. Chen. When Users Don't Ask: Benchmarking
+  Context-Driven Memory Retrieval in Conversational Agents. arXiv:2609.03467, September 2026.
+\bibitem{repobench} T. Liu, C. Xu, J. McAuley. RepoBench: Benchmarking Repository-Level
+  Code Auto-Completion Systems. arXiv:2306.03091, 2023.
+\bibitem{crosscodeeval} Y. Ding, Z. Wang, W. U. Ahmad, H. Ding, M. Tan, N. Jain,
+  M. K. Ramanathan, R. Nallapati, et al. CrossCodeEval: A Diverse and Multilingual
+  Benchmark for Cross-File Code Completion. arXiv:2310.11248, 2023.
+\bibitem{repoprobe} Y. Yang, A. Wu, J. Luo, R. Xuan, Z. Hu, Y. Liu, Z. Qin. RepoProbe:
+  Benchmarking Architecture-Aware Repository Comprehension with Checklists.
+  arXiv:2608.04783, August 2026; ASE 2026.
+\bibitem{contextbench} H. Li, L. Zhu, B. Zhang, R. Feng, J. Wang, Y. Pan, E. T. Barr,
+  F. Sarro, et al. ContextBench: A Benchmark for Context Retrieval in Coding Agents.
+  arXiv:2602.05892, 2026.
+\bibitem{anchormem} Z. Shen, S. Cheng, Z. Guo, W. Wang, Y. Wang, H. Huang. AnchorMem:
+  Anchored Facts with Associative Contexts for Building Memory in Large Language Models.
+  arXiv:2604.17377, April 2026.
+\bibitem{memora} M. Xia, X. Zhang, S. Dixit, P. Harimurugan, R. Wang, V. R\"uhle, R. Sim,
+  C. Bansal, et al. Memora: A Harmonic Memory Representation Balancing Abstraction and
+  Specificity. arXiv:2602.03315, 2026; ICML 2026.
+\bibitem{apexmem} P. Banerjee, M. Moshtaghi, S. Subramanian, A. Misra, A. Chadha. APEX-MEM:
+  Agentic Semi-Structured Memory with Temporal Reasoning for Long-Term Conversational AI.
+  arXiv:2604.14362, April 2026; ACL 2026.
+\bibitem{hipporag} B. Jim\'enez Guti\'errez, Y. Shu, Y. Gu, M. Yasunaga, Y. Su. HippoRAG:
+  Neurobiologically Inspired Long-Term Memory for Large Language Models. arXiv:2405.14831, 2024.
+\end{thebibliography}
+
+\end{document}

@@ -354,12 +354,18 @@ tuning against test labels.
 \section{LoCoMo: Retrieval in Isolation}
 \label{sec:locomo}
 
-Ten conversations, 5,882 turns, 282 multi-hop and 841 single-hop questions
-with evidence. Turns and questions are embedded with zen-embedding-0.6b;
-the dataset's observation annotations serve as the fact layer for this
-experiment, each observation citing the turns it was extracted from.
-Retrieval is cosine over turns for the baseline and the shipped pool and
-re-rank for the linked rows. Nothing is learned.
+Ten conversations, 5,882 turns, 1,540 questions with evidence: 282
+multi-hop, 321 temporal, 96 open-domain, 841 single-hop; the 446 adversarial
+questions are excluded, as Mem0 and Zep exclude them. Turns and questions are
+embedded with zen-embedding-0.6b; the dataset's observation annotations serve
+as the fact layer for this experiment, each observation citing the turns it
+was extracted from. Nothing is learned. Two systems are measured. The first
+cut (Table~\ref{tab:locomo}) is the four-term pool and re-rank that shipped
+in \texttt{/v1/memory/search}: cosine over turns plus the best citing fact,
+adjacency and a time cue. The engine of Section~\ref{sec:read} follows
+(Tables~\ref{tab:ablation}--\ref{tab:minilm}), with its weights and pools
+chosen on conversations 0--2 and frozen at commit \texttt{33d0f8749bd1}
+before conversations 3--9 were run once.
 
 \begin{table}[h]
 \centering
@@ -385,11 +391,13 @@ Retrieval stays under a millisecond per question.}
 \small
 \begin{tabular}{lrrr}
 \toprule
-multi-hop ALL, linked & $k=5$ & $k=10$ & $k=20$ \\
+multi-hop ALL, first cut (all ten) & $k=5$ & $k=10$ & $k=20$ \\
 \midrule
  & 13.5 & 23.4 & 36.2 \\
 \bottomrule
 \end{tabular}
+\vspace{4pt}
+\input{tables/locomo-byk}
 \caption{The same configuration by $k$. A number quoted from this table
 carries its $k$; a reader that is handed ten turns sees 23.4\%, not 36.2\%.}
 \label{tab:byk}
@@ -397,23 +405,42 @@ carries its $k$; a reader that is handed ten turns sees 23.4\%, not 36.2\%.}
 
 \begin{table*}[t]
 \centering
-\small
-\begin{tabular}{lrr}
-\toprule
-multi-hop, R@20 & ALL & ANY \\
-\midrule
-cosine over turns (baseline) & 22.7 & 80.1 \\
-+ fact index & \ldots & \ldots \\ % TODO run locomo-retrieval-all-ablation
-+ adjacency & \ldots & \ldots \\ % TODO run locomo-retrieval-all-ablation
-+ time cue (shipped) & 36.2 & 87.2 \\
-+ surface-entity hop & $-2$ vs shipped & \\
-global reciprocal-rank fusion & $-4$ vs shipped & \\
-\bottomrule
-\end{tabular}
-\caption{Ablation. The fact index carries most of the gain; adjacency and
-the time cue are small and positive; a hop through capitalised words shared
-between nearby facts and a fusion of whole ranked lists are both negative.}
+\footnotesize
+\resizebox{\textwidth}{!}{\input{tables/locomo-ablation}}
+\caption{The engine on all ten conversations at $k=20$, one generator added
+per row, the frozen weights throughout. ALL is the complete-evidence rate,
+ANY the any-evidence rate; R@20 is $|\text{retrieved} \cap
+\text{gold}|/|\text{gold}|$; \emph{supported} counts a question whose
+top-20 holds a gold turn, a turn sharing an atomic fact with a gold turn, or a
+turn containing the gold answer. The fact index carries most of the gain; the
+second hop moves single-hop and temporal questions; a fusion of whole ranked
+lists loses nDCG for a little ANY.}
 \label{tab:ablation}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\resizebox{\textwidth}{!}{\input{tables/locomo-ablation-test}}
+\caption{The same rows on the test split (conversations 3--9), run once
+after the freeze. The failed shapes are below the rule: pseudo-relevance
+feedback drifts the query toward its own top three and examines 634
+candidates to lose; chain search finds the multi-hop turns but scrambles the
+ranking; surface entities and global fusion are the two results that shaped
+the design.}
+\label{tab:ablation-test}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\resizebox{\textwidth}{!}{\input{tables/locomo-minilm}}
+\caption{The same engine over all-MiniLM-L6-v2 vectors at $k=10$, the
+embedder and cut LoCoMo-Conv fixes for every system it compares, all ten
+conversations. With a weak embedder linkage matters more, not less: the
+complete-evidence rate on multi-hop questions rises from 9.6 to 24.1 and
+nDCG from 31.1 to 55.8, from the same fact layer and the same weights.}
+\label{tab:minilm}
 \end{table*}
 
 \paragraph{Where the misses are.} For the gold turns cosine fails to
@@ -519,20 +546,42 @@ matched lane is reported only where a comparable reader could be run.}
 \section{LoCoMo-Conv}
 \label{sec:conv}
 
-The benchmark's own protocol: all-MiniLM-L6-v2 embeddings, $k=10$,
-gemma-4-31B-it at temperature 0, the benchmark's judge. Reference points
-from the paper \cite{locomoconv}: without rewriting, Recall@10 on dialog
-queries spans 0.531--0.659 across the five systems, with AnchorMem at 0.659;
-on implicit queries 0.308--0.456, with mem0 at 0.456 and Memora at 0.445;
-multi-facet rewriting lifts AnchorMem's implicit recall from 0.368 to
-0.524.
+The benchmark's own protocol: all-MiniLM-L6-v2 embeddings, $k=10$, recall
+$= |\text{retrieved} \cap \text{gold}|/|\text{gold}|$ with a gold turn
+counted when its verbatim text appears in a returned memory, gemma-4-31B-it
+at temperature 0, GPT-5.4-mini as judge. Reference points from the paper
+\cite{locomoconv}: without rewriting, Recall@10 on dialog queries spans
+0.531--0.659 across the five systems, with AnchorMem at 0.659; on implicit
+queries 0.308--0.456, with mem0 at 0.456 and Memora at 0.445; multi-facet
+rewriting lifts AnchorMem's implicit recall from 0.368 to 0.524 and its
+composed recall from 0.279 to 0.432.
+
+At the time of writing the data is not released: the paper's one release
+address, \texttt{github.com/MiuLab/LoCoMo-Conv}, answers 404, and no copy
+exists on Hugging Face or in the authors' other repositories. We therefore
+report no LoCoMo-Conv number. Two things could be done without the data,
+and were. First, the harness: \texttt{conv/retrieve.mjs} implements the
+protocol above against any ranking function, with the four styles as a
+loader slot, so the run is one command when the data appears. Second, a
+sanity check of the protocol on the questions the rewrites came from
+(Table~\ref{tab:conv}): the same embedder, the same $k$, the same
+containment rule, on the original LoCoMo questions. Single turns as the
+memory unit reproduce none of the paper's rows; two-turn exchanges land
+within three points of its Naive RAG dialog row. The paper does not state
+its memory unit, and its containment rule pays for larger units, which is
+worth knowing before any system's number on it is compared with another's.
+The same check with zen-embedding-0.6b in place of MiniLM moves single-turn
+recall by 17 points before any linkage, which is why Table~\ref{tab:minilm}
+holds the embedder fixed.
 
 \begin{table*}[t]
 \centering
 \footnotesize
 \input{tables/conv}
-\caption{LoCoMo-Conv test split. Rows add one mechanism each; the last is
-the full read path of Figure~\ref{fig:read}.}
+\caption{LoCoMo-Conv's retrieval protocol on the original LoCoMo questions,
+the closest public proxy while the rewrites are unreleased. R@10 by memory
+unit, all-MiniLM-L6-v2. The paper's Naive RAG row is given for scale; it is
+not the same question set and is not compared.}
 \label{tab:conv}
 \end{table*}
 

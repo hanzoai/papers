@@ -564,46 +564,80 @@ scored 59 / 59 / 33 on multi-hop at 32K / 64K / 262K, the gain over the
 first run being the fixed plan policy for single-hop and a corrected
 lexicon, not a model.
 
-The third resolver treats the plan as a sketch. An oracle search over the
+The third row treats the plan as a sketch. An oracle search over the
 parsed graph (\texttt{mab/oracle.mjs}) found a path from the plan's base
-entity to the gold for 65 of the 67 multi-hop misses at 262K, and a ceiling
-of 98 for a perfect planner; the compiler's errors were near-synonym
-relations (\texttt{language} for \texttt{official\_lang}, \texttt{origin}
-for \texttt{country\_origin}), chains cut a hop short or padded with one,
-and the order of two hops. A second measurement (\texttt{mab/versions.mjs})
-settled, on dev, what ``current'' means: for single-hop questions the gold is
-the last version of its key 71 times and the first 0; for multi-hop chains
-63 are reachable with the latest version at every hop and none with the
-first. So the search keeps ``latest wins'' and relaxes the plan: at each hop
-the planned relation is preferred, its class-mates allowed at a cost, an
-older version taken only when the latest leads nowhere, one typed bridge
-through the entity's own facts when it has no such relation, a planned
-relation nothing satisfies skipped at a cost, and the answer type the
-question names — a city, a country, a person, a language — as the final
-constraint, deciding between stopping a hop early and going one further.
-The best complete path wins by a fixed score; ties go to the more literal
-plan and the later version. It is deterministic, it reads no gold, and it
-calls no model. In the runs of Table~\ref{tab:mab} the plans it searched
-over were the lexicon's (\texttt{meta.json} records the planner of every
-run), so no language model took part at any point; model-compiled plan sets
-are the next rows, labelled as such. On dev it moved multi-hop from 76 to 83 and single-hop
-from 96 to 98; on test, run once, multi-hop 76 / 76 / 51 and single-hop
-97 / 97 / 94. Pooled, 96.5 / 71.5, counting every unanswered question as
-wrong.
+entity to the gold for 65 of the 67 multi-hop misses at 262K; the compiler's
+errors were near-synonym relations (\texttt{language} for
+\texttt{official\_lang}, \texttt{origin} for \texttt{country\_origin}),
+chains cut a hop short or padded with one, and the order of two hops. A
+second measurement (\texttt{mab/versions.mjs}) settled, on dev, what
+``current'' means: for single-hop questions the gold is the last version of
+its key 71 times and the first 0; for multi-hop chains 63 are reachable with
+the latest version at every hop and none with the first. So the search keeps
+``latest wins'' and relaxes the plan: at each hop the planned relation is
+preferred, its class-mates allowed at a cost, an older version taken only
+when the latest leads nowhere, one typed bridge through the entity's own
+facts when it has no such relation, a planned relation nothing satisfies
+skipped at a cost, and the answer type the question names --- a city, a
+country, a person, a language --- as the final constraint, deciding between
+stopping a hop early and going one further. The best complete path wins by a
+fixed score; ties go to the more literal plan and the later version. It is
+deterministic, it reads no gold, and it calls no model at execution time.
+
+The plans it searches over are several per question: the lexicon's, and
+those of Qwen3.8-27B (4-bit, local) compiled once at temperature 0 and once
+at 0.7, at the relation level and at the level of relation families, each
+also in every order of its relations. Every plan of every set is executed
+and the same score selects among them; \texttt{meta.json} records the
+planner of every run and the frozen archive carries every plan set with its
+sha256. The compiler is the one place a language model takes part, before any
+haystack is read; it never sees a fact. Table~\ref{tab:mab-nbest} separates
+the two: plan recall@N (some plan among the first N sets reaches the gold)
+against execution success@N (the selected one does). Recall climbs with
+every set and selection tracks it within a point or two --- 68 against 67
+at 262K --- so the sets, not the selector, set the number. The fourth row
+adds an exhaustive enumeration of the relaxed plan and a lexical tie-break
+from the compiler's own templates. On dev it moved multi-hop from 88 to 93
+and single-hop from 98 to 100; on test, run once, multi-hop 89 / 89 / 67 and
+single-hop 98 / 98 / 97. Pooled, 98.3 / 84.5, counting every unanswered
+question as wrong.
 
 Against the reference points: CAR's gpt-4o pipeline reports 94.8 / 51.5
-pooled and 93 / 41 at 262K; this resolver reports 96.5 / 71.5 pooled and
-94 / 51 at 262K with no reader and, in these runs, no compiler model either. The unsourced ``91 / 57'' is exceeded
-on both columns pooled, and we make no claim against it beyond that. Pith
+pooled and 93 / 41 at 262K; this search reports 98.3 / 84.5 pooled and
+97 / 67 at 262K with no reader. The unsourced ``91 / 57'' names no lane; the
+numbers stand beside it and we make no claim against it beyond that. Pith
 reports multi-hop 95 / 83 / 84 / 68 at 6K / 32K / 64K / 262K under its own
-protocol \cite{pith}, a four-lane mean near 82.5; this resolver is below it
-on every lane, so it is not the best published result on this benchmark, and
-the 262K column is where the remaining error is: \texttt{mab/oracle.mjs} puts
-its ceiling at 98 with the plan the only thing standing between 51 and it — the compiler's
-chain shape on the longest questions, which the search cannot repair when
-the plan names a hop that does not exist and omits one that does. The next
-step is several plans per question, executed deterministically and chosen
-by the same score, not a reader.
+protocol \cite{pith}, a four-lane mean of 82.5 against this search's 84.5:
+above it at 32K and 64K, two below at 6K and one below at 262K, inside the
+bootstrap interval on every lane. Its protocol is undisclosed, so this
+compares reported numbers, not systems, and we claim no best published
+result on the benchmark.
+
+\paragraph{What stops 262K at two thirds.} The search's 33 misses at 262K
+are 29 questions whose gold uses an \emph{older} version of a key that a
+later line updates, and 4 where a shortcut path hides the same choice;
+every one of the 100 has a gold path in the parsed store
+(Table~\ref{tab:mab-ceiling}). The later line is an edit no question in the
+haystack asks for: the benchmark is built from MQuAKE-CF counterfactual
+edits, a haystack packs the edits of instances it never asks about, and the
+gold follows the edit on 183 versioned hops and the original on 46. Two
+ceilings follow. A key is contested when two questions need it in different
+versions; a policy choosing one version per key, however it chooses, can
+satisfy one side of each contest, which caps an oracle at 94 at 262K.
+``Latest wins'' caps at 67, and the search is on that line. Six signals a
+store can read were tried against the 46 older-gold hops, with the 183
+latest-gold hops as control: the object's degree (gold higher 21, lower
+20), whether the object has facts of its own (equal), whether it is tied
+back to its subject elsewhere (13 to 0 for the gold --- and 4 to 42 on the
+control, because the tie marks the \emph{original} fact, which is the gold
+one time in five), contest by another question (6 questions), serial
+distance to the chain's other facts (24 to 38), and position in the list by
+decile (one distribution for followed and ignored edits). None separates
+them. A system that reads only the haystack cannot pass 67 at 262K without
+guessing; the published 68 is one question above that line. The residue is
+a property of the benchmark at that size, and the way past it is not a
+reader but the question's own instance --- which the haystack does not
+carry.
 
 \begin{table*}[t]
 \centering
@@ -615,6 +649,28 @@ split; 32K--262K were run once per configuration. Pooled is the mean of the
 four sizes, as CAR reports its headline.}
 \label{tab:mab}
 \end{table*}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\input{tables/mab-nbest}
+\caption{Best-of-N against selected-of-N on the multi-hop haystacks: plan
+recall@N / execution success@N out of 100, no reader. Sets enter in the
+lane's order; every set is also executed in every order of its relations.}
+\label{tab:mab-nbest}
+\end{table}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\input{tables/mab-ceiling}
+\caption{The ceiling of a consistent version policy per multi-hop haystack,
+out of 100. A contested key is one that two questions need in different
+versions; the oracle row picks one version per key to satisfy the most
+questions, the latest-wins row is the policy every row of
+Table~\ref{tab:mab} uses.}
+\label{tab:mab-ceiling}
+\end{table}
 
 \begin{table*}[t]
 \centering

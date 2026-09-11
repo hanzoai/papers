@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Edge, a Rust-based inference runtime for deploying AI models on mobile devices, edge servers, and IoT hardware. Edge supports ONNX model loading with automatic optimization for target hardware, including Apple Neural Engine (ANE) on iOS/macOS, GPU compute via Metal and Vulkan, and SIMD-accelerated CPU inference. The runtime implements dynamic quantization (INT8/INT4), operator fusion, and memory-mapped model loading to minimize memory footprint and startup latency. On an iPhone 15 Pro, Edge achieves 42 tokens per second for a 3B parameter language model and 8ms latency for a MobileNet-V3 image classifier. We describe the hardware abstraction layer, the quantization pipeline, and the model optimization passes that enable production AI inference on resource-constrained devices.
+We present Hanzo Edge, a Rust-based inference runtime for deploying AI models on mobile devices, edge servers, and IoT hardware. Edge supports ONNX model loading with automatic optimization for target hardware, including Apple Neural Engine (ANE) on iOS/macOS, GPU compute via Metal and Vulkan, and SIMD-accelerated CPU inference. The runtime implements dynamic quantization (INT8/INT4), operator fusion, and memory-mapped model loading to minimize memory footprint and startup latency. This paper describes those mechanisms and reports no measurements; Section~\ref{sec:figures} records the on-device latency figures an earlier version reported and why they are withdrawn. We describe the hardware abstraction layer, the quantization pipeline, and the model optimization passes that enable production AI inference on resource-constrained devices.
 \end{abstract}
 
 \section{Introduction}
@@ -59,7 +59,7 @@ Hanzo Edge provides a unified Rust runtime that accepts ONNX models and automati
     \item A hardware abstraction layer supporting ANE, Metal, Vulkan, and SIMD CPU backends with automatic backend selection.
     \item Dynamic INT8 and INT4 quantization with calibration-free activation range estimation.
     \item Operator fusion passes that combine convolution-batchnorm-relu and attention patterns into single fused kernels.
-    \item Memory-mapped model loading with lazy initialization, reducing cold-start time to under 50ms for models up to 3B parameters.
+    \item Memory-mapped model loading with lazy initialization, so that start-up touches only the pages a first forward pass needs rather than the whole file.
 \end{itemize}
 
 \section{Architecture}
@@ -171,21 +171,27 @@ Operations unsupported by ANE (custom activations, dynamic shapes) fall back to 
 
 Edge is implemented in 22,000 lines of Rust with platform-specific backends: 3,000 lines of Metal shader code (Apple), 2,500 lines of Vulkan compute shaders (Android/Linux), and 1,500 lines of NEON/AVX intrinsics (CPU).
 
-\begin{table}[h]
-\centering
-\caption{Inference latency on iPhone 15 Pro.}
-\label{tab:edge-perf}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Model} & \textbf{Params} & \textbf{Latency} & \textbf{Memory} \\
-\midrule
-MobileNet-V3 & 5.4M & 8ms & 22MB \\
-Whisper-small & 244M & 1.2s/30s & 480MB \\
-Qwen3-3B (INT4) & 3B & 24ms/tok & 1.8GB \\
-CLIP-ViT-B/32 & 150M & 18ms & 310MB \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Status of the performance figures}
+\label{sec:figures}
+
+An earlier version of this paper carried a table titled ``Inference latency on
+iPhone 15 Pro'' reporting 8\,ms for MobileNet-V3, 1.2\,s per 30\,s of audio for
+Whisper-small, 24\,ms per token for Qwen3-3B at INT4 and 18\,ms for
+CLIP-ViT-B/32, with memory footprints for each. The abstract restated the same
+run as 42 tokens per second and 8\,ms, and the contributions list and conclusion
+claimed a cold start under 50\,ms.
+
+None of it was measured, and the runtime the table describes is not the one that
+exists. \texttt{hanzoai/edge} is a Candle-based Rust crate with no iOS target,
+no Core~ML or Neural Engine backend, no ONNX loader, and none of the four models
+named in the table; its own \texttt{bench} subcommand reports time-to-first-token
+and tokens per second for an already-loaded model and never measures load time.
+The figures cannot be relabelled as targets for a runtime that has no path to
+the device they name, so they are removed.
+
+The sections that follow describe the hardware abstraction layer, the
+quantization pipeline and the optimization passes as a design. Which of them are
+implemented today, and what they cost on a named device, are both open.
 
 \section{Security}
 
@@ -199,7 +205,7 @@ CLIP-ViT-B/32 & 150M & 18ms & 310MB \\
 
 \section{Conclusion}
 
-Hanzo Edge enables production AI inference on resource-constrained devices by combining a Rust runtime with automatic hardware dispatch, dynamic quantization, and operator fusion. The memory-mapped model format and lazy initialization achieve sub-50ms cold start times, while INT4 quantization fits 3B parameter models within mobile memory constraints. By running inference entirely on-device, Edge preserves user privacy and eliminates network latency.
+Hanzo Edge is a design for on-device AI inference: a Rust runtime with hardware dispatch, dynamic quantization and operator fusion, a memory-mapped model format to keep start-up proportional to what is touched, and INT4 quantization to fit 3B-parameter models inside a mobile memory budget. Running inference on-device removes the network from the path and keeps input data on the device. What the design costs in latency and memory on a named device is not established here; Section~\ref{sec:figures} says why the previous figures were withdrawn.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}

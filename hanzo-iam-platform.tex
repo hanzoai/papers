@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo IAM, a multi-tenant identity and access management platform that serves as the unified authentication layer for the Hanzo ecosystem. IAM supports OAuth~2.0, OpenID Connect, SAML~2.0, LDAP, and WebAuthn protocols, integrating with over 40 social identity providers. The system implements Casbin-based role-based access control (RBAC) with per-organization policy engines, SCIM~2.0 provisioning for enterprise directory synchronization, and TOTP/WebAuthn multi-factor authentication. IAM processes over 2 million authentication requests daily across 1,200+ tenant organizations with a median authentication latency of 18ms. All credentials are stored using Argon2id hashing with per-tenant salt derivation, and session tokens employ cryptographic binding to prevent token theft.
+We present Hanzo IAM, a multi-tenant identity and access management platform that serves as the unified authentication layer for the Hanzo ecosystem. IAM supports OAuth~2.0, OpenID Connect, SAML~2.0, LDAP, and WebAuthn protocols, integrating with over 40 social identity providers. The system implements Casbin-based role-based access control (RBAC) with per-organization policy engines, SCIM~2.0 provisioning for enterprise directory synchronization, and TOTP/WebAuthn multi-factor authentication. This paper describes the protocol surface, the policy model and the credential handling, and reports no measurements; Section~\ref{sec:figures} records the request volume, tenant count and authentication latency an earlier version reported and why they are withdrawn. All credentials are stored using Argon2id hashing with per-tenant salt derivation, and session tokens employ cryptographic binding to prevent token theft.
 \end{abstract}
 
 \section{Introduction}
@@ -160,7 +160,7 @@ m = r.sub == p.sub && r.org == p.org
     && r.act == p.act
 \end{lstlisting}
 
-Policies support role hierarchies, resource wildcards, and time-based constraints. Policy evaluation adds less than 0.1ms to request latency due to in-memory caching with write-through invalidation.
+Policies support role hierarchies, resource wildcards, and time-based constraints. Policy decisions are served from an in-memory cache with write-through invalidation, so an evaluation is a map lookup rather than a datastore round trip; the cost of that lookup is not measured here (Section~\ref{sec:figures}).
 
 \subsection{SCIM Provisioning}
 
@@ -178,22 +178,28 @@ IAM is implemented in 38,000 lines of Go with zero CGo dependencies. The identit
 
 \paragraph{Rate Limiting.} Authentication endpoints are rate-limited per IP and per account. Failed login attempts trigger exponential backoff: 1s, 2s, 4s, up to 5 minutes. After 10 consecutive failures, the account is locked for 30 minutes with email notification.
 
-\begin{table}[h]
-\centering
-\caption{Authentication latency (ms) by protocol.}
-\label{tab:latency}
-\begin{tabular}{lrr}
-\toprule
-\textbf{Protocol} & \textbf{p50} & \textbf{p99} \\
-\midrule
-OIDC token issue & 12 & 28 \\
-JWT validation & 0.3 & 0.8 \\
-SAML assertion & 18 & 45 \\
-WebAuthn verify & 8 & 22 \\
-RBAC check & 0.05 & 0.1 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Status of the performance figures}
+\label{sec:figures}
+
+An earlier version of this paper carried a table titled ``Authentication latency
+(ms) by protocol'' giving p50/p99 of 12/28\,ms for OIDC token issue, 0.3/0.8\,ms
+for JWT validation, 18/45\,ms for SAML assertion, 8/22\,ms for WebAuthn verify
+and 0.05/0.1\,ms for an RBAC check. The abstract restated these as a median
+authentication latency of 18\,ms over more than two million requests daily
+across 1{,}200 or more tenant organizations, and the policy section stated that
+evaluation adds less than 0.1\,ms.
+
+None of it was measured. The table named no hardware, no load generator and no
+request count; \texttt{hanzoai/iam} contains no benchmark function and no load
+test; and no deployment record in this estate counts authentication requests or
+tenant organizations. The daily-volume and tenant figures in particular describe
+an operating history the service does not have, so they cannot be relabelled as
+targets and are removed.
+
+The latency figures are the cheapest of these to establish honestly, because
+each protocol path is a function call away from a Go benchmark in the same
+repository. What is missing is the run and the machine it ran on, reported the
+way the Hanzo cloud data plane benchmark~\cite{clouddataplane} reports one.
 
 \section{Security}
 \label{sec:security}
@@ -214,7 +220,7 @@ By 2019 the limitations were clear: organizations wanted SSO with their existing
 
 \section{Conclusion}
 
-Hanzo IAM provides a unified identity platform that combines authentication, authorization, and user management in a single service. By supporting the major identity protocols and 40+ social providers, IAM eliminates the need to manage multiple identity systems. The Casbin-based policy engine provides fine-grained access control, and native SCIM provisioning enables enterprise directory integration.
+Hanzo IAM is a unified identity platform that combines authentication, authorization, and user management in a single service. By supporting the major identity protocols and 40+ social providers, IAM removes the need to run several identity systems side by side. The Casbin-based policy engine provides fine-grained access control, and native SCIM provisioning enables enterprise directory integration. This paper reports no latency or volume measurements; Section~\ref{sec:figures} says which were withdrawn and what would replace them.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}
@@ -233,6 +239,9 @@ N. Sakimura et al. OpenID Connect Core 1.0. OpenID Foundation, 2014.
 
 \bibitem{webauthn2019}
 J. Hodges et al. Web Authentication: An API for accessing Public Key Credentials. W3C, 2019.
+
+\bibitem{clouddataplane}
+Hanzo AI Research. The Hanzo Cloud Data Plane: Benchmarking \texttt{zip}, ZAP, and the Road to a Million Requests per Second. Hanzo Industries, 2026.
 
 \end{thebibliography}
 

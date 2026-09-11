@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Storage, an S3-compatible object storage gateway that provides per-tenant encryption, signed URL generation, quota management, and multi-backend support across AWS S3, Google Cloud Storage, and Cloudflare R2. Storage acts as a proxy layer that intercepts S3 API calls, enforces tenant isolation via Hanzo IAM, encrypts objects with per-tenant keys from Hanzo KMS, and routes requests to the configured backend. The system handles 15TB of stored objects across 400+ tenants with a median upload latency overhead of 8ms for encryption and policy enforcement. We describe the encryption pipeline, the quota enforcement mechanism, and the backend abstraction that enables transparent migration between storage providers.
+We present Hanzo Storage, an S3-compatible object storage gateway that provides per-tenant encryption, signed URL generation, quota management, and multi-backend support across AWS S3, Google Cloud Storage, and Cloudflare R2. Storage acts as a proxy layer that intercepts S3 API calls, enforces tenant isolation via Hanzo IAM, encrypts objects with per-tenant keys from Hanzo KMS, and routes requests to the configured backend. This paper describes the encryption pipeline, the quota mechanism and the backend abstraction, and reports no measurements; Section~\ref{sec:figures} records the stored volume, tenant count and latency overhead an earlier version reported and why they are withdrawn. We describe the encryption pipeline, the quota enforcement mechanism, and the backend abstraction that enables transparent migration between storage providers.
 \end{abstract}
 
 \section{Introduction}
@@ -179,23 +179,27 @@ Backends are configured per tenant, enabling cost optimization (R2 for egress-he
 
 Storage is implemented in 12,000 lines of Go. The S3 API compatibility layer uses the \texttt{s3-gw} library, supporting the 12 operations that cover 98\% of real-world S3 API usage.
 
-\begin{table}[h]
-\centering
-\caption{Upload latency overhead (ms) by object size.}
-\label{tab:upload}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Object Size} & \textbf{Encrypt} & \textbf{Auth+Quota} & \textbf{Total} \\
-\midrule
-1KB & 0.1 & 2.0 & 2.1 \\
-1MB & 3.2 & 2.0 & 5.2 \\
-100MB & 45 & 2.0 & 47 \\
-1GB & 380 & 2.0 & 382 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Status of the performance figures}
+\label{sec:figures}
 
-Encryption overhead scales linearly with object size (Table~\ref{tab:upload}). For objects under 10MB (the majority of uploads), total overhead is under 10ms.
+An earlier version of this paper carried a table titled ``Upload latency
+overhead (ms) by object size'' attributing 0.1/2.0/2.1\,ms to a 1\,KB object and
+380/2.0/382\,ms to a 1\,GB object across encryption and authorization, and an
+abstract reporting 15\,TB stored across more than 400 tenants at a median
+overhead of 8\,ms.
+
+None of it was measured. The table named no CPU, said nothing about whether
+AES-NI was available, and gave no sample count; the 8\,ms median in the abstract
+appears nowhere in the table; and no capacity or tenant inventory for this
+service exists in the estate, so the stored volume and tenant count describe an
+operating history that was never observed.
+
+The encryption column is the one figure here that is cheap to establish and
+worth establishing, because it is the tax this gateway adds over talking to the
+backend directly: an AES-256-GCM throughput measurement on a named CPU, with and
+without AES-NI, answers it for every object size at once.
+
+Encryption cost scales linearly with object size, while the authorization and quota check is a fixed cost per request. Below some object size the fixed cost dominates and the gateway is indistinguishable from the backend; above it the cipher does. Where that crossover falls depends on the CPU and is not measured here.
 
 \section{Security}
 
@@ -209,7 +213,7 @@ Encryption overhead scales linearly with object size (Table~\ref{tab:upload}). F
 
 \section{Conclusion}
 
-Hanzo Storage provides a multi-tenant object storage gateway that adds per-tenant encryption, quota management, and backend portability to standard S3-compatible storage. By operating as a proxy rather than a storage engine, Storage leverages the reliability and scalability of established cloud storage providers while adding the isolation and encryption guarantees required for a multi-tenant platform.
+Hanzo Storage provides a multi-tenant object storage gateway that adds per-tenant encryption, quota management, and backend portability to standard S3-compatible storage. By operating as a proxy rather than a storage engine, Storage inherits the durability of the backing provider while adding the isolation and encryption a multi-tenant platform requires. What the proxy costs on the upload path is not established here (Section~\ref{sec:figures}).
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}

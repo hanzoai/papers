@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Ingress, a Kubernetes-native L7 reverse proxy built on Traefik that provides automatic TLS certificate management, a custom static file serving plugin, and multi-namespace routing for the Hanzo platform. Ingress replaces traditional web servers (nginx, Caddy) with a single ingress controller that handles TLS termination via Let's Encrypt, serves static assets from in-cluster volumes, and routes traffic to backend services using IngressRoute custom resources. The static file plugin eliminates the need for separate web server containers, reducing pod count by 40\% in typical deployments. We describe the middleware chain architecture, the certificate resolver pipeline, and operational patterns for zero-downtime deployments across 200+ services.
+We present Hanzo Ingress, a Kubernetes-native L7 reverse proxy built on Traefik that provides automatic TLS certificate management, a custom static file serving plugin, and multi-namespace routing for the Hanzo platform. Ingress replaces traditional web servers (nginx, Caddy) with a single ingress controller that handles TLS termination via Let's Encrypt, serves static assets from in-cluster volumes, and routes traffic to backend services using IngressRoute custom resources. The static file plugin removes the separate web-server container a static site would otherwise need, so a deployment that served assets from its own pod serves them from the ingress instead. By how much that lowers pod count across the platform is not measured here (Section~\ref{sec:figures}). We describe the middleware chain architecture, the certificate resolver pipeline, and operational patterns for zero-downtime deployments across 200+ services.
 \end{abstract}
 
 \section{Introduction}
@@ -169,24 +169,28 @@ Traefik's cross-namespace service references allow a single IngressRoute to rout
 
 The static file plugin is implemented in Go as a Traefik middleware plugin (approximately 800 lines). It uses \texttt{http.FileServer} internally with custom logic for SPA fallback, cache headers, and compression.
 
-\paragraph{Resource Usage.} Each Traefik instance consumes approximately 50MB of memory and 0.1 CPU cores at idle, scaling to 200MB and 0.5 cores under 10,000 concurrent connections.
+\paragraph{Resource Usage.} Memory and CPU scale with the number of live connections and the size of the routing table rather than with request rate, since neither TLS session state nor the static-file cache is per-request. Concrete figures for a named workload are not reported here (Section~\ref{sec:figures}).
 
-\begin{table}[h]
-\centering
-\caption{Latency overhead comparison (ms, p99).}
-\label{tab:compare}
-\begin{tabular}{lrr}
-\toprule
-\textbf{Ingress} & \textbf{API Route} & \textbf{Static File} \\
-\midrule
-nginx + sidecar & 1.8 & 2.2 \\
-Caddy & 1.5 & 1.8 \\
-Hanzo Ingress & 1.2 & 0.8 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Status of the performance figures}
+\label{sec:figures}
 
-The static file plugin achieves lower latency than sidecar-based approaches because files are served directly from the ingress process without an additional network hop (Table~\ref{tab:compare}).
+An earlier version of this paper carried a table titled ``Latency overhead
+comparison (ms, p99)'' placing Hanzo Ingress at 1.2\,ms on an API route and
+0.8\,ms on a static file against 1.8/2.2\,ms for nginx with a sidecar and
+1.5/1.8\,ms for Caddy, and an abstract claiming a 40\% reduction in pod count.
+
+None of it was measured. The comparison named no load generator, no hardware, no
+request count and no configuration for either competitor, which makes it a claim
+about two third-party products with nothing behind it --- the most exposed kind
+of number a paper can carry. The 40\% figure defined neither ``typical
+deployment'' nor a before-and-after pod inventory. Both are removed.
+
+The structural argument the table was meant to support does not need it: serving
+a static asset from the ingress rather than from a pod behind it removes a
+network hop and a container from the path. That is a statement about the
+topology, and it holds whatever the measured difference turns out to be.
+
+A sidecar-based approach pays for a second process and the hop to reach it on every static request. The plugin serves the file from the process that already terminated the connection, so neither cost appears.
 
 \section{Security}
 
@@ -200,7 +204,7 @@ The static file plugin achieves lower latency than sidecar-based approaches beca
 
 \section{Conclusion}
 
-Hanzo Ingress provides a unified ingress layer that eliminates the need for separate web server containers in Kubernetes deployments. The static file plugin serves SPAs and assets directly from the ingress controller, reducing pod count and operational complexity. Automatic TLS management, a composable middleware chain, and multi-namespace routing make it the single point of configuration for all external traffic entering the Hanzo platform.
+Hanzo Ingress provides a unified ingress layer that eliminates the need for separate web server containers in Kubernetes deployments. The static file plugin serves SPAs and assets directly from the ingress controller, which removes a container and a hop from the path an asset takes. Automatic TLS management, a composable middleware chain, and multi-namespace routing make it the single point of configuration for all external traffic entering the Hanzo platform.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}

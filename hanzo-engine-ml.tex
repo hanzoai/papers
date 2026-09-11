@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Engine, a production ML inference engine implemented in Rust that serves multiple models concurrently with dynamic batching, intelligent GPU scheduling, and A/B traffic routing. Engine manages a fleet of GPU workers, automatically loading and unloading models based on traffic patterns, and implements continuous batching for transformer models to maximize GPU utilization. The system serves 200+ models in production across 48 GPUs with a median time-to-first-token (TTFT) of 45ms for language models and 99.9\% availability. Key innovations include: (1) a priority-aware GPU scheduler that co-locates complementary workloads, (2) speculative model preloading based on traffic prediction, and (3) a unified serving protocol supporting both streaming and batch inference.
+We describe the design of Hanzo Engine, an ML inference orchestration layer implemented in Rust that serves multiple models concurrently with dynamic batching, GPU scheduling, and A/B traffic routing. Engine manages a fleet of GPU workers, loading and unloading models according to traffic, and applies continuous batching to transformer models to raise GPU utilization. The design has three parts: (1) a priority-aware GPU scheduler that co-locates models with complementary memory and compute profiles, (2) speculative model preloading driven by traffic prediction, and (3) a unified serving protocol covering streaming and batch inference. This paper describes a design and reports no measurements. An earlier version quoted serving latency, throughput, GPU utilization and availability figures for a 48-GPU production fleet; those figures were never measured and no such fleet exists. Section~\ref{sec:figures} records what they were and what would be needed to replace them.
 \end{abstract}
 
 \section{Introduction}
@@ -57,8 +57,8 @@ Hanzo Engine operates at the orchestration layer above individual model servers.
 \paragraph{Contributions.}
 \begin{itemize}
     \item A priority-aware GPU scheduler that co-locates models with complementary memory and compute profiles on shared GPUs.
-    \item Continuous batching with iteration-level scheduling for transformer models, achieving 3.2x throughput improvement over static batching.
-    \item Speculative model preloading using traffic prediction to reduce cold-start latency from 30s to under 200ms.
+    \item Continuous batching with iteration-level scheduling for transformer models, following Orca~\cite{yu2022}, so that padding waste does not scale with the longest sequence in the batch.
+    \item Speculative model preloading using traffic prediction, which moves the cold-start cost off the request path when the prediction is correct.
     \item A unified serving protocol supporting streaming tokens, batch embeddings, and multimodal inputs.
 \end{itemize}
 
@@ -76,9 +76,9 @@ Hanzo Engine operates at the orchestration layer above individual model servers.
 \node[box] (api) {Serving\\API};
 \node[box, below=of api] (router) {Model\\Router};
 \node[box, below=of router] (scheduler) {GPU\\Scheduler};
-\node[box, below left=0.6cm and 0.3cm of scheduler] (w1) {Worker 1\\(8xA100)};
-\node[box, below=of scheduler] (w2) {Worker 2\\(8xA100)};
-\node[box, below right=0.6cm and 0.3cm of scheduler] (w3) {Worker 3\\(8xH100)};
+\node[box, below left=0.6cm and 0.3cm of scheduler] (w1) {GPU\\Worker 1};
+\node[box, below=of scheduler] (w2) {GPU\\Worker 2};
+\node[box, below right=0.6cm and 0.3cm of scheduler] (w3) {GPU\\Worker $n$};
 \node[box, right=1.5cm of router] (registry) {Model\\Registry};
 \node[box, left=1.5cm of router] (ab) {A/B\\Router};
 
@@ -160,11 +160,11 @@ impl ContinuousBatcher {
 }
 \end{lstlisting}
 
-This achieves 3.2x higher throughput than static batching by eliminating padding waste.
+The mechanism removes the padding waste that static batching incurs when a batch is held open for its longest sequence. Orca~\cite{yu2022} and vLLM~\cite{kwon2023} report the size of that effect for their own systems and workloads; we have not measured it for this one.
 
 \subsection{Speculative Preloading}
 
-Engine tracks per-model request rates with exponential moving averages and preloads models predicted to receive traffic within the next 5 minutes. The predictor uses a simple ARIMA model trained on the last 24 hours of traffic data. Preloading reduces cold-start latency from 30s (model load from storage) to under 200ms (already in GPU memory).
+Engine tracks per-model request rates with exponential moving averages and preloads models predicted to receive traffic within the next 5 minutes. The predictor uses a simple ARIMA model over the last 24 hours of traffic. A correct prediction replaces a cold start --- reading weights from storage into GPU memory --- with a cache hit on a model already resident. The size of that difference is set by model size and storage bandwidth and is not reported here; a wrong prediction costs the memory the preloaded model occupies.
 
 \subsection{A/B Routing}
 
@@ -183,23 +183,32 @@ Results are logged with the model version for offline analysis of quality metric
 
 \section{Implementation}
 
-Engine is implemented in 35,000 lines of Rust. Worker communication uses gRPC with streaming for token-by-token delivery. Model loading uses \texttt{safetensors} format with memory-mapped I/O.
+Engine is implemented in Rust. Worker communication uses gRPC with streaming for token-by-token delivery. Model loading uses \texttt{safetensors} format with memory-mapped I/O.
 
-\begin{table}[h]
-\centering
-\caption{Serving performance (Qwen3-72B, 8xH100).}
-\label{tab:engine-perf}
-\begin{tabular}{lrr}
-\toprule
-\textbf{Metric} & \textbf{Static Batch} & \textbf{Continuous} \\
-\midrule
-TTFT p50 (ms) & 52 & 45 \\
-TTFT p99 (ms) & 280 & 120 \\
-Throughput (tok/s) & 4,200 & 13,400 \\
-GPU utilization & 42\% & 87\% \\
-\bottomrule
-\end{tabular}
-\end{table}
+\section{Status of the performance figures}
+\label{sec:figures}
+
+An earlier version of this paper carried a table titled ``Serving performance
+(Qwen3-72B, 8xH100)'' reporting TTFT p50 of 52\,ms under static batching against
+45\,ms under continuous batching, p99 of 280\,ms against 120\,ms, throughput of
+4{,}200 against 13{,}400\,tok/s, and GPU utilization of 42\% against 87\%. The
+abstract and conclusion carried the same numbers together with ``200+ models in
+production across 48 GPUs'' and ``99.9\% availability,'' and the contributions
+list stated a $3.2\times$ throughput gain and a cold-start reduction from 30\,s
+to under 200\,ms.
+
+None of it was measured. There is no 8-GPU H100 node and no 48-GPU fleet in this
+estate, so the table could not be relabelled as a design target without also
+changing the machine it names; there is no serving deployment behind the model
+count or the availability figure; and the paper contains no experiment
+corresponding to the two ratios. The figures are removed rather than restated.
+
+The measurement they stood in for is available to make. \texttt{hanzoai/engine}
+ships a benchmark command (\texttt{hanzo bench}) that reports prompt and decode
+throughput for a named model and accelerator, and the house convention for
+reporting such a run --- declared hardware, a fixed handler and payload, raw
+artifacts published alongside --- is set out in the Hanzo cloud data plane
+benchmark~\cite{clouddataplane}. What is missing is the run, not the harness.
 
 \section{Security}
 
@@ -215,7 +224,7 @@ GPU utilization & 42\% & 87\% \\
 
 \section{Conclusion}
 
-Hanzo Engine provides production ML inference orchestration that maximizes GPU utilization through continuous batching, intelligent scheduling, and speculative preloading. By operating at the orchestration layer above individual model servers, Engine manages the complexity of multi-model serving---model lifecycle, GPU allocation, traffic routing, and A/B experiments---while maintaining sub-50ms TTFT for language models at 99.9\% availability.
+Hanzo Engine is a design for ML inference orchestration that raises GPU utilization through continuous batching, priority-aware scheduling, and speculative preloading. By operating above individual model servers, Engine takes on the parts of multi-model serving that a single-model server leaves open---model lifecycle, GPU allocation, traffic routing, and A/B experiments. Whether the design delivers the utilization it is built for is an open question here; Section~\ref{sec:figures} says what would answer it.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}
@@ -231,6 +240,9 @@ NVIDIA. Triton Inference Server. 2020.
 
 \bibitem{yu2022}
 G. Yu et al. Orca: A Distributed Serving System for Transformer-Based Generative Models. OSDI, 2022.
+
+\bibitem{clouddataplane}
+Hanzo AI Research. The Hanzo Cloud Data Plane: Benchmarking \texttt{zip}, ZAP, and the Road to a Million Requests per Second. Hanzo Industries, 2026.
 
 \end{thebibliography}
 

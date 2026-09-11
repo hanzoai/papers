@@ -45,7 +45,7 @@
 \hanzocoverpage
 
 \begin{abstract}
-We present Hanzo Vector, a high-performance vector search engine implemented in Rust, designed for retrieval-augmented generation (RAG) pipelines and semantic search in AI applications. Vector implements Hierarchical Navigable Small World (HNSW) graphs with configurable distance metrics (cosine, Euclidean, dot product), scalar and product quantization for memory efficiency, and filtered search with pre- and post-filtering strategies. The engine supports collections of up to 100 million vectors with 99\% recall at 1ms p95 latency for 1536-dimensional embeddings. Key innovations include: (1) a hybrid quantization scheme that selects scalar or product quantization per segment based on dimensionality, (2) filtered HNSW traversal that prunes the search graph using metadata predicates during navigation, and (3) a write-ahead log with snapshot isolation for concurrent reads and writes.
+We present Hanzo Vector, a high-performance vector search engine implemented in Rust, designed for retrieval-augmented generation (RAG) pipelines and semantic search in AI applications. Vector implements Hierarchical Navigable Small World (HNSW) graphs with configurable distance metrics (cosine, Euclidean, dot product), scalar and product quantization for memory efficiency, and filtered search with pre- and post-filtering strategies. The engine is designed for collections in the tens of millions of vectors at embedding dimensions around 1536. This paper describes that design and reports no measurements; Section~\ref{sec:figures} records the recall and latency figures an earlier version reported and why they are withdrawn. Key design elements are: (1) a hybrid quantization scheme that selects scalar or product quantization per segment based on dimensionality, (2) filtered HNSW traversal that prunes the search graph using metadata predicates during navigation, and (3) a write-ahead log with snapshot isolation for concurrent reads and writes.
 \end{abstract}
 
 \section{Introduction}
@@ -59,7 +59,7 @@ Hanzo Vector is designed as an embeddable Rust library with an optional gRPC ser
     \item An HNSW implementation with segment-level adaptive quantization selecting between scalar and product quantization based on dimensionality and recall requirements.
     \item Filtered HNSW traversal integrating metadata predicates into graph navigation, avoiding the recall degradation of post-filtering.
     \item A WAL-based storage engine with snapshot isolation enabling concurrent reads and writes without lock contention.
-    \item Benchmarks demonstrating 99\% recall at 1ms p95 latency on 10M vectors with 1536 dimensions.
+    \item A statement of the recall and latency properties the design is built for, and of what would have to be run to establish them (Section~\ref{sec:figures}).
 \end{itemize}
 
 \section{Architecture}
@@ -163,25 +163,32 @@ The WAL-based storage engine enables concurrent reads and writes. New vectors ar
 
 Vector is implemented in 28,000 lines of Rust. The HNSW index uses \texttt{unsafe} Rust for SIMD-accelerated distance computations (AVX2 on x86, NEON on ARM). The gRPC API uses \texttt{tonic}; the HTTP API uses \texttt{axum}.
 
-\begin{table}[h]
-\centering
-\caption{Search performance (10M vectors, 1536-dim).}
-\label{tab:search}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Config} & \textbf{Recall@10} & \textbf{p50 (ms)} & \textbf{p95 (ms)} \\
-\midrule
-Full precision & 99.5\% & 0.6 & 1.0 \\
-SQ (uint8) & 98.8\% & 0.3 & 0.6 \\
-PQ (m=96, k=256) & 97.2\% & 0.2 & 0.4 \\
-\midrule
-+ Filter (10\%) & 99.1\% & 0.8 & 1.4 \\
-+ Filter (1\%) & 98.5\% & 1.2 & 2.1 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\paragraph{Memory Usage.} At 10M vectors of 1536 dimensions, full-precision storage is 61\,GB and scalar quantization to \texttt{uint8} is 15\,GB; both follow from the element width. Product quantization at $m=96$, $k=256$ stores 96 bytes per vector, or 0.96\,GB for the codes plus the codebooks.
 
-\paragraph{Memory Usage.} Full precision: 61GB for 10M$\times$1536. SQ: 15GB. PQ: 2.4GB.
+\section{Status of the performance figures}
+\label{sec:figures}
+
+An earlier version of this paper carried a table titled ``Search performance
+(10M vectors, 1536-dim)'' reporting recall@10 of 99.5\% at 0.6/1.0\,ms p50/p95
+for full precision, 98.8\% at 0.3/0.6\,ms under scalar quantization and 97.2\%
+at 0.2/0.4\,ms under product quantization, with two filtered rows. The abstract
+and conclusion restated the same figures as 99\% recall at 1\,ms p95 on
+collections of up to 100 million vectors, and the contributions list called them
+benchmarks.
+
+Nothing produced them. The table named no hardware, no query count, and no
+recall ground truth; there is no benchmark harness in \texttt{hanzoai/vector},
+no ANN benchmark configuration, and no dataset --- SIFT, GIST, DEEP1B or
+otherwise --- against which recall could have been computed. The figures are
+removed rather than relabelled as targets, because a recall--latency pair is
+only meaningful against a stated dataset, index build and query set, and this
+paper states none of them.
+
+Establishing them is a bounded piece of work: fix a public dataset and query
+set, build the index at declared \texttt{ef\_construction} and $M$, sweep
+\texttt{ef\_search}, and report the recall--latency curve with the machine
+named. The house convention for reporting such a run is set out in the Hanzo
+cloud data plane benchmark~\cite{clouddataplane}.
 
 \section{Security}
 
@@ -195,7 +202,7 @@ PQ (m=96, k=256) & 97.2\% & 0.2 & 0.4 \\
 
 \section{Conclusion}
 
-Hanzo Vector provides an embeddable, high-performance vector search engine designed for AI workloads. Adaptive quantization, filtered HNSW traversal, and WAL-based storage enable 99\% recall at sub-millisecond latency on collections of tens of millions of vectors. The Rust implementation ensures predictable performance without garbage collection pauses, making Vector suitable for latency-sensitive RAG pipelines.
+Hanzo Vector is an embeddable vector search engine designed for AI workloads. Adaptive quantization, filtered HNSW traversal and WAL-based storage are the three mechanisms it combines, and each addresses a specific cost: memory per vector, recall loss under restrictive filters, and lock contention between readers and writers. What the combination is worth in recall and latency is not established here; Section~\ref{sec:figures} says what would establish it.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{10}
@@ -211,6 +218,9 @@ Qdrant. Vector Search Engine. 2021.
 
 \bibitem{jegou2011}
 H. J\'{e}gou et al. Product Quantization for Nearest Neighbor Search. IEEE TPAMI, 2011.
+
+\bibitem{clouddataplane}
+Hanzo AI Research. The Hanzo Cloud Data Plane: Benchmarking \texttt{zip}, ZAP, and the Road to a Million Requests per Second. Hanzo Industries, 2026.
 
 \end{thebibliography}
 

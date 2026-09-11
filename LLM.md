@@ -101,3 +101,63 @@ The website is a curated, externally checkable catalog rather than an automatic 
 every TeX file. Publishing a new paper therefore requires both its card in
 `site/src/config/papers.ts` and its compiled artifact in `site/public/pdfs/`. The root
 `pdfs/` directory remains CI output and is ignored.
+
+## The 86d8915 batch
+
+Ninety-six papers landed in one commit — fifteen product papers, plus a sync of
+fifty-eight from `zenlm/papers`. Two of the fifteen (`hanzo-base`,
+`hanzo-operate-computer`) were replaced in `dbf6fc9` by rewritten papers under
+`hanzo-base-runtime/` and `hanzo-operative/`. The other ninety-four were audited
+for numbers presented as measurements: every quantitative performance claim was
+put in one of four places — traceable to a run, a harness or a commit; someone
+else's published number, attributed; a target or a model, labelled as one in the
+text; or presented as a result with nothing behind it.
+
+**353 claims are in the last place, and none is in the first.** No paper in the
+batch names an evaluation harness, a run identifier, a checkpoint, a seed or a
+date. None cites `bench/brain` (hanzoai/cloud) or `bench/locomo`
+(hanzoai/semantic), the two harnesses in the estate that declare their splits and
+publish bootstrap intervals, nor `hanzoai/benchmarks`, which backs
+`hanzo-cloud-network-bench.tex`. That paper is what the house standard looks
+like: two machines named, the tuning published as one idempotent script, raw
+numbers in a public repo. The batch does not follow it.
+
+**The thirteen product papers at the repository root are corrected.** Each
+carried a production-operations figure in its abstract — 48 GPUs and 99.9%
+availability, 2M authentications daily across 1,200 tenants, \$240M processed at
+99.97%, 15TB across 400 tenants, three years of ledger operation without a
+discrepancy — for services whose repositories hold no benchmark, whose
+deployments record no such volume, and several of which were first committed
+years after the paper's own date. Those claims cannot be relabelled as targets,
+because a target is a statement about the future and these were statements about
+a past that did not happen, so they are removed and each paper now carries a
+short section saying what was removed and why. Two are different: `pubsub` and
+`ledger` ship harnesses that measure exactly the quantities their tables report,
+so those tables stay with their provenance stated. The gap there is a run, not a
+mechanism.
+
+**The eighty-one `zen/` papers are not corrected and need a decision.** They hold
+321 of the 353 defects, in three recurring shapes: training and inference
+attributed to H100 and A100 fleets of 8 to 16,384 GPUs; efficiency, energy and
+carbon figures with no baseline named; and abstracts whose headline number
+contradicts the paper's own table. Some are checkable without any estate fact —
+decode throughput above the memory-bandwidth ceiling of the part it names, FP8 on
+Ampere, AIME scores that are not multiples of 1/30 on a 30-problem exam, INT4
+requiring more memory than FP16.
+
+They are left alone deliberately. `zenlm/papers` already had a sweeping
+withdrawal pass, `5deeeaa`, which the owner reverted in `f34f609`: *"That commit
+asserted it; nothing verified it... a paper that disclaims its own results is
+worse than one that under-cites them. Where these papers are thin it is in
+provenance — the runs need citing, not retracting."* The subject models are
+mostly real; 78 are published under the `zenlm` org. What is needed is a decision
+about a family of papers — several of which are template-generated, with the same
+pretraining sentence and the same energy table filled in for different models —
+and that is not an edit to make one paper at a time. Two of the eighty-one show
+what the rest could be: `zen-mixture-of-experts.tex` states plainly that it
+publishes no number it has not measured and names its harness, and
+`zen-coder_whitepaper.tex` reports no scores and labels its costs as estimates.
+
+Note also that 69 of the 86 `zen/*.tex` here have diverged from their
+counterparts in `zenlm/papers`, so the two sites publish different text under the
+same titles. A fix applied in one place does not reach the other.

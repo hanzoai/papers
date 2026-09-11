@@ -105,6 +105,9 @@ export const siteConfig: SiteConfig = {
       date: '2026-06-15',
       authors: ['Hanzo AI Research'],
       tags: ['Engine', 'Inference', 'Edge', 'Benchmarks'],
+      relatedLinks: [
+        { label: 'The numbers, live: hanzo.ai/benchmarks/inference', url: 'https://hanzo.ai/benchmarks/inference' },
+      ],
     },
     {
       id: 'hanzo-native-training',
@@ -170,6 +173,7 @@ export const siteConfig: SiteConfig = {
       tags: ['Engine', 'GPU Kernels', 'Benchmarks', 'Methodology'],
       relatedLinks: [
         { label: 'Companion: Evolutionary Schedule Search', url: 'https://papers.hanzo.ai/evolutionary-schedule-search' },
+        { label: 'The numbers, live: hanzo.ai/benchmarks/inference', url: 'https://hanzo.ai/benchmarks/inference' },
       ],
     },
     {
@@ -198,6 +202,60 @@ export const siteConfig: SiteConfig = {
       date: '2026-07-07',
       authors: ['Hanzo AI Research'],
       tags: ['Router', 'Routing', 'Economics', 'On-Device', 'SLO'],
+    },
+
+    // --- What an agent costs when it is doing nothing ---
+    {
+      id: 'hanzo-dormant-agents',
+      title: 'What a Dormant Agent Costs',
+      subtitle: 'State, Execution and Isolation Measured Separately at a Fleet of One Million',
+      abstract: 'An agent platform is usually costed as though an agent were a process, which sets the per-agent floor at a container runtime\'s minimum reservation — 128–512 MB on commodity platforms. At that floor a fleet of a million agents is a datacenter, and every design decision downstream of the estimate is made in its shadow. We take the estimate apart. An idle agent is three separable things: the state it will resume from, the execution context that holds its loop, and the isolation boundary its code runs behind. These have no reason to cost the same, and measured on one laptop they differ by five orders of magnitude. State at rest is a row: 477 bytes on disk, so a million dormant agents occupy 454.6 MiB, written at 309,789 agents/s and resumed in 0.034 ms in-process. Execution at rest is a goroutine: 601 bytes of heap, identical on every run, so a million live loops are 573.0 MB and each starts in 187 ns. Isolation is the expensive one, and it is expensive for a reason: an in-process V8 context costs 0.15 ms but runs only JavaScript, while an OCI container costs 150.80 ms — 1016× more — and is the only one of the two that can run a test suite, a package manager or a shell. The conclusion is not that containers are wasteful. It is that a fleet pays for isolation per running agent, not per registered one, while the industry estimate charges the isolation price to every agent whether or not it is doing anything. We give the capacity model this implies, and we are explicit about what 601 bytes is: a floor for an agent holding nothing, not a forecast for an agent holding a conversation.',
+      pdfUrl: '/pdfs/hanzo-dormant-agents.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-dormant-agents/hanzo-dormant-agents.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-09-07',
+      authors: ['Hanzo AI Research'],
+      tags: ['Agents', 'Cost', 'Isolation', 'Benchmarks', 'Measurement'],
+      relatedLinks: [
+        { label: 'State at rest, live: hanzo.ai/benchmarks/fleet', url: 'https://hanzo.ai/benchmarks/fleet' },
+        { label: 'Execution at rest, live: hanzo.ai/benchmarks/goroutine', url: 'https://hanzo.ai/benchmarks/goroutine' },
+        { label: 'Isolation, live: hanzo.ai/benchmarks/sandbox', url: 'https://hanzo.ai/benchmarks/sandbox' },
+        { label: 'Harness: hanzoai/cloud · bench', url: 'https://github.com/hanzoai/cloud/tree/main/bench' },
+      ],
+    },
+
+    // --- Conversational memory, measured on LoCoMo ---
+    {
+      id: 'hanzo-multi-hop-retrieval',
+      title: 'Hops Do Not Fix Multi-Hop Retrieval',
+      subtitle: 'A Negative Result on Long-Horizon Conversational Memory, and What the Failure Actually Is',
+      abstract: 'On LoCoMo, a dense retriever answering single-hop questions finds every required turn 78.2% of the time at k=20. On multi-hop questions the same retriever over the same index finds every required turn 22.7% of the time — but finds at least one of them 80.1% of the time, essentially the single-hop rate. It reliably finds a relevant turn and reliably misses the rest. The textbook fix is to search more than once and let the first result inform the second; we implemented four retrieval policies over one index — a single search, pseudo-relevance feedback, a union over neighbours of the top hits, and a two-deep chain — so that the only variable is the policy. None of them fixes it: the best gained 0.7 percentage points on multi-hop at double the latency, two were worse than a single search, and the one that gained on multi-hop lost 3.1 points on single-hop. The diagnostic says why. Multi-hop questions need 3.1 gold turns on average (up to 19), and 95.4% of that evidence spans more than one conversation session; the median gold turn sits at rank 24 and the median worst gold turn at rank 67, beyond k=20 for 77.2% of questions and beyond k=100 for 43.1%. Additional hops re-search the same similarity space, and a turn that is far away in that space stays far however many times it is queried. The missing signal is linkage, not similarity — a structure to be built, not a search to be repeated. We publish this because the negative result is the useful part: it rules out the cheap fix and names the expensive one.',
+      pdfUrl: '/pdfs/hanzo-multi-hop-retrieval.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-multi-hop-retrieval/hanzo-multi-hop-retrieval.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-09-07',
+      authors: ['Hanzo AI Research'],
+      tags: ['Memory', 'Retrieval', 'LoCoMo', 'Benchmarks', 'Negative Result'],
+      relatedLinks: [
+        { label: 'The numbers, live: hanzo.ai/benchmarks/locomo', url: 'https://hanzo.ai/benchmarks/locomo' },
+        { label: 'Harness: hanzoai/cloud · bench/brain', url: 'https://github.com/hanzoai/cloud/tree/main/bench/brain' },
+      ],
+    },
+    {
+      id: 'locomo-subject-scope',
+      title: 'Retrieval Scoped by Subject',
+      subtitle: 'A factorial measurement of conversational memory on LoCoMo, and the negative controls that locate the effect',
+      abstract: 'We measure a graph-structured conversational memory against a flat nearest-neighbour index on LoCoMo — 10 conversations, 272 sessions, 5,882 turns, 1,986 questions — using the benchmark\'s own scorer, ported to Go and verified against the original Python on all 1,986 questions and every system reported. Three results follow, and the negative controls are the substance of the paper. First, the aggregate over all five question categories is degenerate: a system that replies “No information available” to every question scores 0.228, above every system here that has to find its own evidence, and only an oracle handed the dataset\'s own annotated evidence scores higher, at 0.252. A quarter of LoCoMo\'s questions are adversarial and the official metric awards a point for declining them, so any mean over the full set measures the abstention rate before it measures the memory; the answerable and adversarial halves have to be reported apart. Second, the effect that survives is subject scope. Restricting retrieval to the person a question names scores 0.502 against 0.200 on the 446 adversarial questions (95% CI over conversations [+0.247, +0.347]) at no measurable cost on the 1,540 answerable ones (0.142 against 0.144, CI [-0.010, +0.006]). The mechanism is reader-independent: with the result limit lifted, the graph memory reaches 76% of the annotated evidence for answerable questions and 27% for adversarial ones, where the flat index reaches 99% and 96%. It is selectively blind, and the blindness falls where the trap turns are. Third, the graph itself is inert — empty it entirely and every number is byte-identical.',
+      pdfUrl: '/pdfs/locomo-subject-scope.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/locomo-subject-scope/main.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-09-09',
+      authors: ['Hanzo AI Research'],
+      tags: ['Memory', 'Retrieval', 'LoCoMo', 'Negative Controls', 'Go'],
+      relatedLinks: [
+        { label: 'The numbers, live: hanzo.ai/benchmarks/locomo-subject-scope', url: 'https://hanzo.ai/benchmarks/locomo-subject-scope' },
+        { label: 'Harness: hanzoai/semantic · bench/locomo', url: 'https://github.com/hanzoai/semantic/tree/v0.2.4/bench/locomo' },
+      ],
     },
 
     {

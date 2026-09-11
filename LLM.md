@@ -136,16 +136,16 @@ short section saying what was removed and why. Two are different: `pubsub` and
 so those tables stay with their provenance stated. The gap there is a run, not a
 mechanism.
 
-**The eighty-one `zen/` papers are not corrected and need a decision.** They hold
-321 of the 353 defects, in three recurring shapes: training and inference
-attributed to H100 and A100 fleets of 8 to 16,384 GPUs; efficiency, energy and
-carbon figures with no baseline named; and abstracts whose headline number
-contradicts the paper's own table. Some are checkable without any estate fact —
-decode throughput above the memory-bandwidth ceiling of the part it names, FP8 on
-Ampere, AIME scores that are not multiples of 1/30 on a 30-problem exam, INT4
-requiring more memory than FP16.
+**The eighty-one `zen/` papers hold the other 321,** in three recurring shapes:
+training and inference attributed to H100 and A100 fleets of 8 to 16,384 GPUs;
+efficiency, energy and carbon figures with no baseline named; and abstracts whose
+headline number contradicts the paper's own table. Some are checkable without any
+estate fact — decode throughput above the memory-bandwidth ceiling of the part it
+names, FP8 on Ampere, AIME scores that are not multiples of 1/30 on a 30-problem
+exam, INT4 requiring more memory than FP16. That checkable subset is now corrected;
+see below.
 
-They are left alone deliberately. `zenlm/papers` already had a sweeping
+The rest are left alone deliberately. `zenlm/papers` already had a sweeping
 withdrawal pass, `5deeeaa`, which the owner reverted in `f34f609`: *"That commit
 asserted it; nothing verified it... a paper that disclaims its own results is
 worse than one that under-cites them. Where these papers are thin it is in
@@ -157,6 +157,82 @@ and that is not an edit to make one paper at a time. Two of the eighty-one show
 what the rest could be: `zen-mixture-of-experts.tex` states plainly that it
 publishes no number it has not measured and names its harness, and
 `zen-coder_whitepaper.tex` reports no scores and labels its costs as estimates.
+
+## The provable subset of the zen papers
+
+A second pass corrected twenty-seven of the eighty-one, on one rule: change a claim
+only where the proof is in the paper itself or in arithmetic, never because a run
+could not be found. Every correction quotes a number the paper already carries, or
+one derived from the paper's own numbers by a division a reader can repeat.
+
+**A figure that appears in no row of the table it summarises.** Twelve papers.
+`zen-agent` averaged GAIA 83.1/68.4/42.3 to 71.2 while its four baseline rows are
+the plain mean of their own three levels; the mean is 64.6. `zen-embeddings-retrieval`
+and `zen3-embedding` state MTEB averages of 72.4 and 74.3 over tables that supply
+their task counts, where the 56-task weighted means are 67.1 and 67.4.
+`zen-mathematical-reasoning` opened with five figures, none of which was any row,
+and explained one of them as best-of-32 when its own sampling table puts best-of-32
+elsewhere. `zen-dso-protocol` claimed 94% of centralized quality and a 78% bandwidth
+cut against tables reading 99.4% and 99.8%-and-better. Also `zen-hallucination-reduction`
+(reductions attached to the wrong benchmarks, one attached to nothing),
+`zen-synthetic-data` (an 8.4-point MT-Bench gain on a 1-to-10 scale from a 7.84
+baseline, where the table says 0.88), `zen-distributed-training`, `zen-finetuning`,
+`zen-legal-ai`, `zen-coder-flash`, `zen-3d` (the abstract quoted the Chair column as
+the ShapeNet result) and `zen-multilingual`, whose XNLI average was understated.
+
+**Arithmetic that the silicon or the scale forbids.** `zen-nano`, `zen-eco` and
+`zen-scribe` each report INT4 needing as much memory as FP16 or more, while their own
+FP16 and INT8 rows are exactly two and one bytes per parameter; `zen_family_overview`
+already carried the right values. Both `zen-designer` papers size a stated 235B model
+at 220 GB in FP16, which is a 110B model; `zen-quantization` puts the same model at
+470 GB. `zen-omni` and `zen-next` recommend cards smaller than the memory the same
+row requires. `zen-live` captions a latency table to an A10G when its own deployment
+table assigns that 98 ms to the H100 and gives the A10G 113 ms.
+`zen-hardware-optimization` calls a throughput table FP8+INT4 when its own cumulative
+table reaches the identical 31,200 tok/s figure through INT4 + FP16.
+
+**A metric that cannot describe the paper's subject.** Six papers share one template
+whose "Visual Understanding Benchmarks" block bundles two metrics computed over images
+a model generates (FID, CLIP score) with one computed over text a model emits about an
+image (VQA v2). No model produces all three. The block went to four papers across four
+modalities, so each got at least one metric it cannot compute: the diffusion papers
+`zen-artist` and `zen-artist-edit` reported VQA v2 and a token rate, and the
+vision-language papers `zen-designer-instruct` and `zen-designer-thinking` reported FID
+and CLIP score. Each paper now keeps the rows its own stated output type can produce.
+
+**Throughput, where the defect is the missing condition rather than the number.**
+Decode reads the active weight set once per token, so one stream cannot outrun
+bandwidth over footprint. `zen4-mini`, `zen3-nano` and `zen-coder-flash` report figures
+above their own bound, but batched serving would make them legal and none of the three
+records a batch size. The numbers stand; each table now carries its bound and the
+arithmetic behind it. This is the same treatment AIME gets in
+`zen-mathematical-reasoning`, where a score that is not a multiple of 1/30 is legal
+under averaging and the caption now says so.
+
+**Left alone, and why.** Training fleets absent from this estate prove nothing about
+models trained on rented capacity. `zen-reranker`'s 98% semantic preservation appears
+in no table, but the only "preserved" figure in the paper describes a different model
+at a different dimension, so it is uncited rather than contradicted.
+`zen-safety-evaluation`'s attack-vector average does not match the mean of its rows,
+but the table states no per-vector counts, so no weighting is determined.
+`zen-vision-architecture`'s MMMU overall covers 30 topics while listing 19, so the
+average is not determined either. `zen4-coder-flash` puts FP8 on an A100: Ampere has
+no FP8 tensor cores, but its claims there are footprint claims, and FP8 weight-only
+storage with dequantisation does run on Ampere.
+
+Two arithmetic problems are real and were not corrected, because fixing them means
+choosing which of several numbers is wrong. The template's pretraining sentence claims
+7 trillion tokens over 60 days on 128 A100 for a 22B-active model, which needs about
+4.5 times the peak BF16 throughput of the hardware it names before any utilisation
+discount; the same sentence in `zen-scribe` implies about 6% utilisation. And the
+derived tables in the two embedding papers quote the corrected MTEB average as their
+uncompressed baseline, so their compression and Matryoshka columns still sit above it
+and need the authors' per-configuration data to re-base.
+
+Of the twenty-seven corrected here, nineteen have diverged from `zenlm/papers`,
+six exist only in this repository, and two — `zen-3d.tex` and `zen-agent.tex` — were
+byte-identical to their counterparts there before this pass and now are not. Those two
+are the ones worth mirroring first.
 
 Note also that 69 of the 86 `zen/*.tex` here have diverged from their
 counterparts in `zenlm/papers`, so the two sites publish different text under the

@@ -40,6 +40,22 @@ export const siteConfig: SiteConfig = {
   logo: '/logos/hanzo-logo.svg',
   papers: [
     {
+      id: 'hanzo-context-memory',
+      title: 'Linkage, Not Similarity',
+      subtitle: 'What long-term agent memory has to retrieve, and how it is measured',
+      abstract: 'Vector similarity retrieves what sounds related; long-term memory has to retrieve what is connected. On LoCoMo a cosine index recovers every annotated turn for only 22.7% of multi-hop questions at k=20 while recovering at least one for 80.1% — the signature of a linkage failure that a better embedding does not fix. An index of atomic facts, each citing the turn it came from, plus two structural bonuses, raises complete evidence to 36.2% with nothing learned and under a millisecond per query. On MemoryAgentBench FactConsolidation the typed search scores 98.3 single-hop and 84.5 multi-hop pooled with no reader at all, against CAR\'s 94.8 / 51.5 with gpt-4o and Naive Brain\'s published 91 / 57 on a matched gpt-4o-mini backbone. Every figure carries a declared dev/test split, a frozen commit, bootstrap intervals, and its own chance floor; the ablations include two plausible additions that make the result worse.',
+      pdfUrl: '/pdfs/hanzo-context-memory.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/hanzo-context-memory.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-09-15',
+      authors: ['Zach Kelling'],
+      tags: ['Benchmarks', 'Memory', 'Retrieval', 'LoCoMo', 'MemoryAgentBench'],
+      relatedLinks: [
+        { label: 'Benchmark suite and every run', url: 'https://github.com/hanzoai/cloud/tree/main/bench/brain' },
+        { label: 'RESULTS.md — regenerated from runs/', url: 'https://github.com/hanzoai/cloud/blob/main/bench/brain/RESULTS.md' },
+      ],
+    },
+    {
       id: 'hanzo-ai-chain',
       title: 'Hanzo AI Chain (AIVM)',
       subtitle: 'Useful-Work Mining, the Native AI Coin, and Post-Quantum Omnichain Settlement',

@@ -12,19 +12,19 @@ on the same host, 20 runs each.
 \textbf{Primitive} & \textbf{median} & \textbf{p95} & \textbf{What it can run} \\
 \midrule
 V8 context, in-process   & \rVeight{}\,ms  & \rVeightP{}\,ms  & JavaScript. No shell, no pip, no pytest. \\
-OCI container, cold      & \rOci{}\,ms     & \rOciP{}\,ms     & Any language, any binary, a real filesystem. \\
-OCI container, pooled    & \rPooled{}\,ms  & \rPooledP{}\,ms  & As above, on a container already started. \\
+microVM, cold boot       & \rVm{}\,ms      & \rVmP{}\,ms      & Any language, any binary, a real kernel and filesystem. \\
+microVM, from a checkpoint & \rVmCkpt{}\,ms & \rVmCkptP{}\,ms & As above, on the disk an earlier run left behind. \\
 \bottomrule
 \end{tabular}
 \caption{Cold start by isolation primitive, 20 runs each. The measured ratio
-between a cold container and an in-process V8 context is
-\rOciRatio{}$\times$.}
+between a microVM boot and an in-process V8 context is
+\rVmRatio{}$\times$.}
 \label{tab:sandbox}
 \end{table}
 
 \paragraph{The ratio is real and it is not a defect.}
-\rOciRatio{}$\times$ is what a kernel-enforced boundary costs: namespaces, a
-mount table, a network interface, a cgroup, and an image to unpack. A V8 context
+\rVmRatio{}$\times$ is what a kernel-enforced boundary costs: a kernel to boot,
+a root image to attach, a virtual network interface, and a machine to shut down. A V8 context
 is a data structure in a process that is already running, so it starts in
 \rVeight{}\,ms and offers a boundary that is exactly as strong as the embedding
 process's correctness. These buy different things and the choice is per workload,
@@ -34,18 +34,32 @@ The workload decides it, and for agents the workload is frequently unambiguous.
 An agent asked to run a project's test suite needs a package manager, a
 filesystem and a shell. No JavaScript isolate provides those at any latency. The
 right comparison for that workload is the second row against other people's
-second rows --- and \rOci{}\,ms compares favourably to the published cold-start
-figures for hosted sandbox platforms, which range from under 200\,ms to several
-seconds~\cite{e2b,modal,cfworkers}.
+second rows, and \emph{we do not win it}. \rVm{}\,ms is slower than the
+under-200\,ms cold start published for Firecracker-based sandboxes, and faster
+than the container-based platforms whose published figures run to
+seconds~\cite{e2b,modal,cfworkers}. Those figures were taken by their authors on
+their own hardware under protocols we did not run; that is the reason none of
+these numbers settles the question, and it is not an argument that ours is
+better than it measures.
 
-\paragraph{Pooling collapses most of the gap, and is the only tier that matters
-at fleet scale.}
-\rPooled{}\,ms is a command dispatched into a container that is already up. It is
-$4\times$ better than a cold start and it is what a fleet actually experiences,
-because a fleet reuses sandboxes rather than creating one per call. The cold
-number is the right one to quote for a first call after a scale-up; the pooled
-number is the right one for steady state, and quoting the cold number as the
-platform's latency is as misleading as quoting the pooled one as its worst case.
+\paragraph{A checkpoint saves the disk, not the boot, and there is no pooled
+tier.}
+An earlier version of this section reported a pooled row at $37.5$\,ms and argued
+that it, rather than the cold number, was what a fleet experiences. That row was
+a command dispatched into an already-running OCI container, measured on a runtime
+this system does not use. The runtime it does use offers no such mode: a VM is
+booted, a command runs, the machine stops. Starting \emph{from a checkpoint} is
+the nearest thing and it is not the same thing --- \rVmCkpt{}\,ms against
+\rVm{}\,ms for a cold boot, which is no difference, because a checkpoint carries
+the filesystem a previous run left and the kernel boots either way.
+
+The published resume figures for other microVM platforms are memory snapshots,
+which is a different mechanism~\cite{e2b}. Setting our checkpoint number beside
+theirs would claim a capability by borrowing the name of one. The honest position
+is that every call here pays a boot, and that the cost of \emph{not} having a
+warm tier is the difference between the two rows of Table~\ref{tab:sandbox} and
+the first row: roughly $3\times$ on a whole agent call once search and embedding
+are counted with it.
 
 \paragraph{Three tiers, chosen by threat model.}
 Taken with \S\ref{sec:code}, the measurements describe a ladder, and the sensible
@@ -55,8 +69,8 @@ policy is to take the cheapest rung the threat model permits:
 \item \textbf{In-process call} --- our own code, no boundary, nanoseconds.
 \item \textbf{In-process runtime} --- tenant code that is not adversarial, a
   capability boundary, \rWazero{}--\rGpython{}\,\textmu s (\S\ref{sec:code}).
-\item \textbf{Container} --- arbitrary binaries, an adversarial tenant, or a real
-  filesystem: \rPooled{}\,ms pooled, \rOci{}\,ms cold.
+\item \textbf{microVM} --- arbitrary binaries, an adversarial tenant, or a real
+  filesystem: \rVm{}\,ms, on every call, because there is no warm tier.
 \end{enumerate}
 
 A platform that offers only the third rung charges every workload the price of

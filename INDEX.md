@@ -133,8 +133,10 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-sdk-ecosystem` | `hanzo-sdk-ecosystem/hanzo-sdk-ecosystem.tex` |
 | `hanzo-search` | `hanzo-search/hanzo-search.tex` |
 | `hanzo-self-improving-agents` | `hanzo-self-improving-agents/hanzo-self-improving-agents.tex` |
+| `hanzo-sparse-basis-routing` | `hanzo-sparse-basis-routing/hanzo-sparse-basis-routing.tex` |
 | `hanzo-stack-comparison` | `hanzo-stack-comparison/hanzo-stack-comparison.tex` |
 | `hanzo-storage-s3` | `hanzo-storage-s3.tex` |
+| `hanzo-temporal-assertion-graph` | `hanzo-temporal-assertion-graph/hanzo-temporal-assertion-graph.tex` |
 | `hanzo-threshold-signing` | `hanzo-threshold-signing/hanzo-threshold-signing.tex` |
 | `hanzo-tokenomics` | `hanzo-tokenomics/hanzo-tokenomics.tex` |
 | `hanzo-unified-harness` | `hanzo-unified-harness/hanzo-unified-harness.tex` |
@@ -144,6 +146,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzod-attested-compute` | `hanzod-attested-compute.tex` |
 | `hip-0302-replicate` | `hip-0302-replicate/hip-0302-replicate.tex` |
 | `lightspeed-dex` | `lightspeed-dex/lightspeed-dex.tex` |
+| `locomo-subject-scope` | `locomo-subject-scope/main.tex` |
 | `mechanism` | `mechanism/mechanism.tex` |
 | `native-object-store-vfs` | `native-object-store-vfs.tex` |
 | `ntt-transform` | `ntt-transform/ntt-transform.tex` |
@@ -243,4 +246,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `zen4-thinking_whitepaper` | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | `zen/zen4-ultra_whitepaper.tex` |
 
-**Total**: 238 papers
+**Total**: 241 papers

@@ -1,0 +1,107 @@
+\section{The sparse-basis inverted index}
+\label{sec:index}
+
+\subsection{Posting lists and top-\texorpdfstring{$k$}{k} evaluation}
+
+\prior{} The index is an inverted file~\cite{zobel2006inverted}: basis element
+$B_i$ owns a posting list $L_i$ of pairs $(x, c_i(x))$ for every row with
+$c_i(x) > 0$, ordered by row identifier, with weights quantised to integer
+impacts~\cite{anh2002impact}. A query touches only the lists of $A(Q)$, so the
+work before any pruning is $\sum_{i \in A(Q)} |L_i|$ rather than anything
+proportional to the corpus. Top-$k$ evaluation uses the established
+document-at-a-time pruning rules: MaxScore~\cite{turtle1995maxscore},
+WAND~\cite{broder2003wand}, and block-max WAND, which stores the maximum impact
+of each block of a posting list and skips blocks whose combined bound cannot
+reach the current threshold~\cite{ding2011bmw}, with variable-sized blocks as a
+later refinement~\cite{mallia2017vbmw}. Their common shape is older than the
+inverted-file literature that carries them: maintain a threshold, order access
+by an upper bound, stop when the bound falls below the threshold, which is the
+instance-optimal threshold algorithm of Fagin et al.~\cite{fagin2003ta}.
+
+None of that is proposed here. What the design does is decide where those
+structures live in a column store, and what a basis element is allowed to be.
+
+\subsection{A basis that is not only words}
+
+\prior{} Indexing something other than a word is long established. Explicit
+semantic analysis represents text as a weighted vector over Wikipedia concepts
+and retrieves through an inverted index over
+them~\cite{gabrilovich2007esa}. Entity-linked representations index documents
+by the entities they mention and rank with a joint word-and-entity
+model~\cite{xiong2017duet,dalton2014entity}. Code search has been served by
+inverted indexes over trigrams and symbols~\cite{cox2012trigram}. Learned
+sparse retrieval produces weights over a vocabulary from a transformer ---
+DeepCT~\cite{dai2020deepct}, DeepImpact~\cite{mallia2021deepimpact},
+COIL and uniCOIL~\cite{gao2021coil,lin2021unicoil}, SPLADE and its
+successors~\cite{formal2021splade,formal2021spladev2,formal2022spladepp} ---
+and a learned dictionary over model activations produces a sparse code whose
+coordinates are interpretable features~\cite{olshausen1996sparse,cunningham2023sae}.
+Structural vocabularies have their own literature: motifs are the small
+recurring subgraphs of a network~\cite{milo2002motifs}.
+
+\proposed{} The proposal is a single weighted index over the union of those
+vocabularies, scored by one inner product. Each type is produced by its own
+extractor and carries its own weight scale: a lexical impact derived from a
+term-frequency model~\cite{robertson2009bm25}, an entity linker's confidence, a
+parser's certainty that a symbol is a definition rather than a mention, a
+dictionary coefficient, a relation's confidence, a motif's count. Those scales
+have nothing in common, so the score carries a per-type factor:
+\[
+  s(Q,x) \;=\; \sum_t w_t \sum_{i \in A_t(Q)} q_i\, c_i(x),
+  \qquad w_t \ge 0 .
+\]
+Fitting $w_t$ is a supervised problem on relevance data and we do not solve it
+here; we state it as the open parameter it is (\S\ref{sec:limits}).
+
+\begin{proposition}[Calibration does not invalidate pruning]
+Let $\mathrm{UB}_t$ bound $\sum_{i \in A_t(Q)} q_i c_i(x)$ over a set of rows
+$R$. Then $\sum_t w_t \mathrm{UB}_t$ bounds $s(Q,x)$ over $R$ for any
+$w_t \ge 0$.
+\end{proposition}
+\begin{proof}
+Immediate from non-negativity of $w_t$ and of each per-type bound.
+\end{proof}
+
+The consequence is practical rather than deep: block maxima and region
+summaries can be built per type, once, and re-weighted at query time without
+being rebuilt, so a change of calibration is a change to the planner and not to
+the index. Weights are required to be non-negative for this; a signed
+dictionary would need both a maximum and a minimum per block and is outside the
+design as written.
+
+\subsection{Layout inside a part}
+
+\proposed{} A posting list is built per part, over row offsets within that
+part, and its blocks are the part's granules. Two consequences follow from that
+choice.
+
+The block maximum of element $B_i$ over granule $g$ is
+$M_{g,i} = \max_{x \in g} c_i(x)$, so the pruning unit and the store's skipping
+unit are the same object. A granule excluded by a bound is a granule the
+store's reader was already able to skip, and a granule excluded by a predicate
+is one the pruning need not bound. The part's own summary is
+$M_{P,i} = \max_{g \in P} M_{g,i}$, which is the first level of
+\S\ref{sec:routing}.
+
+Merges maintain the structure rather than rebuilding it from rows: posting
+lists of the source parts are concatenated under an offset remapping, block
+maxima are carried, and part maxima are recomputed as a maximum over the
+carried block maxima. ClickHouse's text index already merges instead of
+rebuilding, which is the precedent for the operation; what it does not carry is
+weights, because it stores occurrence and not impact.
+
+\subsection{Where this sits relative to learned sparse retrieval}
+
+\prior{} The efficiency literature on learned sparse retrieval is directly
+relevant, because it reports that learned weights weaken the assumptions
+dynamic pruning was built on: impact distributions are flatter, so bounds
+separate worse and skipping is less
+effective~\cite{mackenzie2021wacky,lassance2022efficiency}. The responses are
+guided traversal~\cite{mallia2022guided}, block-max
+pruning~\cite{mallia2024bmp}, and inverted indexes whose blocks carry a summary
+vector rather than a scalar maximum~\cite{bruch2024seismic}. A mixed basis
+inherits that problem with an additional term: the flatness of the impact
+distribution now differs per type, so a single bound over a heterogeneous
+active set is looser than either leg's bound alone. The protocol therefore
+reports the pruning ratio per type as well as in aggregate
+(\S\ref{sec:method}).

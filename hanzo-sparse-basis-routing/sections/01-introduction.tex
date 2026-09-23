@@ -1,0 +1,77 @@
+\section{Introduction}
+\label{sec:intro}
+
+A column store of the MergeTree family holds a table as a set of immutable
+parts, each sorted by the table's ordering key and cut into granules of a few
+thousand rows, with a sparse primary index and a set of skipping indexes
+written inside the part~\cite{schulze2024clickhouse,clickhousedocs}. Retrieval
+that ranks rows by similarity to a query fits that layout awkwardly. The text
+index answers which rows contain a token, not which rows rank highest for a
+weighted query. The vector index is built per part and searched per part, so a
+similarity query visits every part that survives the predicate; the same
+arrangement holds in Lucene and in Milvus, where a segment is the unit an
+approximate index is built over~\cite{lucene,wang2021milvus}. As a table grows,
+the number of parts grows, and the cost of a similarity query grows with it
+unless something excludes parts before they are searched.
+
+This paper describes a design for that gap and states how we intend to measure
+it. Two structures carry it. The first is a weighted inverted file over a mixed
+sparse basis: each basis element --- a word, a linked entity, a code symbol, a
+coordinate of a learned sparse dictionary, a relation, a structural motif ---
+owns a posting list of (row, weight) pairs, and a query written over the same
+basis is scored only over the posting lists of the elements it activates, with
+top-$k$ evaluation under block-max pruning. The second is a routing structure
+built per part: regions with a centroid, a covering radius, the maximum weight
+each basis element attains in the region, and counting statistics, aggregated
+into a table-level structure that the planner consults to drop parts whose best
+possible score cannot reach the running $k$-th best, before any per-part index
+is opened.
+
+\paragraph{What is claimed.}
+Expected retrieval cost should scale with the relevant neighbourhood rather
+than with corpus size: at a fixed query distribution and a fixed recall target,
+the parts, granules and bytes a query touches should grow more slowly than the
+corpus does, and should stay within a bounded factor of the granules that hold
+the answer. That is an empirical claim about a distribution of queries, and
+\S\ref{sec:method} is the protocol that would support or refute it.
+
+\paragraph{What is not claimed.}
+No worst-case guarantee is available here and none is asserted. A query whose
+relevant set is the corpus --- $k$ comparable to $N$, or a request that must
+enumerate every match of a basis element every row carries --- costs time
+linear in the corpus, under this design and under any other. A query whose
+region bounds all exceed the $k$-th best score degrades the routing to a visit
+of every part, which is the cost of the baseline plus the cost of having
+consulted the summaries. High intrinsic dimension makes that degradation the
+common case rather than the rare one~\cite{weber1998quantitative,beyer1999nn},
+and graph indexes have their own hard instances~\cite{indyk2023worst}. The
+design is an expected-cost design; the protocol reports the tail as well as the
+mean so that a claim about the mean cannot hide behind it.
+
+\paragraph{Status of the claims.}
+Sections~\ref{sec:setting}--\ref{sec:routing} describe a design and label each
+component \prior{} or \proposed{}; nothing in them is a measurement.
+Section~\ref{sec:method} specifies a measurement that has not been made.
+Section~\ref{sec:results} holds the table it will fill, and every cell in it
+prints \ph{} until the harness writes \texttt{results-data.tex}.
+Section~\ref{sec:related} places the design against published work, and
+Section~\ref{sec:limits} lists what would make the whole approach the wrong
+one.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=*]
+\item A retrieval index over a heterogeneous sparse basis, laid out inside the
+  parts and granules of a merge-based column store, with block maxima aligned
+  to granules so that the store's existing skipping unit is also the pruning
+  unit (\S\ref{sec:index}).
+\item A part-level routing structure and the planner rule that reads it, built
+  from bounds that metric indexes and dynamic pruning have used separately, and
+  maintained through the merge lifecycle that produces the parts
+  (\S\ref{sec:routing}).
+\item A measurement protocol for expected cost, which holds recall fixed while
+  corpus size varies, fits an exponent to each cost counter, reports bytes
+  fetched per correct answer, and separates the queries for which the design is
+  expected to fail (\S\ref{sec:method}).
+\item A statement of which parts of the design are already published work, with
+  the references, and which are not (\S\ref{sec:related}, Table~\ref{tab:status}).
+\end{itemize}

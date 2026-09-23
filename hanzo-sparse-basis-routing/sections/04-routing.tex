@@ -1,0 +1,145 @@
+\section{Part-level routing}
+\label{sec:routing}
+
+\subsection{What the store already prunes, and what it does not}
+
+\prior{} Predicate pruning in a MergeTree table happens at three levels: parts
+excluded by the minimum and maximum of the partition key, granule ranges
+selected by the sparse primary index, and granules excluded by skipping
+indexes. All three read a predicate. Similarity has no predicate, so none of
+them applies to it, and the vector index is consulted once per surviving part.
+The same arrangement in Lucene and Milvus has the same
+consequence~\cite{lucene,wang2021milvus}: the cost of a similarity query is a
+sum over segments, and it grows as segments accumulate.
+
+\subsection{Region summaries}
+
+The bounds in this subsection are established \prior{}; their arrangement per
+part is what is proposed \proposed{}. Rows inside a part are grouped into
+regions --- by $k$-means over the dense vectors, or by granule ranges when the
+ordering key already clusters similar rows. Region $R$ carries
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item a centroid $\mu_R$ and a covering radius
+  $r_R = \max_{x \in R}\lVert v(x) - \mu_R \rVert$;
+\item a basis summary: $M_{R,i} = \max_{x \in R} c_i(x)$ for the elements
+  present, truncated to the largest entries with one residual bound
+  $M_{R,\ast}$ covering the rest;
+\item statistics: the row count, the number of rows carrying each retained
+  element, and quantiles of the score distribution of the region under a
+  reference query model.
+\end{itemize}
+
+The centroid-and-radius pair is the routing object of metric trees --- the
+branch-and-bound $k$-nearest-neighbour search of Fukunaga and
+Narendra~\cite{fukunaga1975branch}, metric trees~\cite{uhlmann1991metric}, and
+the M-tree's covering radius~\cite{ciaccia1997mtree} --- and bounding regions
+for pruning go back to the R-tree~\cite{guttman1984rtree}. The statistics are
+what distributed retrieval calls resource-selection evidence: CORI ranks
+collections by term statistics~\cite{callan1995cori}, ReDDE estimates how many
+relevant documents a collection holds~\cite{si2003redde}, Taily models each
+shard's score distribution and selects on its tail~\cite{aly2013taily}, and
+selective search over topically clustered shards is the arrangement in
+which such selection pays~\cite{kulkarni2015selective}, resting on the older
+cluster hypothesis~\cite{vanrijsbergen1979ir}. The proposal contributes the
+container, not the bound or the statistic.
+
+\begin{proposition}[Region bounds]
+For non-negative sparse weights, every $x \in R$ satisfies
+\[
+  \sum_{i \in A(Q)} q_i\, c_i(x) \;\le\; \mathrm{UB}_s(Q,R)
+  \;=\; \sum_{i \in A(Q)} q_i\, \widehat{M}_{R,i},
+\]
+where $\widehat{M}_{R,i}$ is $M_{R,i}$ when retained and $M_{R,\ast}$
+otherwise. For the dense leg,
+\[
+  \langle u, v(x)\rangle \le \langle u, \mu_R\rangle + r_R \lVert u \rVert,
+  \qquad
+  \lVert u - v(x)\rVert \ge \lVert u - \mu_R \rVert - r_R .
+\]
+\end{proposition}
+\begin{proof}
+The sparse bound is termwise. The dense bounds are Cauchy--Schwarz and the
+triangle inequality applied to $v(x) - \mu_R$, whose norm is at most $r_R$ by
+the definition of the covering radius.
+\end{proof}
+
+\subsection{From regions to a table-level structure}
+
+\proposed{} A part summary is the union of its region summaries: an enclosing
+ball, the maximum of the region maxima per basis element, and summed
+statistics. Part summaries are themselves grouped into a tree with a small
+fan-out, each interior node carrying the same fields computed over its
+children, which is the M-tree's construction applied to parts rather than to
+rows. The structure is metadata: its size is proportional to the number of
+regions, not to the number of rows, and it is maintained by the merge that
+produces a part, since a merge replaces the summaries of its inputs with one
+computed from the output it already has in memory.
+
+\subsection{The planner rule}
+
+\proposed{} A retrieval query is answered by best-first traversal over that
+tree. The planner keeps a priority queue of nodes ordered by
+$\mathrm{UB}(Q,\cdot)$ and a running threshold $\theta$, the $k$-th best score
+found. It pops the node of highest bound; if the bound is at most $\theta$ it
+stops, because no descendant can beat the threshold. Interior nodes expand to
+children, parts expand to their regions, and a region is evaluated by the
+posting lists and, for the dense leg, by the part's approximate graph
+restricted to the region. This is branch and bound over the same bounds the
+metric-tree literature uses, with the threshold rule of Fagin et
+al.~\cite{fagin2003ta}.
+
+Two departures from exactness are deliberate and are reported separately. The
+per-part graph search is approximate, so the answer is exact only relative to
+what that search returns; recall is governed by its parameters, and the
+protocol fixes recall rather than the parameters. And an approximate routing
+variant stops when the best remaining bound falls below $\theta/(1+\varepsilon)$,
+or after a budget of parts, which is the same trade SPANN makes when it prunes
+posting lists by their centroid distance relative to the
+closest~\cite{chen2021spann}.
+
+Predicates compose with routing rather than replacing it: partition pruning and
+primary-index ranges narrow the parts before summaries are read, and a
+selective predicate can make routing unnecessary. The hard case for every
+system in this family is a predicate that is selective and uncorrelated with
+the index structure, which is what filtered graph search
+addresses~\cite{gollapudi2023filtered,patel2024acorn}; the design as written
+carries the predicate into the region scan and does not solve the general case.
+
+\subsection{Where the bounds stop working}
+
+\proposed{} \emph{Interpretation, not measurement.} Three failure modes are
+predictable and the protocol measures each.
+
+\textbf{High intrinsic dimension.} Covering radii of $k$-means regions approach
+the distances between centroids, every region's ball bound exceeds $\theta$,
+and the traversal visits everything. That is the classical result that
+partition-based structures degrade to a scan in high
+dimension~\cite{weber1998quantitative,beyer1999nn}; the routed store then costs
+the baseline plus the summaries it read, and the protocol reports the summary
+cost separately so the overhead is visible rather than folded into a total.
+
+\textbf{Heavy basis elements.} An element carried with high weight by rows
+everywhere raises $\mathrm{UB}_s$ for every region at once. Dynamic pruning has
+the same weakness for common terms, which is why impact-ordered and
+score-at-a-time evaluation exist~\cite{anh2002impact,lin2015anytime}.
+
+\textbf{Small parts.} A freshly inserted part holds few rows and a summary
+computed over them, so its bound is tight but its share of the corpus is
+small; many such parts make the summary scan the dominant term until merges
+consolidate them. Part count is therefore a controlled variable of the
+protocol, not a detail of the deployment.
+
+\subsection{Routing by summaries elsewhere}
+
+\prior{} Summary-first retrieval appears in the retrieval-augmented generation
+literature in a different form. GraphRAG partitions an entity graph into
+communities, summarises each with a language model, and answers a global query
+by mapping over community summaries and reducing their
+partials~\cite{edge2024graphrag}; RAPTOR builds a tree of recursive abstractive
+summaries and retrieves from its levels~\cite{sarthi2024raptor}. The structural
+analogy is exact --- a summary per region, consulted before the rows --- and
+the mechanism is not: those summaries are natural language read by a model, and
+the map step visits every community at a level rather than excluding any by a
+bound. The routing here excludes regions arithmetically and reads no summary
+text.

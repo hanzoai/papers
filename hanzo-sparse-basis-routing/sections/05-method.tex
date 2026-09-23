@@ -1,0 +1,117 @@
+\section{How the claim is to be measured}
+\label{sec:method}
+
+The protocol below is what the lane that fills Section~\ref{sec:results} is to
+implement, in \texttt{hanzoai/benchmarks}, where it has not yet been published.
+It is written here before any run exists so that the analysis cannot be chosen
+after seeing the results.
+
+\subsection{Corpora}
+
+Corpus sizes are $N \in \{10^5, 10^6, 10^7, 10^8, 10^9\}$, drawn as nested
+samples of one source collection, so every row present at one size is present
+at every larger one and the growth of a cost counter is not confounded by a
+change of content. The first pass is configured on English Wikipedia passages
+(the 2022-12 dump, 35{,}167{,}920 passages) with published all-MiniLM-L6-v2
+vectors~\cite{reimers2019sbert}, sampled by a hash threshold on the article
+identifier, so that each size is a set of whole articles and a subset of the
+next. That collection reaches $3.5 \times 10^7$ rows; the two larger sizes need
+another source, which is not chosen. The first pass covers $10^5$ to $10^7$ on
+upstream ClickHouse~26.4.2.10, the release \texttt{hanzoai/datastore} is forked
+from~\cite{hanzodatastore}; the routed store follows. The collection, its licence
+and its digest are recorded by the harness and printed in the caption of
+Table~\ref{tab:cost}.
+
+Part geometry is controlled rather than observed. Merge settings are fixed
+across sizes, no run collapses the table to a single part, and the part count
+and size distribution at each $N$ are reported with the results: routing is a
+structure over parts, and a table with one part has nothing to route.
+
+\subsection{Queries, ground truth, recall}
+
+A query set is sampled once from the intended distribution and held fixed
+across sizes. The first pass samples Natural Questions
+(open)~\cite{kwiatkowski2019nq,lee2019orqa}, questions posed to a search engine
+that Wikipedia answers: 200 from the training split to set the knobs and 1{,}000
+from the validation split to report. A question is embedded with the corpus
+model for the dense leg, and its content tokens, tokenised as the store's text
+index tokenises the column, form the lexical leg. Exact answers are computed per size by exhaustive scoring, which
+is affordable offline and is what makes recall meaningful; the ground-truth
+procedure and its cost are recorded, as billion-scale benchmarks
+do~\cite{simhadri2022bigann}.
+
+Cost is read at a held recall target. For each system and each $N$, the knobs
+--- graph search effort, part budget, the routing slack $\varepsilon$ --- are
+set to the cheapest configuration whose mean recall@$k$ reaches $\rho$, and the
+chosen values are published with the row. Reporting cost at a fixed knob
+instead would let one system's cost fall because its answers did, which is the
+failure mode that recall-against-throughput curves exist to
+prevent~\cite{aumuller2020annb}.
+
+\subsection{Counters}
+
+Each query records, from the store's own profile events and from
+instrumentation:
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \texttt{SelectedParts}, \texttt{SelectedPartsTotal},
+  \texttt{SelectedMarks} and \texttt{SelectedMarksTotal} --- what index
+  analysis kept and what it started from;
+\item \texttt{ReadCompressedBytes} and \texttt{OSReadBytes} --- bytes from the
+  store and bytes from the device;
+\item routing summaries examined, posting blocks decoded, posting blocks
+  skipped by a bound;
+\item recall@$k$ against the exact answer, and latency.
+\end{itemize} Cold and warm runs are reported separately, cold meaning the page
+cache was dropped before the query. Latency is reported at the median and the
+99th percentile: a design justified by an expectation has to show its tail, and
+the reasons are the familiar ones~\cite{dean2013tail}.
+
+Two derived quantities carry the argument. \emph{Cost per correct answer}
+divides each counter by the number of returned rows that are in the exact
+top-$k$: parts, granules and bytes per correct answer. It is the quantity to
+compare across systems, because it prices recall and work in one number, and it
+is the quantity the exponent is fitted to. \emph{Oracle ratio} is
+$C_{\mathrm{gran}}/|G^{*}(Q)|$, which says how much more than the answer a query
+had to read.
+
+\subsection{Fitting an exponent}
+
+For each system and for parts, granules and bytes touched per correct answer,
+$C(N) = aN^{\alpha}$ is fitted by regressing $\log \mathbb{E}[C]$ on $\log N$ by
+least squares over the size grid, at the held recall target. The interval on
+$\alpha$ comes from a bootstrap over queries: resample the query set with
+replacement, recompute the per-size means, refit~\cite{efron1993bootstrap}. The
+same is done for the raw counters, and for the 99th percentile of each, since a
+mean exponent below one is consistent with a tail exponent at one.
+
+Local slopes between consecutive sizes are reported beside the global fit,
+because curvature is what distinguishes a genuine exponent from an average of
+two regimes. A straight line through four or five points spanning three decades
+is weak evidence for a power law, and we do not claim the functional form: the
+claim is about the interval on $\alpha$ under this protocol, which is a weaker
+and checkable statement~\cite{clauset2009powerlaw}.
+
+\subsection{Systems compared}
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{scan} --- exhaustive scoring with no index, the upper bound on
+  cost and the reference for correctness.
+\item \textbf{base} --- upstream ClickHouse 26.4: primary index, skipping
+  indexes, text index for membership, one vector similarity index per part.
+\item \textbf{route} --- the design of this paper.
+\item \textbf{oracle} --- the granules and parts holding the exact top-$k$,
+  which no system can beat and every system is measured against.
+\end{itemize}
+
+\subsection{Strata, including the ones expected to fail}
+
+Results are reported over the whole query set and over strata: by the size of
+the candidate set $\sum_{i \in A(Q)}|L_i|$, by the margin
+$\theta_k - \theta_{k+1}$, by the number of basis types the query activates,
+and by whether the query carries a selective predicate. Two adversarial strata
+are run deliberately --- a query over an element every row carries, and a query
+whose score distribution is flat enough that no region bound separates --- and
+their rows are expected to show cost linear in $N$. A protocol that reported
+only the mean over a benign distribution could not tell a design that routes
+from one that got a convenient query set.

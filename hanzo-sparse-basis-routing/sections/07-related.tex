@@ -1,0 +1,152 @@
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Inverted files and dynamic pruning.}
+The inverted file and its evaluation strategies are the substrate of the sparse
+half of this design~\cite{zobel2006inverted}. Scoring follows a
+term-weighting model of the BM25 family~\cite{robertson2009bm25} or a learned
+one, and top-$k$ evaluation avoids scoring every posting by keeping an upper
+bound per term (MaxScore~\cite{turtle1995maxscore},
+WAND~\cite{broder2003wand}) or per block of a posting list (block-max
+WAND~\cite{ding2011bmw}, with variable blocks~\cite{mallia2017vbmw}). Their
+guarantee is that the top-$k$ is exact, not that the work is sublinear; the
+work depends on how well the bounds separate, which is a property of the data.
+Impact-ordered indexes and score-at-a-time evaluation trade exactness for a
+budget that can be set in advance~\cite{anh2002impact,lin2015anytime}, and
+PISA~\cite{mallia2019pisa} and Lucene~\cite{lucene} are the reference
+implementations. The threshold algorithm of Fagin et al.\ is the general form
+of all of it, with an instance-optimality result that is the nearest thing in
+this literature to the claim of \S\ref{sec:setting}~\cite{fagin2003ta}.
+
+\paragraph{Learned sparse retrieval.}
+DeepCT~\cite{dai2020deepct} and DeepImpact~\cite{mallia2021deepimpact} learn
+term weights for an inverted index; COIL~\cite{gao2021coil} and
+uniCOIL~\cite{lin2021unicoil} reduce contextualised matching to one weight per
+term; SPLADE learns a sparse expansion over the vocabulary with non-negative
+weights~\cite{formal2021splade,formal2021spladev2,formal2022spladepp}. The
+efficiency consequence is documented and is the reason our protocol reports
+pruning ratios: learned weights flatten impact distributions and weaken
+skipping~\cite{mackenzie2021wacky,lassance2022efficiency}, which guided
+traversal~\cite{mallia2022guided}, block-max pruning~\cite{mallia2024bmp} and
+block summaries richer than a scalar maximum~\cite{bruch2024seismic} answer in
+different ways. Our design is on the same side of that line as Seismic: a
+region summary is a vector of maxima, not a single number.
+
+\paragraph{Vocabularies that are not words.}
+Explicit semantic analysis indexes Wikipedia concepts~\cite{gabrilovich2007esa};
+entity-linked ranking indexes entities beside
+words~\cite{dalton2014entity,xiong2017duet}; code search indexes trigrams and
+symbols~\cite{cox2012trigram}; dictionary learning and sparse autoencoders
+produce interpretable sparse codes over model
+activations~\cite{olshausen1996sparse,cunningham2023sae}; network motifs are
+the structural vocabulary of graphs~\cite{milo2002motifs}. Each is prior art
+for one basis type. We are not aware of a published system that scores one
+weighted inner product over all of them inside a column store's part layout,
+and that arrangement is what we propose.
+
+\paragraph{Partition-based approximate nearest neighbours.}
+Clustering the collection and probing a few clusters is the oldest routing idea
+in this space: the inverted file over visual words~\cite{sivic2003videogoogle},
+IVF with product quantisation~\cite{jegou2011pq}, the inverted
+multi-index~\cite{babenko2012imi}, Faiss as the reference
+implementation~\cite{johnson2021faiss}, ScaNN's anisotropic
+quantisation~\cite{guo2020scann} and SOAR's spilled
+assignments~\cite{sun2023soar}. SPANN keeps centroids in memory and posting
+lists on disk, and prunes the lists to search by their centroid distance
+relative to the nearest one~\cite{chen2021spann}, which is the approximate
+variant of our planner rule. The difference in our setting is not the rule but
+what it ranges over: the partitions are parts of a table that also holds
+scalars, that merge on a schedule the store controls, and that a predicate may
+have already narrowed.
+
+\paragraph{Graph indexes.}
+HNSW~\cite{malkov2020hnsw} and Vamana/DiskANN~\cite{subramanya2019diskann},
+with streaming updates~\cite{singh2021freshdiskann} and filter-aware
+variants~\cite{gollapudi2023filtered,patel2024acorn}, are what a column store
+builds per part today. Their empirical scaling is excellent and their
+worst-case behaviour is not
+guaranteed~\cite{prokhorenkova2020graph,indyk2023worst}; a design that claims
+expected cost, as this one does, cannot borrow a guarantee from them.
+
+\paragraph{Metric and tree indexes.}
+Centroid-and-radius pruning is old and well understood: branch-and-bound
+nearest neighbours over a hierarchical $k$-means
+tree~\cite{fukunaga1975branch}, metric trees~\cite{uhlmann1991metric}, the
+M-tree's covering radius~\cite{ciaccia1997mtree}, vocabulary
+trees~\cite{nister2006vocabtree}, FLANN's randomised and hierarchical
+structures~\cite{muja2014flann}, and, in the spatial setting, the
+R-tree~\cite{guttman1984rtree}. The reason these are not the whole answer is
+equally well documented: above modest dimension the bounds stop separating and
+a scan wins~\cite{weber1998quantitative,beyer1999nn}, which is why locality
+sensitive hashing offers a sublinear query-time guarantee for the approximate
+problem instead~\cite{indyk1998lsh}.
+
+\paragraph{Routing across collections.}
+Selective search partitions a corpus into topical shards and consults a few per
+query~\cite{kulkarni2015selective}, choosing them with collection
+statistics~\cite{callan1995cori}, estimates of relevant-document
+counts~\cite{si2003redde}, or the tail of a shard's score
+distribution~\cite{aly2013taily}; the cluster hypothesis is the assumption that
+makes it work~\cite{vanrijsbergen1979ir}. A part summary is a shard statistic
+under another name, computed by the engine rather than by an offline
+partitioner, and maintained by merges rather than by a repartitioning job.
+
+\paragraph{Column stores and skipping.}
+Modern column stores are surveyed in~\cite{abadi2013columnstores}; ClickHouse's
+architecture, including parts, granules and the sparse primary index, is
+described by its authors~\cite{schulze2024clickhouse,clickhousedocs}. Skipping
+by per-block aggregates is small materialized
+aggregates~\cite{moerkotte1998sma}, and choosing a layout that makes skipping
+effective is fine-grained partitioning~\cite{sun2014skipping}. The
+log-structured merge discipline that produces the parts is
+standard~\cite{oneil1996lsm}. Vector indexes inside such engines are per
+segment or per part~\cite{lucene,wang2021milvus,usearch}, which is the
+condition this paper starts from.
+
+\paragraph{Summary-first retrieval for generation.}
+GraphRAG routes a global question through community
+summaries~\cite{edge2024graphrag} and RAPTOR through a tree of recursive
+summaries~\cite{sarthi2024raptor}. Both read summaries before rows, as we do,
+and neither excludes a summary by an arithmetic bound, which is the whole of
+the difference.
+
+\paragraph{Evaluation practice.}
+Recall-against-cost curves rather than single operating
+points~\cite{aumuller2020annb}, published ground truth and fixed budgets at
+billion scale~\cite{simhadri2022bigann}, percentile latency rather than
+means~\cite{dean2013tail}, bootstrap intervals~\cite{efron1993bootstrap} and
+caution about power-law fits~\cite{clauset2009powerlaw} are the practices
+\S\ref{sec:method} assembles.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}p{0.46\textwidth}ll@{}}
+\toprule
+component & status & references \\
+\midrule
+MergeTree parts, granules, sparse primary index & prior art & \cite{schulze2024clickhouse,clickhousedocs} \\
+Skipping indexes; per-part text and vector indexes & prior art & \cite{clickhousedocs,moerkotte1998sma} \\
+Weighted inverted file, impacts & prior art & \cite{zobel2006inverted,anh2002impact} \\
+MaxScore, WAND, Block-Max WAND & prior art & \cite{turtle1995maxscore,broder2003wand,ding2011bmw} \\
+Threshold rule, instance optimality & prior art & \cite{fagin2003ta} \\
+Learned sparse weights (SPLADE, uniCOIL, DeepImpact) & prior art & \cite{formal2021splade,mallia2021deepimpact,lin2021unicoil} \\
+Concept, entity, symbol, motif vocabularies & prior art & \cite{gabrilovich2007esa,xiong2017duet,cox2012trigram,milo2002motifs} \\
+One weighted index over a mixed basis & proposed & --- \\
+Per-type calibration, bounds preserved & proposed & --- \\
+Posting blocks aligned to granules & proposed & --- \\
+Summaries maintained by part merges & proposed & --- \\
+Centroid-and-radius region bounds & prior art & \cite{fukunaga1975branch,ciaccia1997mtree} \\
+Shard statistics for selection & prior art & \cite{callan1995cori,si2003redde,aly2013taily} \\
+Cluster probing for vectors (IVF, PQ, SPANN, ScaNN) & prior art & \cite{jegou2011pq,chen2021spann,guo2020scann} \\
+Graph indexes per part (HNSW, DiskANN) & prior art & \cite{malkov2020hnsw,subramanya2019diskann} \\
+Summaries read before rows (GraphRAG, RAPTOR) & prior art & \cite{edge2024graphrag,sarthi2024raptor} \\
+Part-level routing before per-part graph search & proposed & --- \\
+Held-recall scaling protocol, oracle ratio & proposed & --- \\
+\bottomrule
+\end{tabular}
+\caption{What this paper takes and what it adds. A row marked proposed is a
+design decision of ours; it is not a claim that no related construction
+exists, only that we are citing none for it.}
+\label{tab:status}
+\end{table}

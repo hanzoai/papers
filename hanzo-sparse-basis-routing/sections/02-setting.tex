@@ -1,0 +1,106 @@
+\section{Setting and notation}
+\label{sec:setting}
+
+\subsection{The store}
+
+We take the storage model of ClickHouse's MergeTree family as
+given~\cite{schulze2024clickhouse,clickhousedocs}. The store the design is
+intended for is Hanzo Datastore, a fork of ClickHouse~26.4 that keeps that
+model~\cite{hanzodatastore}. \prior{} A table is a set of
+parts $P_1,\dots,P_m$. A part is immutable: rows arrive in new parts and
+background merges replace a set of parts with one part holding their union,
+which is the log-structured merge discipline~\cite{oneil1996lsm}. Within a
+part, rows are sorted by the ordering key and divided into granules, by default
+of $8{,}192$ rows or of a byte budget, whichever binds first. The primary index
+is sparse: it stores the ordering key of the first row of each granule, so key
+predicates select ranges of granules rather than rows. Skipping indexes ---
+minimum/maximum, set, Bloom filters over tokens or $n$-grams --- are written
+inside the part, each summarising a run of granules, and exclude granules that
+cannot satisfy a predicate; they are the modern form of small materialized
+aggregates~\cite{moerkotte1998sma} and of the partitioning that data-skipping
+work tunes deliberately~\cite{sun2014skipping}.
+
+Two index types in that family concern retrieval directly. The text index
+stores, per part, the rows in which each token occurs, with no weight, and is
+merged rather than rebuilt when parts merge; it answers membership predicates.
+The vector similarity index builds a USearch HNSW graph~\cite{malkov2020hnsw,
+usearch} whose default granularity is large enough that in practice one graph
+covers a whole part. Both are per part, so the work of a query is a sum over
+the parts it visits.
+
+\subsection{Rows, queries, scores}
+
+\begin{definition}[Basis and representation]
+A basis $\mathcal{B} = \bigcup_t \mathcal{B}_t$ is a set of elements, each
+belonging to one type $t$: a word, a linked entity, a code symbol, a coordinate
+of a learned sparse dictionary, a relation, or a structural motif. A row $x$
+carries a sparse non-negative vector $c(x) \in \mathbb{R}_{\ge 0}^{\mathcal{B}}$
+with few non-zero coordinates, and optionally a dense embedding
+$v(x) \in \mathbb{R}^d$.
+\end{definition}
+
+\begin{definition}[Query and score]
+A query is $Q = \sum_{i \in A(Q)} q_i B_i$ with non-negative $q_i$ and active
+set $A(Q) \subseteq \mathcal{B}$, optionally with a dense vector $u(Q)$. The
+score is
+\[
+  s(Q,x) \;=\; \sum_{i \in A(Q)} q_i\, c_i(x) \;+\; \lambda \langle u(Q), v(x)\rangle ,
+  \qquad \lambda \ge 0 ,
+\]
+and the answer is the $k$ rows of highest score, written $S_k(Q)$, with
+$\theta_k(Q)$ the $k$-th highest score.
+\end{definition}
+
+The form is the vector-space model~\cite{salton1975vsm} over a vocabulary that
+is not only words, and the hybrid term is the usual linear combination of a
+lexical and a dense leg. Restricting weights to be non-negative is what makes
+the bounds in \S\ref{sec:routing} hold as stated; learned sparse encoders of
+the SPLADE family produce non-negative weights by
+construction~\cite{formal2021splade}.
+
+\subsection{What cost means here}
+
+\begin{definition}[Cost counters]
+For a query $Q$ over a corpus of $N$ rows, $C_{\mathrm{parts}}$ is the number
+of parts read, $C_{\mathrm{gran}}$ the number of granules read,
+$C_{\mathrm{bytes}}$ the compressed bytes fetched, and $C_{\mathrm{route}}$ the
+number of routing summaries examined. The store publishes the first three as
+\texttt{SelectedParts}, \texttt{SelectedMarks} and
+\texttt{ReadCompressedBytes}; the fourth has to be instrumented.
+\end{definition}
+
+\begin{definition}[Relevant neighbourhood]
+$G^{*}(Q)$ is the set of granules containing at least one row of $S_k(Q)$, and
+$P^{*}(Q)$ the set of parts containing at least one such granule.
+\end{definition}
+
+Any method that reads at granule granularity and returns $S_k(Q)$ exactly must
+read every granule in $G^{*}(Q)$, so $|G^{*}(Q)|$ is a lower bound on
+$C_{\mathrm{gran}}$ for exact retrieval, and the harness reports it as the
+oracle row. It is a lower bound on reading the answer, not on finding it: a
+method also pays for whatever it reads to establish that nothing else
+qualifies, and that second term is what pruning and routing exist to reduce.
+
+\paragraph{The hypothesis, stated so it can fail.}
+Let $D$ be a query distribution and $\rho$ a recall target. Corpora of size $N$
+are nested samples from one row distribution, so a row present at $N$ is
+present at every larger $N$. The hypothesis is that, with the knobs at each $N$
+set to the cheapest configuration reaching recall $\rho$,
+\[
+  \mathbb{E}_{Q \sim D}\!\left[C(Q;N)\right] \;=\; a N^{\alpha},
+  \qquad \alpha < 1
+\]
+where $C$ is parts, granules or bytes touched per correct answer, and that
+$\mathbb{E}[C_{\mathrm{gran}}] / \mathbb{E}[|G^{*}|]$ does not grow with $N$.
+The second part matters more than the first: an exponent below one can also be
+reached by a method whose answers get worse, which is why recall is held rather
+than reported.
+
+\begin{remark}[Where the hypothesis must fail]
+Queries exist for which every method pays $\Theta(N)$: $k$ proportional to $N$;
+a request that enumerates all matches of a basis element carried by every row;
+a score distribution so flat that $\theta_k$ is met by most regions, leaving no
+bound able to exclude one. The protocol runs such queries as a separate stratum
+and reports them, rather than letting the average over a benign query
+distribution stand for the design's behaviour.
+\end{remark}

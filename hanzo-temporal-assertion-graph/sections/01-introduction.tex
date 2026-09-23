@@ -1,0 +1,87 @@
+\section{Introduction}
+\label{sec:intro}
+
+A store that records what an organization believes about its entities is asked
+two kinds of temporal question. One is about the world: who held a position in
+1998, which services a system depended on last March. The other is about the
+record: what the store would have answered on a given day, before a correction
+arrived. Temporal databases name the two axes valid time and transaction
+time~\cite{snodgrass1985taxonomy,jensen1998glossary}, and a store that keeps
+both is called bitemporal. A graph written by upsert keeps neither. It answers
+``this entity has no owner'' in the same way whether nobody said so, somebody
+said so and withdrew it, or two sources disagreed and the later write won, and
+it cannot be asked which afterwards, because the rows that would distinguish
+the cases were never written.
+
+Hanzo cloud's \texttt{/v1/graph} keeps every assertion and derives answers from
+them. Its store is one append-only table. A row states that an entity stands in
+a relation to a value from an instant, optionally until a second instant, with
+the source, the evidence and the filing identity beside it. There is no node
+table, no update statement and no delete outside erasure; a retraction is a
+row. Reads resolve the rows about one (entity, relation) pair at a point with
+two coordinates: the valid instant asked about, and the transaction instant up
+to which the store's knowledge is admitted. The design is specified in
+HIP-1198~\cite{hip1198} and implemented in \texttt{apps/graph} of Hanzo
+cloud~\cite{hanzocloud}, over an algebra in the package \texttt{claim} that the
+ground-truth capability~\cite{hip1261} shares.
+
+This paper describes that model as it stands at commit \texttt{1fffdf408} on
+the main branch of \texttt{github.com/hanzo-inc/cloud}, states the properties
+that follow from its definitions, and reports two measurements. The first is of
+the store itself on CronQuestions~\cite{saxena2021cronquestions}, a temporal
+question-answering benchmark over Wikidata facts with start and end years. The
+second, on LongMemEval-S~\cite{wu2025longmemeval}, is of a retrieval engine in
+the same memory stack and is reported for what it measures, which is not this
+store.
+
+\paragraph{What the measurements found.}
+A lane in \texttt{hanzoai/benchmarks}~\cite{hanzobenchmarks} turns each
+CronQuestions test question's annotation into store calls and answers from the
+returned intervals with a rule shared by every store. On the
+\res{cron/n} covered questions, a control that answers the same calls from
+dictionaries scores \res{cron/kg/all}\% Hits@1, which is the ceiling of the
+plan. Semantica~0.7.0~\cite{semantica} and the store both reach it and give the
+control's answer to every question \meas{}. The store answers the median call in
+\res{cron/wire/p50}\,ms and semantica in \res{cron/sem/p50}\,ms.
+
+The first run of the same lane, on the version of the store that preceded
+\texttt{1fffdf408}, scored \res{cron/first/wire/all}\% and answered none of the
+\res{cron/n/se} point-in-time questions \meas{}. That version had one read
+instant, \texttt{as\_of}, and it bounded the knowable instant, which is
+transaction time: a fact about 1998 filed today was invisible to a question
+about 1998. With the write clock replayed to each fact's own instant, the same
+version scored \res{cron/first/replay/all}\%; the remaining misses came from a
+second rule, under which a retraction ended every value of a pair, so the end of
+one holder's term ended every other holder's. Section~\ref{sec:time} describes
+the two-instant read that replaced both rules, and \S\ref{sec:eval} reports
+the two defects the harness found in the replacement before it was merged.
+
+\paragraph{Status of every claim.}
+A sentence marked \meas{} states a figure from a run named in
+\texttt{results-data.tex}, which is read from the artifacts the lane committed.
+A sentence marked \shipped{} describes the code at \texttt{1fffdf408}. A sentence
+marked \proposed{} describes a design that has not been built. Propositions are
+proved from the definitions in \S\ref{sec:model}; they describe the rule, and
+the code is claimed to implement the rule only as far as its tests check it.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=*]
+\item A description of an append-only assertion store in which each statement
+  carries its own valid interval, the transaction instant is derived by the
+  server rather than supplied by the filer, versions of a statement supersede
+  each other only by being learned later, and a relation's cardinality is
+  declared (\S\ref{sec:model}).
+\item The resolution rule for a point with a valid and a transaction
+  coordinate, with the properties that follow from it: stability of an answer
+  as known at an instant, refusal of backdating, independence from storage
+  order, and the condition under which a valid-time answer does not depend on
+  when facts were filed (\S\ref{sec:model}, \S\ref{sec:time}).
+\item Schema declared as assertions and checked as known when the checked fact
+  became knowable (\S\ref{sec:schema}); diff, shortest path, community detection
+  and a citation-checked answer built on the same rule (\S\ref{sec:queries}); and
+  erasure with a receipt, with what the receipt does and does not establish
+  (\S\ref{sec:erasure}).
+\item A measurement on CronQuestions beside a dictionary control and an
+  interval-based temporal store, including the failed first run and the defects
+  found during the correction (\S\ref{sec:eval}).
+\end{itemize}

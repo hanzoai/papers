@@ -1,0 +1,254 @@
+\section{The model}
+\label{sec:model}
+
+\subsection{The table}
+
+\shipped{} An organization's graph is one SQLite table in a file opened per
+(organization, project), so that another tenant's rows are not in the database
+being read~\cite{hip1198,sqlitedocs}. The project that selects the file comes
+from a claim the identity service mints, never from the request body. A row is
+an assertion.
+
+\begin{definition}[Assertion]
+An assertion is
+$f = (e, r, v, n, \mathit{at}, \until, \mathit{seen}, \mathit{src},
+\mathit{ev}, \mathit{by}, \mathit{conf})$ together with fields the server sets:
+the write instant $\mathit{wrote}$, the knowable instant, a sequence number and
+a hold bit. The entity $e$ is what is described, $r$ the relation and $v$ the
+value; $n \in \{0,1\}$ says whether $v$ names another entity. With $n = 1$ the
+assertion is an \emph{edge}, with $n = 0$ a \emph{property}. The interval
+$[\mathit{at}, \until)$ is when the filer says the thing was so, with $\until$
+absent for an open interval. $\mathit{seen}$ is when the filer says the
+assertion became available, $\mathit{src}$ names who asserted it, $\mathit{ev}$
+points at the record it came from, $\mathit{by}$ is the filing identity and
+$\mathit{conf} \in [0,1]$ a confidence.
+\end{definition}
+
+An entity is not a row and is never created: it exists because something was
+asserted about it. An edge and a property are the same kind of row, and $n$ is
+the bit that tells a traversal which rows it may follow. The filing identity is
+stamped from the validated principal and never read from the body. Instants are
+stored as whole seconds.
+
+\begin{definition}[Content address]
+$\mathrm{id}(f) = H(e, r, v, n, \mathit{at}, \mathit{seen}, \mathit{src},
+\mathit{ev}, \mathit{by}, \mathit{conf})$, with $\until$ appended when it is
+set, where $H$ is SHA-256 over the length-prefixed fields. The write instant,
+the knowable instant, the sequence number and the hold are excluded.
+\end{definition}
+
+The table has a uniqueness constraint on the content address and inserts with
+\texttt{INSERT OR IGNORE}, so a redelivered assertion appends nothing and the
+write reports it as a duplicate. Including the write instant would make every
+retry a new row. An open interval keeps the address it had before $\until$
+existed, so rows filed then still deduplicate. Two identities asserting the same
+thing produce two rows, because $\mathit{by}$ is part of the address.
+
+\subsection{The knowable instant}
+
+\begin{definition}[Knowable]
+$\knowable(f) = \max(\mathit{seen}(f), \mathit{wrote}(f))$.
+\end{definition}
+
+\shipped{} Admission requires a source and $\mathit{conf} \in [0,1]$, bounds the
+size of the entity, relation, value and evidence, requires a value on an edge,
+requires $\until > \mathit{at}$ when $\until$ is set, sets $\mathit{seen}$ to
+$\mathit{at}$ when absent, requires $\mathit{seen} \ge \mathit{at}$, and refuses
+an $\mathit{at}$ or a $\mathit{seen}$ more than five minutes ahead of the server
+clock. An assertion dated further ahead would not become visible until that
+instant and would change reads when it did. The end $\until$ is not bounded
+by the clock: a term that is known to end next year may say so.
+
+\subsection{Statements and versions}
+
+\begin{definition}[Statement, version, retraction]
+The \emph{statement} of an assertion is $s(f) = (e, r, v, n, \mathit{at})$. The
+assertions sharing a statement are its \emph{versions}; they may differ in
+$\until$ and in provenance. A \emph{retraction} is a property with an empty
+value, $n = 0$ and $v = \varepsilon$.
+\end{definition}
+
+A version that changes $\until$ is how the end of a term is corrected without
+deleting the first account. A retraction is how a claim is withdrawn: the pair
+then reads as withdrawn, with the withdrawn statement and the retraction both
+still readable.
+
+\begin{definition}[Order]
+$f \succ g$ when $\knowable(f) > \knowable(g)$; on equal instants, when
+$\mathit{conf}(f) > \mathit{conf}(g)$; otherwise when
+$\mathrm{id}(f) < \mathrm{id}(g)$ lexicographically.
+\end{definition}
+
+The order in \texttt{claim} has a first term, a rank the caller assigns to
+sources. This store assigns every source the same rank, because ranking one
+publisher above another is a claim about a domain for which it holds no
+vocabulary, so the order reduces to the three terms above. Confidence
+decides only between assertions known at the same instant.
+
+\begin{definition}[Current versions]
+For a transaction instant $\tk$, let $K_{\tk} = \{f : \knowable(f) \le \tk\}$.
+For each statement $s$, the current versions $C_s(\tk)$ are the members of
+$K_{\tk}$ with statement $s$ whose knowable instant is the latest among them.
+All members sharing that latest instant are kept.
+\end{definition}
+
+A version therefore replaces another only by being learned later. Two versions
+learned at the same instant stand together: in the CronQuestions data they are
+two terms of one holder that begin in the same year, filed from two lines of the
+source, and choosing one of them would discard a term (\S\ref{sec:eval-first}).
+
+\subsection{Cardinality}
+
+A relation holds one value at a time or several. An organization declares which
+with an assertion (\texttt{relation:}$r$, \texttt{cardinality},
+\texttt{one}\,$|$\,\texttt{many}), resolved by the same rule as any other pair
+(\S\ref{sec:schema}). Undeclared, a relation holds one value when its pair holds
+properties and several when it holds edges: a property has a value, and an
+entity has neighbours. A position with one holder per term, read from the
+position's side, is several values over time and at most a few at once; an
+owner is one.
+
+\subsection{Resolution}
+
+\begin{definition}[Point, open]
+A \emph{point} is a pair $p = (\tv, \tk)$ of a valid instant and a transaction
+instant. A statement is \emph{open} at $\tv$ when $\mathit{at} \le \tv$ and either
+$\until$ is absent or $\tv < \until$.
+\end{definition}
+
+Let $S$ be the union of $C_s(\tk)$ over the statements of one pair, restricted
+to $\mathit{at} \le \tv$.
+
+\begin{definition}[Resolution, one value]
+Let $T \subseteq S$ be the members with the latest $\mathit{at}$, and $w$ the
+$\succ$-greatest member of $T$. The pair \emph{holds} $w$ at $p$ when $w$ is not
+a retraction and is open at $\tv$; otherwise it holds nothing. The
+\emph{conflicts} are the other members of $T$ that are open, are not
+retractions and name a different value, one per value.
+\end{definition}
+
+A later statement therefore ends an earlier one, a retraction ends what precedes
+it, and a statement past its own $\until$ leaves the pair holding nothing rather
+than falling back to an older value. Accounts of the same instant that disagree
+remain visible as conflicts, and the response marks the pair contested.
+
+\begin{definition}[Resolution, several values]
+The pair holds every non-retraction $f \in S$ that is open at $\tv$ and is not
+ended by a retraction $g \in S$, where $g$ ends $f$ when
+$\mathit{at}(g) > \mathit{at}(f)$, or $\mathit{at}(g) = \mathit{at}(f)$ and
+$g \succ f$.
+\end{definition}
+
+An edge is not ended by another edge, so a pair holds as many edges as were
+asserted and not ended. A statement's own $\until$ ends only that statement; a
+retraction ends every statement of its pair begun before it. The answer lists
+what is held with the most recently begun first; that first statement is
+reported as the winner.
+
+\begin{remark}[What the previous version did]
+Before \texttt{1fffdf408} a statement had no $\until$, every pair held one value,
+and a read took one instant that bounded the knowable instant. A term was filed
+as an assertion at its start and a retraction at its end. Under that rule the
+retraction of one holder's term was the most recent statement about the
+position, and it ended every other holder of the position as well
+(\S\ref{sec:eval-first}).
+\end{remark}
+
+\subsection{Properties}
+
+\begin{proposition}[Answers as known at an instant are stable]
+\label{prop:stable}
+Let an assertion be written at server instant $W$, and let $p = (\tv, \tk)$ with
+$\tk$ in a second before that of $W$. Then the resolution of every pair at $p$,
+and every declared cardinality read at $\tk$, is the same before and after the
+write.
+\end{proposition}
+\begin{proof}
+$\knowable(f) \ge \mathit{wrote}(f) = W > \tk$ at one-second resolution, so
+$f \notin K_{\tk}$. Resolution at $p$ reads only $K_{\tk}$, through the pair's
+rows and the cardinality declaration's rows, and both are filtered by
+$\knowable \le \tk$ before any row limit is applied.
+\end{proof}
+
+\begin{proposition}[No backdating]
+\label{prop:noback}
+For every assertion $f$ and every $\tk < \mathit{wrote}(f)$, $f \notin K_{\tk}$,
+whatever $\mathit{seen}(f)$ the filer supplied.
+\end{proposition}
+\begin{proof}
+$\knowable(f) = \max(\mathit{seen}(f), \mathit{wrote}(f)) \ge
+\mathit{wrote}(f) > \tk$.
+\end{proof}
+
+This is the guard HIP-1198 requires~\cite{hip1198}: a bound on a
+caller-supplied instant is only as strong as the caller's honesty, so the bound
+is on the derived instant. It constrains $\tk$ only. A caller may ask about any
+valid instant, which is what the previous version did not allow.
+
+\begin{proposition}[Resolution does not depend on storage order]
+\label{prop:total}
+$\succ$ is a strict total order on assertions with distinct content addresses.
+The rows a pair holds at $p$ are therefore a function of the set of its rows in
+$K_{\tk}$, not of the order in which they are read.
+\end{proposition}
+\begin{proof}
+The first two terms compare totally ordered values; the last compares distinct
+strings. Current versions are defined as a set. The one-value rule takes a
+maximum of a finite set under a total order, which is unique, and the
+several-value rule is a filter whose test uses only $\succ$ and the fields of
+two rows.
+\end{proof}
+
+Section~\ref{sec:time} adds a fourth property, the condition under which a
+valid-time answer does not depend on any knowable instant, because it is the
+property the CronQuestions measurement tests.
+
+\begin{remark}[Exceptions to Proposition~\ref{prop:stable}]
+Erasure removes rows and can change an answer at any point; that is its purpose
+(\S\ref{sec:erasure}). A read of one pair is bounded at 10{,}000 rows: past
+that, resolution uses the rows begun most recently, and \op{resolve} reports
+the truncation. The bound is applied after the filter on $\knowable$, so a
+truncated answer is still stable in the sense of the proposition, but it may
+differ from the answer the full pair would give.
+\end{remark}
+
+\subsection{The surface}
+
+\shipped{} Table~\ref{tab:surface} lists the operations at \texttt{1fffdf408}.
+Each except GraphQL is typed: one method, one path, one input type and one
+output type, from which the published document, the generated clients and the
+agent tool list are projected. The organization is never an input.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lp{0.60\textwidth}@{}}
+\toprule
+route & what it answers \\
+\midrule
+\texttt{POST /v1/graph} & assert a batch; each member recorded, counted as a duplicate, or refused with a reason \\
+\texttt{GET /v1/graph} & the rows matching an entity, relation or value, optionally bounded by \texttt{as\_of} and \texttt{as\_known}; resolves nothing \\
+\texttt{GET /v1/graph/search} & the same read narrowed by a full-text match \\
+\texttt{POST /v1/graph/resolve} & what one pair holds at a point, with conflicts \\
+\texttt{POST /v1/graph/neighbors} & a bounded walk over edges in force at a point \\
+\texttt{POST /v1/graph/path} & the shortest chain of edges in force between two entities \\
+\texttt{POST /v1/graph/diff} & what began, was superseded and was retracted between two points \\
+\texttt{GET /v1/graph/vocabulary} & relations in use, the declared schema, and the terms of the order \\
+\texttt{POST /v1/graph/extract}, \texttt{/ingest} & the relations a document states, without and with recording them \\
+\texttt{POST /v1/graph/communities} & a Louvain partition of the edges in force at a point \\
+\texttt{POST /v1/graph/answer} & a map-reduce answer over the communities, with citations \\
+\texttt{POST /v1/graph/erase} & erasure of one subject, with a receipt \\
+\texttt{POST /v1/graph/graphql} & GraphQL whose resolvers call the operations above \\
+\bottomrule
+\end{tabular}
+\caption{The operations of \texttt{/v1/graph} at \texttt{1fffdf408}. Every read
+that resolves takes \texttt{as\_of} and \texttt{as\_known}, each defaulting to
+the server clock.}
+\label{tab:surface}
+\end{table}
+
+The extraction pair reads only relations a document states in the form
+\texttt{relation:: value}, with \texttt{[[key]]} marking a value that names an
+entity, and files them through the same admission as \op{assert}; it infers
+nothing from prose. Full-text search is an SQLite FTS5 index with external
+content over the same rows, so it holds no second copy of the text.

@@ -1,0 +1,107 @@
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Temporal and bitemporal databases.}
+Snodgrass and Ahn separated valid time, when a fact is true in the modelled
+world, from transaction time, when it is stored~\cite{snodgrass1985taxonomy}; the
+consensus glossary calls a database that records both
+bitemporal~\cite{jensen1998glossary}, and Snodgrass's book gives the SQL
+patterns for maintaining both by hand~\cite{snodgrass2000developing}.
+SQL:2011 standardised application-time period tables, which carry a valid
+interval as two columns, and system-versioned tables, which the database stamps
+with transaction time; a table may be both~\cite{kulkarni2012sql2011}. The store
+described here is bitemporal in that sense, with three differences. The
+transaction coordinate is the later of a filer's claim and the server clock
+rather than the server clock alone, so that a filer can record lateness but
+cannot record earliness. Nothing is updated, so a transaction-time period has no
+end column: a row is superseded by the existence of a later version, not by
+being closed. And the unit of correction is a statement, a value from an
+instant, rather than a row keyed by a primary key.
+
+Datomic keeps an append-only log of facts, each stamped with the transaction
+that asserted or retracted it, and its \texttt{as-of} and \texttt{since} views
+filter by transaction~\cite{datomic}; valid time is modelled with ordinary
+attributes. The first version of this store had the same shape, and
+\S\ref{sec:eval-first} measures its consequence on history loaded after the
+fact. XTDB is bitemporal by default: a write may state its valid time, which
+otherwise defaults to the transaction time, and the system assigns the
+transaction time~\cite{xtdb}. Helland argues for
+append-only records from which current state is derived~\cite{helland2015immutability},
+which is the design discipline here.
+
+\paragraph{Statements about statements.}
+RDF expresses provenance and time about a triple by reification, which describes
+the triple with four further triples~\cite{rdf11semantics}; by named graphs,
+which put the triple in a graph whose name carries the
+provenance~\cite{carroll2005named}; by singleton properties, which mint a
+property per statement~\cite{nguyen2014singleton}; or by RDF-star, which lets a
+triple be the subject of another~\cite{hartig2017rdfstar}. Temporal RDF attaches
+validity intervals to triples and defines a query semantics over
+them~\cite{gutierrez2005temporal}. Wikidata attaches qualifiers such as start
+time and end time to a statement and gives each statement a rank and
+references~\cite{vrandecic2014wikidata}, and the choice among these encodings for
+Wikidata has been compared directly~\cite{hernandez2015reifying}; YAGO2 attaches
+time and space to its facts in a similar way~\cite{hoffart2013yago2}. Each of
+these makes the statement addressable so that metadata can refer to it. Here the
+statement is the row, and its provenance and interval are columns, so no
+second-order statement is needed; the cost is that the provenance vocabulary is
+fixed by the table rather than open.
+
+\paragraph{Provenance.}
+PROV-O models entities, activities and agents with relations such as
+\texttt{wasGeneratedBy}, \texttt{wasAttributedTo} and
+\texttt{wasDerivedFrom}, and an interval for an activity~\cite{lebo2013provo}.
+The columns of an assertion map onto a small part of it: the filing identity
+onto attribution, the source and evidence onto derivation, and the write onto a
+generation time. The store records no activity and no chain of derivations, and
+it exports nothing in PROV.
+
+\paragraph{Temporal question answering over knowledge graphs.}
+TempQuestions collected temporal questions over Freebase~\cite{jia2018tempquestions}.
+CronQuestions provides a Wikidata-derived temporal graph and template questions
+with annotations, together with CronKGQA, which answers them with temporal
+knowledge-graph embeddings~\cite{saxena2021cronquestions}. TimeQA asks
+time-sensitive questions over documents rather than a graph~\cite{chen2021timeqa}.
+Our use of CronQuestions takes the annotation as given and measures the store
+beneath a question-answering system, not the system; it is closer to a
+correctness and cost test for temporal lookups than to a question-answering
+result.
+
+\paragraph{Temporal graphs for agent memory.}
+Zep builds agent memory on Graphiti, a temporal knowledge graph whose edges carry
+a validity interval in the world and a creation and expiry time in the system;
+when a new edge contradicts an existing one, as judged by a language model, the
+existing edge is invalidated by setting its end
+instants~\cite{rasmussen2025zep,graphiti}. The two designs agree on keeping two
+clocks. They differ in how an old fact stops holding: Graphiti writes end
+instants onto the old edge, and decides contradiction with a model, while this
+store leaves every row as written, derives the end of a value from later rows,
+and decides what ends what by declared cardinality.
+
+Semantica~\cite{semantica} is a Python library for knowledge and context graphs.
+Its temporal model keeps \texttt{valid\_from} and \texttt{valid\_until} on each
+relationship, and a \texttt{recorded\_at} and \texttt{superseded\_at} for the
+transaction axis, and \texttt{query\_at\_time} takes an axis argument. At
+0.7.0, \texttt{recorded\_at} is a field of the relationship that defaults to
+\texttt{valid\_from} when absent; a caller who omits it therefore files history
+that the transaction axis reports as known when it was so, which is the case
+Proposition~\ref{prop:noback} excludes by deriving the instant on the server. The
+lane measures its valid-time query only.
+
+\paragraph{Communities and summaries.}
+Louvain optimises modularity~\cite{newman2004modularity} by local moves and
+aggregation~\cite{blondel2008louvain}; Leiden adds a refinement phase that
+guarantees connected, and well-connected, communities~\cite{traag2019leiden}.
+GraphRAG partitions an entity graph with Leiden, summarises each community with a
+language model in advance, and answers a global question by mapping over the
+summaries and reducing the partial answers~\cite{edge2024graphrag}. The answer
+operation here keeps the map-reduce shape and changes three things: the partition
+is computed from the rows at the requested point on each call, the map reads
+labelled facts rather than stored summaries, and every citation in the result is
+checked against what the model was given.
+
+\paragraph{Erasure.}
+Article~17 of the GDPR gives a data subject a right to erasure and exempts, among
+other things, processing necessary for legal claims~\cite{gdpr}. This store makes
+erasure the single exception to its append-only rule, lets a hold prevent it, and
+records it by a digest rather than by content (\S\ref{sec:erasure}).

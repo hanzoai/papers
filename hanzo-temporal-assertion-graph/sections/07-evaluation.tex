@@ -1,0 +1,350 @@
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{The CronQuestions lane}
+\label{sec:eval-lane}
+
+CronQuestions~\cite{saxena2021cronquestions} pairs a temporal knowledge graph
+drawn from Wikidata~\cite{vrandecic2014wikidata} with template questions about
+it. The lane uses the \texttt{data\_v2} release. Its graph has
+\res{cron/kgfacts} facts (subject, relation, object, start year, end year) over
+\res{cron/entities} entities; \res{cron/inverted} have a start after their end
+and are dropped for every store, because semantica cannot answer any
+point-in-time query while one is loaded (\S\ref{sec:eval-found}), which leaves
+\res{cron/facts}. The test split has \res{cron/of} questions of five types. Four
+are covered: simple entity (\res{cron/n/se}, ``who held $P$ in year $T$''),
+simple time (\res{cron/n/st}), before/after (\res{cron/n/ba}) and first/last
+(\res{cron/n/fl}), \res{cron/n} in all. Time join (\res{cron/n/tj}) is not:
+\res{cron/n/tjtext} of those questions name their second entity only in the
+question text, which the annotation does not carry, and the other
+\res{cron/n/tjjoin} require an overlap join that this pass did not build.
+
+\paragraph{A plan shared by every store.}
+The lane does not parse questions. It turns each question's annotation
+(entities, relation, time, before or after, first or last) into calls of three
+kinds --- \texttt{at}($e, r$, direction, $T$), what a pair holds in year $T$;
+\texttt{history}($e, r$, direction), every interval of a pair; and
+\texttt{touch}($e$), every interval into or out of an entity --- and computes
+the answer from the returned intervals with one function shared by every store.
+The rules were chosen on the validation split, where the control scores
+\res{cron/validall}\% over \res{cron/validn} covered questions, and frozen before
+the test split ran. The control answers the same calls from dictionaries over
+the fact file; its score is the ceiling of the plan. A fact holds from the first
+instant of its start year until the first instant after its end year, and a
+question about year $T$ asks at \texttt{$T$-07-01T00:00:00Z}.
+
+What the lane measures is therefore a store's answers to temporal lookups under a
+fixed plan, and their cost. It is not question answering: no model reads the
+question, and the scores are not comparable to those of systems that parse it,
+such as the models reported with the dataset.
+
+\paragraph{How the store is driven.}
+A test file in the benchmarks repository is compiled into the \texttt{graph}
+package by \texttt{go test -overlay}, leaving the cloud tree unmodified. It opens
+the store as production does, one connection and no key, and passes every
+assertion through \texttt{fromWire}, the admission that \op{POST /v1/graph} calls,
+then records batches directly. It skips the schema check, which on this data has
+no declaration to check against and would add two reads per distinct relation
+per batch.
+Each fact becomes two edges with their own \texttt{at} and \texttt{until}: one
+from the subject, and its inverse from the object under relation $\sim\!r$,
+because \op{resolve} answers one (entity, relation) pair and ``who held $P$''
+needs the fact filed about $P$. The evidence is the line of the fact file.
+\texttt{at} performs what \op{resolve} performs --- the bounded read, the declared
+cardinality, the resolution --- without the HTTP layer and the tenant lookup;
+\texttt{history} and \texttt{touch} perform the raw read. Every question is asked
+at $\tk$ equal to the clock after the load. Two write clocks are run:
+
+\begin{description}[leftmargin=1.4cm,style=nextline,itemsep=2pt]
+\item[wire] every row is written at one server instant, the start of the load,
+  as if a caller filed the whole history at once through the API;
+\item[replay] each row's write instant is its own \texttt{at}, as if a pipeline
+  had filed each fact when it became so. Only code inside the package can set
+  this clock.
+\end{description}
+
+\paragraph{How semantica is driven.}
+Semantica~0.7.0's graph is built by its \texttt{GraphBuilder}, with temporal
+support enabled, from relationships carrying \texttt{valid\_from} and
+\texttt{valid\_until}. It is queried with two methods of
+\texttt{TemporalGraphQuery}: \texttt{query\_at\_time} and
+\texttt{query\_time\_range}.
+Neither call takes an entity, so an answer depends only on the instant: each of
+the \res{cron/sem/distinct} distinct calls the plan needs is made once, and
+questions are answered from its output. Latency is taken on the first 50 calls
+of each kind, each made in full, and each timed call is checked against the
+shared answer; none differed.
+
+\subsection{Results at \texttt{1fffdf408}}
+\label{sec:eval-now}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Hits@1, \% & all & simple entity & simple time & before/after & first/last \\
+\midrule
+\cronrow{cron/kg}{control: the plan over dictionaries}
+\cronrow{cron/sem}{semantica 0.7.0}
+\cronrow{cron/wire}{\texttt{/v1/graph}, wire clock}
+\cronrow{cron/replay}{\texttt{/v1/graph}, replayed clock}
+\midrule
+\cronrow{cron/first/wire}{first run, wire clock}
+\cronrow{cron/first/replay}{first run, replayed clock}
+\bottomrule
+\end{tabular}
+\caption{CronQuestions test split, \res{cron/n} covered questions \meas{}. The
+store's rows ran on \res{cron/when}, semantica's on \res{cron/sem/when} and the
+first run on \res{cron/first/when} (UTC). The interval on each of the first four
+rows' overall score is
+\res{cron/kg/allci}, and on before/after \res{cron/kg/baci}. The first run is the
+store at \texttt{c47fd3692e9a}, before the change described in
+\S\ref{sec:time}; its overall intervals are \res{cron/first/wire/allci} and
+\res{cron/first/replay/allci}.}
+\label{tab:cron}
+\end{table}
+
+All three stores give the control's answer to every covered question: the
+number of predictions that differ from the control's is
+\res{cron/sem/differ} for semantica, \res{cron/wire/differ} for the wire clock
+and \res{cron/replay/differ} for the replayed clock \meas{}. Before/after at
+\res{cron/kg/ba}\% is the plan's own ceiling, not a store's error. The wire and
+replay rows agree, as Proposition~\ref{prop:filing} predicts for this data: when
+a fact became known no longer decides what the store says the world was.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+& load, s & rows & size, MB & query p50 / p99, ms \\
+\midrule
+semantica 0.7.0 & \res{cron/sem/load} & \res{cron/facts} & --- & \res{cron/sem/p50} / \res{cron/sem/p99} \\
+\texttt{/v1/graph}, wire clock & \res{cron/wire/load} & \res{cron/wire/assertions} & \res{cron/wire/mb} & \res{cron/wire/p50} / \res{cron/wire/p99} \\
+\texttt{/v1/graph}, replayed clock & \res{cron/replay/load} & \res{cron/replay/assertions} & \res{cron/replay/mb} & \res{cron/replay/p50} / \res{cron/replay/p99} \\
+\bottomrule
+\end{tabular}
+\caption{Cost on one Apple M1 Max, every store in-process \meas{}. The store's
+latency is every one of the \res{cron/wire/timed} calls, from before the read to
+the returned rows; semantica's is \res{cron/sem/timed} calls, 50 of each kind.
+The machine was shared. One-minute load average at the start, then its peak
+through each timed phase --- wire: \res{cron/wire/loadavg}. Replay:
+\res{cron/replay/loadavg}. Semantica: \res{cron/sem/loadavg}.}
+\label{tab:cost}
+\end{table}
+
+\paragraph{Where the cost goes.}
+The store's median \texttt{at} call is \res{cron/wire/at/p50}\,ms and its median
+\texttt{history} call \res{cron/wire/history/p50}\,ms. Each is one indexed read of
+one pair; \texttt{at} bounds the read by the point and resolves the rows it
+reads. Semantica's
+corresponding medians are \res{cron/sem/at/p50} and \res{cron/sem/history/p50}\,ms.
+Its query calls take no entity, and \texttt{query\_at\_time} reconstructs the
+whole graph at the instant, beginning with a deep copy, before any filter by
+entity can apply. The ratio of the two overall medians is about
+\res{cron/ratio}. It is a property of the two interfaces as the lane uses them,
+not a comparison of two implementations of the same operation: an index by entity
+in front of semantica's reconstruction would change it. Semantica's load is a list
+of dictionaries and builds no index, which is why it takes \res{cron/sem/load}\,s;
+the store's \res{cron/wire/load}\,s is admission, content addressing, the table's
+indexes and the full-text index for \res{cron/wire/assertions} rows.
+
+The load averages in Table~\ref{tab:cost} are high for a ten-core machine and
+differ between rows, so every latency is an upper bound for this hardware and
+small differences between the two clocks mean nothing. The ratio between the
+stores is close to five orders of magnitude and follows from the work each call
+does.
+
+\paragraph{Refused rows.}
+Under the wire clock, \res{cron/wire/refused} statements were refused because
+their start lies after the server clock: Wikidata records terms that have been
+planned but have not begun, and admission refuses an \texttt{at} more than five
+minutes ahead. No covered question asks about them. Under the replayed clock the
+write instant is the statement's own start and nothing is refused, which is the
+whole difference between \res{cron/wire/assertions} and
+\res{cron/replay/assertions} rows.
+
+\subsection{The first run}
+\label{sec:eval-first}
+
+The same lane, run against the store at \texttt{c47fd3692e9a}, is the last two
+rows of Table~\ref{tab:cron} \meas{}. That version had one read instant and one
+value per pair, so the driver filed each fact as four assertions: the edge and
+its inverse at the start, and a retraction of each at the end.
+
+\paragraph{Wire clock: every point-in-time question missed.}
+Every row was written at one instant in 2026, so its knowable instant was in
+2026. The single \texttt{as\_of} bounded the knowable instant, and an
+\texttt{at} call for year $T$ asked at $T$; nothing had been knowable in any year
+the questions ask about. The store answered \res{cron/first/wire/se}\% of
+simple-entity questions. The other three types were unaffected because they read
+history without a bound. The overall score, \res{cron/first/wire/all}\%, is the
+share of covered questions that are not simple-entity questions, less the plan's
+before/after ceiling.
+
+\paragraph{Replayed clock: one value per pair.}
+With each row's write instant set to its own \texttt{at}, transaction time
+coincided with valid time and the read at $T$ saw the rows begun by $T$. The
+store then answered \res{cron/first/replay/se}\% of simple-entity questions
+(interval \res{cron/first/replay/seci}). Table~\ref{tab:misses} gives those
+\res{cron/first/replay/misses} misses by relation; the run's other
+\res{cron/first/replay/bamiss} misses are the before/after questions the plan
+cannot answer. Each of the \res{cron/first/replay/misses} is a pair that holds
+more than one value over time: a position with successive holders read from the
+position's side, a player's teams, a person's employers. The retraction closing one holder's term was the most recent
+statement about the pair and so ended every value it held, including that of
+a holder whose term had begun before the retraction and was still running.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+relation & read from & misses \\
+\midrule
+position held (P39) & the position & \res{cron/first/replay/miss/position} \\
+member of sports team (P54) & the member & \res{cron/first/replay/miss/team} \\
+employer (P108) & the employee & \res{cron/first/replay/miss/employer} \\
+award received (P166) & the recipient & \res{cron/first/replay/miss/award} \\
+spouse (P26) & the person & \res{cron/first/replay/miss/spouse} \\
+\midrule
+all & & \res{cron/first/replay/misses} \\
+\bottomrule
+\end{tabular}
+\caption{Simple-entity questions the first run missed with the replayed clock,
+by the relation and direction of the \texttt{at} call \meas{}. The replay
+predictions at \texttt{2e6d394} joined to the plan on the question index.}
+\label{tab:misses}
+\end{table}
+
+\paragraph{What changed.}
+The change at \texttt{1fffdf408} addresses the two causes separately: a second
+read coordinate, so that a question about the world is not a question about the
+record (\S\ref{sec:time}); and \texttt{until} on the statement with declared
+cardinality, so that the end of one term ends only that term
+(\S\ref{sec:model}). Filing a term as one statement instead of a statement and
+a retraction also halved the rows, from \res{cron/first/wire/assertions} to
+\res{cron/wire/assertions}, and the file from \res{cron/first/wire/mb} to
+\res{cron/wire/mb}\,MB. The load times of the two runs, \res{cron/first/wire/load}
+and \res{cron/wire/load}\,s, were taken at different load averages and are not
+compared.
+
+\subsection{Defects found during the correction}
+\label{sec:eval-defects}
+
+Runs of the lane against the change, before it was merged, located two
+defects, and a test was added for each. The figures of those runs are not in the
+repository, so we report the defects without them.
+
+\paragraph{A zero sentinel that is also an instant.}
+The first form of the change stored an open \texttt{until} as the integer 0. A
+term through 1969 ends at 1970-01-01T00:00:00Z, which is Unix time 0, so every
+such term was read back as open and held indefinitely. Open is now SQL
+\texttt{NULL}, and a migration adds the column to older files without rewriting
+a row. The test \texttt{TestATermEndingIn1969Ends} covers it.
+
+\paragraph{Versions learned together treated as corrections.}
+The first form also kept one version per statement, chosen by the order. The
+knowledge graph repeats statements --- \res{cron/dupkeys} keys, \res{cron/dupends}
+of them with different end years --- and those repeats are written together, so
+their versions share a knowable instant and the order was decided by the
+content address: one of two terms of the same holder was dropped by the value of
+a hash. Versions now correct each other only when one was learned later, and
+versions learned at the same instant all stand. The test
+\texttt{TestTwoAccountsLearnedTogetherBothStand} covers it, and
+\texttt{TestTwoTermsOfOneHolderBothHold} covers the neighbouring case of two
+overlapping terms of one holder with different start years, where keeping only
+the older term reported the wrong term as the most recently begun.
+
+\subsection{Other findings}
+\label{sec:eval-found}
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+\item \textbf{Year 1 was refused as no instant.} Admission tested whether
+  \texttt{at} was Go's zero time, which is 0001-01-01T00:00:00Z. The first run
+  refused \res{cron/first/refused/zero} assertions (\res{cron/first/refused/zerofacts}
+  facts) for that reason. Absence is now detected at the wire, where it can be
+  told apart from the first instant of the calendar.
+\item \textbf{A read that stopped did not say so.} \op{GET /v1/graph} returned at
+  most 10{,}000 rows with no field reporting that the limit was reached. It now
+  reports truncation, as \op{resolve} and \op{neighbors} already did. No read in
+  either run reached the limit.
+\item \textbf{Semantica accepts an inverted interval and then refuses every
+  query.} Its graph builder accepts a relationship whose \texttt{valid\_from}
+  follows its \texttt{valid\_until} and reports no rejected relationship; every
+  later \texttt{query\_at\_time} on that graph raises \texttt{ValueError}. This is why the lane drops the \res{cron/inverted}
+  inverted facts for both stores.
+\item \textbf{Semantica overflows on a far end.}
+  \texttt{query\_time\_range} with an end of 9999-12-31 raises
+  \texttt{OverflowError}, because the day-granularity end is widened past the
+  largest representable date. \texttt{TemporalBound.OPEN} works, and the lane
+  passes it.
+\end{itemize}
+
+\subsection{A second lane: LongMemEval-S}
+\label{sec:eval-lme}
+
+LongMemEval~\cite{wu2025longmemeval} gives each of 500 questions its own history
+of chat sessions between a user and an assistant, with the sessions that hold
+the evidence annotated. The lane in \texttt{brain/longmemeval} of the benchmarks
+repository scores session recall over those annotations: ALL@$k$, the share of
+questions whose evidence sessions are all in the top $k$, with MRR of the first
+evidence session. It compares cosine similarity over all-MiniLM-L6-v2 turn
+vectors~\cite{reimers2019sbert}, a session scored by its best turn, with the
+retrieval engine in \texttt{brain/} of the same repository, run on the same
+cached vectors. The engine's configuration was frozen on the LoCoMo development
+split~\cite{locomo}, and nothing was tuned on LongMemEval, so all 500 questions
+are reported.
+
+\paragraph{What this lane measures and what it does not.}
+It measures that retrieval engine, which combines dense similarity with BM25, a
+timeline of session dates, adjacency within a session and a second retrieval
+hop. It files no assertion and reads nothing from \texttt{/v1/graph}; the
+engine's fact, entity and typed-graph generators propose nothing here, because
+LongMemEval has no fact layer. It measures retrieval and not answers, and it uses
+the release of the S variant that the dataset card now marks as deprecated in
+favour of a cleaned one. We include it because it is the other temporal
+benchmark in the same repository, and its per-type rows show where a timeline
+helps and where it does not. It is not evidence about the assertion store.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{ALL@5} & \multicolumn{2}{c}{ALL@10} & \multicolumn{2}{c}{MRR} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+type & $n$ & cosine & engine & cosine & engine & cosine & engine \\
+\midrule
+\lmerow{all}{all}
+\midrule
+\lmerow{ssu}{single-session user}
+\lmerow{ssa}{single-session assistant}
+\lmerow{ssp}{single-session preference}
+\lmerow{ms}{multi-session}
+\lmerow{tr}{temporal reasoning}
+\lmerow{ku}{knowledge update}
+\midrule
+\lmerow{abs}{abstention items}
+\bottomrule
+\end{tabular}
+\caption{LongMemEval-S, session recall over the annotated evidence sessions, run
+on \res{lme/when} (UTC) \meas{}. ALL@$k$ is in percent, MRR a fraction. The 30 abstention items are also counted in their types. ALL@5
+intervals: cosine \res{lme/all/cosfiveci}, engine \res{lme/all/engfiveci}; ALL@10:
+cosine \res{lme/all/costenci}, engine \res{lme/all/engtenci}.}
+\label{tab:lme}
+\end{table}
+
+Per question, ALL@5 changes on \res{lme/changedfive} of the 500 questions,
+\res{lme/gainfive} gained and \res{lme/lostfive} lost, and ALL@10 on
+\res{lme/changedten}, \res{lme/gainten} gained and \res{lme/lostten} lost
+\meas{}. An exact two-sided sign test on the changed questions, computed here
+from those counts, gives $p \approx$ \res{lme/signfive} and \res{lme/signten}.
+The gain is largest on multi-session and temporal-reasoning questions. The rank
+of the first evidence session falls on \res{lme/firstdown} questions; six of
+those are temporal questions phrased in relative time (``four weeks ago'', ``last
+Saturday''). The timeline generator fires only on a named month or year, and the
+engine does not read the question's date, so it cannot resolve them. The engine
+takes \res{lme/p50}\,ms per question at the median and \res{lme/pninetyfive}\,ms
+at the 95th percentile.

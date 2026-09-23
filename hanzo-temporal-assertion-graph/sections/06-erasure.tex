@@ -1,0 +1,99 @@
+\section{Erasure}
+\label{sec:erasure}
+
+Everywhere else in the store a withdrawn claim stays readable beside its
+retraction. A data subject who exercises a right to erasure, such as the one in
+Article~17 of the GDPR~\cite{gdpr}, asks for the opposite. \op{erase} is the one
+operation that deletes rows, and it is kept narrow enough that it cannot serve as
+a general delete.
+
+\subsection{What the operation does}
+
+\shipped{}
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+\item \textbf{Scope.} It removes the rows that name one entity, as the subject or
+  as the target of an edge, in the caller's own (organization, project) file. A
+  property whose scalar value happens to spell the entity's key is not a
+  reference to it and is left.
+\item \textbf{Authority.} It requires an administrator of the organization it
+  acts in. A platform administrator acting inside another organization is
+  refused unless that organization has made them one of its own administrators.
+\item \textbf{Hold.} If any row that names the entity carries the litigation-hold
+  bit, it removes nothing and reports how many rows are held. An erasure that
+  skipped the held rows would report the subject erased while rows under hold
+  still named it.
+\item \textbf{Record first.} It is refused on a deployment with no durable audit
+  store. The audit record is appended inside the deleting transaction, after the
+  deletes and before the commit, so a failure to record rolls the deletion back.
+  If the commit fails after the record was appended, a second record with an
+  error outcome is appended under the same digest, since the trail is append-only.
+\item \textbf{Bytes, not only rows.} The transaction runs with SQLite's
+  \texttt{secure\_delete}, which overwrites freed pages; the full-text index is
+  switched to its secure-delete mode, which removes the terms rather than masking
+  them; and after the commit the write-ahead log is checkpointed and truncated,
+  so frames written before the erasure leave the file~\cite{sqlitedocs}. A test
+  reads the bytes of the database file, its write-ahead log and its rollback
+  journal before and after, in both journal modes, and requires the subject's
+  key to be present before and absent after. If the checkpoint fails, the
+  erasure stands, every
+  read has lost the rows, and the failure is logged: the bytes leave at the next
+  checkpoint.
+\item \textbf{Bound.} One call removes at most 10{,}000 rows; the receipt says
+  how many still name the entity, and each further call has its own receipt.
+\item \textbf{Reason.} The caller supplies a reason, which the audit trail keeps
+  after the subject is gone, so a reason that contains the entity's key is
+  refused.
+\end{itemize}
+
+\subsection{The receipt}
+
+The receipt lists the content addresses of the removed rows in ascending order,
+a digest over them computed as a content address is ($H$ over the
+length-prefixed identifiers), the instant, the erasing identity, the sources the
+removed rows were filed from, and a status for each store that may hold what the
+organization says about the subject. The audit record carries the digest, the
+count, the reason and the graph's namespace, and neither the entity nor any
+removed field. A receipt is verified by recomputing the digest from its
+identifiers and finding the audit record whose resource is that digest.
+
+\paragraph{What a receipt establishes.} That an erasure removing exactly the
+listed rows was recorded, at the stated instant, by the stated identity, in the
+stated graph; and, with the test above, that the rows' bytes were no longer in
+the database file once the checkpoint succeeded.
+
+\paragraph{What it does not establish.}
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+\item \emph{That nothing else holds the subject.} The receipt names two other
+  stores in the same binary --- the knowledge pages, memories and sources with
+  their vectors, and the \texttt{/v1/ai/memory} service --- whose rows carry no
+  subject key and which offer no delete by subject. Both are listed as
+  unsupported, so at \texttt{1fffdf408} every receipt reports
+  \texttt{complete: false}, and those stores must be handled out of band. Backups,
+  replicas, exports and anything a caller copied out of earlier reads are outside
+  the operation entirely.
+\item \emph{That the subject will stay erased.} The receipt lists the sources the
+  rows were filed from. The store does not own those documents, and ingesting one
+  again files the subject again.
+\item \emph{That the identifiers reveal nothing.} A content address is a hash of
+  low-entropy fields. Whoever holds a receipt and can guess an erased assertion
+  in full can confirm the guess, so the receipt is itself personal data and is
+  held as such. The audit trail keeps only the digest over all identifiers,
+  which confirms a guess only of the entire erased set.
+\end{itemize}
+
+\subsection{Litigation hold}
+
+Article~17(3)(e) of the GDPR exempts processing that is necessary for the
+establishment, exercise or defence of legal claims~\cite{gdpr}, and a record
+that is under hold may not be destroyed. The store models the hold as a bit on
+each row, outside the content address because it describes the record rather
+than the world. Erasure is all or nothing against it, and the deleting statement
+itself also requires the bit to be clear.
+
+At \texttt{1fffdf408}, no operation sets the bit. The refusal path is exercised by
+a test that sets it directly in the database, and HIP-1198 records the same
+gap~\cite{hip1198}. An operation that places and releases a hold, with its own
+audit record, is required before the refusal can occur in service
+\proposed{}. So is a disposal operation that expresses an organization's own
+retention decision and that a hold outranks, which HIP-1198 names as the
+condition for leaving its alpha stage \proposed{}.

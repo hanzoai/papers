@@ -1,0 +1,114 @@
+\section{Operations over edges in force}
+\label{sec:queries}
+
+Neighbors, path, communities and answer read the graph through one function: the
+edges each pair holds at a point, resolved by the rule of \S\ref{sec:model}.
+A walk, a path and a partition therefore cannot disagree about what the graph
+was at a point, and each of them, asked at a past $\tk$, repeats the answer it
+would have given then.
+
+\subsection{Walks and their bounds}
+
+\shipped{} \op{neighbors} walks from up to 256 seeds, out along edges, in against
+them, or both, for up to 32 hops, and returns at most 10{,}000 entities ordered by
+hop count and then by key. A hop reads each entity's pairs that have held an
+edge, including their properties, since a retraction is a property that can end
+an edge, and keeps what each pair holds at the point. An edge that has ended, or
+has been superseded or retracted, is not crossed, and a property is never
+crossed. Each organization's file is served through one connection, so a long
+walk would block every other write for that organization; the bounds limit the
+work as well as the answer, and a response that reached one of them says so.
+
+\subsection{Shortest path and confidence decay}
+
+\shipped{} \op{path} is the same walk stopped at the level that first reaches a
+goal and read back along the hop that first reached each node. Levels are read
+in order and candidate hops are sorted by source, relation and target before
+they are claimed, so the path is a shortest path in hops and ties are broken by
+key rather than by the engine's row order. It may be restricted to a list of
+relations.
+
+The response carries the product of the edges' confidences and the edge of
+lowest confidence. Both are omitted when any edge on the path states no
+confidence, since an absent confidence reads as zero and a product over values
+nobody supplied measures nothing. The product is a summary of the path found. It
+is not the most confident path: selection is by hop count, and a longer path of
+higher confidence is not considered. The product also treats the edges'
+confidences as independent, which the store has no way to check.
+
+\subsection{Communities}
+
+\shipped{} \op{communities} partitions the edges in force at a point, with
+direction dropped and self-loops excluded. Two entities are joined with weight
+equal to the number of distinct (relation, direction) edges between them, so an
+edge asserted by three sources counts once. The algorithm is Louvain
+modularity optimisation~\cite{blondel2008louvain,newman2004modularity}, made
+deterministic: nodes are visited in key order; a node moves to the neighbouring
+community of greatest modularity gain, stays where it is on a tie with its own
+community, and otherwise goes to the lower-numbered one; communities are
+numbered by size and then by lowest key. Each pass's partition is reported as a
+level, coarsest first, with its modularity.
+
+Louvain can return a community whose members are not connected to each other;
+Traag et al.\ describe the defect and give the Leiden refinement as a
+remedy~\cite{traag2019leiden}. The store takes a smaller step: after each pass,
+every community is split into its connected components in the original graph.
+
+\begin{proposition}[Splitting by components does not lower modularity]
+Let community $c$ be the union of two sets $c_1, c_2$ with no edge between them.
+Replacing $c$ by $c_1$ and $c_2$ changes modularity by
+$2\,d_{c_1} d_{c_2} / (2m)^2 \ge 0$, where $d$ is total degree and $m$ total
+edge weight.
+\end{proposition}
+\begin{proof}
+Modularity is $Q = \sum_c \big[ w_c / 2m - (d_c / 2m)^2 \big]$ with $w_c$ twice
+the weight inside $c$. With no edge between $c_1$ and $c_2$,
+$w_c = w_{c_1} + w_{c_2}$ and $d_c = d_{c_1} + d_{c_2}$, so the first term is
+unchanged and the second falls by $2 d_{c_1} d_{c_2}/(2m)^2$.
+\end{proof}
+
+A component of a finer level lies inside one community of the coarser level and
+is connected, so it lies inside one component of that community: the split keeps
+the levels nested. The split guarantees connected communities; it does not
+provide Leiden's further guarantee that communities are well connected, and
+Leiden itself is not implemented. A partition reads at most 100{,}000 edge rows,
+and a graph over that bound is refused rather than partitioned from part of
+itself. Nothing is stored: a partition is recomputed on every call from the rows.
+
+\subsection{An answer over the whole graph}
+
+\shipped{} \op{answer} addresses a question whose answer's location is unknown,
+so no walk can start. It follows the map-reduce shape of
+GraphRAG~\cite{edge2024graphrag} over the partition at the requested point, with
+two differences: nothing is summarized or stored in advance, and every citation
+is checked.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item The coarsest level's communities are ordered: those containing an entity
+  that a full-text match of the question's words finds come first, ranked by
+  BM25~\cite{robertson2009bm25}, and the rest follow by size.
+\item Communities are read in that order into batches of in-force facts, each
+  fact labelled $[i]$: at most 12\,KiB of facts per batch, eight batches, 2{,}048
+  members in all, 256 per community and 64 assertions per member, with members
+  the question names read first and then the most connected.
+\item Each batch is one model call that returns at most ten findings, each citing
+  the labels it rests on. A label outside the batch is dropped, and a finding
+  that cites nothing it was given, or scores itself zero, is discarded.
+\item One further call receives the findings, ordered by score, and returns an
+  answer citing the findings it rests on.
+\end{enumerate}
+
+The response lists the assertion identifiers and community numbers behind each
+cited finding. Each identifier is a row that was given to the model at the
+point, so the model can omit a citation but cannot invent one. An empty answer
+is returned as ungrounded. A non-empty answer that cites no finding is refused
+with an error rather than returned. A failure of any model call fails the whole
+answer, since an answer reduced from the batches that succeeded would read as
+complete. The response reports how many communities were read and skipped,
+whether any bound clipped the facts, and how many model calls were made; the
+calls are billed to the calling organization through the platform's model
+client, which checks the balance before each call.
+
+These checks establish provenance of the citations, not entailment. Nothing
+verifies that a cited fact supports the sentence that cites it, and the answer
+depends on the model the platform routes to.

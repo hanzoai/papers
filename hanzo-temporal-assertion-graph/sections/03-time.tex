@@ -1,0 +1,118 @@
+\section{Reads at two instants}
+\label{sec:time}
+
+\subsection{What each coordinate asks}
+
+\shipped{} Every operation that resolves takes \texttt{as\_of}, the valid
+instant $\tv$, and \texttt{as\_known}, the transaction instant $\tk$; either
+absent is the server clock. The raw read, \op{GET /v1/graph}, takes the same two
+bounds and resolves nothing: with neither, it returns every row matching its
+filter, and it reports when its row limit stopped it.
+
+Holding $\tk$ at the present and moving $\tv$ asks about the world as currently
+known: who held a position in 1998. Holding $\tv$ and moving $\tk$ asks what the
+store would have answered at an earlier moment, which is what makes a past
+answer reproducible and what an audit of a decision needs. Moving both asks what
+was believed on one day about another day. Table~\ref{tab:example} shows the
+three on one pair.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}clllll@{}}
+\toprule
+& value & \texttt{at} & \texttt{until} & filed (knowable) & kind \\
+\midrule
+$a_1$ & \texttt{person/x} & 1993-01-01 & 1998-01-01 & 2026-01-10 & edge \\
+$a_2$ & \texttt{person/y} & 1997-01-01 & 2002-01-01 & 2026-01-10 & edge \\
+$a_3$ & \texttt{person/x} & 1993-01-01 & 1997-01-01 & 2026-03-02 & edge, a version of $a_1$ \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Resolved on the pair (\texttt{position/p}, \texttt{held\_by}), undeclared and so holding several values:}} \\
+\multicolumn{6}{@{}l}{\quad $(\tv, \tk) = (\text{1997-07-01}, \text{2026-02-01})$: holds $a_2$ and $a_1$} \\
+\multicolumn{6}{@{}l}{\quad $(\tv, \tk) = (\text{1997-07-01}, \text{2026-04-01})$: holds $a_2$; $a_3$ replaced $a_1$ and ended in 1997} \\
+\multicolumn{6}{@{}l}{\quad $(\tv, \tk) = (\text{1995-07-01}, \text{2026-04-01})$: holds $a_3$} \\
+\bottomrule
+\end{tabular}
+\caption{An illustration, not data. $a_3$ corrects the end of $a_1$'s term. As
+known before the correction, the old account holds; as known after it, the new
+one does; asking about another year changes neither. The first line is the case
+the previous version could not answer: both terms hold in 1997, and neither ends
+the other.}
+\label{tab:example}
+\end{table}
+
+\subsection{The previous rule, in these terms}
+
+The version measured in the first CronQuestions run read at one instant,
+\texttt{as\_of}, and bounded the knowable instant by it. In the terms of this
+section that is a read at $(\tv, \tk) = (\infty, T)$: transaction time only,
+with every statement ever filed eligible regardless of when it was so. A
+question about 1998 asked at $T = $ 1998 found the rows the store had heard of
+by 1998, and history filed in 2026 was not among them. The measurement recorded
+this as zero correct answers on point-in-time questions when the whole
+knowledge graph was filed at one instant (\S\ref{sec:eval-first}). A system that
+reads by transaction time alone has this behaviour by construction; Datomic's
+\texttt{as-of} database value, for instance, is a transaction-time
+filter~\cite{datomic}, and valid time is left to be modelled in the schema.
+
+The guard that produced the behaviour, Proposition~\ref{prop:noback}, was kept.
+What changed is that the question about the world now has its own coordinate,
+so the guard applies to the coordinate it was meant for.
+
+\subsection{When filing time does not matter}
+
+The CronQuestions lane files the whole knowledge graph twice, once with every
+row written at one server instant and once with each row's write instant set to
+its own $\mathit{at}$, and asks every question at $\tk$ after the load. The
+following property says when the two must agree.
+
+\begin{proposition}[Valid-time answers independent of filing time]
+\label{prop:filing}
+Take a pair that holds several values and contains no retraction, and suppose
+that all versions of each of its statements share one knowable instant. Then for
+every $\tk$ at or after the latest knowable instant among its rows, the pair
+holds at $(\tv, \tk)$ exactly its rows that are open at $\tv$, whatever the
+knowable instants are.
+\end{proposition}
+\begin{proof}
+Every row is in $K_{\tk}$. Because the versions of each statement share their
+knowable instant, every version is current. The several-value rule keeps each
+non-retraction that is open at $\tv$ and not ended by a retraction, and the pair
+has none. No step compares knowable instants.
+\end{proof}
+
+For a pair holding one value, the knowable instant enters through $\succ$ only
+when two statements share an $\mathit{at}$; if none do, the same conclusion
+holds with ``the latest statement begun by $\tv$, if open'' in place of ``its
+rows open at $\tv$''. Every relation in the lane is an edge and undeclared, so
+every pair holds several values, and the lane files no retraction. The knowledge
+graph does repeat statements: \res{cron/dupkeys} (subject, relation, object,
+start year) keys occur on more than one line, \res{cron/dupends} of them with
+different end years. Under the first clock every row shares one write instant,
+and under the second the versions of a statement share $\mathit{at}$, so they
+share a knowable instant under both. The proposition therefore predicts that
+the two loads answer identically, and they do, question for question
+(\S\ref{sec:eval-now}).
+
+\subsection{Diff between two points}
+
+\shipped{} \op{diff} takes two points $a = (\tv^a, \tk^a)$ and
+$b = (\tv^b, \tk^b)$ with $b$ no earlier than $a$ on either coordinate and
+$a \ne b$. Only a pair with a statement that began or ended in
+$(\tv^a, \tv^b]$, or became knowable in $(\tk^a, \tk^b]$, can hold something
+different at the two points, so the operation selects those pairs with one
+query, resolves each at both points, and reports three kinds of change:
+a value held at $b$ and not at $a$ (\emph{asserted}); for a one-valued pair, a
+value replaced by another (\emph{superseded}, reported once however many
+intermediate values there were); and a value held at $a$ and not at $b$
+(\emph{retracted}), together with what ended it --- the retraction, the later
+value, or the statement's own $\until$.
+
+Because the report is computed from what each pair holds at the two points and
+not from the rows in between, a version that loses the order produces no change,
+and one that repeats the value already held is reported as nothing. Holding the
+transaction coordinates equal gives what happened in the world between two
+valid instants as currently known; holding the valid coordinates equal gives
+what the store learned between two transaction instants, which is an audit of
+the record. The number of pairs examined is bounded, 10{,}000 by default, and
+the response says when the bound or a pair's row limit was reached.

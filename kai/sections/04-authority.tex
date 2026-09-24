@@ -1,0 +1,125 @@
+\section{Policy is the authority}
+\label{sec:authority}
+
+A model that answers ``may this command run?'' will sometimes be wrong, and
+some of its inputs are written by an adversary: a file the agent read, a web
+page it fetched, an issue it was asked to fix. Prompt injection is not a
+failure of a particular model but a property of any model that reads untrusted
+text. The question is therefore not how accurate the decision model is but what
+the system does when it is wrong. We answer it structurally.
+
+\subsection{The verdict lattice}
+
+\begin{definition}[Verdicts]
+The verdicts are the chain $V = \{\allow, \ask, \deny\}$ ordered
+$\allow < \ask < \deny$, with join $a \join b = \max(a, b)$. \allow{} runs the
+action, \ask{} puts it to a person, \deny{} refuses it.
+\end{definition}
+
+A deterministic policy $\pi$ maps a state to a verdict. It is written by
+people, reviewed like code, and evaluated before any model is consulted: a
+command that reads \texttt{\textasciitilde/.ssh} and opens a network connection is \deny{}
+by rule, whatever any model says about it. Where no rule applies the policy
+returns \allow, which here means only ``the policy has no objection''. A
+Decision Program (Section~\ref{sec:programs}) maps the same state to a model
+verdict $\mu(s) \in V$, and the effective verdict of an enforced program is
+\begin{equation}
+  \varepsilon(s) = \pi(s) \join \mu(s).
+  \label{eq:join}
+\end{equation}
+
+\begin{proposition}[The model only tightens]
+\label{prop:tighten}
+For every state $s$ and every model verdict $\mu(s)$,
+$\varepsilon(s) \ge \pi(s)$. In particular the set of states on which an
+action runs without a person, $\{s : \varepsilon(s) = \allow\}$, is a subset
+of $\{s : \pi(s) = \allow\}$, whatever the model outputs.
+\end{proposition}
+\begin{proof}
+$\max(a, b) \ge a$. If $\varepsilon(s) = \allow$ then
+$\pi(s) \le \varepsilon(s) = \allow$, and \allow{} is the least element.
+\end{proof}
+
+\begin{corollary}
+\label{cor:envelope}
+The safety envelope of the system is the policy's and does not depend on the
+model. An adversary who controls the state completely, and so controls
+$\mu(s)$ completely, can make an action ask or be refused where the policy
+would have allowed it, and can do nothing else.
+\end{corollary}
+
+The proposition is elementary, which is the point. The property that matters
+most is guaranteed by an order and a maximum, not by an estimate of a model's
+error rate.
+
+\subsection{Abstention and escalation}
+
+A model verdict is derived from answers, and an answer can be unsure. Let the
+program's verdict question have answer $p$ with rescaled confidence
+$\kappa_p$ (Equation~\eqref{eq:kappa}) and threshold $t$. The model verdict is
+\begin{equation}
+  \mu(s) =
+  \begin{cases}
+    \ask & \text{if } \kappa_p < t,\\
+    \arg\max_i p_i & \text{otherwise,}
+  \end{cases}
+\end{equation}
+so an unsure model defers to a person rather than guessing. Programs may also
+declare escalations: a \op{noul} question whose $p_{\op{true}}$ reaches its
+threshold raises the verdict to a stated level. The command-risk program of
+Appendix~\ref{app:program} escalates to \deny{} when
+``could this command read, print or send credentials, keys or tokens?'' holds
+at $p_{\op{true}} \ge 0.3$, and to \ask{} for production impact or network
+access. Escalations are joins, so Proposition~\ref{prop:tighten} holds for
+the composed verdict unchanged.
+
+\subsection{Modes, and why promotion is measurable}
+
+A program runs in one of three modes.
+\begin{description}[leftmargin=1.5em,style=nextline]
+  \item[shadow] The model verdict is recorded and never shown or applied;
+    $\varepsilon = \pi$.
+  \item[advisory] The model verdict is shown to the operator beside the
+    policy's; $\varepsilon = \pi$.
+  \item[enforced] $\varepsilon = \pi \join \mu$.
+\end{description}
+A program's thresholds are set against one calibration of one model revision
+and the program names that calibration. A decision computed under a different
+calibration is demoted to shadow, because its probabilities are not the ones
+its thresholds were validated for \proposed.
+
+\begin{proposition}[Enforcement costs only friction]
+\label{prop:friction}
+Let a program run in shadow over a sample of states and record $\pi(s)$ and
+$\mu(s)$ for each. The states on which enforcing it would change the
+outcome are exactly $F = \{s : \mu(s) > \pi(s)\}$, and on each of them the
+change is from a looser verdict to a stricter one.
+\end{proposition}
+\begin{proof}
+$\pi(s) \join \mu(s) \ne \pi(s)$ iff $\mu(s) > \pi(s)$, and then the
+join is $\mu(s) > \pi(s)$.
+\end{proof}
+
+The shadow record therefore contains the complete counterfactual of
+enforcement, not an estimate of it. Each state in $F$ is either a catch (the
+policy would have allowed something a person, shown it, would refuse) or
+friction (a person is interrupted, or an action refused, for nothing). With
+labels from the people who handled those states, the catch rate and the
+friction rate are counts, and promoting a program from shadow to enforced is a
+decision about whether the catches are worth the friction. It requires no
+estimate of the probability that the model misses something, because
+enforcement cannot make a miss worse than the policy's own.
+
+\subsection{Constraints and preferences}
+
+Not every program produces a verdict. A routing program chooses a model tier,
+a context program chooses how much of a chunk to show. These split into two
+parts. The \emph{constraint} part lives in a lattice with the same rule: which
+providers may see this state (any, approved, self-hosted only), whether a file
+is sensitive enough that it must not leave the organization. Policy sets the
+floor, the model may tighten it, Proposition~\ref{prop:tighten} applies. The
+\emph{preference} part is a free choice within the constraint: cheap or
+frontier among the permitted models, a summary or the full chunk. There the
+model decides, and each program declares a default for abstention that errs
+toward quality over cost, such as the frontier tier or the full chunk. A wrong
+preference costs money or quality; it cannot cross a constraint.

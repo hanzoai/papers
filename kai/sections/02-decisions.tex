@@ -1,0 +1,86 @@
+\section{Typed decisions}
+\label{sec:decisions}
+
+\begin{definition}[Typed question]
+A typed question is a triple $q = (\tau, \iota, C)$ of a type
+$\tau \in \{\op{choice}, \op{score}, \op{noul}\}$, an instruction $\iota$ in
+natural language, and an ordered list of criteria
+$C = (c_1, \dots, c_k)$, each a label with a description.
+\begin{itemize}[leftmargin=1.5em]
+  \item A \op{choice} question selects one label from $k \ge 1$ unordered
+    options.
+  \item A \op{score} question selects one of $k$ ordered levels
+    $0, \dots, k-1$, each with a description.
+  \item A \op{noul} question is a predicate: $k = 2$, with criteria
+    $(\op{false}, \op{true})$ whose descriptions the caller may override.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Answer]
+An answer to $q$ over a state $s$ is a distribution $p \in \Delta^{k-1}$ over
+the criteria. It is reported by type: a \op{choice} answer reports
+$\arg\max_i p_i$; a \op{score} answer reports the expected level
+$\bar\ell = \sum_i i\, p_i$ together with a legend mapping levels to
+descriptions; a \op{noul} answer reports $p_{\op{true}}$. Every answer also
+carries the full distribution.
+\end{definition}
+
+The state is whatever the answer should depend on: a message, a JSON object
+describing a shell command and its working directory, a transcript, a
+document. A question never sees anything else, which is what makes it
+replayable: the pair (question, state) and the model revision determine the
+distribution.
+
+\subsection{What an answer is sure of}
+\label{sec:confidence}
+
+Three summaries of $p$ are in use, and they are different numbers.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item The probability of the reported answer, $\pmax = \max_i p_i$. We call
+    it \op{answer\_confidence}. When the model is calibrated it is the
+    probability that the reported answer is right, which is the quantity a risk
+    threshold should be written against.
+  \item The rescaled maximum
+    \begin{equation}
+      \kappa = \frac{k\,\pmax - 1}{k - 1}, \qquad k \ge 2,
+      \label{eq:kappa}
+    \end{equation}
+    which is 0 at the uniform distribution and 1 at a point mass. Jev and
+    OpenRouter report this as \op{confidence}~\cite{laya,openrouterdecisions}.
+  \item One minus normalised entropy,
+    $h = 1 - H(p)/\ln k$, which the Laya runtime reports as \op{confidence} on
+    \op{choice} and \op{score} answers~\cite{laya}.
+\end{itemize}
+
+\begin{proposition}
+\label{prop:kappa}
+For fixed $k$, a threshold on $\kappa$ is a threshold on $\pmax$:
+$\kappa \ge t \iff \pmax \ge \bigl(1 + t(k-1)\bigr)/k$. The implied threshold
+on $\pmax$ depends on $k$.
+\end{proposition}
+\begin{proof}
+Equation~\eqref{eq:kappa} is affine and increasing in $\pmax$ for $k \ge 2$;
+solve $\kappa = t$ for $\pmax$.
+\end{proof}
+
+So $\kappa \ge 0.5$ asks for $\pmax \ge 0.75$ on a \op{noul} question, $0.67$
+on a three-way choice and $0.55$ on a ten-way choice. A single threshold
+applied across questions of different arity is a different risk level on each.
+The entropy summary $h$ depends on the whole distribution, not only its
+maximum, and orders answers differently again. In our recorded run
+(Section~\ref{sec:evaluation}) the English checkpoint answered an urgency
+question with $p = (0.039, 0.150, 0.811)$ over three levels: $\pmax = 0.811$,
+$\kappa = 0.717$ and $h = 0.471$ \meas. A gate at 0.5 passes this answer under
+one definition and abstains under the other.
+
+\paragraph{The convention we fix.}
+Every backend behind \op{/v1/decisions} reports \op{confidence} as $\kappa$,
+so a threshold written for Jev means the same thing when Kai answers, and adds
+\op{answer\_confidence} $= \pmax$ as a separate field. The entropy summary is
+kept in the runtime for diagnostics and is not on the wire. A Decision Program
+writes its abstention thresholds against $\kappa$ and its \op{noul} thresholds
+against $p_{\op{true}}$, and records the calibration those thresholds were set
+against (Section~\ref{sec:programs}). The Rust runtime implements this
+convention and its tests assert Equation~\eqref{eq:kappa} on every backend
+\proposed.

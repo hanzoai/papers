@@ -1,0 +1,257 @@
+\section{Decisions as programs for studies}
+\label{sec:studies}
+
+The objects of the previous sections were built for an agent's inner loop, but
+nothing in them is specific to agents. A trade study, an analysis of
+alternatives or a source selection is also a set of typed judgments over
+evidence, aggregated into a recommendation. Today such a study usually lives in
+slides and spreadsheets: the scores survive, the reasons for them are in
+someone's memory, and a year later, when a cost estimate or a test result
+changes, the study is redone from the beginning because nobody can say which
+of its conclusions depended on the number that moved. Public programs now ask
+for the alternative. The U.S.\ Army's 2026 SBIR topic ARM26BX06-NV012,
+\emph{Agentic-AI, Schema-Driven Decision Management for Auditable Studies and
+Acquisition Decisions}~\cite{armysbir}, asks for studies that are defined by a
+schema, executed with agentic assistance, auditable after the fact, and
+refreshable as evidence changes. This section describes how the objects above
+provide that \proposed.
+
+\subsection{The study as a program}
+
+A study program fixes:
+\begin{itemize}[leftmargin=1.5em]
+  \item alternatives $A = \{a_1, \dots, a_n\}$;
+  \item criteria $J = \{j_1, \dots, j_m\}$ with weights
+    $w \in \Delta^{m-1}$, $w_j \ge 0$, $\sum_j w_j = 1$;
+  \item for each criterion $j$, ordered levels $L_j$ with a description of
+    each and a value $u_j(\ell) \in [0, 1]$ for each level, in the manner of
+    multi-attribute utility theory~\cite{keeney1976};
+  \item named assumptions $\theta$, each with a value and a declared range: a
+    budget ceiling, a fielding date, a discount rate, a threat estimate;
+  \item constraints, predicates $g(a; \theta)$ that an alternative must
+    satisfy to be considered at all, such as fitting the budget or meeting a
+    threshold requirement;
+  \item for each cell $(a, j)$, an executor and its inputs. Most cells are a
+    typed \op{score} question whose levels are $L_j$, answered by Kai over the
+    evidence a query selects for alternative $a$. A cell that is arithmetic,
+    such as a life-cycle cost from a cost model or a range from a performance
+    model, is computed by that deterministic model from the evidence and
+    $\theta$, and its value placed on the same scale.
+\end{itemize}
+It is a Decision Program in the sense of Section~\ref{sec:programs}: named,
+versioned, immutable, bound to a model and a calibration. Judgments go to Kai,
+arithmetic goes to deterministic code, and nothing numeric comes from
+generated prose.
+
+\paragraph{Aggregation.}
+Cell $(a, j)$ returns a distribution $p_{aj}$ over $L_j$. Its expected value
+and variance are
+\begin{equation}
+  U_{aj} = \sum_{\ell \in L_j} p_{aj}(\ell)\, u_j(\ell), \qquad
+  \sigma^2_{aj} = \sum_{\ell \in L_j} p_{aj}(\ell)\, u_j(\ell)^2 - U_{aj}^2,
+\end{equation}
+and an alternative's value is the weighted sum
+\begin{equation}
+  V(a) = \sum_{j} w_j\, U_{aj}, \qquad
+  \operatorname{Var} V(a) = \sum_j w_j^2\, \sigma^2_{aj},
+  \label{eq:value}
+\end{equation}
+the variance under the assumption that cells are answered independently. A
+deterministic cell has $\sigma_{aj} = 0$ unless its model reports an
+uncertainty. The recommendation is the best feasible alternative,
+$a^\star = \arg\max \{V(a) : g(a; \theta) \text{ holds for every constraint}\}$.
+
+The additive form assumes the criteria are preferentially independent; where
+they are not, the study must say so and use a different aggregation, and the
+sensitivity results below apply only to the additive one.
+
+\subsection{The DecisionPackage}
+
+The unit of record for a study is a DecisionPackage: the study program and its
+version; the assumptions and constraints in force; every cell's question or
+deterministic model, evidence references with content hashes, model
+revision, calibration and full answer distribution; every human override,
+recorded beside the answer it overrides with its author and reason rather than
+in place of it; the policy results for any cell a policy governs; the values
+$V(a)$ with their variances; the recommendation; the sensitivity report of
+Section~\ref{sec:flip}; and the approvals, recording who approved the program
+before it ran and who accepted the recommendation after. A package is the audit trail: every number in the
+study's conclusion resolves to a field in it, and every field resolves to an
+answer and the evidence the answer read.
+
+A package separates what people decided from what models estimated, and
+each kind of work goes to the component suited to it. People decide the
+alternatives, criteria, weights, level descriptions, value functions,
+assumptions and constraints, and approve the program that encodes them. Kai
+makes the bounded judgments. Deterministic models do the arithmetic and check
+the constraints. Policy governs who may approve what. People may override any
+cell. The generative plane helps with each step it does not own: it elicits
+criteria and level descriptions from source documents and interviews, proposes
+the evidence query for each cell, reasons through the ambiguous engineering
+questions a person must then settle, and writes the narrative of the final
+report. Every number the narrative states must resolve to a package
+field, and a sentence that states one that does not is rejected, in the way
+our assertion graph rejects an uncited claim in a generated
+answer~\cite{hanzographpaper}.
+
+\subsection{What flips the decision}
+\label{sec:flip}
+
+A recommendation is only as useful as the account of how fragile it is. A
+package reports four answers to ``what would flip it?''.
+
+\paragraph{Weights.}
+For a challenger $b$, write $\delta_b = U_{a^\star} - U_b \in \mathbb{R}^m$ for
+the difference of cell values across criteria, so that
+$V(a^\star) - V(b) = w^{\top}\delta_b > 0$. Let
+$P = I - \tfrac{1}{m}\mathbf{1}\mathbf{1}^{\top}$ project onto the directions
+that keep the weights summing to one.
+
+\begin{proposition}[Smallest weight change]
+\label{prop:weights}
+The smallest change $\Delta$ in Euclidean norm with $\mathbf{1}^{\top}\Delta = 0$
+that makes $b$ tie $a^\star$ is
+\begin{equation}
+  \Delta^\star_b = -\frac{w^{\top}\delta_b}{\lVert P\delta_b\rVert^2}\,
+  P\delta_b, \qquad
+  \lVert \Delta^\star_b \rVert = \frac{w^{\top}\delta_b}{\lVert P\delta_b\rVert},
+  \label{eq:weightflip}
+\end{equation}
+provided $P\delta_b \ne 0$. If $w + \Delta^\star_b \ge 0$ it is the smallest
+change within the simplex; otherwise it is a lower bound on that change.
+\end{proposition}
+\begin{proof}
+Minimise $\lVert\Delta\rVert^2$ subject to $\mathbf{1}^{\top}\Delta = 0$ and
+$\delta_b^{\top}\Delta = -w^{\top}\delta_b$. Since $\Delta$ lies in the range
+of $P$ and $P$ is symmetric and idempotent,
+$\delta_b^{\top}\Delta = (P\delta_b)^{\top}\Delta$, so this is the distance
+from the origin to a hyperplane in that subspace with normal $P\delta_b$,
+attained at the stated point. Adding the constraint $w + \Delta \ge 0$
+shrinks the feasible set, which can only raise the minimum. If $P\delta_b = 0$,
+every weight vector ranks $a^\star$ and $b$ the same way and no change of
+weights flips them.
+\end{proof}
+
+The package reports $\rho_w = \min_b \lVert\Delta^\star_b\rVert$, the
+challenger that attains it, and the direction: which criteria's weights must
+rise and which fall. A stakeholder who disagrees with the weights can read
+from it how far they would have to disagree to change the answer.
+
+\paragraph{Answers.}
+Moving one cell's value changes one alternative's $V$ by $w_j$ times the
+move. For the runner-up $b$ with margin $\Delta V = V(a^\star) - V(b)$, the
+recommendation flips if $U_{a^\star j}$ falls by $\Delta V / w_j$ or $U_{bj}$
+rises by $\Delta V / w_j$, and likewise for every other challenger with its own
+margin. We report each cell's required shift $r_{aj}$ in units of the cell's
+own standard deviation, $z_{aj} = r_{aj}/\sigma_{aj}$. A cell with small
+$z_{aj}$ is one where the recommendation turns on a judgment the model is
+itself unsure of: that is where an analyst's time, or more evidence, is worth
+the most, the question the value of information literature
+asks~\cite{howard1966}. A cell whose required shift exceeds the range of $u_j$
+cannot flip the recommendation alone and is reported as such.
+
+\paragraph{Assumptions and constraints.}
+Weights and answers are not the only inputs a reviewer doubts. For each
+assumption $\theta_i$ the package sweeps its declared range, holding the
+others fixed, recomputes the cells that depend on it, and reports the
+break-even value $\theta_i^\star$, if there is one in the range, at which the
+recommendation changes, whether because another alternative's value overtakes
+$a^\star$'s or because a constraint admits or excludes an alternative. Where
+the margin $V(a^\star; \theta) - \max_{b} V(b; \theta)$ is continuous in
+$\theta_i$ and changes sign across the range, bisection finds the crossing;
+otherwise a grid does, and the package says which. Only cells whose inputs
+include $\theta_i$ are recomputed at each point, by the reuse rule of
+Proposition~\ref{prop:refresh}, and a deterministic cell costs a function
+call. ``The recommendation holds for any budget above \$41M and any fielding
+date before 2029'' is the kind of sentence this produces, and each of its
+numbers resolves to a sweep in the package.
+
+\paragraph{The model's own uncertainty.}
+Sampling a level for every cell from its $p_{aj}$ and recomputing $\arg\max$
+estimates the probability that the recommendation would differ if each cell
+were resolved, $\Pr[\arg\max_a V(a) \ne a^\star]$. The estimate is as good as
+the calibration of the cells it samples, which is one more reason the program
+records the calibration it was run under.
+
+\paragraph{An illustration.}
+The following is a constructed example, not data. Three alternatives are
+scored on cost ($w = 0.40$), performance ($0.35$) and schedule risk ($0.25$):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccc|c@{}}
+\toprule
+ & cost & performance & schedule & $V$ \\
+\midrule
+A & 0.60 & 0.80 & 0.70 & 0.695 \\
+B & 0.80 & 0.60 & 0.60 & 0.680 \\
+C & 0.50 & 0.70 & 0.90 & 0.670 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A is recommended by 0.015 over B and 0.025 over C. For B,
+$\delta_B = (-0.20, 0.20, 0.10)$ and Equation~\eqref{eq:weightflip} gives
+$\Delta^\star_B = (+0.040, -0.029, -0.012)$, of norm 0.051: raising the cost
+weight from 0.40 to 0.44, taken from the other two, makes B tie A. For C the
+change is $(-0.042, -0.042, +0.083)$, of norm 0.102, a rise in the schedule
+weight from 0.25 to 0.33. Both stay in the simplex, so both are exact, and
+$\rho_w = 0.051$ toward B.
+
+For the answers, suppose A's performance cell is the least certain,
+$\sigma = 0.12$, with $\sigma = 0.03$ for B's cost, $0.04$ for the schedule
+cells of A and B, and $0.05$ elsewhere. The shift that flips A against B is
+$0.015/0.35 = 0.043$ on A's performance, which is $z = 0.36$; the next
+smallest is A's cost, $0.015/0.40 = 0.038$ at $\sigma = 0.05$, $z = 0.75$;
+no cell of C can flip the recommendation within less than $z = 1.25$. The
+package would say: the recommendation rests on A's performance evidence, and a
+third of a standard deviation there changes it. Taking each cell as normal
+with these moments, B beats A with probability 0.39 and C beats A with
+probability 0.33, and in $4 \times 10^5$ joint samples A is best in 54\%, B in
+28\% and C in 19\%. The study recommends A and says, in the same document,
+that the recommendation is close to a three-way tie which one more performance
+measurement of A would most likely settle.
+
+\subsection{Refresh}
+
+A study refreshed a year later should cost in proportion to what changed. Give
+each cell a key: the program version, the question, the model revision and
+calibration, and the content hashes of the evidence its query selected.
+
+\begin{proposition}[Exact reuse]
+\label{prop:refresh}
+If a cell's key is unchanged and inference is deterministic on the backend,
+its answer distribution is unchanged, so reusing the stored answer gives the
+same package as recomputing it. A refresh then asks $O(c)$ questions for $c$
+changed cells, and every value, variance and sensitivity figure is recomputed
+from the cells, which is arithmetic.
+\end{proposition}
+\begin{proof}
+The distribution is a function of the question, the state and the model
+revision with its calibration (Section~\ref{sec:decisions}); the state of a
+cell is the evidence its key hashes. Equal keys give equal inputs.
+\end{proof}
+
+A refresh produces a new package and a diff: which cells changed and by how
+much, whether $a^\star$ changed, and how $\rho_w$ and the cells' $z$ values
+moved. The refresh can run on a schedule or on an event, when a new document
+lands that some cell's query selects.
+
+\subsection{Evidence and time}
+
+A package must be able to say not only what it concluded but what was known
+when it concluded it. Hanzo's temporal assertion graph~\cite{hanzographpaper}
+answers every read at a valid instant and a transaction instant, and an answer
+as known at an instant is unchanged by every later write except erasure. If a
+study's evidence queries read the graph and the package records the
+transaction instant of the run, the package can be replayed exactly as known
+on the day it was decided, even after the evidence was later corrected, and the
+diff between that replay and a refresh separates what changed in the world
+from what changed in the record.
+
+Engineering studies increasingly keep their alternatives, requirements and
+analyses in a system model. SysML~v2~\cite{sysmlv2} gives such models a
+textual notation and a standard API, which makes them addressable as evidence:
+an alternative can be a reference to a part definition, a criterion to a
+requirement, and a cell's state to the serialised elements its question should
+read. We have not yet built this binding.

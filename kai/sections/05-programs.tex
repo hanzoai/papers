@@ -1,0 +1,160 @@
+\section{Decision Programs and the wire}
+\label{sec:programs}
+
+\subsection{Decision Programs}
+
+\begin{definition}[Decision Program]
+A Decision Program is a named, versioned, immutable record
+\[
+  P = (\op{name@version},\ \text{description},\ \text{model},\ \text{mode},\
+       \text{calibration},\ Q,\ t,\ R)
+\]
+of the model that answers it, the mode its output may be used in, the
+calibration its thresholds were set against, a set $Q$ of named typed
+questions, a threshold $t_q$ for each question, and an optional verdict rule
+$R$ naming the verdict question and its escalations.
+\end{definition}
+
+A program is the only place a question's natural-language text lives. A
+caller does not write ``should this command run?''; it runs
+\op{agent.command-risk@1} on a state. Any change to a question's wording, its
+criteria, a threshold, the model or the calibration is a new version, because
+thresholds are only meaningful for the probabilities they were validated
+against, and those probabilities depend on every one of these. Versions are
+never edited in place, so a record that names \op{agent.command-risk@1} names
+one fixed set of questions forever.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{0.23\linewidth}p{0.47\linewidth}l@{}}
+\toprule
+Program & Questions & Mode at v1 \\
+\midrule
+\op{agent.preflight@1} & task type (code, conversation, research, operation);
+  complexity (4 levels); model tier; needs the user; needs repository context;
+  sensitivity (4 levels); private model required & advisory \\
+\op{agent.command-risk@1} & verdict (\allow, \ask, \deny); secret exposure;
+  production impact; network & advisory \\
+\op{agent.model-route@1} & tier (cheap, zen-coder, frontier); reasoning depth
+  (4 levels); long context; private model required & shadow \\
+\op{agent.context@1} & scope (none, file, module, repository, external);
+  needs repository context; needs the web; needs memory & shadow \\
+\op{agent.tool-select@1} & next tool (read, search, edit, shell, web, ask the
+  user, none); can the next steps run in parallel & shadow \\
+\op{agent.progress@1} & status (advancing, stalled, looping, blocked); needs
+  the user & advisory \\
+\op{agent.complete@1} & done; verified rather than claimed; work remaining
+  (3 levels) & advisory \\
+\bottomrule
+\end{tabular}
+\caption{The Decision Programs an agent loop runs, as defined for the Rust
+runtime \proposed. All seven name \op{kai-1-agent}. Unmarked questions are
+\op{noul}.}
+\label{tab:programs}
+\end{table}
+
+Table~\ref{tab:programs} lists the programs an agent loop runs. They cover the
+decision points of the Jev notes~\cite{jevnote} (context visibility, routing,
+tool choice, permissions, sensitivity) and add three the loop needs at its
+edges: preflight before a task starts, progress while it runs, and completion
+before it reports done. \op{agent.complete@1} asks separately whether the work
+is done and whether that is shown rather than claimed, because an agent that
+says it ran the tests and an agent whose transcript contains a passing test
+run are different states, and only the second should end a task.
+
+\subsection{The decision record}
+
+Every execution of a program produces a record: the program id, a content
+hash of the state and a reference to where the state is kept under the
+tenant's retention policy, the backend and model revision that answered, the
+calibration, every answer with its full distribution, the policy verdict, the
+model verdict, the effective verdict and the mode, latency and metered usage,
+and the caller's identity. With the state and the model revision, a record can
+be replayed; on the same backend the replay reproduces the distributions, and
+across backends the parity bound of Section~\ref{sec:model} applies. The
+records of a program in shadow are the sample on which it is promoted
+(Proposition~\ref{prop:friction}), and the outcomes people chose on those
+states are its training labels.
+
+\subsection{Testing a program}
+
+Because a program's output is typed, a program can be tested the way code is,
+and a change to it is a change a test suite can catch \proposed.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Unit tests} are states with the answer a person expects, and a
+    tolerance, such as: a command that pipes a private key to \texttt{curl}
+    is never \allow. They run on every new model revision and calibration
+    before a program version names them.
+  \item \textbf{Replay tests} re-run recorded decisions and require the same
+    distributions within the parity bound. They catch a runtime or tokenizer
+    change that moved answers without anyone intending it.
+  \item \textbf{Calibration tests} check, on a labelled sample, that answers
+    reported at a given $\pmax$ are right about that often, per question.
+  \item \textbf{Policy tests} are the policy's own: deterministic rules tested
+    as the code they are, independent of any model.
+\end{itemize}
+A new program version is the old one with a passing suite; a regression shows
+up as a failing named case, not as a vague change in agent behaviour noticed
+weeks later.
+
+\subsection{\texorpdfstring{\op{POST /v1/decisions}}{POST /v1/decisions}}
+
+The interface takes OpenRouter's Decisions API~\cite{openrouterdecisions}
+as its wire format, field for field. A request names a model, a state and a
+map of named questions; the response returns a map of typed answers under the
+same names, with usage and cost. Appendix~\ref{app:wire} gives an example.
+Hanzo adds fields a client of the upstream schema may ignore:
+\op{answer\_confidence} on every answer; \op{routing}, saying which checkpoint
+answered and why; the act head's output as \op{action}; and a program form of
+the request, \op{\{program, state\}}, which expands a named Decision Program to
+its questions and returns its verdict and mode beside the answers.
+
+\paragraph{Model-agnostic by name.}
+The \op{model} field chooses the backend. A \op{kai-*} name is answered by the
+native runtime. A \op{typesafe/jev-*} name, such as \op{typesafe/jev-1.13} or
+the alias \op{\textasciitilde typesafe/jev-latest}, is forwarded unchanged to
+OpenRouter's \op{POST /api/alpha/decisions}, and the response is checked at
+the boundary: every question must come back answered with its own type, and a
+choice's probabilities are restored to the caller's label order. OpenRouter
+listed Jev on 2026-09-24 at \$0.042 per million input tokens with output free
+and a 32k context; its default model listing omits it, and it appears when the
+listing is asked for all output modalities. Because the wire is shared and
+\op{confidence} is normalised to Equation~\eqref{eq:kappa} on both paths, a
+program can move between Jev and Kai by changing one field, and its records
+say which answered.
+
+\subsection{Where it runs}
+
+The same crate is used in three places \proposed.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{In the agent.} Hanzo Dev links the runtime and answers
+    \op{agent.command-risk@1} and \op{agent.preflight@1} on the developer's
+    CPU. The state, which is often a command line or a diff, does not leave
+    the machine to be judged.
+  \item \textbf{In the engine.} Hanzo's inference engine serves
+    \op{/v1/decisions} natively, batching questions across requests.
+  \item \textbf{In the cloud.} Hanzo's cloud exposes \op{/v1/decisions} with
+    its identity, quota and metering, and routes to the engine or to
+    OpenRouter by model name.
+\end{itemize}
+Nothing in the runtime depends on a network service or a Python stack, so the
+same binary serves a disconnected installation, an on-premises cluster or a
+workstation as it serves the cloud, on the tensor library's CPU backend and,
+where present, its CUDA and Metal backends. In a disconnected installation the
+Jev backend is simply absent, and a program that names it fails closed rather
+than falling back to another model.
+
+\subsection{First deployment: the coding agent in shadow}
+
+The first deployment is Hanzo's Slack coding agent, which takes a request in a
+channel and runs it in a sandbox. Every run records \op{agent.preflight@1}
+before it starts and \op{agent.command-risk@1} before each command, in shadow.
+A deployment may run a program in a lower mode than its definition allows,
+never a higher one, so the mode a program is defined with is a ceiling that
+each deployment approaches separately.
+The agent's behaviour is unchanged; the records accumulate the decisions a
+person made on the same states. That is the flywheel: shadow records become
+labelled data, the labelled data trains a Kai checkpoint on Hanzo's own
+traffic, the new checkpoint gets a new calibration and new program versions,
+and each program is promoted only when its shadow counts justify it.

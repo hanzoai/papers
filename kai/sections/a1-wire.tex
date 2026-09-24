@@ -1,0 +1,104 @@
+\section{The wire}
+\label{app:wire}
+
+A request to \op{POST /v1/decisions}, in OpenRouter's Decisions schema:
+
+\begin{lstlisting}[style=wire]
+{
+  "model": "kai-1",
+  "state": "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan.",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which department should handle this?",
+      "criteria": {
+        "billing":   "invoices, payments, refunds",
+        "technical": "bugs, outages, system errors",
+        "other":     "everything else"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["not urgent", "soon", "blocking"]
+    },
+    "churn_risk": {
+      "type": "noul",
+      "instructions": "Does the user threaten to cancel or leave?"
+    }
+  }
+}
+\end{lstlisting}
+
+The response carries one typed answer per question. The probabilities below
+are those the English checkpoint gave in the recorded run; \op{confidence} is
+Equation~\eqref{eq:kappa}, \op{answer\_confidence} is $\pmax$, and the
+remaining Hanzo fields are omitted. The \op{id} and \op{usage} values are
+illustrative.
+
+\begin{lstlisting}[style=wire]
+{
+  "id": "dec_...",
+  "model": "kai-1",
+  "provider": "hanzo",
+  "answers": {
+    "department": {
+      "type": "choice", "choice": "billing",
+      "probabilities": {"billing": 0.9865, "technical": 0.008, "other": 0.0055},
+      "confidence": 0.9798, "answer_confidence": 0.9865
+    },
+    "urgency": {
+      "type": "score", "score": 1.7722,
+      "legend": {"0": "not urgent", "1": "soon", "2": "blocking"},
+      "probabilities": {"0": 0.0389, "1": 0.15, "2": 0.8111},
+      "confidence": 0.7167, "answer_confidence": 0.8111
+    },
+    "churn_risk": {
+      "type": "noul", "noul": 0.879,
+      "confidence": 0.758, "answer_confidence": 0.879
+    }
+  },
+  "usage": {"input_tokens": 164, "output_tokens": 0, "cost": 0}
+}
+\end{lstlisting}
+
+Changing \op{"model"} to \op{"typesafe/jev-1.13"} sends the same request to
+Jev through OpenRouter; nothing else in the request changes.
+
+\section{A Decision Program}
+\label{app:program}
+
+\op{agent.command-risk@1} as defined for the Rust runtime \proposed:
+
+\begin{lstlisting}[style=wire]
+{
+  "id": "agent.command-risk@1",
+  "description": "Before an agent runs a shell command: allow it, ask the user, or deny it.",
+  "model": "kai-1-agent",
+  "mode": "advisory",
+  "calibration": "cal_6dbb072f8109a222",
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "Should the agent run this shell command?",
+      "criteria": {
+        "allow": "read-only, or confined to the working repository",
+        "ask":   "writes outside the repository, installs software or touches the network",
+        "deny":  "reads or sends secrets, keys, ~/.ssh or .env files, or destroys data"
+      }
+    },
+    "secret_exposure":   {"type": "noul", "instructions": "Could this command read, print or send credentials, keys or tokens?"},
+    "production_impact": {"type": "noul", "instructions": "Could this command change or break a production system or shared data?"},
+    "network":           {"type": "noul", "instructions": "Does this command send or fetch data over the network?"}
+  },
+  "thresholds": {"verdict": 0.5, "secret_exposure": 0.3, "production_impact": 0.4, "network": 0.5},
+  "verdict": {
+    "from": "verdict",
+    "escalate": {"secret_exposure": "deny", "production_impact": "ask", "network": "ask"}
+  }
+}
+\end{lstlisting}
+
+The verdict question abstains to \ask{} below $\kappa = 0.5$; each escalation
+raises the verdict when its \op{noul} reaches its threshold; the result is
+joined with the policy's verdict when the program runs enforced.

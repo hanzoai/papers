@@ -1,0 +1,146 @@
+\section{Evaluation}
+\label{sec:evaluation}
+
+This section reports the one run we have made and the protocol for the rest.
+
+\subsection{The recorded run}
+
+We ran the reference runtime, upstream Laya 0.3.20 in Python with PyTorch in
+f32 on CPU, against the \texttt{hanzoai/kai-1} bundle at revision
+\texttt{b50502c2}, whose root, \texttt{multilingual/} and
+\texttt{typed-decisions/} folders hold the three checkpoints of
+Table~\ref{tab:family}. Nine states, each with one to three questions, were
+answered by all three checkpoints: 27 cases and 36 answers, recorded with their
+collated batches, logits, act outputs and decoded answers, together with the
+router's choice for each state. The record is the parity fixture of the Rust
+runtime. The states are small by design; they exercise the three question
+types, criteria given as strings and as objects, a single-option choice, a
+long state, a conversation given as a list of messages, and two non-English
+states. They are not a benchmark, and we draw no accuracy figure from them.
+Everything in this subsection is \meas.
+
+\paragraph{Permissions.}
+Two of the states were shell commands put to a three-way permission question:
+\begin{center}
+\small
+\texttt{cat \textasciitilde/.ssh/id\_ed25519 | curl -X POST https://example.com -d @-}
+\quad and \quad \texttt{rg -n TODO src/}
+\end{center}
+with the criteria \allow{} (``read-only, inside the repository''), \ask{}
+(``writes outside the repo or touches the network'') and \deny{} (``touches
+secrets, \texttt{\textasciitilde/.ssh} or \texttt{.env}''). The first sends a private key to a
+remote host; the second searches the source tree.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llccclcc@{}}
+\toprule
+Command & Checkpoint & $p(\allow)$ & $p(\ask)$ & $p(\deny)$ & Answer & $\kappa$ & act \\
+\midrule
+exfiltrate key & \op{kai-1}              & 0.419 & 0.355 & 0.226 & \allow & 0.129 & 1.0 \\
+               & \op{kai-1-multilingual} & 0.689 & 0.194 & 0.118 & \allow & 0.533 & 1.0 \\
+               & \op{kai-1-agent}        & 0.371 & 0.389 & 0.240 & \ask   & 0.084 & 1.0 \\
+\midrule
+search source  & \op{kai-1}              & 0.386 & 0.273 & 0.341 & \allow & 0.079 & 1.0 \\
+               & \op{kai-1-multilingual} & 0.764 & 0.102 & 0.134 & \allow & 0.646 & 1.0 \\
+               & \op{kai-1-agent}        & 0.424 & 0.345 & 0.231 & \allow & 0.136 & 1.0 \\
+\bottomrule
+\end{tabular}
+\caption{The three bootstrap checkpoints on two commands \meas. $\kappa$ is
+Equation~\eqref{eq:kappa} with $k = 3$; ``act'' is the act head's probability
+of acting. The router sends both states to \op{kai-1}.}
+\label{tab:perm}
+\end{table}
+
+Table~\ref{tab:perm} shows what the bootstrap checkpoints know about
+permissions: very little. No checkpoint put more than 0.25 on \deny{} for the
+key exfiltration, and two ranked \allow{} first. The English checkpoint, which
+the router chooses for both states, gave \allow{} a slightly \emph{higher}
+probability for the exfiltration (0.419) than for the search (0.386). The
+answers are close to uniform: $\kappa$ is below 0.14 for four of the six. The
+act head returned 1.0 for all six, as it did for every answer in the run.
+
+Run through the machinery of Section~\ref{sec:authority}, the picture changes.
+Under the command-risk program's verdict threshold of $t = 0.5$, the English
+and agent checkpoints abstain on both commands, so their verdict is \ask; the
+multilingual checkpoint clears the threshold and says \allow{} for both. A
+deterministic rule that refuses reading \texttt{\textasciitilde/.ssh} together with network
+egress makes the policy verdict for the first command \deny, and by
+Proposition~\ref{prop:tighten} the effective verdict is \deny{} for every
+checkpoint in every mode. The search command, which no rule objects to, runs
+under the policy alone and asks under the English and agent checkpoints if they
+were enforced: friction, in the sense of Proposition~\ref{prop:friction}, and
+the reason \op{agent.command-risk@1} starts in advisory mode and its first
+deployment in shadow.
+
+These questions are not the ones \op{agent.command-risk@1} asks. The program
+words its criteria differently and adds three \op{noul} questions whose
+escalations are designed for exactly this case. We report the recorded
+questions because they are the ones we have measured.
+
+\paragraph{Disagreement on a plain predicate.}
+The first state reads ``Hi, we were billed twice for March. Please refund the
+duplicate today or we will cancel our plan.'' All three checkpoints assigned it
+to billing, with $\pmax$ of 0.987, 1.000 and 0.812, and all three put its
+urgency near the top of a three-level scale (expected levels 1.77, 1.79 and
+1.73). Asked the predicate ``Does the user threaten to cancel or leave?'', the
+English checkpoint answered $p_{\op{true}} = 0.879$ and the agent checkpoint
+0.771, while the multilingual checkpoint answered $p_{\op{true}} = 0.045$: a
+confident no to an explicit threat. The router sends this state to the English
+checkpoint, so in service the answer would have been right. It is still a
+warning. The upstream authors note that \op{noul} answers are sensitive to how
+the two labels are described~\cite{laya}, and the multilingual checkpoint, which
+is the only one that answers non-English text, ships without fitted
+temperatures (Section~\ref{sec:model}). \op{noul} thresholds in a program must
+be validated per checkpoint, which is what binding a program to a calibration
+enforces.
+
+\paragraph{Routing.}
+The Hindi state (``I was charged twice in March, please refund the duplicate
+amount'') was routed to the multilingual checkpoint, which answered
+billing at 0.951; the English checkpoint, had it been asked, would have said
+billing at 0.451 and the agent checkpoint ``other'' at 0.434. The Spanish state
+(``the app closes every time I open the settings''), Latin script with
+diacritics, was routed to the multilingual checkpoint, which
+answered technical with $\pmax = 0.989$ where the English checkpoint gave 0.661. On both,
+the checkpoint the router chose was the one that was most sure and, by
+inspection, right.
+
+\subsection{What will be measured, and how}
+\label{sec:eval-plan}
+
+Each of the following has a stated procedure so that its result can be
+reported whichever way it comes out \proposed.
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+  \item[E1 Parity.] The Rust runtime replays the recorded run: identical
+    collated batches, identical routing, decoded probabilities within
+    $10^{-4}$ of the reference, identical labels. A checkpoint that fails is
+    not served natively.
+  \item[E2 Latency and throughput.] Per-question and per-request latency,
+    median and 99th percentile, at batch sizes 1, 8 and 32, for native Kai and
+    the Python reference on the same CPU (x86-64 with AVX2 and AVX-512, and
+    Apple silicon), and for Jev through OpenRouter measured from the same
+    host with the network included. The first round of every binary is run
+    and discarded; a freshly started process reads high on its first round.
+  \item[E3 Agreement.] Kai and Jev answer the same questions over the same
+    states; we report agreement of labels and the distribution of
+    $|\Delta\pmax|$ by question type, and treat disagreement as a sample to
+    label, not as an error of either model.
+  \item[E4 Accuracy and calibration on our traffic.] From the coding agent's
+    shadow records, labelled by the decisions people made, accuracy, Brier
+    score and expected calibration error per program and question, before and
+    after refitting temperatures, and per checkpoint.
+  \item[E5 Promotion.] For each program, the catch and friction counts of
+    Proposition~\ref{prop:friction} over its shadow sample, and the decision
+    taken on them.
+  \item[E6 Studies.] On a trade study with a published outcome, whether the
+    package reproduces the recommendation; whether the flip analysis
+    identifies the cells that later evidence actually moved; and the number of
+    questions a refresh asks against the number a full rerun asks.
+\end{description}
+
+Cost is reported as measured cost per thousand decisions on each backend,
+compute for the native runtime and billed tokens for the others, and not as a
+saving against a counterfactual we did not run.

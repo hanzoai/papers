@@ -1,0 +1,145 @@
+\section{Kai}
+\label{sec:model}
+
+Kai is a cross-encoder with a typed head. It reads the question, the options
+and the state together and scores each option at a marker token, so every
+option is judged in the context of the others and of the state, in one
+forward pass, without generating text. The description below is of the
+architecture as the Rust port implements it, which reproduces the reference
+PyTorch implementation of the upstream checkpoints~\cite{laya}.
+
+\subsection{Input}
+
+Each row of a batch is one question over one state:
+\begin{center}
+\small
+\texttt{[CLS]} $\langle\tau\rangle$ \texttt{question:} $\iota$ \texttt{[SEP]}
+\texttt{[MASK]} $c_1$ \texttt{[MASK]} $c_2$ $\cdots$ \texttt{[MASK]} $c_k$
+\texttt{[SEP]} $s$ \texttt{[SEP]}
+\end{center}
+Each option is written as its label and description after a marker token; a
+\op{score} level is written as \texttt{level $i$:} followed by its
+description. The positions $m_1, \dots, m_k$ of the markers are recorded
+with a mask over the option slots. All questions of a request are collated
+into one batch, so a request with several questions over one state is still a
+single forward pass. The options share a token budget, \op{head\_max\_len},
+of 192 tokens on the English checkpoint and 256 on the other two; beyond it
+options are trimmed, and a question whose options cannot fit is rejected
+rather than truncated silently~\cite{laya}.
+
+\subsection{Encoder and head}
+
+Let $E$ be the encoder and $H = E(x) \in \mathbb{R}^{L \times d}$ its output.
+The head adds a learned type embedding $e_\tau \in \mathbb{R}^d$ to every
+position and applies two pre-norm transformer encoder layers
+$T_1, T_2$ (ReLU feed-forward of width $4d$, $d/64$ heads, LayerNorm
+$\epsilon = 10^{-5}$, a key padding mask from the attention mask):
+\begin{equation}
+  \tilde H = T_2\bigl(T_1(H + \mathbf{1} e_\tau^{\top})\bigr).
+\end{equation}
+A scorer reads the head's state at each marker:
+\begin{equation}
+  z_i = w_2^{\top}\,\mathrm{GELU}\bigl(W_1\,\mathrm{LN}(\tilde H_{m_i}) + b_1\bigr) + b_2,
+  \qquad i = 1, \dots, k,
+\end{equation}
+and option slots the row does not have receive $z_i = -10^4$, so they take no
+mass. The distribution is a tempered softmax,
+\begin{equation}
+  p_i = \frac{\exp(z_i / T_{\tau,k})}{\sum_{j} \exp(z_j / T_{\tau,k})},
+  \label{eq:softmax}
+\end{equation}
+where $T_{\tau,k}$ is a temperature fitted after training for the question
+type and, where the checkpoint ships one, for the bucket of option counts
+$k$ falls in. The runtime confines every temperature to $[0.5, 5]$: the English
+checkpoint ships a fitted value of $0.10$ for choices of eleven or more
+options, which would sharpen those distributions tenfold, and the multilingual
+checkpoint ships $T = 1$ for every type, which is to say no fit at all
+\meas.
+
+\paragraph{The act head.}
+A second head reads the \texttt{[CLS]} state together with four features of
+the option distribution,
+$\phi(p) = \bigl(p_{(1)},\, p_{(1)} - p_{(2)},\, H(p)/\ln k,\, k/255\bigr)$,
+where $p_{(1)} \ge p_{(2)}$ are the two largest probabilities, and outputs two
+logits for acting on the answer versus escalating it. The checkpoints'
+configuration records the costs it was trained against (escalation 0.5, a
+wrong action 3.0). In our recorded run it returned an act probability of
+exactly 1.0 on all 36 answers, including answers whose top option held 0.39 of
+the mass \meas. We carry its output on the wire as an ignorable field and do
+not use it: escalation is decided by the program's thresholds and by policy
+(Section~\ref{sec:authority}).
+
+\subsection{The family}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrrl@{}}
+\toprule
+Model & Encoder & Params & Context & Revision \\
+\midrule
+\op{kai-1}              & ModernBERT-large~\cite{modernbert} & 421M & 512  & \texttt{b50502c2} \\
+\op{kai-1-multilingual} & mmBERT-base~\cite{mmbert}          & 322M & 1024 & \texttt{3119843b} \\
+\op{kai-1-agent}        & ModernBERT-large                   & 421M & 1024 & \texttt{e3e41649} \\
+\bottomrule
+\end{tabular}
+\caption{The Kai checkpoints on Hugging Face under \texttt{hanzoai/}. Parameter
+counts and context lengths are the upstream model card's \reported. Each is the
+upstream Laya checkpoint (\op{laya}, \op{laya-multilingual},
+\op{laya-typed-decisions}) with byte-identical \texttt{model.safetensors}
+\shipped. The multilingual checkpoint reads up to 8,192 tokens when asked to.}
+\label{tab:family}
+\end{table}
+
+\op{kai-1} is the English checkpoint. \op{kai-1-multilingual} covers more than a
+hundred languages at a smaller width ($d = 768$, 12 heads, rotary base
+160{,}000, against $d = 1024$ and 16 heads for the English encoder).
+\op{kai-1-agent} is the English architecture fine-tuned by its upstream authors
+on a typed-decisions benchmark of 2,000 decisions across four workflows, where
+they report 0.766 accuracy against 0.362 for the base English checkpoint
+\reported~\cite{laya}. The upstream authors also report 32.8\,ms for one
+question and 72.3\,ms for ten batched questions on a T4 GPU with the
+multilingual checkpoint, 39.5\,ms for one question with the English one, and
+193--464\,ms per request on CPU with checkpoints preloaded \reported. We have
+not yet reproduced these; Section~\ref{sec:eval-plan} says how we will.
+
+\subsection{Routing between checkpoints}
+
+The English checkpoint does not degrade gently off English. Its authors report
+that on Khmer it scores 0.000 accuracy at 0.952 mean confidence
+\reported~\cite{laya}, so a confidence gate cannot catch the failure after the
+fact. The choice of checkpoint is therefore made before the forward pass, from
+the script of the state and, for Latin script, from a function-word and
+diacritic heuristic. The Rust port keeps the reference detector's word lists,
+thresholds and tie-breaks unchanged, so a state routes to the checkpoint it
+would have routed to before, and its tests replay the reference's routing
+decisions \proposed. In the recorded run, seven of nine states routed to the
+English checkpoint and the Hindi and Spanish states to the multilingual one
+\meas.
+
+\subsection{Provenance}
+
+The upstream code and checkpoints are released under Apache-2.0; the fork is
+\texttt{hanzoai/decision} on GitHub and the weights are the three repositories
+of Table~\ref{tab:family}, with the upstream notice kept. The encoders are
+ModernBERT~\cite{modernbert} and mmBERT~\cite{mmbert}, both with published
+training descriptions. For deployments that must account for the origin of
+every model in the loop, this matters: the decision plane does not depend on
+the generative models it governs.
+
+\subsection{The Rust runtime}
+
+The native runtime has two parts \proposed. A model module in Hanzo's tensor
+library (\texttt{hanzo-transformers}, \texttt{models/kai.rs}) implements the
+encoder and head above over the existing ModernBERT implementation, with the
+rotary base and head counts read from each checkpoint's configuration. A crate,
+\texttt{hanzo-decision}, holds everything that is not the network: question
+parsing, sequence layout and collation, tokenisation, checkpoint routing,
+decoding of logits to typed answers, Decision Programs, the verdict lattice,
+and a remote backend for OpenRouter. Its parity suite replays the reference
+runtime's collated batches, logits, act outputs, decoded answers and routing
+decisions, recorded from Python with PyTorch in f32 on CPU, and requires
+decoded probabilities to agree within $10^{-4}$. The same crate links into the
+Hanzo Dev agent and into the hosted engine, so the decision a developer's
+machine makes offline and the one the cloud makes are computed by the same
+code.

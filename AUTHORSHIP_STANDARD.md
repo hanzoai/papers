@@ -18,7 +18,7 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 \author{
     Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai} \\
     \textit{Hanzo Industries Inc (Techstars '17)} \\
-    Los Angeles, California \\
+    San Francisco, California \\
     \texttt{https://hanzo.ai}
 }
 ```
@@ -61,7 +61,7 @@ For papers spanning multiple organizations:
 \author{
     Hanzo AI Research\textsuperscript{1,2,3}\thanks{Corresponding author: research@hanzo.ai} \\
     \\
-    \textsuperscript{1}\textit{Hanzo Industries Inc (Techstars '17), Los Angeles, CA} \\
+    \textsuperscript{1}\textit{Hanzo Industries Inc (Techstars '17), San Francisco, CA} \\
     \textsuperscript{2}\textit{Lux Industries Inc \texttt{research@lux.network}} \\
     \textsuperscript{3}\textit{Zoo Labs Foundation (501(c)(3)), \texttt{research@zoo.ngo}}
 }

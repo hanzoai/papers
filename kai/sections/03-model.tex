@@ -1,145 +1,188 @@
 \section{Kai}
 \label{sec:model}
 
-Kai is a cross-encoder with a typed head. It reads the question, the options
-and the state together and scores each option at a marker token, so every
-option is judged in the context of the others and of the state, in one
-forward pass, without generating text. The description below is of the
-architecture as the Rust port implements it, which reproduces the reference
-PyTorch implementation of the upstream checkpoints~\cite{laya}.
+Kai maps evidence $E$, a typed question and, inside a program, other questions'
+answers to a distribution over the question's options: an evidence encoder, an
+option encoder, a cross-attention head with a law per type, and a refinement
+schedule over dependent questions (Figure~\ref{fig:kai}).
 
-\subsection{Input}
+\input{figures/kai}
 
-Each row of a batch is one question over one state:
-\begin{center}
-\small
-\texttt{[CLS]} $\langle\tau\rangle$ \texttt{question:} $\iota$ \texttt{[SEP]}
-\texttt{[MASK]} $c_1$ \texttt{[MASK]} $c_2$ $\cdots$ \texttt{[MASK]} $c_k$
-\texttt{[SEP]} $s$ \texttt{[SEP]}
-\end{center}
-Each option is written as its label and description after a marker token; a
-\op{score} level is written as \texttt{level $i$:} followed by its
-description. The positions $m_1, \dots, m_k$ of the markers are recorded
-with a mask over the option slots. All questions of a request are collated
-into one batch, so a request with several questions over one state is still a
-single forward pass. The options share a token budget, \op{head\_max\_len},
-of 192 tokens on the English checkpoint and 256 on the other two; beyond it
-options are trimmed, and a question whose options cannot fit is rejected
-rather than truncated silently~\cite{laya}.
+\subsection{Evidence}
+\label{sec:evidence}
 
-\subsection{Encoder and head}
+\begin{definition}[Evidence]
+An evidence record is a tuple
+\[
+  e = (\mathit{id}, \mathit{modality}, t, \mathit{source}, \mathit{frame},
+  \mathit{unit}, \mathit{payload}, \mathit{uncertainty}, \mathit{provenance})
+\]
+of a modality (text, JSON, time series, audio, image, video, or
+$\op{Custom}(\cdot)$), a time or interval, the payload's frame and unit, the
+source's error model, and the producer with its inputs. A decision's evidence
+is a set of records.
+\end{definition}
 
-Let $E$ be the encoder and $H = E(x) \in \mathbb{R}^{L \times d}$ its output.
-The head adds a learned type embedding $e_\tau \in \mathbb{R}^d$ to every
-position and applies two pre-norm transformer encoder layers
-$T_1, T_2$ (ReLU feed-forward of width $4d$, $d/64$ heads, LayerNorm
-$\epsilon = 10^{-5}$, a key padding mask from the attention mask):
+Sensor metadata (unit, rate, calibration, error bound, quality) is input, and
+temporal summaries (instant, window, trend, event, baseline, forecast) are
+records too, produced by code or a forecasting
+model~\cite{das2024timesfm,ansari2024chronos}; a new sensor needs an adapter,
+not a new model. Each modality has one encoder into width $d$: the text encoder;
+one rate-aware encoder for every time series, embedding each sample with its
+timestamp, rate and unit; and frozen Whisper~\cite{radford2023whisper} and
+SigLIP~\cite{zhai2023siglip} with trained projections. Latents are keyed by
+content hash and computed once per changed evidence state \proposed.
+
+Today evidence is JSON read as text: each question's instruction and the
+serialised state form one context,
+\texttt{[CLS]}~$\langle\tau\rangle$~\texttt{question:}~$\iota$~\texttt{[SEP]}~$s$~\texttt{[SEP]},
+cut at the context length by dropping the state's tail and encoded by
+ModernBERT~\cite{modernbert} or mmBERT~\cite{mmbert} \shipped.
+
+\subsection{Factorized choice}
+\label{sec:factor}
+
+Let $H \in \mathbb{R}^{L\times d}$ be the context's token states plus a learned
+type embedding $e_\tau$, and $O_i \in \mathbb{R}^{L_i\times d}$ those of option
+$i$, encoded alone as \texttt{[CLS]}~$c_i$~\texttt{[SEP]}. An option's encoding
+depends on its text only, so each distinct option in a batch is encoded once
+for every question that lists it \shipped, and across calls once per program
+version \proposed. Two pre-norm cross-attention blocks, in which option tokens
+attend to context tokens and nothing else, give
+$X_i = B_2(B_1(O_i + e_\tau, H), H)$; with $v_i$ the mean of $X_i$,
 \begin{equation}
-  \tilde H = T_2\bigl(T_1(H + \mathbf{1} e_\tau^{\top})\bigr).
+  s_i = w^{\top}\,\mathrm{GELU}\bigl(W\,\mathrm{LN}(v_i) + b\bigr).
 \end{equation}
-A scorer reads the head's state at each marker:
+The type fixes the law, at a temperature $T$ fitted per type and option-count
+bucket on validation data \shipped:
+\begin{itemize}[leftmargin=1.5em]
+  \item \op{choice}: $p_i = \operatorname{softmax}_i(s_i/T)$.
+  \item \op{noul}: $p_{\op{true}} = \sigma\bigl((s_{\op{true}} -
+    s_{\op{false}})/T\bigr)$, each side scored with its own description.
+  \item \op{score}: a cumulative-link model~\cite{mccullagh1980} over levels
+    $1..k$, $P(y \le j) = \sigma\bigl((\theta_j - \eta)/T\bigr)$. The location
+    $\eta = a^{\top}\bar v$ reads the state-aware level vectors; the cutpoints
+    read the level texts alone,
+    $\theta_j = b^{\top}\bar o + \sum_{i \le j}
+    \operatorname{softplus}(g^{\top}[\bar o_i; \bar o_{i+1}])$ with $\bar o_i$
+    the mean of $O_i$, so they are ordered.
+\end{itemize}
+
+\begin{proposition}[Symmetry]
+\label{prop:symmetry}
+For any weights, permuting a question's options permutes $p$ the same way, and
+exchanging the texts of a \op{noul}'s sides maps $p_{\op{true}}$ to
+$1 - p_{\op{true}}$ \shipped.
+\end{proposition}
+\begin{proof}
+$s_i$ depends on $c_i$ and $H$ alone, and softmax is permutation equivariant;
+the exchange swaps $s_{\op{true}}$ and $s_{\op{false}}$, and
+$\sigma(-x) = 1 - \sigma(x)$.
+\end{proof}
+
+kai-1 has neither: its options share one sequence, in order.
+
+\paragraph{Retrieval.}
+A choice with more than $k = 32$ options is narrowed first. The context's first
+token and each option's mean token are projected to unit vectors $u$, $r_i$;
+$\pi = \operatorname{softmax}_i(e^{\gamma}\langle u, r_i\rangle)$ with $\gamma$
+learned. The head scores the top $k$ under $\pi$, a set $S$, and the rest keep
+their retrieval probability:
 \begin{equation}
-  z_i = w_2^{\top}\,\mathrm{GELU}\bigl(W_1\,\mathrm{LN}(\tilde H_{m_i}) + b_1\bigr) + b_2,
-  \qquad i = 1, \dots, k,
+  p_i = \begin{cases} (1-\rho)\,\operatorname{softmax}_{j \in S}(s_j/T)_i & i \in S,\\
+  \pi_i & i \notin S,\end{cases}
+  \qquad \rho = \sum_{i \notin S} \pi_i ,
 \end{equation}
-and option slots the row does not have receive $z_i = -10^4$, so they take no
-mass. The distribution is a tempered softmax,
+so the mass beyond the top $k$ is kept, not renormalised away, and the head
+costs $O(k)$ per question for any option count \shipped.
+
+\paragraph{Training.}
+Log loss plus Brier score against each question's target distribution, both
+strictly proper~\cite{gneiting2007}, plus 0.2 times the retrieval log loss;
+bf16 over f32 masters on Metal, AdamW, token-budgeted batches, encoder from
+kai-1. Data are the train splits of the harness's sources at pinned revisions,
+minus any example sharing a content unit (the state's text, or the first 200
+letters and digits of a field of 200 or more characters) with a harness
+evaluation state \shipped.
+
+\subsection{Typed-variable diffusion}
+\label{sec:diffusion}
+
+A program's questions depend on each other, and answered independently they
+can break its rules: approving an invoice flagged as a duplicate.
+
+\begin{definition}[Typed variables]
+A program's questions are variables $Z = (Z_v)_{v \in V}$, each with a finite
+domain $D_v$ (labels, levels, or a \op{noul}'s sides), with a dependency DAG
+$G$ on $V$ and rules $R$, each on two variables:
+$Z_a = i \Rightarrow Z_b = j$, or $\lnot(Z_a = i \land Z_b = j)$.
+\end{definition}
+
+Kai predicts masked slots jointly: for a masked set $M \subseteq V$,
 \begin{equation}
-  p_i = \frac{\exp(z_i / T_{\tau,k})}{\sum_{j} \exp(z_j / T_{\tau,k})},
-  \label{eq:softmax}
+  p_\theta(Z_M \mid E, Z_{V\setminus M}, G) = \prod_{v \in M}
+  p_\theta(Z_v \mid E, Z_{V\setminus M}, G),
 \end{equation}
-where $T_{\tau,k}$ is a temperature fitted after training for the question
-type and, where the checkpoint ships one, for the bucket of option counts
-$k$ falls in. The runtime confines every temperature to $[0.5, 5]$: the English
-checkpoint ships a fitted value of $0.10$ for choices of eleven or more
-options, which would sharpen those distributions tenfold, and the multilingual
-checkpoint ships $T = 1$ for every type, which is to say no fit at all
-\meas.
+each slot a query over the evidence latents and the visible slots, scored
+against its own domain by the head above. Training draws $t \sim U(0,1)$ and
+masks each variable with probability $t$: absorbing-state discrete
+diffusion~\cite{austin2021d3pm} over typed variables, not tokens. $M = V$ is a
+set of independent questions; $|M| = 1$ asks one with all others known
+\proposed.
 
-\paragraph{The act head.}
-A second head reads the \texttt{[CLS]} state together with four features of
-the option distribution,
-$\phi(p) = \bigl(p_{(1)},\, p_{(1)} - p_{(2)},\, H(p)/\ln k,\, k/255\bigr)$,
-where $p_{(1)} \ge p_{(2)}$ are the two largest probabilities, and outputs two
-logits for acting on the answer versus escalating it. The checkpoints'
-configuration records the costs it was trained against (escalation 0.5, a
-wrong action 3.0). In our recorded run it returned an act probability of
-exactly 1.0 on all 36 answers, including answers whose top option held 0.39 of
-the mass \meas. We carry its output on the wire as an ignorable field and do
-not use it: escalation is decided by the program's thresholds and by policy
-(Section~\ref{sec:authority}).
+\paragraph{Inference.}
+Passes are spent on uncertainty.
+\begin{enumerate}[leftmargin=1.5em]
+  \item Pass 1 predicts every variable and freezes those whose top probability
+    reaches $\tau$.
+  \item Pass $d+1$ re-asks, once, each unfrozen variable whose parents are all
+    settled (frozen, roots, or re-asked), conditioned on their answers.
+  \item Each unsettled variable keeps its top $m$ candidates; a small selector
+    scores assignments of the candidate lattice for coherence.
+  \item A deterministic projection returns
+    $\hat z = \arg\max_{z \models R} \sum_{v} \log p_v(z_v)$.
+\end{enumerate}
 
-\subsection{The family}
+\begin{proposition}[Depth bounds cost]
+\label{prop:depth}
+Steps 1 and 2 end within $\operatorname{depth}(G) + 1$ passes, depth counted in
+edges, and ask at most $2|V|$ questions.
+\end{proposition}
+\begin{proof}
+Roots and frozen variables are settled after pass 1. If every variable of depth
+below $d$ is settled after pass $d$, each of depth $d$ has all parents settled
+and is re-asked by pass $d+1$. Each variable is asked in pass 1 and at most once
+more.
+\end{proof}
 
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}llrrl@{}}
-\toprule
-Model & Encoder & Params & Context & Revision \\
-\midrule
-\op{kai-1}              & ModernBERT-large~\cite{modernbert} & 421M & 512  & \texttt{b50502c2} \\
-\op{kai-1-multilingual} & mmBERT-base~\cite{mmbert}          & 322M & 1024 & \texttt{3119843b} \\
-\op{kai-1-agent}        & ModernBERT-large                   & 421M & 1024 & \texttt{e3e41649} \\
-\bottomrule
-\end{tabular}
-\caption{The Kai checkpoints on Hugging Face under \texttt{hanzoai/}. Parameter
-counts and context lengths are the upstream model card's \reported. Each is the
-upstream Laya checkpoint (\op{laya}, \op{laya-multilingual},
-\op{laya-typed-decisions}) with byte-identical \texttt{model.safetensors}
-\shipped. The multilingual checkpoint reads up to 8,192 tokens when asked to.}
-\label{tab:family}
-\end{table}
+Steps 1, 2 and 4 are in the code with the factorized model as the conditional:
+a re-asked variable sees its parents' answers and probabilities as typed facts
+added to its state, each pass is one batched call, and the projection is an
+exact branch and bound bounded by the sum of per-variable maxima \shipped. The
+trained slot model, the lattice and selector, and distilling the passes into
+one or two are \proposed.
 
-\op{kai-1} is the English checkpoint. \op{kai-1-multilingual} covers more than a
-hundred languages at a smaller width ($d = 768$, 12 heads, rotary base
-160{,}000, against $d = 1024$ and 16 heads for the English encoder).
-\op{kai-1-agent} is the English architecture fine-tuned by its upstream authors
-on a typed-decisions benchmark of 2,000 decisions across four workflows, where
-they report 0.766 accuracy against 0.362 for the base English checkpoint
-\reported~\cite{laya}. The upstream authors also report 32.8\,ms for one
-question and 72.3\,ms for ten batched questions on a T4 GPU with the
-multilingual checkpoint, 39.5\,ms for one question with the English one, and
-193--464\,ms per request on CPU with checkpoints preloaded \reported. We have
-not yet reproduced these; Section~\ref{sec:eval-plan} says how we will.
+\subsection{Checkpoints and runtime}
+\label{sec:checkpoints}
 
-\subsection{Routing between checkpoints}
+\textbf{kai-1} is \texttt{hanzoai/kai-1} (\texttt{b50502c2}),
+\texttt{kai-1-multilingual} (\texttt{3119843b}) and \texttt{kai-1-agent}
+(\texttt{e3e41649}), whose weights have the SHA-256 of the Laya 0.3.20
+checkpoints~\cite{laya}: ModernBERT-large at context 512, mmBERT-base at 1024,
+and ModernBERT-large fine-tuned on typed decisions~\cite{typeddecisions} at
+1024. Their joint head packs the question, each option after a marker token,
+and the state into one sequence, within a 192--256-token option budget; a script
+detector routes non-English states to the multilingual checkpoint. Every
+measurement of kai-1 is a measurement of Laya \shipped. \textbf{Factorized
+checkpoints} have the architecture above, start from kai-1's encoders, and are
+named by the run that evaluates them (\res{kj/kai/model}, weights
+\res{kj/kai/weights}).
 
-The English checkpoint does not degrade gently off English. Its authors report
-that on Khmer it scores 0.000 accuracy at 0.952 mean confidence
-\reported~\cite{laya}, so a confidence gate cannot catch the failure after the
-fact. The choice of checkpoint is therefore made before the forward pass, from
-the script of the state and, for Latin script, from a function-word and
-diacritic heuristic. The Rust port keeps the reference detector's word lists,
-thresholds and tie-breaks unchanged, so a state routes to the checkpoint it
-would have routed to before, and its tests replay the reference's routing
-decisions \proposed. In the recorded run, seven of nine states routed to the
-English checkpoint and the Hindi and Spanish states to the multilingual one
-\meas.
-
-\subsection{Provenance}
-
-The upstream code and checkpoints are released under Apache-2.0; the fork is
-\texttt{hanzoai/decision} on GitHub and the weights are the three repositories
-of Table~\ref{tab:family}, with the upstream notice kept. The encoders are
-ModernBERT~\cite{modernbert} and mmBERT~\cite{mmbert}, both with published
-training descriptions. For deployments that must account for the origin of
-every model in the loop, this matters: the decision plane does not depend on
-the generative models it governs.
-
-\subsection{The Rust runtime}
-
-The native runtime has two parts \proposed. A model module in Hanzo's tensor
-library (\texttt{hanzo-transformers}, \texttt{models/kai.rs}) implements the
-encoder and head above over the existing ModernBERT implementation, with the
-rotary base and head counts read from each checkpoint's configuration. A crate,
-\texttt{hanzo-decision}, holds everything that is not the network: question
-parsing, sequence layout and collation, tokenisation, checkpoint routing,
-decoding of logits to typed answers, Decision Programs, the verdict lattice,
-and a remote backend for OpenRouter. Its parity suite replays the reference
-runtime's collated batches, logits, act outputs, decoded answers and routing
-decisions, recorded from Python with PyTorch in f32 on CPU, and requires
-decoded probabilities to agree within $10^{-4}$. The same crate links into the
-Hanzo Dev agent and into the hosted engine, so the decision a developer's
-machine makes offline and the one the cloud makes are computed by the same
-code.
+The runtime is Rust on Hanzo's tensor library, \texttt{hanzo-ml}. The
+\texttt{kai} crate holds the model, question parsing, layout, token-budget
+batching, decoding and refinement, on CPU in f32 and Metal in bf16 \shipped,
+and on CUDA and ROCm where the library builds them \proposed. The
+\texttt{decision} crate serves \op{POST /v1/decisions} over a registry:
+factorized checkpoints and kai-1 in process, Jev through
+OpenRouter~\cite{openrouterdecisions} \proposed. Native kai-1 matches the Python
+reference to \res{par/logit} per logit (Section~\ref{sec:repro}).

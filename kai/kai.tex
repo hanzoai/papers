@@ -1,4 +1,4 @@
-% Kai: typed decision models as a control plane for agentic systems
+% Kai: typed decision models over evidence
 \documentclass[11pt]{article}
 \usepackage{../shared/hanzocover}
 \usepackage{amsmath, amssymb, amsthm}
@@ -10,7 +10,7 @@
 \usepackage{listings}
 \input{../shared/lstlang}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta,fit}
+\usetikzlibrary{positioning,arrows.meta,fit,calc}
 \usepackage{hyperref}
 \hypersetup{colorlinks=true,linkcolor=black,citecolor=blue,urlcolor=blue}
 % Identifiers set in typewriter do not hyphenate; let a line stretch instead of
@@ -25,10 +25,20 @@
 % A figure someone else measured and published; we have not reproduced it.
 \newcommand{\reported}{\textcolor{gray!70!black}{\small[reported]}}
 
+% Measured constants come from results-data.tex, which scripts/results.py
+% writes from the run artifacts data/runs.json names. A key that file does not
+% define prints XXX, so no table can show a number no run produced.
+\newcommand{\ph}{\textbf{XXX}}
+\newcommand{\setres}[2]{\expandafter\def\csname res:#1\endcsname{#2}}
+\newcommand{\res}[1]{\ifcsname res:#1\endcsname\csname res:#1\endcsname\else\ph\fi}
+\input{results-data}
+% One metric for Kai, kai-1 and Jev: \three{kj/agnews}{accuracy}.
+\newcommand{\three}[2]{\res{#1/kai/#2} & \res{#1/laya/#2} & \res{#1/jev/#2}}
+
 \newcommand{\op}[1]{\texttt{#1}}
-\newcommand{\allow}{\textsc{allow}}
-\newcommand{\ask}{\textsc{ask}}
-\newcommand{\deny}{\textsc{deny}}
+\newcommand{\allow}{\textup{\textsc{allow}}}
+\newcommand{\ask}{\textup{\textsc{ask}}}
+\newcommand{\deny}{\textup{\textsc{deny}}}
 \newcommand{\join}{\sqcup}
 \newcommand{\pmax}{p_{\max}}
 
@@ -44,16 +54,16 @@
 \theoremstyle{remark}
 \newtheorem{remark}{Remark}
 
-\title{Kai: Typed Decision Models as a Control Plane\\for Agentic Systems\\[0.35em]
-{\large Decisions as versioned programs under deterministic policy,\\
-with sensitivity and refresh for auditable studies}}
+\title{Kai: Typed Decision Models over Evidence\\[0.35em]
+{\large Factorized choice, typed-variable diffusion, and decisions\\
+as versioned programs under deterministic policy}}
 \author{
     Hanzo AI Research\thanks{Corresponding author: research@hanzo.ai} \\
     \textit{Hanzo Industries Inc (Techstars '17)} \\
-    Los Angeles, California \\
+    San Francisco, California \\
     \texttt{https://hanzo.ai}
 }
-\date{2026-09-24 \quad Weights at \texttt{hanzoai/kai-1} \texttt{b50502c2}}
+\date{2026-09-25 \quad Code at \texttt{hanzoai/decision} \texttt{20742d5}}
 
 \begin{document}
 
@@ -62,33 +72,25 @@ with sensitivity and refresh for auditable studies}}
 
 \begin{abstract}
 \noindent
-An agent makes many small decisions for every task it performs: whether a
-command may run, which model a subtask needs, which context the next turn
-should see, whether the work is finished. Most agents put each of these to a
-generative model and parse its prose. We describe Hanzo Decision, which moves
-them to a discriminative plane. A decision is a typed question (\op{choice},
-\op{score} or \op{noul}) over explicit state, and its answer is a probability
-distribution over criteria the caller enumerated, computed in one encoder
-forward pass with no generated text. Kai is the model family that answers
-them: three checkpoints on ModernBERT and mmBERT encoders, published as
-\texttt{hanzoai/kai-1}, \texttt{kai-1-multilingual} and \texttt{kai-1-agent}
-and derived from the open Laya checkpoints. Decisions are grouped into
-versioned Decision Programs whose thresholds are bound to a calibration and
-whose output runs in shadow, advisory or enforced mode. A deterministic policy
-remains the authority. Verdicts form the lattice
-$\allow < \ask < \deny$ and the effective verdict is the join of the policy's
-and the model's, so no model output, including one induced by adversarial
-state, can loosen a policy verdict. The risk of enforcing a model is then
-friction alone, and friction can be counted from shadow records before a
-program is promoted. The public interface, \op{POST /v1/decisions}, is
-wire-compatible with OpenRouter's Decisions API and routes by model name to
-native Kai or to TypeSafe's Jev. We carry the same objects to studies: a
-DecisionPackage records a trade study as typed answers over evidence, reports
-which weights and which answers would flip its recommendation, and refreshes
-only the answers whose evidence changed. In a recorded run of the three
-bootstrap checkpoints on a command that sends a private SSH key to a remote
-host, two ranked \allow{} first and none placed more than 0.25 on \deny. That
-result is why the model is advisory and the policy is not.
+Agents, controllers and engineering studies ask many small questions of
+explicit state. Kai answers them as typed decisions, a \op{choice},
+\op{score} or \op{noul} over options the caller lists, returned as a
+calibrated distribution with no generated text. We give its final
+architecture. All input is evidence of one record type (text, sensor streams
+with their metadata, audio, images, video), encoded once per change. Options
+are encoded alone and scored against the evidence by two cross-attention
+blocks, so option count, order and question count are not bounded by one
+sequence; \op{noul} is label-symmetric by construction, \op{score} a
+cumulative-link model, and large choices are narrowed by retrieval that keeps
+the mass it cuts. A program's dependent questions are typed variables, refined
+in waves bounded by dependency depth and projected onto the program's rules.
+Programs are versioned DAGs whose verdicts join a deterministic policy on
+$\allow < \ask < \deny$, so no model loosens policy, and each run is a hashed
+package that replays, diffs and refreshes. We report capabilities existing
+decision models lack, the native runtime's speed, and accuracy on a frozen
+62-suite harness against kai-1 (the Laya checkpoints) and TypeSafe's Jev. Every
+claim carries its status, and every number is written by a script from a kept
+run.
 \end{abstract}
 
 \clearpage
@@ -100,10 +102,9 @@ result is why the model is advisory and the policy is not.
 \input{sections/03-model}
 \input{sections/04-authority}
 \input{sections/05-programs}
-\input{sections/06-studies}
-\input{sections/07-evaluation}
+\input{sections/06-evaluation}
+\input{sections/07-limits}
 \input{sections/08-related}
-\input{sections/09-limits}
 \input{sections/99-conclusion}
 
 {\small
@@ -113,5 +114,6 @@ result is why the model is advisory and the policy is not.
 
 \appendix
 \input{sections/a1-wire}
+\input{sections/a2-results}
 
 \end{document}

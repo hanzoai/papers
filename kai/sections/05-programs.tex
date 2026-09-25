@@ -1,160 +1,161 @@
-\section{Decision Programs and the wire}
+\section{Programs and packages}
 \label{sec:programs}
 
-\subsection{Decision Programs}
-
 \begin{definition}[Decision Program]
-A Decision Program is a named, versioned, immutable record
-\[
-  P = (\op{name@version},\ \text{description},\ \text{model},\ \text{mode},\
-       \text{calibration},\ Q,\ t,\ R)
-\]
-of the model that answers it, the mode its output may be used in, the
-calibration its thresholds were set against, a set $Q$ of named typed
-questions, a threshold $t_q$ for each question, and an optional verdict rule
-$R$ naming the verdict question and its escalations.
+A Decision Program is a named, versioned, immutable record of options,
+objectives (a weight, direction and metric each), hard constraints (bounds on
+metrics), assumptions (a value and declared range each), risks (likelihood and
+severity), evidence, and a DAG of typed nodes: a deterministic expression, a
+Kai question, a Zen prompt, a solver, a human approval, or a policy gate
+(Section~\ref{sec:authority}). A node reads assumptions, evidence or other
+nodes' outputs, and writes JSON.
 \end{definition}
 
-A program is the only place a question's natural-language text lives. A
-caller does not write ``should this command run?''; it runs
-\op{agent.command-risk@1} on a state. Any change to a question's wording, its
-criteria, a threshold, the model or the calibration is a new version, because
-thresholds are only meaningful for the probabilities they were validated
-against, and those probabilities depend on every one of these. Versions are
-never edited in place, so a record that names \op{agent.command-risk@1} names
-one fixed set of questions forever.
+A program is the only place a question's wording lives, and any change to
+wording, options, a threshold, the model or the calibration is a new version,
+because a threshold means something only for the probabilities it was validated
+against. The executor runs nodes in dependency order with models, solvers and
+people behind interfaces, scores each option as weighted min-max-normalised
+metrics minus expected risk (likelihood times severity), and recommends the
+best option meeting every constraint \shipped. Refining a program's Kai
+questions as the typed variables of Section~\ref{sec:diffusion} is
+\proposed. Table~\ref{tab:programs} lists an agent loop's programs: the Jev
+notes' decision points~\cite{jevnote}, plus preflight, progress and
+completion.
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}p{0.23\linewidth}p{0.47\linewidth}l@{}}
+\begin{tabular}{@{}p{0.25\linewidth}p{0.55\linewidth}l@{}}
 \toprule
-Program & Questions & Mode at v1 \\
+Program & Questions & Mode \\
 \midrule
-\op{agent.preflight@1} & task type (code, conversation, research, operation);
-  complexity (4 levels); model tier; needs the user; needs repository context;
-  sensitivity (4 levels); private model required & advisory \\
+\op{agent.preflight@1} & task type; complexity (4); model tier; needs the
+  user; needs repository context; sensitivity (4); private model & advisory \\
 \op{agent.command-risk@1} & verdict (\allow, \ask, \deny); secret exposure;
   production impact; network & advisory \\
-\op{agent.model-route@1} & tier (cheap, zen-coder, frontier); reasoning depth
-  (4 levels); long context; private model required & shadow \\
-\op{agent.context@1} & scope (none, file, module, repository, external);
-  needs repository context; needs the web; needs memory & shadow \\
-\op{agent.tool-select@1} & next tool (read, search, edit, shell, web, ask the
-  user, none); can the next steps run in parallel & shadow \\
+\op{agent.model-route@1} & tier; reasoning depth (4); long context; private
+  model & shadow \\
+\op{agent.context@1} & scope (5); needs repository; needs web; needs memory
+  & shadow \\
+\op{agent.tool-select@1} & next tool (7); steps can run in parallel & shadow \\
 \op{agent.progress@1} & status (advancing, stalled, looping, blocked); needs
   the user & advisory \\
 \op{agent.complete@1} & done; verified rather than claimed; work remaining
-  (3 levels) & advisory \\
+  (3) & advisory \\
 \bottomrule
 \end{tabular}
-\caption{The Decision Programs an agent loop runs, as defined for the Rust
-runtime \proposed. All seven name \op{kai-1-agent}. Unmarked questions are
-\op{noul}.}
+\caption{Agent-loop programs, as defined in \texttt{program/programs}
+\shipped. Unmarked questions are \op{noul};
+levels or options in parentheses. A deployment may run a program below its
+mode, never above.}
 \label{tab:programs}
 \end{table}
 
-Table~\ref{tab:programs} lists the programs an agent loop runs. They cover the
-decision points of the Jev notes~\cite{jevnote} (context visibility, routing,
-tool choice, permissions, sensitivity) and add three the loop needs at its
-edges: preflight before a task starts, progress while it runs, and completion
-before it reports done. \op{agent.complete@1} asks separately whether the work
-is done and whether that is shown rather than claimed, because an agent that
-says it ran the tests and an agent whose transcript contains a passing test
-run are different states, and only the second should end a task.
+\subsection{The Decision Package}
 
-\subsection{The decision record}
+A run's record is a Decision Package: program and version; assumptions,
+constraints and evidence references with content hashes; each node's
+definition, backend revision, calibration and output, with every answer's full
+distribution; human overrides beside what they override, with author and
+reason; policy results; ranking, recommendation and sensitivity; approvals. Its
+hash covers every field but the timing trace. Replay re-runs the program on
+the recorded evidence, recomputing Kai and solver nodes under the recorded
+revisions and taking Zen and human outputs, which are observations, from the
+record; under the same revisions it reproduces the hash. A diff lists the
+values that changed and the flip conditions the later package moved past. The
+report is rendered only from computed results, so each number in it resolves
+to a field \shipped; rejecting a Zen-written narrative that states a number no
+field holds, as our assertion graph rejects an uncited
+claim~\cite{hanzographpaper}, is \proposed.
 
-Every execution of a program produces a record: the program id, a content
-hash of the state and a reference to where the state is kept under the
-tenant's retention policy, the backend and model revision that answered, the
-calibration, every answer with its full distribution, the policy verdict, the
-model verdict, the effective verdict and the mode, latency and metered usage,
-and the caller's identity. With the state and the model revision, a record can
-be replayed; on the same backend the replay reproduces the distributions, and
-across backends the parity bound of Section~\ref{sec:model} applies. The
-records of a program in shadow are the sample on which it is promoted
-(Proposition~\ref{prop:friction}), and the outcomes people chose on those
-states are its training labels.
+\begin{proposition}[Exact reuse]
+\label{prop:refresh}
+Cache each node's output under the hash of its definition, inputs and backend
+revision \shipped. If a key is unchanged and the backend deterministic, reuse yields the
+package a full rerun would; a refresh after $c$ nodes' inputs change recomputes
+those nodes and their descendants, and nothing else.
+\end{proposition}
+\begin{proof}
+A node's output is a function of its definition, inputs and backend revision
+(Section~\ref{sec:decisions}).
+\end{proof}
 
-\subsection{Testing a program}
+\subsection{What flips the decision}
+\label{sec:flip}
 
-Because a program's output is typed, a program can be tested the way code is,
-and a change to it is a change a test suite can catch \proposed.
-\begin{itemize}[leftmargin=1.5em]
-  \item \textbf{Unit tests} are states with the answer a person expects, and a
-    tolerance, such as: a command that pipes a private key to \texttt{curl}
-    is never \allow. They run on every new model revision and calibration
-    before a program version names them.
-  \item \textbf{Replay tests} re-run recorded decisions and require the same
-    distributions within the parity bound. They catch a runtime or tokenizer
-    change that moved answers without anyone intending it.
-  \item \textbf{Calibration tests} check, on a labelled sample, that answers
-    reported at a given $\pmax$ are right about that often, per question.
-  \item \textbf{Policy tests} are the policy's own: deterministic rules tested
-    as the code they are, independent of any model.
-\end{itemize}
-A new program version is the old one with a passing suite; a regression shows
-up as a failing named case, not as a vague change in agent behaviour noticed
-weeks later.
+For each parameter, the others held, the package reports where the top option
+changes \shipped. For a \emph{weight}, scaling all scores by the weight plus
+the others' sum makes each a line, so the top option is an upper envelope of
+lines and crossovers are exact; a \emph{risk}'s likelihood or severity enters
+linearly, also exact; a \emph{constraint bound} changes the feasible set only
+at the options' metric values. An \emph{assumption} is swept on a 32-interval
+grid with each change bisected, which misses a flip and flip-back inside one
+interval; downstream non-expression nodes are held at their recorded outputs.
 
-\subsection{\texorpdfstring{\op{POST /v1/decisions}}{POST /v1/decisions}}
+All weights at once have a closed form \proposed. For a challenger $b$ let
+$\delta_b = U_{a^\star} - U_b \in \mathbb{R}^m$ be the difference of the two
+options' normalised metrics, so $V(a^\star) - V(b) = w^{\top}\delta_b > 0$, and
+$P = I - \tfrac{1}{m}\mathbf{1}\mathbf{1}^{\top}$.
 
-The interface takes OpenRouter's Decisions API~\cite{openrouterdecisions}
-as its wire format, field for field. A request names a model, a state and a
-map of named questions; the response returns a map of typed answers under the
-same names, with usage and cost. Appendix~\ref{app:wire} gives an example.
-Hanzo adds fields a client of the upstream schema may ignore:
-\op{answer\_confidence} on every answer; \op{routing}, saying which checkpoint
-answered and why; the act head's output as \op{action}; and a program form of
-the request, \op{\{program, state\}}, which expands a named Decision Program to
-its questions and returns its verdict and mode beside the answers.
+\begin{proposition}[Smallest weight change]
+\label{prop:weights}
+The smallest $\Delta$ in Euclidean norm with $\mathbf{1}^{\top}\Delta = 0$ that
+makes $b$ tie $a^\star$ is
+\begin{equation}
+  \Delta^\star_b = -\frac{w^{\top}\delta_b}{\lVert P\delta_b\rVert^2}\,P\delta_b,
+  \qquad
+  \lVert \Delta^\star_b \rVert = \frac{w^{\top}\delta_b}{\lVert P\delta_b\rVert},
+\end{equation}
+provided $P\delta_b \ne 0$; if $w + \Delta^\star_b \ge 0$ it is the smallest
+change within the simplex, otherwise a lower bound.
+\end{proposition}
+\begin{proof}
+Minimise $\lVert\Delta\rVert^2$ subject to $\mathbf{1}^{\top}\Delta = 0$ and
+$\delta_b^{\top}\Delta = -w^{\top}\delta_b$. On the range of $P$,
+$\delta_b^{\top}\Delta = (P\delta_b)^{\top}\Delta$: the distance from the origin
+to a hyperplane with normal $P\delta_b$. Adding $w + \Delta \ge 0$ can only raise
+the minimum. If $P\delta_b = 0$, no weight change reorders $a^\star$ and $b$.
+\end{proof}
 
-\paragraph{Model-agnostic by name.}
-The \op{model} field chooses the backend. A \op{kai-*} name is answered by the
-native runtime. A \op{typesafe/jev-*} name, such as \op{typesafe/jev-1.13} or
-the alias \op{\textasciitilde typesafe/jev-latest}, is forwarded unchanged to
-OpenRouter's \op{POST /api/alpha/decisions}, and the response is checked at
-the boundary: every question must come back answered with its own type, and a
-choice's probabilities are restored to the caller's label order. OpenRouter
-listed Jev on 2026-09-24 at \$0.042 per million input tokens with output free
-and a 32k context; its default model listing omits it, and it appears when the
-listing is asked for all output modalities. Because the wire is shared and
-\op{confidence} is normalised to Equation~\eqref{eq:kappa} on both paths, a
-program can move between Jev and Kai by changing one field, and its records
-say which answered.
+$\rho_w = \min_b \lVert\Delta^\star_b\rVert$ is how far a stakeholder must
+disagree with the weights to change the answer. Sampling each Kai cell from its
+distribution estimates the probability that resolving the cells would change
+the recommendation, as well as the cells are calibrated \proposed.
 
-\subsection{Where it runs}
+\subsection{Studies, SysML and the engineering graph}
 
-The same crate is used in three places \proposed.
-\begin{itemize}[leftmargin=1.5em]
-  \item \textbf{In the agent.} Hanzo Dev links the runtime and answers
-    \op{agent.command-risk@1} and \op{agent.preflight@1} on the developer's
-    CPU. The state, which is often a command line or a diff, does not leave
-    the machine to be judged.
-  \item \textbf{In the engine.} Hanzo's inference engine serves
-    \op{/v1/decisions} natively, batching questions across requests.
-  \item \textbf{In the cloud.} Hanzo's cloud exposes \op{/v1/decisions} with
-    its identity, quota and metering, and routes to the engine or to
-    OpenRouter by model name.
-\end{itemize}
-Nothing in the runtime depends on a network service or a Python stack, so the
-same binary serves a disconnected installation, an on-premises cluster or a
-workstation as it serves the cloud, on the tensor library's CPU backend and,
-where present, its CUDA and Metal backends. In a disconnected installation the
-Jev backend is simply absent, and a program that names it fails closed rather
-than falling back to another model.
+A trade study is typed judgments over evidence aggregated into a
+recommendation; in slides it is redone a year later because no one can say
+which conclusion rested on the number that moved. The U.S.\ Army's topic
+ARM26BX06-NV012~\cite{armysbir} asks for studies that are schema-defined,
+agent-assisted, auditable and refreshable: a program, a package, a diff and a
+refresh. The additive score assumes preferentially independent
+criteria~\cite{keeney1976}.
 
-\subsection{First deployment: the coding agent in shadow}
+A SysML~v2~\cite{sysmlv2} model, in a subset of the textual notation or as
+Systems Modeling API JSON, imports into one element model that keeps each
+element's id, metaclass and owner. An engineering knowledge graph built from it
+holds typed entities and relations, each with provenance and a validity
+interval, and answers neighbours, shortest paths, BM25 retrieval, the evidence
+behind a decision, the graph as of a time, and the diff between two revisions;
+a cited JLTV powertrain trade in \texttt{demo/} exercises both \shipped. Read
+through Hanzo's bitemporal assertion graph~\cite{hanzographpaper}, a package
+would replay as known on the day it was decided, separating what changed in the
+world from what changed in the record \proposed.
 
-The first deployment is Hanzo's Slack coding agent, which takes a request in a
-channel and runs it in a sandbox. Every run records \op{agent.preflight@1}
-before it starts and \op{agent.command-risk@1} before each command, in shadow.
-A deployment may run a program in a lower mode than its definition allows,
-never a higher one, so the mode a program is defined with is a ceiling that
-each deployment approaches separately.
-The agent's behaviour is unchanged; the records accumulate the decisions a
-person made on the same states. That is the flywheel: shadow records become
-labelled data, the labelled data trains a Kai checkpoint on Hanzo's own
-traffic, the new checkpoint gets a new calibration and new program versions,
-and each program is promoted only when its shadow counts justify it.
+\subsection{The wire and where it runs}
+
+\op{POST /v1/decisions} speaks OpenRouter's Decisions
+API~\cite{openrouterdecisions} field for field (Appendix~\ref{app:wire}). The
+\op{model} field selects the backend: Kai and kai-1 run in process;
+\op{typesafe/jev-1.13} is forwarded to OpenRouter, each answer checked for its
+type and each choice restored to the caller's order. Hanzo adds
+\op{answer\_confidence}, \op{routing}, and a program form,
+\op{\{program, state\}}, returning verdict and mode. One crate links into the
+Hanzo Dev agent, the inference engine and the cloud; it needs no network service
+or Python, so one binary serves a workstation or a disconnected site, where a
+program naming Jev fails closed \proposed. The first deployment runs
+\op{agent.preflight@1} and \op{agent.command-risk@1} in shadow in Hanzo's Slack
+coding agent; its records become labels, and a program is promoted when its
+shadow counts justify it (Proposition~\ref{prop:friction}).

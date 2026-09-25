@@ -1,14 +1,15 @@
 \section{Kai}
 \label{sec:model}
 
-Kai maps evidence $E$, a typed question and, inside a program, other questions'
-answers to a distribution over the question's options: an evidence encoder, an
-option encoder, a cross-attention head with a law per type, and a refinement
-schedule over dependent questions (Figure~\ref{fig:kai}).
+Kai is one model: a multilingual text encoder, adapters that bring other
+evidence into its width, and a typed-variable decision decoder
+(Figure~\ref{fig:kai}). It maps evidence $E$, a typed question and, inside a
+program, other questions' answers to a distribution over the question's
+options.
 
 \input{figures/kai}
 
-\subsection{Evidence}
+\subsection{Evidence and adapters}
 \label{sec:evidence}
 
 \begin{definition}[Evidence]
@@ -27,11 +28,12 @@ Sensor metadata (unit, rate, calibration, error bound, quality) is input, and
 temporal summaries (instant, window, trend, event, baseline, forecast) are
 records too, produced by code or a forecasting
 model~\cite{das2024timesfm,ansari2024chronos}; a new sensor needs an adapter,
-not a new model. Each modality has one encoder into width $d$: the text encoder;
-one rate-aware encoder for every time series, embedding each sample with its
-timestamp, rate and unit; and frozen Whisper~\cite{radford2023whisper} and
-SigLIP~\cite{zhai2023siglip} with trained projections. Latents are keyed by
-content hash and computed once per changed evidence state \proposed.
+not a new model. Each non-text modality has one adapter into the encoder's
+width $d$: one rate-aware adapter for every time series, embedding each sample
+with its timestamp, rate and unit; frozen Whisper~\cite{radford2023whisper} and
+SigLIP~\cite{zhai2023siglip} front ends with trained projections for audio,
+images and video. Latents are keyed by content hash and computed once per
+changed evidence state \proposed.
 
 Today evidence is JSON read as text: each question's instruction and the
 serialised state form one context,
@@ -39,7 +41,7 @@ serialised state form one context,
 cut at the context length by dropping the state's tail and encoded by
 ModernBERT~\cite{modernbert} or mmBERT~\cite{mmbert} \shipped.
 
-\subsection{Factorized choice}
+\subsection{Decoder: factorized choice}
 \label{sec:factor}
 
 Let $H \in \mathbb{R}^{L\times d}$ be the context's token states plus a learned
@@ -80,7 +82,7 @@ the exchange swaps $s_{\op{true}}$ and $s_{\op{false}}$, and
 $\sigma(-x) = 1 - \sigma(x)$.
 \end{proof}
 
-kai-1 has neither: its options share one sequence, in order.
+Laya has neither: its options share one sequence, in order.
 
 \paragraph{Retrieval.}
 A choice with more than $k = 32$ options is narrowed first. The context's first
@@ -99,13 +101,13 @@ costs $O(k)$ per question for any option count \shipped.
 \paragraph{Training.}
 Log loss plus Brier score against each question's target distribution, both
 strictly proper~\cite{gneiting2007}, plus 0.2 times the retrieval log loss;
-bf16 over f32 masters on Metal, AdamW, token-budgeted batches, encoder from
-kai-1. Data are the train splits of the harness's sources at pinned revisions,
+bf16 over f32 masters on Metal, AdamW, token-budgeted batches. Data are the
+train splits of the harness's sources at pinned revisions,
 minus any example sharing a content unit (the state's text, or the first 200
 letters and digits of a field of 200 or more characters) with a harness
 evaluation state \shipped.
 
-\subsection{Typed-variable diffusion}
+\subsection{Decoder: typed-variable diffusion}
 \label{sec:diffusion}
 
 A program's questions depend on each other, and answered independently they
@@ -155,34 +157,50 @@ and is re-asked by pass $d+1$. Each variable is asked in pass 1 and at most once
 more.
 \end{proof}
 
-Steps 1, 2 and 4 are in the code with the factorized model as the conditional:
+Steps 1, 2 and 4 are in the code with Kai's factorized head as the conditional:
 a re-asked variable sees its parents' answers and probabilities as typed facts
 added to its state, each pass is one batched call, and the projection is an
 exact branch and bound bounded by the sum of per-variable maxima \shipped. The
 trained slot model, the lattice and selector, and distilling the passes into
 one or two are \proposed.
 
-\subsection{Checkpoints and runtime}
+\subsection{One checkpoint line, provenance, runtime}
 \label{sec:checkpoints}
 
-\textbf{kai-1} is \texttt{hanzoai/kai-1} (\texttt{b50502c2}),
-\texttt{kai-1-multilingual} (\texttt{3119843b}) and \texttt{kai-1-agent}
-(\texttt{e3e41649}), whose weights have the SHA-256 of the Laya 0.3.20
-checkpoints~\cite{laya}: ModernBERT-large at context 512, mmBERT-base at 1024,
-and ModernBERT-large fine-tuned on typed decisions~\cite{typeddecisions} at
-1024. Their joint head packs the question, each option after a marker token,
-and the state into one sequence, within a 192--256-token option budget; a script
-detector routes non-English states to the multilingual checkpoint. Every
-measurement of kai-1 is a measurement of Laya \shipped. \textbf{Factorized
-checkpoints} have the architecture above, start from kai-1's encoders, and are
-named by the run that evaluates them (\res{kj/kai/model}, weights
-\res{kj/kai/weights}).
+Kai has one checkpoint line, \texttt{hanzoai/kai}, with a revision per training
+stage: A, typed text decisions (the harness's train splits, MASSIVE in 51
+locales, agentic, coding and skill decisions, CLINC150, XNLI, SST-5, extreme
+choice, robustness); B, the evidence adapters with the encoder frozen (sensors,
+time series, audio, image, video, graph and SysML); C, joint masked decoding
+over whole programs. Stage A's training code is on the main branch \shipped;
+the stages and their revisions are \proposed{} until each has a harness run.
+The encoder is mmBERT-base~\cite{mmbert}, multilingual, at an 8,192-token
+context \proposed; the model code runs any ModernBERT-family
+encoder~\cite{modernbert} \shipped. The revision evaluated here is
+\res{kj/kai/model} (weights \res{kj/kai/weights}).
 
-The runtime is Rust on Hanzo's tensor library, \texttt{hanzo-ml}. The
-\texttt{kai} crate holds the model, question parsing, layout, token-budget
-batching, decoding and refinement, on CPU in f32 and Metal in bf16 \shipped,
-and on CUDA and ROCm where the library builds them \proposed. The
-\texttt{decision} crate serves \op{POST /v1/decisions} over a registry:
-factorized checkpoints and kai-1 in process, Jev through
-OpenRouter~\cite{openrouterdecisions} \proposed. Native kai-1 matches the Python
-reference to \res{par/logit} per logit (Section~\ref{sec:repro}).
+\paragraph{Provenance.}
+Kai initializes from Laya's weights~\cite{laya}, released under Apache-2.0: the
+encoder and type embedding as they are, Laya's two self-attention head layers
+split into the two cross-attention blocks, and its marker scorer as the option
+scorer; retrieval and the ordinal head start fresh \shipped.
+
+\paragraph{Laya, the baseline.}
+Laya 0.3.20's three checkpoints are not Kai revisions: English on
+ModernBERT-large at a 512-token context, multilingual on mmBERT-base at 1,024,
+and Laya-TD, ModernBERT-large fine-tuned on typed
+decisions~\cite{typeddecisions} at 1,024. Their joint head packs the question,
+each option after a marker token, and the state into one sequence within a
+192--256-token option budget, and a script detector routes non-English states
+to the multilingual checkpoint. We run their byte-identical weights in Laya's
+Python reference runtime and natively in Rust through a port of the joint head
+\proposed, whose parity with the reference is \res{par/logit} per logit
+(Section~\ref{sec:repro}).
+
+\paragraph{Runtime.}
+Rust on Hanzo's tensor library, \texttt{hanzo-ml}. The \texttt{kai} crate holds
+the model, question parsing, layout, token-budget batching, decoding and
+refinement, on CPU in f32 and Metal in bf16 \shipped, and on CUDA and ROCm where
+the library builds them \proposed. The \texttt{decision} crate serves
+\op{POST /v1/decisions} over a registry: Kai and Laya in process, Jev through
+OpenRouter~\cite{openrouterdecisions} \proposed.

@@ -232,7 +232,8 @@ def parity(runs):
     if r is None:
         return
     put("par/states", r["states"])
-    put("par/checkpoints", r["checkpoints"])
+    c = r["checkpoints"]
+    put("par/checkpoints", len(c) if isinstance(c, list) else c)
     put("par/labels", "%d/%d" % (r["labels_equal"], r["labels"]))
     for f in ("max_logit", "max_prob", "bound"):
         put("par/" + f.replace("max_", ""), sci(r[f]))

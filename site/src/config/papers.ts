@@ -52,8 +52,9 @@ export const siteConfig: SiteConfig = {
       authors: ['Hanzo AI Research'],
       tags: ['Agents', 'Decisions', 'Policy', 'Calibration', 'Decision Analysis'],
       relatedLinks: [
-        { label: 'Weights: huggingface.co/hanzoai/kai-1', url: 'https://huggingface.co/hanzoai/kai-1' },
-        { label: 'Code: github.com/hanzoai/decision', url: 'https://github.com/hanzoai/decision' },
+        { label: 'Model: docs.hanzo.ai/docs/models/kai', url: 'https://docs.hanzo.ai/docs/models/kai' },
+        { label: 'Benchmarks: github.com/hanzoai/benchmarks', url: 'https://github.com/hanzoai/benchmarks/tree/main/decision' },
+        { label: 'Spec: HIP-1332', url: 'https://github.com/hanzoai/hips/blob/main/HIPs/hip-1332-kai-the-decision-model.md' },
       ],
     },
     {

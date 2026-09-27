@@ -99,6 +99,26 @@ pdfs/%.pdf: %.tex \
 	@touch $@
 	@echo "  OK   $@"
 
+# An arXiv upload is a paper's sources, which arXiv compiles without running
+# bibtex, from one flat directory. So it is the paper directory's tracked TeX,
+# the shared files it names with the ../shared/ prefix dropped, and the .bbl
+# latexmk wrote. The upload is then compiled alone, without bibtex, the way
+# arXiv will; one that needs anything outside itself fails here, not after
+# submission. For a paper in its own directory: make arxiv/kai/kai.tar.gz
+arxiv/%.tar.gz: pdfs/%.pdf
+	@rm -rf arxiv/$* arxiv/$*.check && mkdir -p arxiv/$*
+	@cd $(dir $*) && git ls-files -- '*.tex' '*.sty' '*.cls' '*.bst' '*.pdf' '*.png' '*.jpg' \
+		| tar -cf - -T - | tar -xf - -C $(CURDIR)/arxiv/$*
+	@for n in $$(grep -rhoE '\.\./shared/[A-Za-z0-9_-]+' arxiv/$* | sort -u | sed 's|.*/||'); do \
+		cp shared/$$n.* arxiv/$*/; done
+	@find arxiv/$* -name '*.tex' -exec sed -i.orig 's|\.\./shared/||g' {} + && find arxiv/$* -name '*.orig' -delete
+	@cp pdfs/$*.bbl arxiv/$*/
+	@cp -R arxiv/$* arxiv/$*.check && cd arxiv/$*.check \
+		&& latexmk -pdf -bibtex- -halt-on-error -interaction=nonstopmode -quiet $(notdir $*).tex > /dev/null 2>&1 \
+		|| { echo "  FAIL arxiv/$*: the upload does not compile alone"; false; }
+	@rm -rf arxiv/$*.check && tar -czf $@ -C arxiv/$* .
+	@echo "  OK   $@ ($$(tar -tzf $@ | wc -l | tr -d ' ') files)"
+
 # Clean auxiliary files (keep PDFs). The second sweep clears what the previous
 # rule left at the repo root; latexmk writes beside the PDF and never there.
 .PHONY: clean
@@ -129,6 +149,7 @@ help:
 	@echo "Targets:"
 	@echo "  make -k all               - Compile all $(words $(ALL_TEX)) papers, report every failure"
 	@echo "  make pdfs/<name>.pdf      - Compile a specific paper"
+	@echo "  make arxiv/<dir>/<name>.tar.gz - arXiv upload of a paper in its own directory"
 	@echo "  make list                 - List all discovered papers"
 	@echo "  make clean                - Remove auxiliary files"
 	@echo "  make clean-all            - Remove all generated files"

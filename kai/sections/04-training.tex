@@ -1,0 +1,183 @@
+\section{Training}
+\label{sec:training}
+
+Kai trains in stages on one checkpoint line, in Rust, on the machines Hanzo
+has: an Apple M4 Max (Metal), a DGX Spark (CUDA) and an AMD Strix Halo with a
+Radeon 8060S (ROCm), joined over a LAN. Everything in this section is in the
+\texttt{train} crate \shipped{} unless marked.
+
+\subsection{Stages}
+\label{sec:stages}
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+  \item[A, text decisions.] The train splits of the harness's sources; MASSIVE
+    in all 51 locales and MASSIVE utterances half in English; CLINC150, XNLI in
+    15 languages, SST-5, BoolQ and MNLI; function selection (ToolACE, Glaive,
+    Nemotron's tool calling); agent runs judged by hidden tests (resolve, next
+    action); Hanzo's own agent sessions and repositories, labelled by outcomes
+    (the next tool result, a re-run, a revert, the file a commit changed), never
+    by what the agent chose; 1{,}181 skills; jailbreak prompts collected in the
+    wild; and robustness transforms of 13 sources (options shuffled, relabelled,
+    swapped, subset, near-miss).
+  \item[B, evidence.] Every parameter frozen but the adapters, over bearing
+    faults, turbofan degradation (C-MAPSS), speech, hydraulic rigs, Monash
+    forecasting, network telemetry, UCR series, and generated conflicts
+    (camera against telemetry, specification against SysML, an expired
+    calibration) whose gold is \op{evidence\_conflict}, not
+    \op{decision\_ready}, and \op{human\_review}.
+  \item[C, programs.] The typed-variable decoder over whole programs: rules
+    mined from typed-decision gold, turbofan and test-rig programs, SysML~v2
+    architectures lowered to programs and mutated once per case with the
+    decision's change recorded, readiness, trade and test-plan programs,
+    closed-form vehicle dynamics, and pairs of real telemetry with generated
+    logs; generators hold out templates whole, so validation and test ask new
+    programs.
+\end{description}
+
+A stage is one JSON file: its initial checkpoint (a hub revision, or a finished
+run whose provenance names that stage with every planned batch merged), data
+build, admitted license classes, per-suite takes, frozen prefixes, token
+budget, retrieval loss weights, $k$, schedule and outer optimizer. Stage A has
+run; Section~\ref{sec:findings} is what it taught, and the final stage-A run
+follows from it. The B and C data are built and their stage files written;
+their trained checkpoints are \proposed.
+
+\subsection{Local SGD across devices}
+\label{sec:cluster}
+
+One path trains a stage on one machine or many: local SGD with an outer
+Nesterov step, DiLoCo~\cite{douillard2023diloco}. A coordinator owns the plan,
+$\theta$ in F32, the outer optimizer, validation and checkpoints, and runs
+inside a worker process; other machines join it at any time. Workers pull
+batches one at a time, so a faster device takes more, and run AdamW from
+$\theta$ for a round's wall time (300\,s). Each then sends
+$\Delta_w = \theta_w - \theta$ in bf16 with the tokens it processed, adding
+back what bf16 rounding dropped from its previous delta, error
+feedback~\cite{seide2014onebit,karimireddy2019ef}. With $\Delta$ the
+token-weighted mean of the round's deltas and $g = -\Delta$,
+\begin{equation}
+  m \leftarrow \mu m + g, \qquad \theta \leftarrow \theta - \eta\,(g + \mu m).
+  \label{eq:outer}
+\end{equation}
+The change to $\theta$ goes out in bf16, $\theta$ moves by exactly what went out
+and the remainder joins the next change, so every worker's copy of $\theta$ is
+bit-identical to the coordinator's. Deltas are summed in the order workers
+joined, never the order their reports arrive, so a run does not depend on
+network timing. A batch counts once its delta is merged; a worker that drops
+has its unmerged batches requeued. The handshake checks the build (a hash of
+the model and training sources and the lock file), the tokenized corpus and the
+parameter names.
+
+\begin{proposition}[Outer step]
+\label{prop:outer}
+If every round's mean delta is the same $\Delta$, the outer step of
+Equation~\eqref{eq:outer} tends to $\frac{\eta}{1-\mu}\Delta$.
+\end{proposition}
+\begin{proof}
+$m$ tends to $g/(1-\mu)$, so $\eta(g + \mu m) \to \eta g (1 + \frac{\mu}{1-\mu})
+= \frac{\eta}{1-\mu} g$.
+\end{proof}
+
+So $(\eta, \mu) = (0.7, 0.9)$ moves $\theta$ by $7\times$ a round's mean delta
+wherever rounds agree, and $(1.0, 0.3)$ by $1.43\times$. Section~\ref{sec:collapse}
+is why this number matters.
+
+\paragraph{Exactness.}
+A checkpoint (every so many batches, each epoch, and the end) is taken at a
+round boundary and holds the weights, the outer momentum, its rounding carry,
+the merged batches and the round, and each worker's AdamW moments, step and
+carry, which a worker of that name gets back when it rejoins. Resuming continues
+bit-identically to the uninterrupted run, and with one step a round, $\eta = 1$
+and $\mu = 0$, the cluster equals the same rounds replayed in one process bit
+for bit, for one and three workers (tested on CPU). int8 deltas halve the bytes
+but broke that equivalence by up to $1.3\times10^{-5}$, so deltas stay bf16.
+
+\paragraph{Heterogeneity.}
+The first stage-A run merged 91{,}899 batches from the Metal, CUDA and ROCm
+machines in one run; in its round 45 they took 757, 465 and 226 steps at
+7{,}054, 4{,}226 and 2{,}325 tokens/s \meas. Pilots of one stage on Metal and on
+CUDA agree: mean validation accuracy 0.504 and 0.500 over 48 suites, log loss
+1.493 and 1.501 \meas. ROCm needed three kernels \texttt{hanzo-ml} lacked there
+(comparison, \op{index\_add}, sigmoid); a stage-A delta with the token
+embeddings frozen is 250\,MB in bf16, about 2.2\,s each way over the LAN.
+
+\paragraph{Budget and memory.}
+Compute is bf16 over F32 masters~\cite{micikevicius2018mixed}. A batch is bounded
+by a budget on context tokens, option tokens, option-head query and key tokens,
+rows and evidence tokens, and holds one suite, or a mixed share across suites.
+A device that cannot hold the budget runs a batch as micro-batches within a
+fraction of it with gradients summed (equal to one pass within
+$1.5\times10^{-8}$), and a worker exits cleanly under a free-memory floor, read
+from \texttt{sysctl} on macOS and \texttt{/proc/meminfo} on Linux, rather than
+push a shared machine into swap. Freezing the token embeddings (61\% of the
+weights) raised a stage-A pilot from 5{,}181 to 5{,}747 tokens/s and cut peak
+memory from 53.7 to 47.3\,GB; grouping options by length cut option padding from
+49\% to 14\%; Muon on the 2-D weights ran at 3{,}125 tokens/s with a worse
+validation log loss (2.114 against 2.056) and was removed \meas.
+
+\paragraph{Wide choices.}
+A choice whose options exceed the budget trains as inference answers it: on a
+sample of $k$ options, the gold first, about half the negatives from
+retrieval's current top 64 at $\theta$, a quarter the gold's nearest by token
+Jaccard, the rest uniform. A draw is a function of the row, epoch, round and
+seed, so every worker draws alike. Before this, 42{,}066 of the first stage-A
+plan's 213{,}398 batches were one row whose options alone exceeded the budget,
+and at about 2.9\,MB per option token of a CPU F32 step one such row took a
+machine past its floor at any micro-batch size \meas.
+
+\subsection{Data, licenses and the barrier}
+\label{sec:barrier}
+
+A stage's data is a content-addressed build: the same inputs give the same
+hash, shards are homogeneous in source, dataset, revision, license class and
+transformation, and each record carries its provenance (source, dataset,
+revision, class, transformation, task family, language, domain, decision type,
+candidate count, scope). The manifest, with each shard's SHA-256, is what the
+trainer admits.
+
+\paragraph{License classes.}
+GREEN is permissive or ours; YELLOW is third-party model output from closed or
+unnamed generators; RED is non-commercial, unstated or restrictive terms. A
+record starts at its dataset's class, judged at the upstream source, and only
+rises: one of our own transcripts rises to YELLOW with any message recorded from
+a closed model. A turn carrying such a message is shown to Kai only as the
+person's messages and tool outputs. Classes are recorded facts; which classes
+train is the owner's recorded decision, written into every build (on
+2026-09-25, all three), so a GREEN-only build is one flag. Evaluation is a role,
+not a class: benchmark datasets, every built set's test split, and whatever the
+barrier catches never train, and a run asked to admit them refuses.
+
+\paragraph{The barrier.}
+Every protected evaluation item is read at a pin: the frozen harness's 9{,}499
+states, the extension suites' 82{,}860 test states, the Army demo models, and
+the Enso study's workloads (GPQA Diamond, HLE, LiveCodeBench v6, CharXiv,
+SWE-bench Pro and Verified, Terminal-Bench 2.0), 98{,}065 items; WordNet, which
+the capability suites draw on, is banned outright. A record is caught when
+\begin{itemize}[leftmargin=1.5em]
+  \item it shares an exact content unit with an item: the state's string leaves
+    in order with whitespace squashed and keys ignored, or the first 200 letters
+    and digits of any leaf of 200 or more characters;
+  \item it carries an item's key, a SWE-bench instance id;
+  \item it is a near duplicate: estimated Jaccard of character 5-gram sets at
+    least 0.5, from 256 min-hashes~\cite{broder1997resemblance} in 64 LSH bands
+    of 4, so a pair at Jaccard $j$ is a candidate with probability
+    $1 - (1 - j^4)^{64}$, 0.984 at 0.5, and each candidate is checked on all
+    256;
+  \item it contains an item: at least 80\% of the item's sampled 50-character
+    spans, a span sampled when its hash is 0 mod 16 so both sides sample the same
+    windows; an item of 50 or more characters with fewer than four sampled spans
+    is contained when a text holds its whole normal form.
+\end{itemize}
+The last rule exists because the one before it missed two: a harness test email
+quoted inside a longer train email, and a harness jailbreak prompt opening a
+longer one, reached five records of the first stage-A build. Planted over every set (twenty
+items each, verbatim, with a word dropped and two swapped, and inside 1{,}900
+characters of transcript), nothing of 50 or more characters reaches a shard; an
+item under 50 characters, a MASSIVE or CLINC utterance, is caught only when
+equal or near, since phrases that short recur in unrelated text. The build the
+final stage-A run reads (\texttt{a3-d7a9a437cf484811}) read 2{,}762{,}444
+records and caught 19{,}803: against the harness 14{,}875 near duplicates and 71
+containments, against the extension suites 4{,}818 near, 34 exact and 3
+contained, and 2 SWE-bench keys; 547 of typed decisions' 1{,}185 train states
+were caught near (Section~\ref{sec:overlap}). Its records are 1{,}799{,}005
+GREEN, 217{,}727 YELLOW and 713{,}841 RED \meas.

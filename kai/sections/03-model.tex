@@ -1,92 +1,136 @@
 \section{Kai}
 \label{sec:model}
 
-Kai is one model: a multilingual text encoder, adapters that bring other
-evidence into its width, and a typed-variable decision decoder
-(Figure~\ref{fig:kai}). It maps evidence $E$, a typed question and, inside a
-program, other questions' answers to a distribution over the question's
-options.
+Kai is one model: a multilingual text encoder, adapters that bring any other
+evidence into its width, a factorized option head, and a typed-variable decoder
+over a program's questions (Figure~\ref{fig:kai}). It maps evidence $E$, a
+typed question and, inside a program, other questions' answers to a
+distribution over the question's options. Everything in this section is in the
+\texttt{kai} crate \shipped; what is trained, and when, is
+Section~\ref{sec:training}.
 
 \input{figures/kai}
 
-\subsection{Evidence and adapters}
+\subsection{Evidence}
 \label{sec:evidence}
 
 \begin{definition}[Evidence]
 An evidence record is a tuple
 \[
   e = (\mathit{id}, \mathit{modality}, t, \mathit{source}, \mathit{frame},
-  \mathit{unit}, \mathit{payload}, \mathit{uncertainty}, \mathit{provenance})
+  \mathit{unit}, \mathit{sensor}, \mathit{uncertainty}, \mathit{quality},
+  \mathit{provenance}, \mathit{payload})
 \]
-of a modality (text, JSON, time series, audio, image, video, or
-$\op{Custom}(\cdot)$), a time or interval, the payload's frame and unit, the
-source's error model, and the producer with its inputs. A decision's evidence
-is a set of records.
+of an identifier the state's text may cite, a modality (eighteen named, any
+other a $\op{Custom}(\cdot)$), a time span, the payload's frame and unit, sensor
+metadata (sensor, location, calibration date and validity, limits, and per
+channel a name, unit, calibration, error bound and quality), an uncertainty (a
+standard deviation, an interval or a quality grade), a quality flag (valid,
+degraded or expired, with a loss share), the producer with its inputs, and a
+payload: text, JSON, numeric channels with a rate or timestamps, bytes, frames,
+a grid, a vector, points, or a URL the caller resolves. A decision's evidence is
+the state plus a set of records.
 \end{definition}
 
-Sensor metadata (unit, rate, calibration, error bound, quality) is input, and
-temporal summaries (instant, window, trend, event, baseline, forecast) are
-records too, produced by code or a forecasting
-model~\cite{das2024timesfm,ansari2024chronos}; a new sensor needs an adapter,
-not a new model. Each non-text modality has one adapter into the encoder's
-width $d$: one rate-aware adapter for every time series, embedding each sample
-with its timestamp, rate and unit; frozen Whisper~\cite{radford2023whisper} and
-SigLIP~\cite{zhai2023siglip} front ends with trained projections for audio,
-images and video. Latents are keyed by content hash and computed once per
-changed evidence state \proposed.
+A new sensor needs an adapter, not a new model, and a number is never serialized
+as prose: 43.2\,\textdegree C, 43.2\,psi and 43.2\,mm/s differ by their unit,
+and an expired calibration weakens the record. The adapter follows from the
+payload's form. Text and JSON go through the text encoder, pooled. Numeric
+channels go through a sensor encoder: patches of the series as points, log
+bands and statistics, six summary tokens per channel (instant, windows, trend,
+events, baseline, forecast), and each channel's metadata line through the text
+encoder. Audio takes two paths, Whisper-base~\cite{radford2023whisper}, frozen,
+for what is said and the sensor encoder over the waveform for how it sounds;
+images and thermal or radar grids go through SigLIP~\cite{zhai2023siglip},
+frozen; video becomes appearance, motion and event tokens from SigLIP per
+frame, never unbounded frame tokens; vectors and point clouds go through a
+projector. Every token gains embeddings for its modality, quality, descriptor
+(time, uncertainty) and metadata line. The context the option head attends to
+is the text encoder's tokens followed by the evidence tokens; retrieval's query
+stays the text's. Forecasts from time-series
+models~\cite{das2024timesfm,ansari2024chronos} enter as records, not answers.
 
-Today evidence is JSON read as text: each question's instruction and the
-serialised state form one context,
-\texttt{[CLS]}~$\langle\tau\rangle$~\texttt{question:}~$\iota$~\texttt{[SEP]}~$s$~\texttt{[SEP]},
-cut at the context length by dropping the state's tail and encoded by
-ModernBERT~\cite{modernbert} or mmBERT~\cite{mmbert} \shipped.
+A checkpoint that declares no evidence answers bit for bit as a text-only one,
+so adapters can be added to a trained line. On an Apple M1 Max in F32 with the
+adapters untrained, preparing and encoding 10\,s of six-channel 1\,kHz
+telemetry into 30 tokens takes 28\,ms on Metal (551\,ms on CPU, nearly all of
+it the metadata lines through the text encoder); 10\,s of 16\,kHz audio on both
+paths, 138\,ms; one 384-pixel image, 47\,ms; sixteen video frames into 63 event
+tokens, 508\,ms (median of five, \texttt{bench latency}) \meas.
 
-\subsection{Decoder: factorized choice}
+\paragraph{Encode once.}
+A state is encoded once and each question alone,
+\[
+  \texttt{[CLS]}\ s\ \texttt{[SEP]}
+  \qquad\text{and}\qquad
+  \texttt{[CLS]}\ \langle\tau\rangle\ \texttt{question:}\ \iota\ \texttt{[SEP]};
+\]
+an option's tokens attend to the question's tokens with its evidence and to the
+state's tokens under one softmax, the state's keys and values projected once
+and gathered per row. Every distinct option in a batch is encoded once for all
+the questions that list it, and inside a program session every evidence record,
+question and option is encoded once whatever the number of refinement passes.
+The earlier layout, one sequence per question with the state inside it, uses
+the same weights, so a checkpoint answers under either. Keeping latents across
+calls, keyed by content hash per changed evidence state and per program
+version, is \proposed.
+
+\subsection{Factorized choice}
 \label{sec:factor}
 
-Let $H \in \mathbb{R}^{L\times d}$ be the context's token states plus a learned
-type embedding $e_\tau$, and $O_i \in \mathbb{R}^{L_i\times d}$ those of option
-$i$, encoded alone as \texttt{[CLS]}~$c_i$~\texttt{[SEP]}. An option's encoding
-depends on its text only, so each distinct option in a batch is encoded once
-for every question that lists it \shipped, and across calls once per program
-version \proposed. Two pre-norm cross-attention blocks, in which option tokens
-attend to context tokens and nothing else, give
-$X_i = B_2(B_1(O_i + e_\tau, H), H)$; with $v_i$ the mean of $X_i$,
+Let $C$ be the tokens a question's options attend to, each with the question
+type's learned embedding $e_\tau$ added, and $O_i \in \mathbb{R}^{L_i\times d}$
+the token states of option $i$, encoded alone as
+\texttt{[CLS]}~$c_i$~\texttt{[SEP]}. Two pre-norm cross-attention blocks, in
+which option tokens attend to the context and to nothing else, give
+$X_i = B_2(B_1(O_i + e_\tau, C), C)$; with $v_i$ the mean of $X_i$,
 \begin{equation}
   s_i = w^{\top}\,\mathrm{GELU}\bigl(W\,\mathrm{LN}(v_i) + b\bigr).
 \end{equation}
 The type fixes the law, at a temperature $T$ fitted per type and option-count
-bucket on validation data \shipped:
+bucket on held-out data:
 \begin{itemize}[leftmargin=1.5em]
   \item \op{choice}: $p_i = \operatorname{softmax}_i(s_i/T)$.
   \item \op{noul}: $p_{\op{true}} = \sigma\bigl((s_{\op{true}} -
     s_{\op{false}})/T\bigr)$, each side scored with its own description.
   \item \op{score}: a cumulative-link model~\cite{mccullagh1980} over levels
-    $1..k$, $P(y \le j) = \sigma\bigl((\theta_j - \eta)/T\bigr)$. The location
-    $\eta = a^{\top}\bar v$ reads the state-aware level vectors; the cutpoints
-    read the level texts alone,
-    $\theta_j = b^{\top}\bar o + \sum_{i \le j}
-    \operatorname{softplus}(g^{\top}[\bar o_i; \bar o_{i+1}])$ with $\bar o_i$
-    the mean of $O_i$, so they are ordered.
+    $0..k-1$ with cutpoints $\theta_1 < \dots < \theta_{k-1}$ and
+    $P(y < j) = \sigma(\theta_j - \eta)$. The location $\eta = a^{\top}
+    \mathrm{std}(\bar v - c)$ reads the mean of the state-aware level vectors
+    less a running center $c$; the cutpoints read the level texts alone, a base
+    $b^{\top}\mathrm{std}(\bar o)$ and gaps
+    $\theta_{j+1} - \theta_j = \operatorname{softplus}(g^{\top}
+    [\mathrm{std}(\bar o_j); \mathrm{std}(\bar o_{j+1})])$, with $\bar o_j$ the
+    mean of $O_j$ and $\mathrm{std}$ each vector at zero mean and unit variance.
+    The likelihood is computed in log space,
+    $\log P(y = j) = \log\sigma(\theta_{j+1} - \eta) + \log\sigma(\eta -
+    \theta_j) + \log\sigma(g_j)$, which is exact and never a difference that
+    rounds to zero.
 \end{itemize}
+The scorer and the ordinal layers compute in F32 whatever the encoder's dtype:
+what decides is a difference of two outputs that can share an offset far larger
+than it (Section~\ref{sec:other}).
 
 \begin{proposition}[Symmetry]
 \label{prop:symmetry}
 For any weights, permuting a question's options permutes $p$ the same way, and
 exchanging the texts of a \op{noul}'s sides maps $p_{\op{true}}$ to
-$1 - p_{\op{true}}$ \shipped.
+$1 - p_{\op{true}}$.
 \end{proposition}
 \begin{proof}
-$s_i$ depends on $c_i$ and $H$ alone, and softmax is permutation equivariant;
+$s_i$ depends on $c_i$ and $C$ alone, and softmax is permutation equivariant;
 the exchange swaps $s_{\op{true}}$ and $s_{\op{false}}$, and
 $\sigma(-x) = 1 - \sigma(x)$.
 \end{proof}
 
-Laya has neither: its options share one sequence, in order.
+Laya has neither: its options share one sequence, in order, and each is read at
+a marker token whose context includes the options before it.
 
 \paragraph{Retrieval.}
-A choice with more than $k = 32$ options is narrowed first. The context's first
-token and each option's mean token are projected to unit vectors $u$, $r_i$;
+A choice with more than $k$ options, a checkpoint field (32 in the first stage-A
+run, 160 since), is narrowed first. The sum of the context's first tokens and
+each option's mean token are projected, each less a running center, to unit
+vectors $u$ and $r_i$, and
 $\pi = \operatorname{softmax}_i(e^{\gamma}\langle u, r_i\rangle)$ with $\gamma$
 learned. The head scores the top $k$ under $\pi$, a set $S$, and the rest keep
 their retrieval probability:
@@ -96,18 +140,12 @@ their retrieval probability:
   \qquad \rho = \sum_{i \notin S} \pi_i ,
 \end{equation}
 so the mass beyond the top $k$ is kept, not renormalised away, and the head
-costs $O(k)$ per question for any option count \shipped.
+costs $O(k)$ per question for any option count. A running center moves 1\% of
+the way to each training batch's mean input after its step and takes no
+gradient; without it, encoder states' shared offset gave every context nearly
+the same query (Section~\ref{sec:other}).
 
-\paragraph{Training.}
-Log loss plus Brier score against each question's target distribution, both
-strictly proper~\cite{gneiting2007}, plus 0.2 times the retrieval log loss;
-bf16 over f32 masters on Metal, AdamW, token-budgeted batches. Data are the
-train splits of the harness's sources at pinned revisions,
-minus any example sharing a content unit (the state's text, or the first 200
-letters and digits of a field of 200 or more characters) with a harness
-evaluation state \shipped.
-
-\subsection{Decoder: typed-variable diffusion}
+\subsection{Typed-variable diffusion}
 \label{sec:diffusion}
 
 A program's questions depend on each other, and answered independently they
@@ -116,91 +154,115 @@ can break its rules: approving an invoice flagged as a duplicate.
 \begin{definition}[Typed variables]
 A program's questions are variables $Z = (Z_v)_{v \in V}$, each with a finite
 domain $D_v$ (labels, levels, or a \op{noul}'s sides), with a dependency DAG
-$G$ on $V$ and rules $R$, each on two variables:
+$G$ on $V$ and rules $R$, each on two answers:
 $Z_a = i \Rightarrow Z_b = j$, or $\lnot(Z_a = i \land Z_b = j)$.
 \end{definition}
 
-Kai predicts masked slots jointly: for a masked set $M \subseteq V$,
+The decoder predicts masked slots jointly: for a masked set $M \subseteq V$,
 \begin{equation}
   p_\theta(Z_M \mid E, Z_{V\setminus M}, G) = \prod_{v \in M}
-  p_\theta(Z_v \mid E, Z_{V\setminus M}, G),
+  p_\theta(Z_v \mid E, Z_{V\setminus M}, G).
 \end{equation}
-each slot a query over the evidence latents and the visible slots, scored
-against its own domain by the head above. Training draws $t \sim U(0,1)$ and
-masks each variable with probability $t$: absorbing-state discrete
-diffusion~\cite{austin2021d3pm} over typed variables, not tokens. $M = V$ is a
-set of independent questions; $|M| = 1$ asks one with all others known
-\proposed.
+A slot is its question's mean token plus a value: a learned mask vector while
+its answer is unknown, else the known option's mean token through a linear map.
+Decoder layers let each slot attend to the others, with a learned per-head bias
+for a parent, a child, any other slot, and itself when its answer is shown,
+beside a null key of value zero, and then to the evidence latents. The last
+read is the variable's message; through a map that starts at zero it is added
+to the query tokens of the variable's options, which the factorized head then
+scores against the question and the evidence. A variable with nothing else to
+read gets a message of exactly zero, so one variable alone is the factorized
+head, and a new decoder answers as the checkpoint it starts from (tested to
+$10^{-5}$). For a shown slot the distribution revises the answer shown, and
+$1 - p(\text{shown})$ flags it.
 
-\paragraph{Inference.}
-Passes are spent on uncertainty.
+Training (stage C) hides variables by one of three patterns: $\lceil r n\rceil$
+of $n$ at random with $r \sim U(0, 1]$, absorbing-state discrete
+diffusion~\cite{austin2021d3pm} over typed variables rather than tokens; a node
+and all its descendants; or only the descendants. It tests 15\% of the shown
+answers, half of those shown wrong, so the model learns to revise a wrong
+answer and keep a right one. The loss is log loss plus Brier score over hidden
+and tested variables, plus the mean probability that the joint state breaks a
+rule: $q(a)(1 - q(b))$ for $a \Rightarrow b$, $q(a)\,q(b)$ for
+$\lnot(a \land b)$. Every program of two or more variables gains a \op{defer}
+variable reading all the others, whose gold is to act when every answer is
+clear (top probability at least 0.9) and to defer otherwise.
+
+\paragraph{Refinement.}
+One scheduler serves any model that answers a set of questions given known
+answers: the decoder with known answers as visible slots, or the factorized
+head with a node's known parents added to its state as typed facts. Passes are
+spent on uncertainty.
 \begin{enumerate}[leftmargin=1.5em]
-  \item Pass 1 predicts every variable and freezes those whose top probability
-    reaches $\tau$.
-  \item Pass $d+1$ re-asks, once, each unfrozen variable whose parents are all
-    settled (frozen, roots, or re-asked), conditioned on their answers.
-  \item Each unsettled variable keeps its top $m$ candidates; a small selector
-    scores assignments of the candidate lattice for coherence.
-  \item A deterministic projection returns
-    $\hat z = \arg\max_{z \models R} \sum_{v} \log p_v(z_v)$.
+  \item Pass 1 predicts every variable with nothing known and freezes those
+    whose top probability reaches $\tau$.
+  \item Waves by dependency depth: a variable settles once frozen, a root, or
+    re-asked; each wave asks, once, every unsettled variable whose parents have
+    all settled, and freezes again.
+  \item Each unfrozen variable keeps its top $m$ candidates. One more pass asks
+    each unfrozen variable's unfrozen children with the variable set to each
+    candidate, giving pairwise terms
+    $\log p(\text{child} \mid \text{node} = c) - \log p(\text{child})$;
+    variables sharing a child are set in different jobs, so each term
+    conditions on one variable alone.
+  \item A selector takes the joint answer over the candidates of highest
+    log-probability plus pairwise terms that keeps every rule.
+  \item A projection onto the rules over the full domains,
+    $\hat z = \arg\max_{z \models R} \sum_{v} \log p_v(z_v)$, moves nothing
+    when the selection already keeps them.
 \end{enumerate}
 
 \begin{proposition}[Depth bounds cost]
 \label{prop:depth}
 Steps 1 and 2 end within $\operatorname{depth}(G) + 1$ passes, depth counted in
-edges, and ask at most $2|V|$ questions.
+edges, and ask at most $2|V|$ questions; with step 3, refinement takes at most
+$\operatorname{depth}(G) + 2$ passes whatever $|V|$.
 \end{proposition}
 \begin{proof}
 Roots and frozen variables are settled after pass 1. If every variable of depth
 below $d$ is settled after pass $d$, each of depth $d$ has all parents settled
 and is re-asked by pass $d+1$. Each variable is asked in pass 1 and at most once
-more.
+more. Step 3 is one pass.
 \end{proof}
 
-Steps 1, 2 and 4 are in the code with Kai's factorized head as the conditional:
-a re-asked variable sees its parents' answers and probabilities as typed facts
-added to its state, each pass is one batched call, and the projection is an
-exact branch and bound bounded by the sum of per-variable maxima \shipped. The
-trained slot model, the lattice and selector, and distilling the passes into
-one or two are \proposed.
+Selection and projection are exact branch and bound, each node's options tried
+best first and bounded by the sum of per-variable maxima. Rules between answers
+encode graph colouring, so exact selection is exponential on some graphs: the
+search stops with an error after $2^{20}$ steps rather than return an answer it
+has not proved.
 
-\subsection{One checkpoint line, provenance, runtime}
+\subsection{One checkpoint line}
 \label{sec:checkpoints}
 
 Kai has one checkpoint line, \texttt{hanzoai/kai}, with a revision per training
-stage: A, typed text decisions (the harness's train splits, MASSIVE in 51
-locales, agentic, coding and skill decisions, CLINC150, XNLI, SST-5, extreme
-choice, robustness); B, the evidence adapters with the encoder frozen (sensors,
-time series, audio, image, video, graph and SysML); C, joint masked decoding
-over whole programs. Stage A's training code is on the main branch \shipped;
-the stages and their revisions are \proposed{} until each has a harness run.
-The encoder is mmBERT-base~\cite{mmbert}, multilingual, at an 8,192-token
-context \proposed; the model code runs any ModernBERT-family
-encoder~\cite{modernbert} \shipped. The revision evaluated here is
-\res{kj/kai/model} (weights \res{kj/kai/weights}).
-
-\paragraph{Provenance.}
-Kai initializes from Laya's weights~\cite{laya}, released under Apache-2.0: the
-encoder and type embedding as they are, Laya's two self-attention head layers
-split into the two cross-attention blocks, and its marker scorer as the option
-scorer; retrieval and the ordinal head start fresh \shipped.
+stage; language, domain, modality and hardware are not product lines. The
+encoder is mmBERT-base~\cite{mmbert}, multilingual with 8{,}192 positions,
+trained at 1{,}024 tokens; the code runs any ModernBERT-family
+encoder~\cite{modernbert}. Kai initializes from Laya's multilingual
+weights~\cite{laya}, released under Apache-2.0: the encoder and type embedding
+as they are, Laya's two self-attention head layers split into the two
+cross-attention blocks, and its marker scorer as the option scorer; retrieval
+and the ordinal head start fresh.
 
 \paragraph{Laya, the baseline.}
 Laya 0.3.20's three checkpoints are not Kai revisions: English on
 ModernBERT-large at a 512-token context, multilingual on mmBERT-base at 1,024,
-and Laya-TD, ModernBERT-large fine-tuned on typed
-decisions~\cite{typeddecisions} at 1,024. Their joint head packs the question,
-each option after a marker token, and the state into one sequence within a
-192--256-token option budget, and a script detector routes non-English states
-to the multilingual checkpoint. We run their byte-identical weights in Laya's
-Python reference runtime and natively in Rust through a port of the joint head
-\proposed, whose parity with the reference is \res{par/logit} per logit
-(Section~\ref{sec:repro}).
+and a typed-decisions checkpoint, the English one fine-tuned on the
+typed-decisions~\cite{typeddecisions} train split. Their joint head packs the
+question and each option after a marker token into one sequence with the state,
+and a script detector routes non-English states to the multilingual checkpoint.
+Hanzo serves their byte-identical weights natively through a Rust port of the
+joint head: against Laya's Python reference on 21 recorded states in twelve
+languages and all three checkpoints, the largest logit difference is
+$2.86\times 10^{-5}$ against an enforced bound of $10^{-4}$, the largest
+probability difference $6.2\times 10^{-6}$, and 108 of 108 labels agree
+(\texttt{decision/tests/parity.rs}) \meas. Every decision records the weights'
+SHA-256 it was answered with.
 
 \paragraph{Runtime.}
-Rust on Hanzo's tensor library, \texttt{hanzo-ml}. The \texttt{kai} crate holds
-the model, question parsing, layout, token-budget batching, decoding and
-refinement, on CPU in f32 and Metal in bf16 \shipped, and on CUDA and ROCm where
-the library builds them \proposed. The \texttt{decision} crate serves
-\op{POST /v1/decisions} over a registry: Kai and Laya in process, Jev through
-OpenRouter~\cite{openrouterdecisions} \proposed.
+Rust on Hanzo's tensor library, \texttt{hanzo-ml}, on CPU in F32 and on Metal,
+CUDA and ROCm in bf16. The \texttt{decision} crate serves
+\op{POST /v1/decisions} with Kai and Laya in process and Jev through
+OpenRouter, one worker per checkpoint draining its queue into shared forward
+passes; the \texttt{control} crate runs a program over many states in process
+behind a C ABI (Section~\ref{sec:enso}). No Python is on the serving path.

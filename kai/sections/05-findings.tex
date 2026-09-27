@@ -1,0 +1,143 @@
+\section{What stage A taught}
+\label{sec:findings}
+
+Every figure in this section is \meas{}, from runs whose logs, stage files and
+scripts are kept beside the paper in \texttt{data/diagnosis/} or recorded in
+\texttt{hanzoai/decision}'s \texttt{LLM.md}.
+
+\subsection{The encoder stopped relating two texts}
+\label{sec:collapse}
+
+The first stage-A run started from Laya's multilingual weights and trained one
+epoch of the full mixture, 91{,}899 batches over three machines, with the outer
+step $(\eta, \mu) = (0.7, 0.9)$, $7\times$ a round's mean delta
+(Proposition~\ref{prop:outer}). Validation split in two. Tasks that relate two
+texts fell: RAG relevance was 0.625 and BoolQ 0.826 at 2{,}325 batches, 0.482
+and 0.668 at 13{,}101, and RAG's log loss sat at $\ln 2$ at every validation
+after; from 13{,}101 batches to the end MNLI fell from 0.713 to 0.593 and XNLI
+from 0.698 to 0.630. Single-text tasks rose over the same span: AG News from
+0.375 to 0.845, emotion from 0.525 to 0.679, MASSIVE from 0.440 to 0.730. On the
+frozen harness the checkpoint answered RAG relevance at chance (F32 accuracy
+0.480, AUC 0.486, 374 of 400 questions answered relevant), and a ridge probe on
+the head's option vectors read relevance at AUC 0.35 where the same probe read
+jailbreak at 0.93. Its encoder layers ended 30 to 44\% (relative Frobenius
+norm) from their initial weights; the English baseline of the same head,
+trained in one process at the same learning rates for 53{,}322 steps, ended 5\%
+from its own and kept RAG relevance at 0.682.
+
+\paragraph{Not the data.}
+All 155{,}761 RAG training records agree with MS~MARCO's \op{is\_selected}
+label, except 281 pairs MS~MARCO itself labels both ways; the classes are
+balanced (77{,}955 and 77{,}806), and 76{,}109 queries carry exactly one
+selected and one unselected passage. The relabelling transform leaves every
+target as it was and the side swap reverses target and option texts together
+on all 3{,}995 rows. The barrier removed 339 of 159{,}258 records. Truncation
+(contexts of 52 to 250 tokens under a 1{,}024-token limit), the fitted
+temperature, the class prior and bf16 were each ruled out.
+
+\paragraph{The encoder, not the head.}
+Single-process fits on the RAG shards alone, on Metal, locate the fault:
+\begin{itemize}[leftmargin=1.5em]
+  \item from Laya's multilingual weights, validation accuracy reached 0.645
+    after 229 batches;
+  \item from the stage-A checkpoint it stayed at 0.497 and 0.495, training log
+    loss at 0.693, chance; 0.522 in F32;
+  \item stage A's encoder under the head of the Laya run at 229 batches: 0.517,
+    then 0.497, training loss at 0.693;
+  \item that run's encoder under stage A's head: 0.662 after 104 batches, the
+    training loss falling to 0.45.
+\end{itemize}
+Measured on the encoders alone, over 200 RAG validation contexts laid out as Kai
+lays them and run in F32 by an independent ModernBERT implementation, the mean
+cosine similarity between different contexts' mean token states is 0.981 for
+stage A against 0.853 for Laya (1 would make every context the same), and
+swapping only the query moves the passage tokens' states by 0.085 of their norm
+in stage A against 0.34 in Laya and 0.73 in the RAG-trained encoder. Stage A's
+encoder had stopped letting one text change how it reads the other.
+
+\paragraph{The cause.}
+The outer step alone does not do it: on the RAG shards alone, from Laya's
+weights, with $(0.7, 0.9)$, validation read 0.590, 0.532, 0.623 and 0.580,
+noisier than plain training and never at chance. One process over the English
+mixture does not do it either (the baseline above). The full mixture under the
+$7\times$ outer step does. Which part of the mixture drives it would take a
+replay of stage A, which we did not run. Two continuations agree. Stage a2
+continued stage A with the same outer step and regressed on Metal and CUDA
+alike, then diverged in cooldown (training log loss 2.85 to 13.45 while the
+learning rate fell to a tenth); stage a3 continued it with $(1.0, 0.3)$ and
+inherited the collapse, validation RAG 0.497, BoolQ 0.638, MNLI 0.583 and XNLI
+0.600 at 16{,}598 batches while its single-text suites were at their best (AG
+News 0.890, emotion 0.831, MASSIVE 0.787), and was stopped.
+
+\paragraph{The fix.}
+The final stage-A run starts again from Laya's multilingual weights, over a3's
+data (two epochs of the harness's train suites at the English baseline's takes,
+the rest of the mixture as replay), with the outer step $(1.0, 0.3)$,
+$1.43\times$ a round's mean delta, and validates every 8{,}000 batches so a
+repeat shows early. Logging the context similarity above at each validation, a
+cheap early warning, is \proposed. The harness decides whether the fix held;
+its tables are Section~\ref{sec:accuracy}'s.
+
+\subsection{Laya had seen half the typed-decisions test set, reworded}
+\label{sec:overlap}
+
+The barrier caught 547 of the 1{,}185 typed-decisions train states it read, all
+as near duplicates (measure 0.50 to 0.97, median 0.61), none exact. Laya's
+typed-decisions checkpoint was fine-tuned on the whole train split. Measured
+over its 1{,}200 rows with the barrier's measure (a state's string leaves;
+numbers ignored), 587 rows sit at Jaccard 0.5 or more from some test state, all
+in two of the four workflows (agent traces 298 of 300, invoices 289 of 300); on
+the test side, 200 of the 400 states, every agent-trace and every invoice
+state, have such a sibling. They are template siblings, not copies:
+\begin{itemize}[leftmargin=1.5em]
+  \item with numbers included no train state equals a test state; the closest
+    pair scores 0.90, and 44 score 0.8 or more;
+  \item a caught train row agrees with its nearest test state on 0.406 of the
+    questions and on all five in 38 of 587, where random train and test states
+    of the same workflow agree on 0.416 and on all five 5.3\% of the time;
+  \item the test set shares templates with itself as much: 195 of its 400
+    states have another test state at 0.5 or more.
+\end{itemize}
+One pair: the same task (``Update every service to the patched logging
+library.''), agent and constraint; in train one constraint violation and one
+irreversible action, gold \emph{harmful}, \emph{human review}, risk 3; in test
+none of either and two tool errors, gold \emph{partial}, \emph{observe}, risk 1.
+So Laya's typed-decisions checkpoint saw same-wording siblings of half the test
+set, with different numbers and different gold, and no near-copy of a test
+answer. Its typed-decisions score measures a model that knows the templates;
+Kai's builds drop the 547, so Kai trains on 638 of the states the builder reads.
+
+\subsection{Other defects, each fixed}
+\label{sec:other}
+
+\begin{description}[leftmargin=1.5em,style=nextline]
+  \item[A shared offset decided every score question alike.] The head's option
+    vectors share an offset of norm 18{,}400 against 350 to 950 of what varies
+    across rows; standardized, 99.83\% of the ordinal location's input energy
+    was one vector for all 800 typed-decision score rows, so each question got
+    one level whatever the state. The location now reads its level vectors less
+    a running center; in its test, removing the center collapses the spread of
+    locations from 0.33 to 0.01.
+  \item[bf16 rounded the decision away.] At that offset Metal's bf16 moved
+    \op{noul} logits in steps of 0.0625: RAG's 400 answers took 15 distinct
+    values, 69 of them exact ties. The scorer and ordinal layers now compute in
+    F32.
+  \item[Retrieval gave every context one query.] At 49{,}071 batches the skills
+    choice (1{,}181 options) had recall@32 of 0.000 against a chance of 0.027.
+    Contexts' first tokens had norm 48.7, 47.9 of it their shared mean, pairwise
+    cosine 0.97; projected raw, every skills context got nearly the same query
+    (cosine 0.995). A fresh retrieval head fit on those frozen states recalled
+    0.137 of its own training rows at 32 raw and 0.934 centered: hence the
+    running centers of Section~\ref{sec:factor}.
+  \item[The ordinal head had no gradient.] From the initial weights $\eta$
+    started near 95 against cutpoints of 4 to 9, and a clamped difference of two
+    sigmoids had no gradient once both rounded alike. With the log-space
+    likelihood of Section~\ref{sec:factor}, one epoch of SST-5 alone moved test
+    accuracy from 0.126 to 0.455 and log loss from 24.14 to 1.213.
+  \item[A balanced class taught the wrong prior.] Jailbreak detection trained
+    balanced, at $P = 0.5$, where the harness asks at 0.228 (91 of 400). It
+    ranked well (F32 AUC 0.834) at the wrong prior: at one half it flagged 223
+    of 400, accuracy 0.620; at the harness's prior, 0.850. Later stages draw it
+    at its pool's rate, with every in-the-wild jailbreak prompt of JailbreakHub
+    and 4{,}000 of its regular prompts as negatives.
+\end{description}

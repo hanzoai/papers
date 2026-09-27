@@ -65,10 +65,11 @@ all: $(ALL_PDFS)
 #   -outdir         absolute, because -cd moved us: PDF and aux land together
 #                   under pdfs/, never at the repo root
 #
-# A paper is more than its .tex. A figure, a section fragment, a .bib, a local
-# .sty or the shared preamble all change the PDF, so all of them have to change
-# the build. Without them `make` answers "up to date" over a stale PDF after a
-# figure edit, which is the same silent success the old `|| true` produced.
+# A paper is more than its .tex. A figure, a section fragment, a generated
+# table, a .bib, a local .sty or the shared preamble all change the PDF, so all
+# of them have to change the build. Without them `make` answers "up to date"
+# over a stale PDF after a figure edit, which is the same silent success the old
+# `|| true` produced.
 # Secondary expansion is what makes $* usable in a pattern rule's prerequisites.
 # The sibling-.tex line is skipped for a paper that lives at the repository
 # root, where it would make all 150 of them depend on each other.
@@ -82,6 +83,7 @@ all: $(ALL_PDFS)
 pdfs/%.pdf: %.tex \
             $$(wildcard $$(dir $$*)figures/*.tex) \
             $$(wildcard $$(dir $$*)sections/*.tex) \
+            $$(wildcard $$(dir $$*)tables/*.tex) \
             $$(if $$(filter ./,$$(dir $$*)),,$$(wildcard $$(dir $$*)*.tex)) \
             $$(wildcard $$(dir $$*)*.bib) \
             $$(wildcard $$(dir $$*)*.sty) \

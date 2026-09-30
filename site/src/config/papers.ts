@@ -39,24 +39,6 @@ export const siteConfig: SiteConfig = {
   accentColor: '#00D9FF',
   logo: '/logos/hanzo-logo.svg',
   papers: [
-    // --- Typed decisions: Kai and Hanzo Decision ---
-    {
-      id: 'kai',
-      title: 'Kai: Typed Decision Models as a Control Plane for Agentic Systems',
-      subtitle: 'Decisions as versioned programs under deterministic policy, with sensitivity and refresh for auditable studies',
-      abstract: 'Most AI systems treat a decision as text: evidence goes into a prompt and a recommendation comes out as prose. Hanzo Decision treats the decision as a program. A decision is a typed question (choice, score or noul) over explicit state, answered with a probability distribution over the options the caller listed, in one encoder forward pass with no generated text. Kai is the model family that answers these questions: three open checkpoints derived from Laya, published as hanzoai/kai-1, kai-1-multilingual and kai-1-agent. Versioned Decision Programs bind thresholds to a calibration and run in shadow, advisory or enforced mode. A deterministic policy stays the authority: the effective verdict is the join of the policy verdict and the model verdict on allow < ask < deny, so no model output can loosen a policy verdict, and the cost of enforcing a model is friction that shadow records count exactly. POST /v1/decisions is wire-compatible with OpenRouter\'s Decisions API and routes by model name to Kai or to Jev. For trade studies, a Decision Package records the typed answers over evidence, computes the smallest weight, answer or assumption change that flips the recommendation, and on refresh recomputes only what changed. In a recorded run, two of the three bootstrap checkpoints ranked allow first for a command that sends a private SSH key to a remote host. That result is why the model advises and the policy decides.',
-      pdfUrl: '/pdfs/kai.pdf',
-      latexUrl: 'https://github.com/hanzoai/papers/blob/main/kai/kai.tex',
-      githubUrl: 'https://github.com/hanzoai/papers',
-      date: '2026-09-24',
-      authors: ['Hanzo AI Research'],
-      tags: ['Agents', 'Decisions', 'Policy', 'Calibration', 'Decision Analysis'],
-      relatedLinks: [
-        { label: 'Model: docs.hanzo.ai/docs/models/kai', url: 'https://docs.hanzo.ai/docs/models/kai' },
-        { label: 'Benchmarks: github.com/hanzoai/benchmarks', url: 'https://github.com/hanzoai/benchmarks/tree/main/decision' },
-        { label: 'Spec: HIP-1332', url: 'https://github.com/hanzoai/hips/blob/main/HIPs/hip-1332-kai-the-decision-model.md' },
-      ],
-    },
     {
       id: 'hanzo-context-memory',
       title: 'Linkage, Not Similarity',

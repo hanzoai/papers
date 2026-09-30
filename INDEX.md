@@ -33,7 +33,6 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-vs-claude` | `defense/hanzo-vs-claude.tex` |
 | `hanzo-zap-protocol` | `defense/hanzo-zap-protocol.tex` |
 | `earle-genetic-marketing` | `earle-genetic-marketing/earle-genetic-marketing.tex` |
-| `enso` | `enso/main.tex` |
 | `equality` | `equality/equality.tex` |
 | `evolutionary-schedule-search` | `evolutionary-schedule-search.tex` |
 | `hanzo-4-0-launch` | `hanzo-4-0-launch/hanzo-4-0-launch.tex` |
@@ -145,7 +144,6 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-webhooks` | `hanzo-webhooks/hanzo-webhooks.tex` |
 | `hanzod-attested-compute` | `hanzod-attested-compute.tex` |
 | `hip-0302-replicate` | `hip-0302-replicate/hip-0302-replicate.tex` |
-| `kai` | `kai/kai.tex` |
 | `lightspeed-dex` | `lightspeed-dex/lightspeed-dex.tex` |
 | `locomo-subject-scope` | `locomo-subject-scope/main.tex` |
 | `mechanism` | `mechanism/mechanism.tex` |

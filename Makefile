@@ -104,7 +104,7 @@ pdfs/%.pdf: %.tex \
 # the shared files it names with the ../shared/ prefix dropped, and the .bbl
 # latexmk wrote. The upload is then compiled alone, without bibtex, the way
 # arXiv will; one that needs anything outside itself fails here, not after
-# submission. For a paper in its own directory: make arxiv/kai/kai.tar.gz
+# submission. For a paper in its own directory: make arxiv/attestation/attestation.tar.gz
 arxiv/%.tar.gz: pdfs/%.pdf
 	@rm -rf arxiv/$* arxiv/$*.check && mkdir -p arxiv/$*
 	@cd $(dir $*) && git ls-files -- '*.tex' '*.sty' '*.cls' '*.bst' '*.pdf' '*.png' '*.jpg' \

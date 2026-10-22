@@ -144,6 +144,7 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `hanzo-webhooks` | `hanzo-webhooks/hanzo-webhooks.tex` |
 | `hanzod-attested-compute` | `hanzod-attested-compute.tex` |
 | `hip-0302-replicate` | `hip-0302-replicate/hip-0302-replicate.tex` |
+| `kai` | `kai/kai.tex` |
 | `lightspeed-dex` | `lightspeed-dex/lightspeed-dex.tex` |
 | `locomo-subject-scope` | `locomo-subject-scope/main.tex` |
 | `mechanism` | `mechanism/mechanism.tex` |
@@ -245,4 +246,4 @@ Auto-generated catalogue of research papers. Regenerate: `scripts/gen-index.sh` 
 | `zen4-thinking_whitepaper` | `zen/zen4-thinking_whitepaper.tex` |
 | `zen4-ultra_whitepaper` | `zen/zen4-ultra_whitepaper.tex` |
 
-**Total**: 242 papers
+**Total**: 243 papers

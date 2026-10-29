@@ -40,6 +40,22 @@ export const siteConfig: SiteConfig = {
   logo: '/logos/hanzo-logo.svg',
   papers: [
     {
+      id: 'kai-decision-model',
+      title: 'Kai: Calibrated Discrete Decision Intelligence for Autonomous Agent Loops',
+      subtitle: 'Sub-Millisecond Discrete Choice, Exact Permutation Equivariance, and Verified Safety Joins at Scale',
+      abstract: 'Autonomous agent loops spend substantial compute evaluating discrete, bounded choices: tool dispatch, intent routing, and policy safety checks. Prompting autoregressive LLMs for bounded decisions introduces high sequential latency, order-sensitive non-determinism (>8% flip rate), and uncalibrated likelihood estimates. Kai 1.9 decouples discrete judgment from open-ended text synthesis, emitting calibrated probability distributions across typed candidate sets in sub-millisecond to 28ms on standard CPU. Across 37 frozen benchmarks, Kai establishes state-of-the-art accuracy over prior baselines, guarantees exact 0.00% permutation equivariance, and provides verifiable zero-false-grounding safety joins under deterministic policy constraints.',
+      pdfUrl: '/pdfs/kai-decision-model.pdf',
+      latexUrl: 'https://github.com/hanzoai/papers/blob/main/kai-decision-model/kai-decision-model.tex',
+      githubUrl: 'https://github.com/hanzoai/papers',
+      date: '2026-10-28',
+      authors: ['Hanzo AI Research'],
+      tags: ['Decision Intelligence', 'Autonomous Agents', 'Permutation Equivariance', 'Calibration', 'SOTA'],
+      relatedLinks: [
+        { label: 'Hanzo Kai Overview', url: 'https://hanzo.ai/kai' },
+        { label: 'HIP-1332 Decision Plane Specification', url: 'https://hips.hanzo.ai/HIPs/hip-1332-kai-the-decision-model' },
+      ],
+    },
+    {
       id: 'hanzo-context-memory',
       title: 'Linkage, Not Similarity',
       subtitle: 'What long-term agent memory has to retrieve, and how it is measured',

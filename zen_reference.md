@@ -12,7 +12,7 @@ Zen AI is a comprehensive family of ultra-efficient language models that serve a
   - Technical overview of complete Zen ecosystem
   - 600M to 480B parameter models
   - 95% reduction in energy consumption
-  - Recursive AI Self-Improvement System (RAIS) with 94% effectiveness
+  - Recursive AI Self-Improvement System (RAIS) with 94% effectiveness (internal, unverified, pending reproducible eval)
 
 ## Model Papers
 

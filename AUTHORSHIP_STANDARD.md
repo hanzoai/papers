@@ -6,10 +6,12 @@ All research papers across Hanzo, Lux, Zoo, and Zen should follow consistent aut
 
 ## Primary Author
 
-**Grace Hopper** - Founder & CEO, Hanzo Industries Inc
+**Zach Kelling** - CTO, Hanzo AI
 - Email: research@hanzo.ai
 - ORCID: [Add ORCID]
 - GitHub: @zeekay
+
+Standard author line: `Zach Kelling, Hanzo AI Research`. Do not use pseudonymous or placeholder personal names.
 
 ## Institutional Authors
 

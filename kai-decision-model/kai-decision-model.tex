@@ -21,99 +21,103 @@
 \maketitle
 
 \begin{abstract}
-Modern autonomous agent architectures spend substantial computational budgets on discrete, bounded decision problems: selecting among candidate tools, routing queries across service taxonomies, evaluating code diffs, and triaging execution failures. Standard industry practice delegates these discrete choices to autoregressive large language models (LLMs) via prompted token generation. This approach incurs severe latency overheads ($200\text{--}500\,\text{ms}$), token-order sensitivity ($>8\%$ permutation flip rates), uncalibrated likelihood estimates, and non-deterministic schema deviations.
+Modern autonomous agent architectures spend substantial computational budgets on discrete, bounded decision problems: selecting among candidate tools, routing queries across service taxonomies, evaluating code diffs, and triaging execution failures. Standard industry practice delegates these discrete choices to autoregressive large language models (LLMs) via prompted token generation, which couples bounded classification to sequential token decoding and prompt formatting.
 
-We introduce \textbf{Kai 1.9}, a specialized decision model engineered to evaluate structured, typed decision spaces over rich operational evidence. Kai decouples discrete judgment from open-ended language generation: rather than synthesizing free-form text, Kai directly emits calibrated probability distributions over typed candidate sets (`choice`, `noul` boolean, and ordinal `score`). On standard CPU infrastructure, Kai executes in sub-millisecond to $28\,\text{ms}$, achieving up to a $10\times$ latency reduction and $100\times$ lower compute cost relative to frontier LLMs. Across 37 frozen evaluation benchmarks, Kai establishes state-of-the-art accuracy against existing decision baselines, guarantees exact permutation equivariance ($0.00\%$ flip rate under candidate reordering), and demonstrates verifiable zero-false-grounding safety joins under deterministic policy constraints.
+We describe \textbf{Kai}, a specialized decision model engineered to evaluate structured, typed decision spaces over operational evidence, and \textbf{Hanzo Decision}, the deterministic policy plane that governs it. Rather than synthesizing free-form text, Kai emits calibrated probability distributions over typed candidate sets (\texttt{choice}, \texttt{noul} boolean, and ordinal \texttt{score}). Because candidate options are scored independently by a factorized cross-attention head and normalized jointly, option scoring is invariant to candidate ordering by construction. On the frozen 12-suite decision harness (\texttt{hanzoai/benchmarks} at commit \texttt{2c74e2d}), \texttt{kai-1} achieves a mean accuracy of $0.857$ against $0.780$ for \texttt{typesafe/jev-1.13-20260917} (outperforming Jev on 11 of 12 suites) and a mean Expected Calibration Error (ECE) of $0.093$ versus $0.139$. We further detail how learned consequence predictions from Kai compose with \textbf{Nio}, a deterministic policy verifier that enforces provenance checks and confidence floors ($\tau \ge 0.90$) without altering raw model predictions.
 \end{abstract}
 
 \section{Introduction}
 
-Autonomous systems and multi-agent workflows execute iterative sense-decide-act loops. While open-ended text synthesis is critical for drafting prose or generating code, the overwhelming majority of intermediate operational steps represent bounded, discrete decision problems:
+Autonomous systems and multi-agent workflows execute iterative sense-decide-act loops. While open-ended text synthesis is critical for drafting prose or generating code, many intermediate operational steps represent bounded, discrete decision problems:
 \begin{itemize}
-    \item \textit{Tool Dispatch}: Selecting the optimal capability from a catalog of hundreds of schema definitions.
-    \item \textit{Intent Routing}: Classifying customer queries or workflow tickets into fine-grained service destinations.
-    \item \textit{Safety Guardrails}: Validating system actions against ethical safety floors and operational risk policies.
+    \item \textit{Tool Dispatch}: Selecting a capability from a catalog of schema definitions.
+    \item \textit{Intent Routing}: Classifying customer queries or workflow tickets into service destinations.
+    \item \textit{Safety Guardrails}: Evaluating operational states before deterministic policy gates permit or escalate actions.
     \item \textit{Execution Triage}: Determining whether an integration test failure requires retrying, patching, or human escalation.
 \end{itemize}
 
-Prompting an autoregressive LLM to resolve these problems presents four systematic failure modes:
+Prompting an autoregressive LLM to resolve these problems presents four structural limitations:
 \begin{enumerate}
-    \item \textbf{High Sequential Latency}: Autoregressive token decoding requires $O(T)$ sequential matrix-vector iterations and external network transport, consuming hundreds of milliseconds per step and throttling agent velocity.
-    \item \textbf{Permutation Sensitivity}: Reordering the sequence of candidate options in an LLM prompt induces non-negligible decision instability ($>8\%$ disagreement), introducing nondeterminism into production logic.
-    \item \textbf{Poor Confidence Calibration}: Text generation probabilities are poorly calibrated for multi-way categorical selections, exhibiting overconfidence on incorrect choices and spurious zero-probability predictions.
+    \item \textbf{Sequential Decoding Overhead}: Autoregressive token decoding requires sequential generation steps even when the valid output space is a known finite set.
+    \item \textbf{Prompt Order Sensitivity}: Concatenating candidate options into a single causal prompt makes attention weights dependent on the linear order in which options appear.
+    \item \textbf{Misaligned Calibration}: Next-token probabilities over subword vocabularies do not directly yield calibrated categorical distributions over domain options.
     \item \textbf{Syntactic Fragility}: Relying on regex or JSON parsers to extract structured outputs from generated prose introduces schema drift and parsing errors.
 \end{enumerate}
 
-Kai separates bounded judgment from open-ended generation. Under this paradigm, generative engines (such as Zen) synthesize language and reasoning trajectories, while Kai resolves bounded decision variables with calibrated confidence and high-throughput execution.
+Kai separates bounded judgment from open-ended generation. Under this paradigm, generative engines (such as Zen) synthesize language and reasoning trajectories, Kai produces probability distributions over bounded decision variables, and deterministic policy retains final authority.
 
 \section{The Decision Plane and Wire Interface}
 
-Kai is exposed via the standardized Hanzo Decision interface:
+Kai is exposed via the Hanzo Decision interface specified in HIP-1332:
 \begin{center}
 \texttt{POST https://api.hanzo.ai/v1/decisions}
 \end{center}
 
 \subsection{Typed Question Primitives}
 
-A decision request evaluates an operational \textit{state} against one or more typed questions. Kai evaluates all questions within the request context simultaneously without requiring serial round-trips:
+A decision request evaluates an operational \textit{state} against one or more typed questions:
 \begin{itemize}
-    \item \textbf{Choice} (\texttt{choice}): Multi-way categorical selection over an arbitrary candidate set. Kai outputs a complete, calibrated probability distribution across all valid candidates.
-    \item \textbf{Noul} (\texttt{noul}): Calibrated two-sided boolean decision, evaluating affirmative versus negative claims without positional token bias.
-    \item \textbf{Score} (\texttt{score}): Ordinal evaluation across an ordered set of discrete criteria levels (e.g., urgency tiers, severity scales, quality ratings).
+    \item \textbf{Choice} (\texttt{choice}): Multi-way categorical selection over a candidate set. Kai outputs a probability distribution across all valid candidates.
+    \item \textbf{Noul} (\texttt{noul}): Two-sided boolean decision evaluating affirmative versus negative propositions.
+    \item \textbf{Score} (\texttt{score}): Ordinal evaluation across an ordered set of discrete criteria levels, trained with the ranked probability score (RPS).
 \end{itemize}
 
-\subsection{Permutation Equivariance}
+\subsection{Factorized Option Scoring}
 
-Prompt-based LLMs process candidate options in linear order, making attention weights dependent on candidate position. In contrast, Kai computes candidate representations via symmetric cross-attention over evidence representations. Reordering candidate options leaves the resulting probability distribution invariant:
+Prompt-based LLMs process candidate options in linear order within a single sequence. In contrast, Kai encodes the question and state as one sequence and encodes each candidate option independently ($\texttt{[CLS] option [SEP]}$, up to 512 tokens) through a shared 22-layer, 768-dimensional multilingual encoder (mmBERT-base), followed by two cross-attention blocks and a scalar scorer. For candidate sets exceeding 160 options, a 256-dimensional dual-encoder retrieval stage shortlists the top 160 candidates before cross-attention scoring. Because each scored option is evaluated independently against the encoded state and normalized via a symmetric softmax, reordering the candidate map commutes with normalization:
 \begin{equation}
 \mathcal{P}(\pi(C) \mid S) = \pi(\mathcal{P}(C \mid S)) \quad \forall \, \pi \in \mathcal{S}_K
 \end{equation}
-where $C$ denotes the set of $K$ candidate options, $S$ denotes the input state, and $\mathcal{S}_K$ is the symmetric group of permutations. In production testing, Kai achieves an empirical **$0.00\%$ permutation flip rate**, guaranteeing reproducible and order-independent decisions.
+where $C$ denotes a candidate set of size $K \le 160$, $S$ denotes the input state, and $\mathcal{S}_K$ is the symmetric group of permutations.
 
-\section{Deterministic Policy Coupling and Safety}
+\section{Separation of Learned Judgment and Deterministic Policy}
 
-Decision models in autonomous pipelines must interface with hard operational constraints. Under the Hanzo Decision architecture, probabilistic outputs from Kai never unilaterally dictate high-consequence actions without policy validation.
+A core architectural principle of Hanzo Decision (HIP-1332) is that a learned decision model is never an autonomous authority. We strictly separate:
+\begin{enumerate}
+    \item \textbf{Kai (Learned Decision Model)}: Produces unmodified, temperature-calibrated probability distributions over candidate choices, entity spans, entity kinds, and consequence counts directly from neural model weights.
+    \item \textbf{Nio (Deterministic Policy Layer)}: An independent, rule-governed verification engine (e.g., \texttt{nio/harm@2}) that inspects Kai's probability distributions alongside verifiable text provenance.
+\end{enumerate}
 
-\subsection{Consequence Grounding}
-Kai evaluates both the primary decision outcome and its quantified operational consequences. Consequence quantities are grounded across continuous horizons ($[0, 100]$), distinguishing between zero impact, positive counts, and unquantified uncertainty.
-
-\subsection{Safety Joins (\texttt{nio/harm@2})}
-When evaluated under policy profiles such as \texttt{nio/harm@2}, Kai joins deterministically with automated safety governors:
-\begin{itemize}
-    \item If consequences exceed quantified policy floors ($\tau \ge 0.90$), the system deterministically executes the action with minimal harm.
-    \item If evidence is ambiguous, contradictory, or corrupted by adversarial framing, certainty drops below the qualification threshold, triggering deterministic policy escalation.
-\end{itemize}
-Across extensive adversarial perturbation suites (including semantic hedging, crowd distraction, and infrastructure ambiguity), Kai maintains a **$0.00\%$ false-grounded rate**, ensuring zero unauthorized bypasses of safety constraints.
+Under \texttt{nio/harm@2}, categorical consequence predictions cannot authorize an action unless: (a) the learned model's calibrated confidence on every required grounding variable meets or exceeds the policy floor ($\tau \ge 0.90$), (b) the cited evidence substring is verbatim-verified within the input state, and (c) deterministic numeral and safety-invariant checks detect no unquantified human risk or contradictory framing. Whenever any condition fails, Nio deterministically escalates rather than guessing.
 
 \section{Empirical Evaluation}
 
-We evaluated Kai 1.9 across 37 standardized, frozen decision suites spanning high-cardinality intent classification, multimodal telemetry triage, multi-task dispatch, and safety-critical grounding.
+Table~\ref{tab:benchmarks} reports the reproducible evaluation of \texttt{kai-1} (weights SHA-256 \texttt{0834a74f\dots}) on the frozen 12-suite decision harness (\texttt{hanzoai/benchmarks} \texttt{decision/} at commit \texttt{2c74e2d}), measured on CUDA in BF16 and recorded in Hanzo's public research ledger (\texttt{<suite>-harness-kai-1.0834a74f-kai}) against Laya and \texttt{typesafe/jev-1.13-20260917}.
 
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{lccc}
+\begin{tabular}{lccccc}
 \toprule
-\textbf{Metric} & \textbf{Kai 1.9} & \textbf{Baseline (Jev 1.13)} & \textbf{Advantage} \\
+\textbf{Suite} & \textbf{Kai Acc} & \textbf{Laya Acc} & \textbf{Jev Acc} & \textbf{Kai ECE} & \textbf{Jev ECE} \\
 \midrule
-Suites Won & \textbf{37 / 37} & 0 / 37 & +37 \\
-Permutation Flip Rate & \textbf{0.00\%} & 8.60\% & Exact Invariance \\
-Expected Calibration Error (ECE) & \textbf{0.041} & 0.112 & $2.7\times$ Tighter \\
-Negative Log-Likelihood (NLL) & \textbf{0.482} & 1.347 & $2.8\times$ Lower Loss \\
-Zero-Probability Errors & \textbf{0.00\%} & 4.25\% & Eliminated \\
-Inference Latency (p50) & \textbf{12--28 ms} & 235 ms & $8.4\times\text{--}19.5\times$ Faster \\
-Serving Platform & Standard CPU & GPU Cluster & Low Operational Cost \\
+AG News & 0.9425 & \textbf{0.9500} & 0.8600 & \textbf{0.033} & 0.102 \\
+DAIR emotion & \textbf{0.9350} & 0.5950 & 0.6025 & \textbf{0.018} & 0.280 \\
+Banking77 & \textbf{0.9075} & 0.4250 & 0.8350 & 0.074 & \textbf{0.073} \\
+Support triage & 0.4400 & \textbf{0.5025}$^\dagger$ & 0.3650 & \textbf{0.444} & 0.483 \\
+Email spam & \textbf{0.9975} & \textbf{0.9975} & 0.9775 & \textbf{0.003} & 0.060 \\
+Phishing & \textbf{0.9900} & 0.9825$^\dagger$ & 0.9000 & \textbf{0.010} & 0.039 \\
+Jailbreak & 0.9175 & 0.7050 & \textbf{0.9400} & 0.074 & \textbf{0.047} \\
+Toxicity & \textbf{0.8025} & 0.5300 & 0.6625 & 0.195 & \textbf{0.177} \\
+RAG relevance & \textbf{0.6800} & 0.6250 & 0.6200 & \textbf{0.028} & 0.279 \\
+Routing & \textbf{1.0000} & 0.6391 & 0.9774 & \textbf{0.000} & 0.014 \\
+Typed decisions & 0.7590 & \textbf{0.7660} & 0.7355 & 0.171 & \textbf{0.047} \\
+MASSIVE (51 lang, macro) & \textbf{0.9096} & 0.3822 & 0.8902 & \textbf{0.060} & 0.064 \\
+\midrule
+\textbf{Mean of 12} & \textbf{0.857} & --- & 0.780 & \textbf{0.093} & 0.139 \\
 \bottomrule
 \end{tabular}
-\caption{Empirical performance across frozen decision benchmarks.}
+\caption{Frozen 12-suite decision harness (\texttt{hanzoai/benchmarks} at \texttt{2c74e2d}). $^\dagger$Indicates suites overlapping Laya's training split (\texttt{decision/trained/overlap.json}).}
 \label{tab:benchmarks}
 \end{table}
 
-\subsection{Latency and Operational Economics}
-Because Kai eliminates autoregressive unrolling, decisions execute in a single forward pass over compiled evidence representations. On standard off-the-shelf CPU hardware, Kai delivers sub-millisecond execution for single-choice decisions and under $28\,\text{ms}$ for complex multi-variable state programs. When deployed in agent loops, this performance profile removes the decision latency bottleneck, enabling agents to execute tens of reasoning and verification cycles in the time previously required for a single LLM API response.
+Against Jev 1.13, \texttt{kai-1} achieves higher accuracy on 11 of 12 suites (trailing on jailbreak by 2.25 percentage points) and lower calibration error on 8 of 12 suites (higher ECE on Banking77, jailbreak, toxicity, and typed decisions). On the cardinality scaling suite (\texttt{cap.cardinality}, CUDA, FP32), \texttt{kai-1} achieves $0.9675$, $0.9350$, $0.9075$, and $0.9075$ accuracy at 4, 16, 77, and 150 options respectively, compared to Jev's $0.9050$, $0.8525$, $0.8425$, and $0.9400$. At 1,000 options and above, accuracy degrades sharply ($0.005$ at 1,000), marking high-cardinality retrieval calibration as an active area of improvement.
+
+\subsection{Production Latency Context}
+On production CPU infrastructure serving \texttt{POST /v1/decisions}, a single \texttt{noul} (yes/no) decision executes in $38\,\text{ms}$ at p50, while a batch of 100 independent questions in a single request completes in $13.9\,\text{s}$. Complex multi-question causal grounding requests evaluated under multi-worker load exhibit higher latency ($2.5\text{--}3.3\,\text{s}$ p50 on CPU when scoring multiple entity, count, kind, and certainty heads per request).
 
 \section{Conclusion}
 
-Discrete decisions represent a foundational computational primitive distinct from generative text synthesis. By dedicating a purpose-built runtime to typed, calibrated, and permutation-equivariant judgment, Kai 1.9 establishes a new state-of-the-art in autonomous decision intelligence. Serving globally at \texttt{POST /v1/decisions}, Kai enables high-reliability agent loops that are faster, reproducible, and verifiable under strict policy guarantees.
+Discrete decisions represent a distinct computational primitive from open-ended text generation. By combining a factorized cross-attention decision reader (Kai) with a deterministic, provenance-verifying policy layer (Nio), Hanzo Decision provides typed, calibrated probability distributions and auditable safety gates at \texttt{POST /v1/decisions}.
 
 \end{document}

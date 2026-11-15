@@ -1,0 +1,232 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+\emergencystretch=2em
+
+\title{\textbf{Adaptive Speculative Decoding, Sub-Millisecond Tokenization,\\and Hot-Path Inference Systems in Hanzo Engine}}
+\author{
+  Zach Kelling \\
+  Hanzo AI Research \\
+  \texttt{research@hanzo.ai}
+}
+\date{November 15, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+End-to-end latency in multi-turn coding agents is governed jointly by CPU frontend hot paths (prompt tokenization, chat-template rendering, multimodal tensor preparation, and KV-block routing) and GPU speculative decode efficiency across alternating explanatory prose and grounded code edits. We describe a set of native Rust systems shipped in \texttt{hanzoai/engine} (commit \texttt{36cd0bb3c}) and \texttt{hanzoai/ml} (commit \texttt{c9bee7434}): (1) an incremental $\mathcal{O}(1)$ amortized \texttt{SuffixAutomaton} maintaining most-recent occurrence positions (\texttt{last\_end}) via lockstep 2-gram intersection and rollback checkpoints, accelerating lookup misses by $26.8\times$--$34.8\times$ across 1K--16K token contexts; (2) \texttt{SA\_SPEC} suffix bypass combined with an EWMA cooldown regression guard (\texttt{GuardedDraft} / \texttt{AdaptiveSpeculativeGuard}) that gates neural draft forwards and single-token CUDA decode-graph capture while unconditionally verifying every proposed token under target-model logits; (3) two speculative verification bugfixes resolving \texttt{top\_k == 1} argmax routing in \texttt{Sampler::is\_argmax} and nonzero \texttt{layout.start\_offset()} pointer indexing across CUDA top-$k$/top-$1$ kernels; (4) a clean-room pure-Rust \texttt{hanzo-tokenizer} crate with packed 2-bit Unicode class scanners, open-addressed BPE merges, and a self-bypassing \texttt{PromptTokenCache}; (5) SIMD image resize and planar normalization in \texttt{hanzo-vision} plus cached \texttt{minijinja} templates; and (6) an epoch-fenced KV directory and \texttt{HKV1} async TCP transport in \texttt{hanzo-kv-fabric}. Measured on an NVIDIA Grace-Blackwell GB10 node with a 4B ternary hybrid-attention model (\texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf}) over a warm 20-turn coding-agent conversation, full adaptive speculation lifts draft acceptance from $21.3\%$ to $49.2\%$, reduces total wall-clock time from $75{,}036.1\,\text{ms}$ (unguarded MTP) and $65{,}648.7\,\text{ms}$ (uncached decode) to $38{,}190.3\,\text{ms}$ ($1.96\times$ and $1.72\times$ speedups, respectively), and lowers grounded edit inter-token latency from $27.57\,\text{ms}$ to $2.79\,\text{ms}$ ($2.59\,\text{ms}$ under standalone lookup). We report negative and neutral results explicitly, including unguarded MTP's $1.68\times$ slowdown against cached decode on prose-heavy turns and a $0.82\times$ regression on $3\times$ CPU upsampling.
+\end{abstract}
+
+\section{Introduction}
+Multi-turn coding assistants alternate between two distinct execution regimes within a single session. Explanatory turns synthesize novel prose tokens with low $n$-gram overlap against the context window, whereas diff and file-edit turns reproduce substantial spans of identifiers, signatures, and configuration keys already resident in prompt history. Running an unguarded neural Multi-Token Prediction (MTP) drafter uniformly across both regimes introduces unnecessary draft forward passes and target hidden-state transfers when acceptance falls below breakeven, slowing wall-clock delivery relative to plain unspeculated decoding~\cite{leviathan2023speculative,chen2023accelerating}. Meanwhile, re-tokenizing growing chat histories via backtracking regular expressions, repeatedly compiling Jinja chat templates, and executing scalar image preprocessors accumulate avoidable host latency before GPU execution even begins.
+
+This paper documents the architecture and measured behavior of the native Rust hot-path stack implemented in \texttt{hanzoai/engine} (\texttt{36cd0bb3c}) and \texttt{hanzoai/ml} (\texttt{c9bee7434})~\cite{hanzo2026engine}. Every component runs without C/C++ FFI dependencies in its default configuration, preserves target-model output equivalence under verification, and guards fast paths against adverse workloads through automatic bypass and fallback policies. All measurements in this study come directly from the checked-in Rust harnesses \texttt{hotpath\_bench}, \texttt{kv\_fabric\_bench}, \texttt{upsample\_nearest2d\_bench}, and \texttt{zen6\_agent\_20turn\_bench} on hardware recorded in Section~\ref{sec:eval}.
+
+\section{Incremental Suffix Automaton, \texttt{SA\_SPEC}, and \texttt{GuardedDraft}}
+
+\subsection{Most-Recent \texttt{SuffixAutomaton} with Lockstep 2-Gram Intersection}
+Standard prompt lookup scans backwards linearly through the token prefix $T_{0:L}$ on every decode step, costing $\mathcal{O}(L \cdot n_{\max})$ per probe and spiking whenever no long $n$-gram match exists. Textbook suffix automata~\cite{blumer1985suffix} support $\mathcal{O}(n_{\max})$ queries and $\mathcal{O}(1)$ amortized incremental updates, yet their standard construction tracks \texttt{first\_pos}, whereas speculative continuation from repetitive codebases prefers the \emph{most recent} occurrence (\texttt{last\_end}) of the longest matching context suffix.
+
+Our native \texttt{SuffixAutomaton} (\texttt{suffix\_automaton.rs}) maintains exact most-recent occurrence retrieval over $T_{0:L-1}$ with incremental append and rollback checkpoints for rejected draft tokens:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Inline transitions (\texttt{SmallEdges})}: Each state stores up to four \texttt{(token\_id, next\_state)} pairs inline before spilling to an \texttt{AHashMap}, avoiding heap allocations on sparse internal states.
+  \item \textbf{Exact \texttt{last\_end} maintenance}: Leaf extensions propagate directly through \texttt{last\_1gram} and \texttt{last\_2gram} maps backed by a 1-based exclusive end-position chain (\texttt{prev\_2gram}). For internal automaton states with match length $n \ge 3$, exact most-recent match location is resolved without false positives by intersecting backward 2-gram occurrence chains from the match tail and head in lockstep, preserving 100\% parity with brute-force reverse $n$-gram lookup.
+  \item \textbf{Undo checkpoints}: Appending tokens pushes compact \texttt{Checkpoint} records tracking state count, link modifications (\texttt{link\_undo}), and edge updates (\texttt{edge\_undo}), allowing speculative verification rejections to roll back automaton state in $\mathcal{O}(\gamma)$ time rather than rebuilding across $L$ tokens.
+\end{enumerate}
+
+\subsection{\texttt{SA\_SPEC} Neural Draft Bypass and \texttt{AdaptiveSpeculativeGuard}}
+When an autoregressive model exposes both a context \texttt{SuffixAutomaton} and a neural draft head (such as an MTP head or block-diffusion drafter~\cite{cai2024medusa,fu2024lookahead}), running both unconditionally wastes GPU compute whenever context lookup already supplies a confident multi-token continuation. Conversely, running the neural drafter during unconstrained prose turns yields low acceptance ($\sim 21\%$) while inhibiting single-token CUDA decode graph capture (which cannot capture dynamic hidden-state extraction needed to feed MTP).
+
+Our adaptive speculative controller couples two mechanisms in \texttt{hanzo-engine/src/speculative}:
+\begin{itemize}[noitemsep]
+  \item \textbf{\texttt{SA\_SPEC} (\texttt{sa\_bypass\_threshold})}: On each speculative step, the engine queries \texttt{SuffixAutomaton} first. Whenever the longest suffix match length satisfies $n_{\text{match}} \ge \tau_{\text{SA}}$ (set to $\tau_{\text{SA}} = 4$ in agent benchmarks), \texttt{SA\_SPEC} emits up to $\gamma = 6$ suffix-matched draft tokens and skips the neural draft forward pass completely (\texttt{record\_sa\_bypass()}).
+  \item \textbf{\texttt{GuardedDraft} / \texttt{AdaptiveSpeculativeGuard}}: Tracks an exponentially weighted moving average (\texttt{ewma\_accepted}) of accepted tokens per draft round. When low-yield streaks exceed \texttt{max\_low\_streak}, the guard enters an exponentially backed-off cooldown window (\texttt{cooldown\_left}, up to \texttt{MAX\_BACKOFF\_SHIFT} $= 2$) carried across sequential turns in a conversation (\texttt{with\_cross\_seq\_carry(true)}). During cooldown, \texttt{GuardedDraft} skips neural draft proposals, disables target hidden-state extraction (\texttt{draft\_needs\_target\_hiddens()}), and allows single-token CUDA decode graphs to re-engage, periodically issuing single-step probes after cooldown to recover immediately when workload structure shifts back toward code edits.
+  \item \textbf{Unconditional target verification}: Neither \texttt{SA\_SPEC} nor context lookup ever skips target-model logit evaluation. Every proposed draft token sequence is verified identically against target-model logits inside \texttt{verifier.rs}.
+\end{itemize}
+
+\subsection{Verification Correctness Fixes: \texttt{top\_k == 1} Argmax and CUDA \texttt{start\_offset()}}
+Benchmarking greedy speculative verification uncovered two latent correctness defects resolved in commit \texttt{1a9d35400}:
+\begin{enumerate}[noitemsep]
+  \item \textbf{\texttt{Sampler::is\_argmax()} handling \texttt{top\_k == 1}}: Request construction translates deterministic configs (\texttt{temperature: None, top\_k: Some(1)}) into \texttt{Sampler} instances with \texttt{temperature = Some(1.0)} and \texttt{top\_k = 1}. Previously, \texttt{Sampler::is\_argmax()} checked only \texttt{self.temperature.is\_none()}, causing deterministic \texttt{top\_k == 1} requests to bypass \texttt{SA\_SPEC}, skip greedy lookup continuation, and take stochastic verification paths. Expanding the predicate to \texttt{self.temperature.is\_none() || self.top\_k == 1} aligns greedy routing without disturbing stochastic top-$k$ temperature scaling.
+  \item \textbf{Nonzero \texttt{layout.start\_offset()} in CUDA top-$k$/top-$1$ kernels}: During multi-token verification over $M$ drafted logits \texttt{[1, M, V]}, row slicing produces a contiguous 1D view with \texttt{stride == [1]} and \texttt{layout.start\_offset() == idx * V}. All four CUDA sampling kernels in \texttt{ops.rs} (\texttt{cuda\_topk}, \texttt{cuda\_topk\_logits\_f32}, \texttt{cuda\_topk\_logits\_f32\_packed}, and \texttt{cuda\_top1\_logits\_f32\_cached}) previously dereferenced device base pointers directly without adding \texttt{layout.start\_offset()}, reading row $0$ on every verification step and producing duplicate-token stuttering. Adding explicit element pointer offsets across F16, BF16, and F32 paths eliminates verification stuttering completely (verified via \texttt{cuda\_sliced\_row\_topk\_respects\_start\_offset} across all four kernels and zero duplicate-word stutters across all 100 evaluation turns).
+\end{enumerate}
+
+\section{Pure-Rust \texttt{hanzo-tokenizer} and Self-Bypassing Prefix Caching}
+
+Mainstream Hugging Face \texttt{tokenizers}~\cite{huggingface2024tokenizers} incurs substantial CPU overhead from regex-engine pre-tokenization backtracking and repeated BPE merge heap allocations~\cite{gage1994bpe}. We built \texttt{hanzo-tokenizer} as a clean-room, Apache-2.0 Rust crate integrated through \texttt{FastTokenizerPool}:
+\begin{itemize}[noitemsep]
+  \item \textbf{Packed 2-bit Unicode class LUT and SWAR scanners}: Instead of executing general regex backtracking engines on common pre-tokenizer patterns, \texttt{unicode\_lut.rs} compiles character classes into compact lookup tables paired with byte-level word-at-a-time (SWAR) scanners for modern BPE regex families, while keeping safe fallback to \texttt{tokenizers} in \texttt{FastTokenizerPool} when unsupported lookarounds appear.
+  \item \textbf{Compact \texttt{MergeMap} and \texttt{pretoken\_hash} memoization}: Open-addressed hashing over packed token-pair keys with \texttt{FxBuildHasher} reduces merge lookup cost and cache pressure on large vocabularies ($151\text{K}$--$248\text{K}$ tokens).
+  \item \textbf{3-probe startup parity gate}: At initialization, \texttt{FastTokenizerPool} verifies exact token-ID agreement between \texttt{hanzo-tokenizer} and the reference Hugging Face tokenizer across structured probes before activating the fast path.
+  \item \textbf{Self-bypassing \texttt{PromptTokenCache}}: Multi-turn chat prompts append assistant replies and user turns to an existing prefix. \texttt{PromptTokenCache} (\texttt{prompt\_cache.rs}) stores bounded LRU entries indexed by text hash alongside newline split checkpoints \texttt{(byte\_offset, token\_end\_index)} so appended turns re-encode only the suffix delta and pre-EOS boundaries remain exact. Because hashing and prefix scanning add overhead on workloads with disjoint prompts or non-matching structures, encountering \texttt{CONSECUTIVE\_MISS\_THRESHOLD = 2} consecutive misses activates a bypass cooldown for \texttt{COOLDOWN\_CALLS = 8} calls (bounded prefix scan depth \texttt{MAX\_PREFIX\_SCAN\_ENTRIES = 32}), automatically trading back to full caching if prefix locality returns.
+\end{itemize}
+
+\section{Vision Preprocessing, Chat Templates, and \texttt{HKV1} KV Fabric}
+
+\subsection{SIMD Vision Pipeline (\texttt{hanzo-vision}) and CPU Upsampling (\texttt{hanzo-ml})}
+For multimodal Vision-Language Models, scalar RGB resize followed by separate normalization passes introduces tens of milliseconds of host latency per high-resolution frame~\cite{hanzo2026engine}. We updated \texttt{hanzo-vision} to pair SIMD Catmull-Rom image resizing (\texttt{fast\_image\_resize} behind \texttt{simd\_resize\_rgb}) with a fused single-pass planar \texttt{u8 -> CHW f32} normalizer (\texttt{ToNormalizedTensor}), eliminating intermediate interleaved float tensor allocations while preserving $<10^{-5}$ numerical agreement (\texttt{max\_diff = 0.00e0} vs scalar normalization on identical resized buffers, bounded within $1/127.5 + 10^{-4}$ end-to-end against \texttt{image::FilterType::CatmullRom}).
+
+In \texttt{hanzo-ml}, we vectorized CPU \texttt{Tensor::upsample\_nearest2d} for integer $2\times$ scaling and contiguous inner-row duplication, checking bit-exactness against a scalar reference (\texttt{max\_abs\_diff = 0.0}) and measuring both $2\times$ and non-power-of-two $3\times$ shapes explicitly.
+
+\subsection{Cached Chat Templates and Epoch-Fenced \texttt{HKV1} KV Transfer}
+Repeatedly compiling complex Jinja2 tool-calling chat templates on every turn wastes host microseconds; pinning \texttt{minijinja} $2.24.0$ and caching compiled environments per model avoids redundant parsing and bytecode generation. For disaggregated prefill-decode clusters~\cite{kwon2023pagedattention,dao2022flashattention}, \texttt{hanzo-kv-fabric} implements \texttt{EpochFencedKvDirectory} (epoch-fenced block ownership publication, lookup, and stale-epoch fencing to prevent split-brain KV reads) and an asynchronous framed TCP transport (\texttt{KvBlockTransport}, wire magic \texttt{HKV1}) supporting verified SHA-256 block pushes and pulls without external C++ transport libraries.
+
+\section{Empirical Evaluation}
+\label{sec:eval}
+
+All benchmarks were executed after the final commits (\texttt{hanzoai/engine} @ \texttt{36cd0bb3c}, \texttt{hanzoai/ml} @ \texttt{c9bee7434}) on a single NVIDIA Grace-Blackwell GB10 host (\texttt{aarch64}, $10\times$ Cortex-X925 + $10\times$ Cortex-A725, $121\,\text{GiB}$ unified LPDDR5X RAM, SM121 GPU, CUDA 13.0, \texttt{rustc 1.98.1}).
+
+\subsection{Microbenchmarks: Suffix Automaton, Vision, Templates, Ops, and KV Fabric}
+
+Table~\ref{tab:sam} summarizes CPU lookup latency for \texttt{SuffixAutomaton} versus linear reverse scan in \texttt{hotpath\_bench}. Miss latency shrinks from $\mathcal{O}(L)$ linear search ($9.87$--$160.18\,\mu\text{s}$) to $0.37$--$4.61\,\mu\text{s}$ ($26.8\times$--$34.8\times$ faster), while hit paths drop from $8.90$--$153.25\,\mu\text{s}$ to $0.38$--$4.61\,\mu\text{s}$. On the 64-step grounded code-edit decode harness in \texttt{hotpath\_bench}, \texttt{SA\_SPEC} bypassed \textbf{64/64 (100\%)} neural draft passes while preserving exact greedy token agreement.
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{rrrrrrr}
+\toprule
+\textbf{Context Len} & \textbf{Hit (Naive)} & \textbf{Hit (SAM)} & \textbf{Hit Speedup} & \textbf{Miss (Naive)} & \textbf{Miss (SAM)} & \textbf{Miss Speedup} \\
+\midrule
+1,024 & $8.90\,\mu\text{s}$ & $0.38\,\mu\text{s}$ & $23.4\times$ & $9.87\,\mu\text{s}$ & $0.37\,\mu\text{s}$ & $26.8\times$ \\
+4,096 & $34.29\,\mu\text{s}$ & $1.22\,\mu\text{s}$ & $28.1\times$ & $38.24\,\mu\text{s}$ & $1.18\,\mu\text{s}$ & $32.3\times$ \\
+16,384 & $153.25\,\mu\text{s}$ & $4.61\,\mu\text{s}$ & $33.2\times$ & $160.18\,\mu\text{s}$ & $4.61\,\mu\text{s}$ & $34.8\times$ \\
+\bottomrule
+\end{tabular}%
+}
+\caption{\texttt{SuffixAutomaton} vs naive reverse $n$-gram scan (\texttt{hotpath\_bench}, NVIDIA GB10 CPU).}
+\label{tab:sam}
+\end{table}
+
+Table~\ref{tab:micro} reports the remaining subsystem microbenchmarks from \texttt{hotpath\_bench}, \texttt{kv\_fabric\_bench}, and \texttt{upsample\_nearest2d\_bench}. Notice that \texttt{UpsampleNearest2D} achieves a $2.11\times$ speedup on $2\times$ upsampling ($2.964 \to 1.405\,\text{ms}$) but regresses to $0.82\times$ ($1.867 \to 2.283\,\text{ms}$) on non-integer $3\times$ stride patterns; we retain the optimization scoped to contiguous and $2\times$ paths while documenting the $3\times$ limitation transparently.
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Subsystem} & \textbf{Workload} & \textbf{Baseline} & \textbf{Hanzo Native} & \textbf{Speedup / Rate} \\
+\midrule
+\texttt{hanzo-vision} & $1080\text{p} \to 896\times 896$ CHW & $41.85\,\text{ms}$ & $12.94\,\text{ms}$ & $3.23\times$ ($\Delta_{\max}=0$) \\
+\texttt{hanzo-vision} & $4\text{K} \to 896\times 896$ CHW & $89.92\,\text{ms}$ & $28.05\,\text{ms}$ & $3.21\times$ ($\Delta_{\max}=0$) \\
+\texttt{hanzo-ml} & \texttt{UpsampleNearest2D 2x} ($1{\times}256{\times}64{\times}64$) & $2.964\,\text{ms}$ & $1.405\,\text{ms}$ & $2.11\times$ ($\Delta_{\max}=0$) \\
+\texttt{hanzo-ml} & \texttt{UpsampleNearest2D 3x} ($1{\times}256{\times}64{\times}64$) & $1.867\,\text{ms}$ & $2.283\,\text{ms}$ & $0.82\times$ (negative) \\
+\texttt{minijinja 2.24} & 12-turn + 2-tool chat template render & $10.2\,\mu\text{s}$ & $7.5\,\mu\text{s}$ & $1.36\times$ \\
+\texttt{hanzo-kv-fabric} & Directory publish+lookup+fence (512 blk) & --- & $139.3\,\mu\text{s}$ & p95 $160.2\,\mu\text{s}$ ($61.8\,\mu\text{s}$ inline) \\
+\texttt{hanzo-kv-fabric} & \texttt{HKV1} TCP loopback $256\,\text{KiB}$ push / pull & --- & $2.05 / 2.09\,\text{ms}$ & $122.0 / 119.5\,\text{MiB/s}$ \\
+\texttt{hanzo-kv-fabric} & \texttt{HKV1} TCP loopback $1024\,\text{KiB}$ push / pull & --- & $6.80 / 7.87\,\text{ms}$ & $147.2 / 127.1\,\text{MiB/s}$ \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Vision SIMD, CPU upsampling, template cache, and KV fabric measurements (\texttt{hotpath\_bench}, \texttt{kv\_fabric\_bench}, \texttt{upsample\_nearest2d\_bench}).}
+\label{tab:micro}
+\end{table}
+
+\subsection{Tokenization Parity and Throughput}
+
+Table~\ref{tab:tok_hotpath} compares Hugging Face \texttt{tokenizers 0.21.4} against pure-Rust \texttt{hanzo-tokenizer} inside \texttt{hotpath\_bench} (synthetic fixtures per model family), and Table~\ref{tab:tok_real} reports a $32{,}770\,\text{B}$ single-shot code/prose document plus a $3{,}599\,\text{B}$ 20-turn incremental chat harness evaluated directly against seven shipped tokenizer configurations, verifying 100\% token-ID parity on every model.
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Tokenizer Profile} & \textbf{HF 0.21.4} & \textbf{Hanzo Cold} & \textbf{Speedup} & \textbf{20T Cold} & \textbf{20T Cached (19 hits)} \\
+\midrule
+Synthetic cl100k & $12{,}383.6\,\mu\text{s}$ & $826.9\,\mu\text{s}$ & $14.98\times$ & $183.8\,\mu\text{s}$ & $41.5\,\mu\text{s}$ \\
+Qwen3-8B & $24{,}844.0\,\mu\text{s}$ & $839.3\,\mu\text{s}$ & $29.60\times$ & $184.5\,\mu\text{s}$ & $41.2\,\mu\text{s}$ \\
+Kimi-K2.5 & $19{,}853.8\,\mu\text{s}$ & $513.5\,\mu\text{s}$ & $38.66\times$ & $282.6\,\mu\text{s}$ & $52.2\,\mu\text{s}$ \\
+gpt-oss-120b & $19{,}196.9\,\mu\text{s}$ & $611.0\,\mu\text{s}$ & $31.42\times$ & $284.7\,\mu\text{s}$ & $54.2\,\mu\text{s}$ \\
+GLM-4.7 & $20{,}048.1\,\mu\text{s}$ & $541.5\,\mu\text{s}$ & $37.02\times$ & $287.2\,\mu\text{s}$ & $53.3\,\mu\text{s}$ \\
+Nemotron-3-Nano-30B & $17{,}302.1\,\mu\text{s}$ & $538.5\,\mu\text{s}$ & $32.13\times$ & $276.9\,\mu\text{s}$ & $53.2\,\mu\text{s}$ \\
+DeepSeek-V3.2 & $11{,}178.9\,\mu\text{s}$ & $691.1\,\mu\text{s}$ & $16.18\times$ & $222.0\,\mu\text{s}$ & $45.6\,\mu\text{s}$ \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Tokenizer benchmark in \texttt{hotpath\_bench} (100\% token-ID parity with HF \texttt{tokenizers 0.21.4}).}
+\label{tab:tok_hotpath}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+\textbf{Model Tokenizer (Toks)} & \textbf{HF 0.21.4} & \textbf{Hanzo p50} & \textbf{Hanzo p95} & \textbf{Rate} & \textbf{vs HF} & \textbf{20T Cold / Cached} \\
+\midrule
+Zen6-Nano-4B (9,860) & $15{,}872.7\,\mu\text{s}$ & $155.8\,\mu\text{s}$ & $529.2\,\mu\text{s}$ & $200.6\,\text{MiB/s}$ & $101.9\times$ & $151.8 / 37.7\,\mu\text{s}$ ($4.03\times$) \\
+GPT-OSS-120B (9,280) & $16{,}693.6\,\mu\text{s}$ & $187.7\,\mu\text{s}$ & $369.5\,\mu\text{s}$ & $166.5\,\text{MiB/s}$ & $89.0\times$ & $246.8 / 65.7\,\mu\text{s}$ ($3.76\times$) \\
+Qwen3-8B (9,338) & $9{,}701.0\,\mu\text{s}$ & $117.5\,\mu\text{s}$ & $193.3\,\mu\text{s}$ & $266.0\,\text{MiB/s}$ & $82.6\times$ & $142.1 / 39.4\,\mu\text{s}$ ($3.60\times$) \\
+Nemotron-3-Nano-30B (9,744) & $14{,}231.0\,\mu\text{s}$ & $177.3\,\mu\text{s}$ & $335.8\,\mu\text{s}$ & $176.2\,\text{MiB/s}$ & $80.3\times$ & $221.4 / 71.3\,\mu\text{s}$ ($3.11\times$) \\
+DeepSeek-V3.2 (10,092) & $15{,}797.8\,\mu\text{s}$ & $210.0\,\mu\text{s}$ & $659.7\,\mu\text{s}$ & $148.8\,\text{MiB/s}$ & $75.2\times$ & $185.9 / 40.9\,\mu\text{s}$ ($4.54\times$) \\
+Kimi-K2.5 (9,164) & $12{,}466.8\,\mu\text{s}$ & $181.3\,\mu\text{s}$ & $525.2\,\mu\text{s}$ & $172.3\,\text{MiB/s}$ & $68.7\times$ & $236.8 / 58.7\,\mu\text{s}$ ($4.03\times$) \\
+GLM-5.2 (9,106) & $12{,}227.5\,\mu\text{s}$ & $349.7\,\mu\text{s}$ & $783.4\,\mu\text{s}$ & $89.4\,\text{MiB/s}$ & $35.0\times$ & $258.0 / 74.9\,\mu\text{s}$ ($3.45\times$) \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Production tokenizer evaluation ($32{,}770\,\text{B}$ single-shot + $3{,}599\,\text{B}$ 20-turn incremental chat, 100\% exact token-ID parity with Hugging Face \texttt{tokenizers 0.21.4}).}
+\label{tab:tok_real}
+\end{table}
+
+\subsection{Warm 20-Turn CUDA Developer-Agent End-to-End Evaluation}
+
+Isolated CPU wins only translate into developer productivity if the integrated GPU serving loop eliminates wasted speculative work without degrading prose turns. We evaluated five configurations sequentially inside \texttt{zen6\_agent\_20turn\_bench} using \texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf} on CUDA (\texttt{MAX\_SEQ\_LEN = 8192}, \texttt{MAX\_GEN\_TOKENS = 96}, greedy deterministic sampling). Turns 1--10 pose open-ended architectural diagnostics (low context overlap), while Turns 11--20 perform grounded verbatim code and JSON edits referencing repository snippets in prompt history.
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrr}
+\toprule
+\textbf{Config} & \textbf{TTFT p50/p95} & \textbf{ITL p50/p95} & \textbf{Prose ITL} & \textbf{Edit ITL} & \textbf{Wall (ms)} & \textbf{GPU (ms)} & \textbf{Acc / Prop} & \textbf{SA / Guard} \\
+\midrule
+\texttt{plain\_nocache} & $1{,}087.2 / 2{,}522.3$ & $27.25 / 31.63$ & $26.81\,\text{ms}$ & $27.65\,\text{ms}$ & $65{,}648.7$ & $65{,}607.0$ & $0 / 0$ ($0.0\%$) & $0 / 0$ \\
+\texttt{cached\_plain} & $\mathbf{268.7} / \mathbf{463.7}$ & $24.05 / 31.65$ & $\mathbf{21.85}\,\text{ms}$ & $27.57\,\text{ms}$ & $44{,}602.2$ & $44{,}566.0$ & $0 / 0$ ($0.0\%$) & $0 / 0$ \\
+\texttt{cached\_mtp\_unguarded} & $317.4 / 480.3$ & $41.89 / 69.42$ & $45.22\,\text{ms}$ & $36.71\,\text{ms}$ & $75{,}036.1$ & $74{,}990.0$ & $521 / 2{,}442$ ($21.3\%$) & $0 / 0$ \\
+\texttt{cached\_prompt\_lookup} & $305.3 / 497.5$ & $\mathbf{14.25} / 60.47$ & $27.43\,\text{ms}$ & $\mathbf{2.59}\,\text{ms}$ & $38{,}772.5$ & $38{,}727.0$ & $672 / 1{,}900$ ($35.4\%$) & $0 / 434$ \\
+\texttt{cached\_adaptive\_full} & $342.2 / 568.2$ & $14.36 / 60.73$ & $26.04\,\text{ms}$ & $2.79\,\text{ms}$ & $\mathbf{38{,}190.3}$ & $\mathbf{38{,}146.0}$ & $643 / 1{,}308$ ($\mathbf{49.2\%}$) & $160 / 861$ \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Warm 20-turn CUDA developer-agent benchmark on \texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf} (NVIDIA GB10). Latency figures in ms; all 100 turn outputs exhibit zero duplicate-token stuttering after the \texttt{1a9d35400} CUDA \texttt{start\_offset()} fix.}
+\label{tab:agent}
+\end{table}
+
+Four quantitative findings emerge from Table~\ref{tab:agent}:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Prefix KV caching cuts time-to-first-token by $4.05\times$}: Caching prefix blocks (\texttt{prefix\_cache\_n = 16}, hitting $28{,}704$ of $33{,}215$ prompt tokens) drops p50 TTFT from $1{,}087.2\,\text{ms}$ to $268.7\,\text{ms}$ (p95 from $2{,}522.3\,\text{ms}$ to $463.7\,\text{ms}$) and total session wall time from $65{,}648.7\,\text{ms}$ to $44{,}602.2\,\text{ms}$ ($1.47\times$).
+  \item \textbf{Unguarded neural MTP regresses $1.68\times$ on mixed turns}: Running MTP continuously on mixed prose and edit workloads accepts only $21.3\%$ of $2{,}442$ drafted tokens across $1{,}221$ verify rounds, inflating prose p50 ITL from $21.85\,\text{ms}$ to $45.22\,\text{ms}$ and total wall time to $75{,}036.1\,\text{ms}$.
+  \item \textbf{Suffix lookup cuts edit ITL by $10.64\times$}: Grounded edit p50 ITL plunges from $27.57\,\text{ms}$ (\texttt{cached\_plain}) to $2.59\,\text{ms}$ (\texttt{cached\_prompt\_lookup}) and $2.79\,\text{ms}$ (\texttt{cached\_adaptive\_full}, $9.88\times$), while total wall time falls below unspeculated decoding.
+  \item \textbf{\texttt{SA\_SPEC} + \texttt{GuardedDraft} achieves the lowest total wall time}: Combining \texttt{SuffixAutomaton} lookup, \texttt{SA\_SPEC} bypass ($160$ neural draft rounds bypassed), and \texttt{GuardedDraft} cooldown ($861$ low-yield skips) reduces total neural proposals from $2{,}442$ to $1{,}308$, lifts verified acceptance from $21.3\%$ to $49.2\%$, and completes the 20-turn conversation in \textbf{38,190.3\,ms} ($1.96\times$ faster than unguarded MTP, $1.72\times$ faster than uncached decode, and $1.17\times$ faster than \texttt{cached\_plain}). Note that under FP16/BF16 CUDA reductions, batched $M>1$ verification and cached vs.\ uncached prefill can break near-tied logit ordering slightly differently than serial $M=1$ decode ($5/20$ identical turn texts between \texttt{cached\_adaptive\_full} and \texttt{cached\_plain}, vs.\ $9/20$ with unguarded MTP), with zero token-repetition artifacts across all $100$ outputs.
+\end{enumerate}
+
+\section{Limitations and Safety}
+Our warm 20-turn end-to-end CUDA numbers evaluate one 4B quantized hybrid-attention model (\texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf}) on one NVIDIA GB10 workstation; scaling ratios will shift on larger models (where neural draft passes cost more relative to target compute), bandwidth-bound Metal or ROCm GPUs, or non-coding workloads lacking local context repetition. Additionally, while \texttt{hanzo-tokenizer} guarantees bit-identical output against \texttt{tokenizers 0.21.4} at startup and falls back on unsupported regex lookarounds, models requiring PCRE2 lookaround engines do not receive SWAR tokenization acceleration. Finally, speculative decoding preserves greedy or distribution equivalence up to floating-point reduction associativity across batch sizes $M>1$ versus $M=1$.
+
+\section{Reproducibility}
+All implementation code and harnesses are public in \texttt{hanzoai/engine} (commit \texttt{36cd0bb3c}) and \texttt{hanzoai/ml} (commit \texttt{c9bee7434})~\cite{hanzo2026engine}:
+\begin{itemize}[noitemsep]
+  \item CPU hot-path harness: \texttt{cargo run --release -p hanzo-cli --features cuda --example hotpath\_bench}
+  \item KV fabric loopback harness: \texttt{cargo run --release -p hanzo-kv-fabric --example kv\_fabric\_bench}
+  \item CPU upsample harness: \texttt{cargo run --release -p hanzo-ml --example upsample\_nearest2d\_bench}
+  \item Warm 20-turn CUDA harness: \\ \texttt{cargo run --release -p hanzo-cli --features cuda --example zen6\_agent\_20turn\_bench}
+  \item CUDA \texttt{start\_offset()} regression test: \\ \texttt{cargo test -p hanzo-engine --features cuda cuda\_sliced\_row\_topk\_respects\_start\_offset}
+\end{itemize}
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

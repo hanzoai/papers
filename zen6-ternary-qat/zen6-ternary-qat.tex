@@ -1,0 +1,126 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+\emergencystretch=2em
+
+\title{\textbf{Zen 6 Nano and Zen 6: Hadamard-Rotated 1.58-Bit Ternary\\Post-Training and Multi-Runtime Open Weights}}
+\author{
+  Zach Kelling \\
+  Hanzo AI Research \\
+  \texttt{research@hanzo.ai}
+}
+\date{November 15, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the \textbf{Zen 6 Nano} ($2\text{B}$, $4\text{B}$, $9\text{B}$) and \textbf{Zen 6} ($27\text{B}$) open-weight multimodal and coding model family published under the Apache-2.0 license across 21 public Hugging Face repositories in the \texttt{hanzoai} and \texttt{zenlm} namespaces. The checkpoints build transparently on Apache-2.0 upstream hybrid-attention and ternary foundations: the \texttt{Qwen3.5} 3:1 Gated-DeltaNet + grouped-query attention (GQA) backbone, \texttt{prism-ml/Bonsai-2} Sylvester-Walsh-Hadamard ternary weights, and \texttt{ProCreations} / \texttt{z-lab} \texttt{DFlash2} speculative drafters. To adapt model identity, tool-calling syntax, and developer reasoning without degrading upstream ternary representations, we apply Straight-Through Estimator quantization-aware post-training (STE-QAT) with a hybrid Muon + AdamW optimizer directly in the ternary latent space. Across the $4\text{B}$, $9\text{B}$, and $27\text{B}$ releases, post-training converges target cross-entropy loss from $3.5585 \to 0.2411$ ($4\text{B}$), $3.5268 \to 0.1026$ ($9\text{B}$), and $2.3220 \to 0.9597$ ($27\text{B}$) while mutating only $0.394\%$--$1.022\%$ of discrete ternary weights. We export every size consistently across four bit-packed inference formats---\texttt{PTQ1\_0} ($1.750\,\text{bpw}$ base-3), \texttt{PQ2\_0} ($2.125\,\text{bpw}$ Hadamard-rotated 2-bit), \texttt{Q2\_0} ($2.250\,\text{bpw}$), and \texttt{MLX-2bit}---paired with \texttt{BF16}/\texttt{Q8\_0} vision projectors and \texttt{MTP-Q8\_0} / \texttt{DFlash2} speculative heads. Live CUDA execution of \texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf} inside Hanzo Engine completes a warm 20-turn developer-agent conversation in $38.19\,\text{s}$ ($2.79\,\text{ms}$ grounded edit inter-token latency).
+\end{abstract}
+
+\section{Base Models, Provenance, and Hybrid 3:1 Architecture}
+
+\paragraph{Explicit Upstream Attribution.}
+In accordance with Hanzo research standards and the Apache-2.0 license, the Zen 6 ternary series does not claim from-scratch pretraining. Every release discloses its exact upstream lineage in both Hugging Face metadata and model cards:
+\begin{itemize}[noitemsep]
+  \item \textbf{Backbone Architecture}: \texttt{Qwen/Qwen3.5} hybrid linear-full attention transformer with multimodal vision projector and $248{,}320$-token vocabulary (Apache-2.0)~\cite{qwen2026qwen35,yang2024gateddeltanet}.
+  \item \textbf{Pretrained Ternary Initialization}: \texttt{prism-ml/Bonsai-2} ($2\text{B}$, $4\text{B}$, $9\text{B}$, $27\text{B}$) Hadamard-rotated ternary base weights (Apache-2.0)~\cite{prismml2026bonsai2}.
+  \item \textbf{Speculative Block-Diffusion Drafters}: \texttt{ProCreations} / \texttt{z-lab} \texttt{DFlash2} draft modules (Apache-2.0)~\cite{procreations2026dflash2}, alongside extracted Multi-Token Prediction (\texttt{MTP-Q8\_0}) heads.
+\end{itemize}
+
+\paragraph{Why $2\text{B} / 4\text{B} / 9\text{B} / 27\text{B}$ (and no $8\text{B}$ Tier).}
+Unlike uniform dense architectures that include an $8\text{B}$ parameter step, the hybrid 3:1 Gated-DeltaNet + GQA family repeats blocks of three linear-attention layers followed by one full-attention layer (\texttt{full\_attention\_interval = 4}, \texttt{head\_dim = 256}, \texttt{max\_position\_embeddings = 262,144}, \texttt{linear\_conv\_kernel\_dim = 4})~\cite{yang2024gateddeltanet,qwen2026qwen35}. This block multiplier fixes the native intermediate step between $4\text{B}$ ($32$ layers, $d=2560$) and $27\text{B}$ ($64$ layers, $d=5120$) at \textbf{9B} ($32$ layers, $d=4096$, intermediate $12{,}288$, untied embeddings). Publishing native $2\text{B}$, $4\text{B}$, $9\text{B}$, and $27\text{B}$ checkpoints avoids architectural mismatch or artificial pruning to an $8\text{B}$ target. Table~\ref{tab:arch} details all four configurations directly from the shipped \texttt{config.json} specifications~\cite{hanzo2026weights}.
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrr}
+\toprule
+\textbf{Model} & \textbf{Layers} & \textbf{$d_{\text{model}}$} & \textbf{$d_{\text{ffn}}$} & \textbf{Q / KV Heads} & \textbf{Linear K / V} & \textbf{Tied Emb.} & \textbf{Vocab} & \textbf{Context} \\
+\midrule
+Zen 6 Nano 2B & 24 & 2,048 & 6,144 & 8 / 2 & 16 / 16 & Yes & 248,320 & 262,144 \\
+Zen 6 Nano 4B & 32 & 2,560 & 9,216 & 16 / 4 & 16 / 32 & Yes & 248,320 & 262,144 \\
+Zen 6 Nano 9B & 32 & 4,096 & 12,288 & 16 / 4 & 16 / 32 & No & 248,320 & 262,144 \\
+Zen 6 27B & 64 & 5,120 & 17,408 & 24 / 4 & 16 / 32 & No & 248,320 & 262,144 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Hybrid 3:1 Gated-DeltaNet + GQA architectural specifications across the Zen 6 family.}
+\label{tab:arch}
+\end{table}
+
+\section{Block Sylvester-Walsh-Hadamard Rotation and Balanced Ternary Projection}
+
+Aggressive sub-2-bit quantization degrades severely in the presence of channel-wise weight and activation outliers~\cite{ma2024bitnet,ashkboos2024quarot,tseng2024quip}. Following the \texttt{prism\_hadamard\_qwen35} parameterization~\cite{prismml2026bonsai2}, each projection block of size $B = 64$ or $B = 128$ is transformed by the normalized Sylvester-Walsh-Hadamard matrix:
+\begin{equation}
+H_B[r, c] = \frac{(-1)^{\operatorname{popcount}(r \mathbin{\&} c)}}{\sqrt{B}}, \qquad H_B^\top H_B = I_B.
+\end{equation}
+Rotating activations $x' = H_B x$ and weights $W' = W H_B^\top$ preserves exact inner products $W' x' = W x$ up to floating-point rounding while spreading localized activation outliers uniformly across all $B$ coordinates before rounding weights into balanced ternary values $Q_g(W') \in \{-s_g, 0, +s_g\}$ with per-group FP16 scale $s_g$. Because $H_B$ is orthogonal and entry-free to multiply via butterfly additions, fused CUDA, Metal, and ROCm kernels absorb the transform directly on the register/shared-memory tile path~\cite{ashkboos2024quarot,tseng2024quip}.
+
+\section{Straight-Through Estimator QAT with Hybrid Muon + AdamW}
+
+Na\"ive BF16 fine-tuning over ternary checkpoints introduces high-magnitude float deltas that snap back erratically upon re-quantization to $1.58$ bits. Instead, we execute Straight-Through Estimator Quantization-Aware Post-Training (STE-QAT)~\cite{bengio2013ste}: forward passes quantize rotated weights onto the discrete ternary lattice $\{-s_g, 0, +s_g\}$, while backward passes route clipped gradients into continuous latent shadow weights.
+
+To converge identity, grounded MCP XML/JSON tool calling, reasoning tags (\texttt{<think>}), and multi-turn persona adherence rapidly without destabilizing pre-trained knowledge, we pair orthogonalized Muon updates~\cite{jordan2024muon} on 2D linear matrices with AdamW on 1D normalization and group-scale vectors. Table~\ref{tab:qat} records measured cross-entropy convergence and exact percentage of weights whose discrete ternary trit assignment changed during post-training across all four model sizes (recorded verbatim from \texttt{eval\_report.json} artifacts).
+
+\begin{table}[ht]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrl}
+\toprule
+\textbf{Model} & \textbf{QAT Steps} & \textbf{Initial CE} & \textbf{Final CE} & \textbf{Mean / Max Trit Flips} & \textbf{Notes} \\
+\midrule
+Zen 6 Nano 2B & 70 & $3.7885$ & $0.0475$ & $6.188\%$ / $9.020\%$ & Experimental ROME/STE pass; qualitative eval pending \\
+Zen 6 Nano 4B & 28 & $3.5585$ & $0.2411$ & $1.022\%$ / $2.085\%$ & Identity + \texttt{<think>} + MCP tools verified \\
+Zen 6 Nano 9B & 28 & $3.5268$ & $0.1026$ & $0.877\%$ / $1.675\%$ & Identity + \texttt{<think>} + MCP tools verified \\
+Zen 6 27B & 24 & $2.3220$ & $0.9597$ & $0.394\%$ / $0.885\%$ & Identity + \texttt{<think>} + MCP tools verified \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Hybrid Muon + AdamW STE-QAT convergence and discrete trit flip rates (\texttt{eval\_report.json}). Over $98.9\%$ of ternary weights remain invariant on the flagship 4B, 9B, and 27B checkpoints.}
+\label{tab:qat}
+\end{table}
+
+Qualitative verification on the re-quantized GGUF checkpoints confirms clean model identity responses in both think and no-think modes, valid \texttt{<tool\_call>} structured calls, and coherent instruction following on the $4\text{B}$, $9\text{B}$, and $27\text{B}$ models. For $2\text{B}$, \texttt{eval\_report.json} records CE convergence ($3.7885 \to 0.0475$) over $70$ steps ($6.188\%$ trit flips), while qualitative GGUF prompt fields in its report remain empty and are flagged accordingly.
+
+\section{Cross-Runtime Packed Ternary Codecs and Speculative Heads}
+
+Because inference runtimes across NVIDIA CUDA, AMD ROCm, Vulkan, and Apple Silicon MLX require distinct memory layouts, we build and publish four synchronized serialization codecs per model tier plus multimodal projectors and speculative draft heads:
+\begin{itemize}[noitemsep]
+  \item \textbf{\texttt{PTQ1\_0} ($1.750\,\text{bpw}$)}: Packs 5 balanced ternary trits per byte via base-3 arithmetic ($3^5 = 243 < 256$) per group with a trailing FP16 scale, yielding the smallest footprint ($410\,\text{MB}$ at $2\text{B}$, $906\,\text{MB}$ at $4\text{B}$, $1.9\,\text{GB}$ at $9\text{B}$, $5.6\,\text{GB}$ at $27\text{B}$).
+  \item \textbf{\texttt{PQ2\_0} ($2.125\,\text{bpw}$)}: 64-weight Hadamard-rotated 2-bit blocks paired with FP16 scales for fast fused INT8/DP4A tensor-core and register execution ($494\,\text{MB}$ at $2\text{B}$, $1.1\,\text{GB}$ at $4\text{B}$, $2.3\,\text{GB}$ at $9\text{B}$, $6.8\,\text{GB}$ at $27\text{B}$).
+  \item \textbf{\texttt{Q2\_0} ($2.250\,\text{bpw}$)}: Standard 32-weight group 2-bit quantization with FP16 scale for universal GGUF compatibility ($522\,\text{MB}$--$7.2\,\text{GB}$).
+  \item \textbf{\texttt{MLX-2bit} (\texttt{group\_size = 128}, affine 2-bit)}: Packs 16 weights per \texttt{uint32} word alongside \texttt{scales} and \texttt{biases} for native Apple Silicon execution, plus deltas packaged in \texttt{mlx-patch.npz} and paired \texttt{mtp/model.safetensors} weights.
+\end{itemize}
+For vision understanding, every tier ships paired \texttt{mmproj-BF16.gguf} and \texttt{mmproj-Q8\_0.gguf} multimodal projectors ($348$--$889\,\text{MB}$). For speculative decoding, $4\text{B}$ and $9\text{B}$ include unified \texttt{-PQ2\_0-MTP-Q8\_0.gguf} bundles as well as standalone \texttt{DFlash2} draft GGUFs ($4\text{B}$ in \texttt{BF16}, $9\text{B}$ and $27\text{B}$ in \texttt{Q8\_0}). On NVIDIA GB10 CUDA under Hanzo Engine (\texttt{36cd0bb3c}), serving \texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf} with adaptive \texttt{SA\_SPEC} + \texttt{GuardedDraft} completes a warm 20-turn developer-agent session in $38{,}190.3\,\text{ms}$ ($2.79\,\text{ms}$ grounded edit ITL, $49.2\%$ draft acceptance, $1.96\times$ faster than unguarded MTP).
+
+\section{Open-Weight Registry, Limitations, and Reproducibility}
+
+\paragraph{Artifact Registry.}
+All 21 updated Apache-2.0 repositories are hosted publicly across Hugging Face with \texttt{LICENSE}, \texttt{NOTICE}, \texttt{SHA256SUMS}, \texttt{chat\_template.jinja}, and \texttt{eval\_report.json} manifests~\cite{hanzo2026weights}:
+\begin{itemize}[noitemsep]
+  \item \textbf{GGUF collections}: \texttt{zenlm/zen6-nano-\{2b,4b,9b\}}, \texttt{hanzoai/zen6-nano-\{2b,4b,9b\}}, alias \texttt{\{zenlm,hanzoai\}/zen6-nano} ($4\text{B}$), \texttt{zenlm/zen6-gguf}, \texttt{zenlm/zen6-flash}, and \texttt{hanzoai/zen6} ($27\text{B}$).
+  \item \textbf{MLX 2-bit collections}: \texttt{zenlm/zen6-nano-\{2b,4b,9b\}-mlx}, \\ \texttt{hanzoai/zen6-nano-\{2b,4b,9b\}-mlx}, aliases \texttt{\{zenlm,hanzoai\}/zen6-nano-mlx} ($4\text{B}$), and \texttt{\{zenlm,hanzoai\}/zen6-mlx} ($27\text{B}$).
+\end{itemize}
+
+\paragraph{Limitations.}
+As noted in Table~\ref{tab:qat}, the $2\text{B}$ post-training artifact records only CE training loss reduction and omits populated \texttt{gguf\_eval} qualitative checks; downstream users seeking verified tool-calling on edge devices should select $4\text{B}$ or $9\text{B}$. Moreover, while $4\text{B}$ has full 20-turn agent CUDA timing in Hanzo Engine (\texttt{36cd0bb3c}), standalone accuracy sweeps on public benchmarks (e.g., GSM8K, MMLU-Pro, LiveCodeBench) after STE-QAT remain in progress and are not claimed here~\cite{prismml2026bonsai2}. All inference benchmarks on \texttt{zen6-nano-4b-PQ2\_0-MTP-Q8\_0.gguf} reproduce via \texttt{hanzo-cli} example \texttt{zen6\_agent\_20turn\_bench} with model verification hashes in \texttt{SHA256SUMS}.
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

@@ -99,6 +99,10 @@ pdfs/%.pdf: %.tex \
 	@touch $@
 	@echo "  OK   $@"
 
+# defense/hanzo-compendium.tex embeds the other defense/*.pdf chapters via
+# \includepdf, so under parallel `make -j` they must finish before it runs.
+pdfs/defense/hanzo-compendium.pdf: $(filter-out pdfs/defense/hanzo-compendium.pdf,$(filter pdfs/defense/%.pdf,$(ALL_PDFS)))
+
 # An arXiv upload is a paper's sources, which arXiv compiles without running
 # bibtex, from one flat directory. So it is the paper directory's tracked TeX,
 # the shared files it names with the ../shared/ prefix dropped, and the .bbl
